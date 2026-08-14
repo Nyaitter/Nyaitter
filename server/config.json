@@ -1,0 +1,98 @@
+{
+	"server": {
+		"port": 3000,
+		"jsonBodyLimit": "2mb",
+		"trustProxy": false
+	},
+	"static": {
+		"jsCssCacheMaxAge": 3600,
+		"assetCacheMaxAge": 86400
+	},
+	"cors": {
+		"allowedOrigins": ["http://localhost:3000", "http://127.0.0.1:3000"],
+		"credentials": false,
+		"preflightMaxAge": 600
+	},
+	"limits": {
+		"postContentMax": 1000,
+		"dmContentMax": 2000,
+		"timelineDefaultLimit": 30,
+		"userSearchDefaultLimit": 20,
+		"userSearchMaxLimit": 100,
+		"dmMessagesDefaultLimit": 50,
+		"dmMessagesMaxLimit": 100,
+		"parentPostPreviewLength": 100,
+		"followingDefaultLimit": 100,
+		"maxFileUploadSizeMB": 10
+	},
+	"auth": {
+		"sessionExpiryDays": 30,
+		"verificationCodeExpiryMinutes": 15,
+		"botTokenPrefix": "bot_",
+		"sessionTokenBytes": 32,
+		"botTokenIdBytes": 16,
+		"verificationCodeBytes": 4
+	},
+	"inMemory": {
+		"initialUserId": 0
+	},
+	"database": {
+		"adapter": "memory",
+		"postgres": {
+			"connectionString": "postgres://user:pass@localhost:5432/nyaitter",
+			"poolSize": 10,
+			"ssl": false
+		},
+		"d1": {
+			"workerUrl": "",
+			"authToken": ""
+		}
+	},
+	"storage": {
+		"adapter": "local",
+		"local": {
+			"uploadDir": "./uploads"
+		},
+		"r2": {
+			"accountId": "",
+			"bucket": "nyaitter-uploads",
+			"accessKeyId": "",
+			"secretAccessKey": "",
+			"publicDomain": ""
+		}
+	},
+	"logging": {
+		"level": "info",
+		"pretty": true,
+		"requestIdHeader": "x-request-id"
+	},
+	"rateLimit": {
+		"enabled": true,
+		"windowMs": 60000,
+		"max": 1000,
+		"auth": {
+			"windowMs": 60000,
+			"max": 100
+		}
+	},
+	"security": {
+		"hsts": {
+			"enabled": false,
+			"maxAge": 31536000,
+			"includeSubDomains": true
+		},
+		"helmet": {
+			"enabled": false
+		}
+	},
+	"health": {
+		"detailed": false
+	},
+	"contributors": [6199, 7549, 8571, 4812, 9741],
+	"federation": {
+		"publicUrl": "",
+		"domain": "nyaitter.jp",
+		"allow_external_login": true,
+		"trusted_servers": []
+	}
+}

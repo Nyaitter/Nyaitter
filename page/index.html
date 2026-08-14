@@ -1,0 +1,352 @@
+<!doctype html>
+<html lang="ja">
+	<head>
+		<meta charset="UTF-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+		<meta name="robots" content="noindex, nofollow, noarchive" />
+			<title>Nyaitter</title>
+			<meta name="theme-color" content="#1d9bf0" />
+			<meta name="apple-mobile-web-app-capable" content="yes" />
+			<meta name="apple-mobile-web-app-status-bar-style" content="default" />
+			<link rel="manifest" href="/manifest.webmanifest" />
+			<link rel="icon" href="favicon.png?v=v1" type="image/png" />
+			<link rel="apple-touch-icon" sizes="180x180" href="pwa-icon-192.png" />
+		<link
+			rel="stylesheet"
+			href="https://cdn.jsdelivr.net/npm/emojione@4.0.0/extras/css/emojione.min.css"
+			integrity="sha384-+JoywCPFwbtS2KrNLFu8EJHK+r5KPfqww25+fIBceLuhRk4muZy4TZR/4gXrk3qX"
+			crossorigin="anonymous"
+		/>
+			<link rel="stylesheet" href="./style.css?v=v1" />
+		<script src="https://cdn.jsdelivr.net/npm/@twemoji/api@15.1.0/dist/twemoji.min.js" integrity="sha384-o28+zJO3/45GHIy+9TFKGaYnbt0KQcFRzyBrb0WSSrz7bPGwGI1d64worBiXPgXw" crossorigin="anonymous"></script>
+		<script src="https://cdn.jsdelivr.net/npm/emojione@4.0.0/lib/js/emojione.min.js" integrity="sha384-1BsqfFBBtVbyYG2C3PTRFz+m1tERshCkrZnIAIhP8+ES00qPKe9EvOWpRb5Uoscd" crossorigin="anonymous"></script>
+		<script src="./vendor/emoji-mart.js"></script>
+	</head>
+	<body>
+		<div class="app-container">
+			<!-- 左側ナビゲーションメニュー -->
+			<nav id="left-nav">
+				<div id="nav-logo"></div>
+				<div id="nav-menu-top"></div>
+				<div id="nav-menu-bottom"></div>
+			</nav>
+			<!-- 中央メインコンテンツ -->
+			<main id="main-content">
+				<header id="page-header">
+					<!-- ヘッダー内容はJSで動的に生成されます -->
+				</header>
+				<div id="content-area">
+					<div id="main-screen" class="screen hidden">
+						<div class="timeline-tabs-sticky-container">
+							<div class="timeline-tabs">
+								<button
+									class="timeline-tab-button active"
+									data-tab="foryou"
+								>
+									すべて
+								</button>
+								<button
+									class="timeline-tab-button"
+									data-tab="following"
+								>
+									フォロー中
+								</button>
+							</div>
+						</div>
+						<div class="post-form-sticky-container">
+							<div class="post-form-container"></div>
+						</div>
+						<div id="timeline"></div>
+					</div>
+					<div id="explore-screen" class="screen hidden">
+						<div id="explore-content"></div>
+					</div>
+					<div id="notifications-screen" class="screen hidden">
+						<div id="notifications-content"></div>
+					</div>
+					<div id="likes-screen" class="screen hidden">
+						<div id="likes-content"></div>
+					</div>
+					<div id="stars-screen" class="screen hidden">
+						<div id="stars-content"></div>
+					</div>
+					<div id="profile-screen" class="screen hidden">
+						<div id="profile-header"></div>
+						<div id="profile-tabs"></div>
+						<div id="profile-content"></div>
+					</div>
+					<div id="settings-screen" class="screen hidden"></div>
+					<div id="post-detail-screen" class="screen hidden">
+						<div id="post-detail-content"></div>
+					</div>
+					<div id="search-results-screen" class="screen hidden">
+						<div id="search-results-content"></div>
+					</div>
+					<div id="dm-screen" class="screen hidden">
+						<div id="dm-content"></div>
+					</div>
+					<div id="admin-logs-screen" class="screen hidden">
+						<div id="admin-logs-content"></div>
+					</div>
+				</div>
+			</main>
+			<!-- 右側サイドバー -->
+			<aside id="right-sidebar">
+				<div id="right-sidebar-search-widget-container"></div>
+				<div id="recommendations-widget-container"></div>
+				<div id="right-sidebar-links-container"></div>
+			</aside>
+		</div>
+		<div id="login-banner" class="hidden">
+			<div class="login-banner-content">
+				<h2>NyaitterはScratcherのためのSNSです</h2>
+				<h4>Scratchアカウントがあれば簡単に参加できます</h4>
+			</div>
+			<div class="login-banner-actions">
+				<button id="banner-login-button">ログイン</button>
+				<button id="banner-signup-button">参加</button>
+			</div>
+		</div>
+					<div id="login-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="login-title">
+				<div class="modal-content login-modal-content">
+					<button type="button" class="modal-close-btn" aria-label="閉じる">×</button>
+					<div class="login-modal-heading">
+						<h3 id="login-title">ログイン</h3>
+					</div>
+					<div id="auth-step1">
+						<p id="login-instruction" class="settings-help-text">ScratchID、またはNyaitterアドレスを入力してください。</p>
+						<label class="login-modal-field" for="username-input">ScratchID または Nyaitterアドレス</label>
+						<input type="text" id="username-input" placeholder="ScratchID または Nyaitterアドレス" autocomplete="username" required />
+						<button type="button" id="get-code-btn" class="settings-primary-button login-auth-action">認証コードを取得</button>
+					</div>
+					<div id="auth-step2" class="hidden">
+						<p class="settings-help-text">この認証コードをコピーして、下のいずれかにコメントしてください。</p>
+						<button type="button" id="verification-code" class="login-verification-code" title="クリックしてコピー"></button>
+						<div class="login-modal-links">
+							<a class="login-secondary-button" href="https://scratch.mit.edu/projects/1239738451/" target="_blank" rel="noopener noreferrer">認証用プロジェクトを開く</a>
+							<a class="login-secondary-button" href="https://scratch.mit.edu/" target="_blank" rel="noopener noreferrer" id="pflink">プロフィールを開く</a>
+						</div>
+						<button type="button" id="verify-comment-btn" class="settings-primary-button login-auth-action">コメントを認証</button>
+					</div>
+					<p id="error-message" class="login-modal-message login-modal-error hidden" role="alert"></p>
+					<p id="copy-message" class="login-modal-message login-modal-copy hidden" role="status">認証コードをコピーしました。</p>
+					<div id="login-loading-overlay" class="login-loading-overlay hidden" aria-live="polite"><div class="spinner"></div></div>
+				</div>
+			</div>
+			<div id="external-confirm-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="external-confirm-title">
+				<div class="modal-content login-modal-content">
+					<button type="button" class="modal-close-btn" aria-label="閉じる" id="external-confirm-close-btn">×</button>
+					<div class="login-modal-heading">
+						<h3 id="external-confirm-title">外部ログインの確認</h3>
+					</div>
+					<p id="external-confirm-instruction" class="settings-help-text">
+						別のNyaitterサーバーから、このアカウントでのログイン確認を求められています。
+					</p>
+					<div id="external-confirm-detail" class="external-confirm-detail hidden">
+						<p class="settings-help-text"><strong>要求されたアドレス</strong></p>
+						<p id="external-confirm-address" class="login-verification-code" style="cursor: default;"></p>
+						<p class="settings-help-text"><strong>いまのアカウント</strong></p>
+						<p id="external-confirm-current-user" class="settings-help-text"></p>
+					</div>
+					<div id="external-confirm-actions" class="external-confirm-actions hidden">
+						<button type="button" id="external-confirm-approve-btn" class="settings-primary-button login-auth-action">ログインを許可する</button>
+						<button type="button" id="external-confirm-deny-btn" class="login-secondary-button login-auth-action">拒否して戻る</button>
+					</div>
+					<div id="external-confirm-login-needed" class="external-confirm-actions hidden">
+						<button type="button" id="external-confirm-open-login-btn" class="settings-primary-button login-auth-action">ログインする</button>
+					</div>
+					<p id="external-confirm-error" class="login-modal-message login-modal-error hidden" role="alert"></p>
+					<div id="external-confirm-loading" class="login-loading-overlay hidden" aria-live="polite"><div class="spinner"></div></div>
+				</div>
+			</div>
+			<div id="post-modal" class="modal-overlay hidden">
+
+			<div class="modal-content">
+				<!--<button class="modal-close-btn">×</button>-->
+				<div class="post-form-container-modal"></div>
+			</div>
+		</div>
+		<div
+			id="image-preview-modal"
+			class="modal-overlay hidden"
+		>
+			<button
+				class="modal-close-btn"
+				style="top: 1rem; right: 1rem; font-size: 2rem"
+			>
+				×
+			</button>
+			<img id="image-preview-modal-content" src="" alt="拡大画像" />
+		</div>
+		<div id="edit-post-modal" class="modal-overlay hidden">
+			<div class="modal-content">
+				<!--<button class="modal-close-btn">×</button>-->
+				<div id="edit-post-modal-content"></div>
+			</div>
+		</div>
+		<div id="create-dm-modal" class="modal-overlay hidden">
+			<div class="modal-content" style="max-width: 500px">
+				<button class="modal-close-btn">×</button>
+				<div id="create-dm-modal-content"></div>
+			</div>
+		</div>
+		<div id="dm-manage-modal" class="modal-overlay hidden">
+			<div class="modal-content" style="max-width: 500px">
+				<button class="modal-close-btn">×</button>
+				<div id="dm-manage-modal-content"></div>
+			</div>
+		</div>
+					<div id="account-switcher-modal" class="modal-overlay hidden">
+				<div class="modal-content" style="max-width: 400px">
+					<button class="modal-close-btn">×</button>
+					<div id="account-switcher-modal-content"></div>
+				</div>
+			</div>
+			<div id="login-approval-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="login-approval-modal-title">
+				<div class="modal-content login-approval-modal-content">
+					<button type="button" class="modal-close-btn" aria-label="閉じる">×</button>
+					<div id="login-approval-modal-body"></div>
+				</div>
+			</div>
+
+		<div
+			id="connection-error-overlay"
+			class="modal-overlay hidden"
+			style="z-index: 2000"
+		>
+			<div
+				style="
+					background: white;
+					padding: 2rem;
+					border-radius: 16px;
+					text-align: center;
+				"
+			>
+				<h2 style="margin-top: 0">Nyaitterに接続できませんでした</h2>
+				<p>ネットワーク接続を確認して、もう一度お試しください。</p>
+				<button
+					id="retry-connection-btn"
+					style="
+						padding: 0.6rem 1.2rem;
+						border-radius: 9999px;
+						border: none;
+						background-color: var(--primary-color);
+						color: white;
+						font-weight: 700;
+					"
+				>
+					再試行
+				</button>
+			</div>
+		</div>
+		<div
+			id="freeze-overlay"
+			class="modal-overlay hidden"
+			style="z-index: 2000; background: rgba(240, 240, 240, 0.95)"
+		>
+			<div
+				style="
+					background: white;
+					padding: 2rem;
+					border-radius: 16px;
+					text-align: center;
+					max-width: 500px;
+					margin: 1rem;
+					box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+				"
+			>
+				<h2 style="margin-top: 0; color: #d9534f">
+					あなたは凍結されています
+				</h2>
+				<p>
+					あなたは<a
+						href="rule"
+						target="_blank"
+						rel="noopener noreferrer"
+						>Nyaitterルール</a
+					>に違反したため凍結されました。
+				</p>
+				<p style="margin-top: 1.5rem">
+					<strong>凍結理由:</strong><br /><span
+						id="freeze-reason"
+						style="
+							display: inline-block;
+							margin-top: 0.5rem;
+							white-space: pre-wrap;
+						"
+					></span>
+				</p>
+				<small style="display: block; margin-top: 2rem"
+					><a
+						href="https://forms.gle/buZpMftRNWjfhqVz8"
+						target="_blank"
+						rel="noopener noreferrer"
+						>間違いですか? 異議申し立てをする</a
+					></small
+				>
+			</div>
+		</div>
+		<div id="loading-overlay"><div class="spinner"></div></div>
+		<div id="edit-dm-message-modal" class="modal-overlay hidden">
+			<div class="modal-content">
+				<!--<button class="modal-close-btn">×</button>-->
+				<div id="edit-dm-message-modal-content"></div>
+			</div>
+		</div>
+		<div
+			id="mainjs-error-overlay"
+			class="modal-overlay hidden"
+			style="z-index: 3001"
+		>
+			<div
+				style="
+					background: white;
+					padding: 2rem;
+					border-radius: 16px;
+					text-align: center;
+					max-width: 400px;
+					margin: 2rem auto;
+				"
+			>
+				<h2 style="margin-top: 0; color: #d9534f">エラー</h2>
+				<div
+					id="mainjs-error-text"
+					style="color: #d9534f; margin: 1em 0; word-break: break-all"
+				></div>
+				<p style="color: #888; font-size: 0.96em">
+					Nyaitterに問題が発生しました
+				</p>
+				<ul
+					style="
+						text-align: left;
+						color: #888;
+						margin: 1.2em 0 1.5em 0;
+						font-size: 0.98em;
+					"
+				>
+					<li>キャッシュや拡張機能の影響の可能性があります</li>
+					<li>
+						キャッシュの削除や拡張機能の無効化をしても直らない場合は管理者へご連絡ください
+					</li>
+				</ul>
+					<button
+						id="mainjs-error-reload-btn"
+						style="
+						padding: 0.7em 1.5em;
+						font-size: 1em;
+						border-radius: 9999px;
+						background: #1d9bf0;
+						color: white;
+						border: none;
+						font-weight: 700;
+					"
+				>
+					再読み込み
+				</button>
+			</div>
+		</div>
+
+				<script src="./login.js?v=v1"></script>
+				<script type="module" src="./js/main.js?v=v1"></script>
+	</body>
+</html>

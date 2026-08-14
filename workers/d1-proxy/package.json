@@ -1,0 +1,16 @@
+{
+  "name": "nyaitter-d1-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cloudflare D1 Proxy Worker for Nyaitter",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "migrate:local": "wrangler d1 migrations apply nyaitter-d1 --local",
+    "migrate:remote": "wrangler d1 migrations apply nyaitter-d1 --remote"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}

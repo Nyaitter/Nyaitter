@@ -1,0 +1,660 @@
+const express = require('express');
+const { optionalAuth, requireAuth } = require('../middleware/auth');
+const config = require('../config');
+const {
+	serializeUser,
+	serializeUserBrief,
+	serializePublicProfile,
+	serializePostsByIds,
+	serializePostsBatch,
+	serializeNotification,
+} = require('../utils/serialize');
+const { getPublicUrl } = require('../utils/nyaitterAddress');
+const { filterViewablePosts } = require('../utils/postVisibility');
+const { ScratchIconService } = require('../services/ScratchIconService');
+
+const router = express.Router();
+
+function getDbAdapter(req) {
+	return req.app.locals.dbAdapter;
+}
+
+function getStorageAdapter(req) {
+	return req.app.locals.storageAdapter;
+}
+
+function getScratchIconService(req) {
+	if (!req.app.locals.scratchIconService) {
+		req.app.locals.scratchIconService = new ScratchIconService();
+	}
+	return req.app.locals.scratchIconService;
+}
+
+// アイコン画像を実際に配信しているScratch CDNのみを許可し、任意サイトへの
+const ALLOWED_ICON_REDIRECT_HOSTS = new Set([
+	'uploads.scratch.mit.edu',
+	'cdn2.scratch.mit.edu',
+]);
+
+function isAllowedIconRedirectUrl(value) {
+	let candidate = String(value || '');
+	if (candidate.startsWith('//')) {
+		candidate = `https:${candidate}`;
+	}
+	if (candidate.startsWith('/')) {
+		return true;
+	}
+	try {
+		const url = new URL(candidate);
+		return url.protocol === 'https:' && ALLOWED_ICON_REDIRECT_HOSTS.has(url.hostname.toLowerCase());
+	} catch (_) {
+		return false;
+	}
+}
+
+async function sendScratchFallbackIcon(req, res, scid) {
+	const entry = await getScratchIconService(req).getSourceIcon(
+		scid,
+		getScratchUserIconUrl,
+	);
+	if (!entry) return false;
+
+	res.setHeader('Cache-Control', 'public, max-age=21600, stale-while-revalidate=86400');
+	res.setHeader('Content-Type', entry.contentType);
+	res.setHeader('ETag', entry.etag);
+	if (req.headers['if-none-match'] === entry.etag) {
+		res.status(304).end();
+	} else {
+		res.send(entry.buffer);
+	}
+	return true;
+}
+
+async function publishNewNotification(req, userId, notification) {
+	const structuredNotification = await serializeNotification(
+		getDbAdapter(req),
+		notification,
+		getPublicUrl(req),
+	);
+	if (!structuredNotification) return;
+
+	const realtime = req.app.locals.realtime;
+	if (realtime) {
+		try {
+			await realtime.publishNewNotification(userId, structuredNotification, getDbAdapter(req));
+		} catch (error) {
+			console.warn('[users] notification realtime delivery failed:', error.message);
+		}
+	}
+
+	const pushService = req.app.locals.pushNotificationService;
+	if (pushService?.enabled) {
+		void pushService.sendNotificationToUser(userId, structuredNotification).catch((error) => {
+			console.warn('[users] notification push delivery failed:', error.message);
+		});
+	}
+}
+
+function serializeUserCard(user, publicUrl) {
+	return {
+		...serializeUserBrief(user, publicUrl),
+		me: user.me || user.bio || '',
+		created_at: user.created_at || user.createdAt || null,
+	};
+}
+
+function isProfileSectionVisible(user, viewerId, section) {
+	if (viewerId != null && Number(viewerId) === Number(user.id)) return true;
+	const settings = user.settings || {};
+	const settingBySection = {
+		likes: 'show_like',
+		stars: 'show_star',
+		following: 'show_follow',
+		followers: 'show_follower',
+	};
+	const setting = settingBySection[section];
+	return setting === 'show_follower' ? settings[setting] !== false : Boolean(settings[setting]);
+}
+
+function sendPrivateProfileSection(res, section) {
+	return res.status(403).json({
+		error: 'このプロフィール項目は非公開です',
+		visibility: 'private',
+		section,
+	});
+}
+
+async function getScratchUserIconUrl(scid) {
+	if (!scid) return 'https://uploads.scratch.mit.edu/get_image/user/0_60x60.png';
+	try {
+		const res = await fetch(
+			`https://api.scratch.mit.edu/users/${encodeURIComponent(scid)}`,
+		);
+		if (res.ok) {
+			const data = await res.json();
+			if (data && data.profile && data.profile.images) {
+				const imgUrl =
+					data.profile.images['90x90'] ||
+					data.profile.images['60x60'] ||
+					data.profile.images['50x50'] ||
+					data.profile.images['32x32'];
+				if (imgUrl) return imgUrl;
+			}
+		}
+	} catch (err) {
+		console.warn(`[users/icon] Scratch API fetch error for ${scid}:`, err.message);
+	}
+	return `https://uploads.scratch.mit.edu/get_image/user/${encodeURIComponent(scid)}_60x60.png`;
+}
+
+async function handleUserIcon(req, res) {
+	const db = getDbAdapter(req);
+	const userId = parseInt(req.params.userId, 10);
+	if (!Number.isInteger(userId) || userId <= 0) {
+		return res.redirect(302, '/logo.png');
+	}
+
+		try {
+			const user = await db.getUserById(userId);
+
+		
+			if (user && user.icon_data && user.icon_data.trim() !== '') {
+				const iconData = user.icon_data.trim();
+
+				// R2/D1・ローカルストレージに保存されたアイコンはキーだけをDBへ保存する。
+
+				// キーを相対リダイレクトすると現在の /server/api/users/... 配下として解決されるため、
+				if (!/^(?:https?:)?\/\//i.test(iconData) && !iconData.startsWith('/')) {
+					const storage = getStorageAdapter(req);
+					if (storage && typeof storage.getPublicUrl === 'function') {
+						try {
+							const publicUrl = await storage.getPublicUrl(iconData);
+							if (typeof publicUrl === 'string' && publicUrl && isAllowedIconRedirectUrl(publicUrl)) {
+								return res.redirect(302, publicUrl);
+							}
+						} catch (error) {
+							console.warn('[users/icon] stored icon URL resolution failed:', error.message);
+						}
+					}
+					return res.redirect(302, '/logo.png');
+				}
+
+				// 同一オリジン相対パス、または許可済みScratch CDNのURLだけをリダイレクトする。
+				// それ以外（プロトコル相対・任意ホストの絶対URL）はフォールバック画像へ倒す。
+				if (isAllowedIconRedirectUrl(iconData)) {
+					return res.redirect(302, iconData);
+				}
+				return res.redirect(302, '/logo.png');
+			}
+
+			if (user && user.scid) {
+				await sendScratchFallbackIcon(req, res, user.scid);
+				return;
+			}
+
+	} catch (err) {
+		console.error('[users] icon route error:', err);
+	}
+
+	return res.redirect(302, '/logo.png');
+}
+
+router.get('/:userId/icon', optionalAuth, handleUserIcon);
+
+router.get('/search', optionalAuth, async (req, res) => {
+	const db = getDbAdapter(req);
+	const query = req.query.q || '';
+	const limit = Math.min(
+		parseInt(req.query.limit, 10) || config.limits.userSearchDefaultLimit,
+		config.limits.userSearchMaxLimit,
+	);
+
+	if (query.trim().length === 0) {
+		return res.json({ users: [] });
+	}
+
+	try {
+					const users = await db.searchUsers(query, limit);
+			res.json({ users: users.map((user) => serializeUserCard(user, getPublicUrl(req))) });
+
+	} catch (err) {
+		console.error('[users] search error:', err);
+		res.status(500).json({ error: 'ユーザー検索に失敗しました' });
+	}
+});
+
+router.get('/recommended', optionalAuth, async (req, res) => {
+	const db = getDbAdapter(req);
+	const viewerId = req.user ? req.user.id : null;
+
+	try {
+		const allUsers = db.getAllUsers ? await db.getAllUsers() : [];
+		let candidates = allUsers
+			.slice()
+			.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+		if (viewerId) {
+			candidates = candidates.filter(
+				(u) => u.id !== Number(viewerId),
+			);
+		}
+					const selected = candidates.slice(0, 3);
+			res.json({ users: selected.map((user) => serializeUserCard(user, getPublicUrl(req))) });
+
+	} catch (err) {
+		console.error('[users] recommended error:', err);
+		res.status(500).json({ error: 'おすすめユーザー取得に失敗しました' });
+	}
+});
+
+router.get('/logs', requireAuth, async (req, res) => {
+	const db = getDbAdapter(req);
+
+	if (!req.user.admin) {
+		return res.status(403).json({ error: 'Admin access required' });
+	}
+
+	const limit = Math.min(parseInt(req.query.limit, 10) || 20, 100);
+	const offset = parseInt(req.query.offset, 10) || 0;
+
+	try {
+		const logs = await db.getLogs(limit, offset);
+		res.json({ logs });
+	} catch (err) {
+		console.error('[users] logs error:', err);
+		res.status(500).json({ error: 'ログ取得に失敗しました' });
+	}
+});
+
+router.get('/:userId', optionalAuth, async (req, res) => {
+	const db = getDbAdapter(req);
+	const userId = parseInt(req.params.userId, 10);
+
+	if (!Number.isInteger(userId) || userId < 0) {
+		return res.status(400).json({ error: 'Invalid user id' });
+	}
+
+	try {
+		const user = await db.getUserById(userId);
+		if (!user) {
+			return res.status(404).json({ error: 'User not found' });
+		}
+
+			const viewerId = req.user ? req.user.id : null;
+			res.json({
+				user: await serializePublicProfile(db, user, viewerId, getPublicUrl(req)),
+			});
+	} catch (err) {
+		console.error('[users] profile error:', err);
+		res.status(500).json({ error: 'プロフィール取得に失敗しました' });
+	}
+});
+
+router.get('/', optionalAuth, async (req, res) => {
+	const db = getDbAdapter(req);
+	const ids = (req.query.ids || '')
+		.split(',')
+		.map((id) => parseInt(id, 10))
+		.filter((id) => Number.isInteger(id) && id >= 0);
+
+	if (ids.length === 0) {
+		return res.json({ users: [] });
+	}
+
+	try {
+					const users = await db.getUsersByIds(ids);
+			res.json({ users: users.map((user) => serializeUserCard(user, getPublicUrl(req))) });
+
+	} catch (err) {
+		console.error('[users] batch error:', err);
+		res.status(500).json({ error: 'ユーザー取得に失敗しました' });
+	}
+});
+
+router.get('/:userId/counts', optionalAuth, async (req, res) => {
+	const db = getDbAdapter(req);
+	const userId = parseInt(req.params.userId, 10);
+
+	if (!Number.isInteger(userId) || userId < 0) {
+		return res.status(400).json({ error: 'Invalid user id' });
+	}
+
+	try {
+		const [post_count, media_count, follower_count, following_count] =
+			await Promise.all([
+				db.getPostCount ? db.getPostCount(userId) : 0,
+				db.getMediaCount ? db.getMediaCount(userId) : 0,
+				db.getFollowerCount ? db.getFollowerCount(userId) : 0,
+				db.getFollowingCount ? db.getFollowingCount(userId) : 0,
+			]);
+
+		res.json({
+			post_count,
+			media_count,
+			follower_count,
+			following_count,
+		});
+	} catch (err) {
+		console.error('[users] counts error:', err);
+		res.status(500).json({ error: 'カウント取得に失敗しました' });
+	}
+});
+
+router.get('/:userId/media', optionalAuth, async (req, res) => {
+	const db = getDbAdapter(req);
+	const userId = parseInt(req.params.userId, 10);
+	const limit = Math.min(parseInt(req.query.limit, 10) || 15, 50);
+	const offset = parseInt(req.query.offset, 10) || 0;
+
+	if (!Number.isInteger(userId) || userId < 0) {
+		return res.status(400).json({ error: 'Invalid user id' });
+	}
+
+	try {
+		const mediaItems = await db.getMediaPosts(userId, limit, offset);
+		res.json({ media_items: mediaItems });
+	} catch (err) {
+		console.error('[users] media error:', err);
+		res.status(500).json({ error: 'メディア取得に失敗しました' });
+	}
+});
+
+router.get('/:userId/is-lock', optionalAuth, async (req, res) => {
+	const db = getDbAdapter(req);
+	const userId = parseInt(req.params.userId, 10);
+
+	if (!Number.isInteger(userId) || userId < 0) {
+		return res.status(400).json({ error: 'Invalid user id' });
+	}
+
+	try {
+		const user = await db.getUserById(userId);
+		if (!user) {
+			return res.status(404).json({ error: 'User not found' });
+		}
+		res.json({ lock: !!(user.settings && user.settings.lock) });
+	} catch (err) {
+		console.error('[users] is-lock error:', err);
+		res.status(500).json({ error: '取得に失敗しました' });
+	}
+});
+
+router.get('/:userId/status', requireAuth, async (req, res) => {
+	const db = getDbAdapter(req);
+	const userId = parseInt(req.params.userId, 10);
+
+	if (!req.user.admin) {
+		return res.status(403).json({ error: 'Admin access required' });
+	}
+
+	if (!Number.isInteger(userId) || userId < 0) {
+		return res.status(400).json({ error: 'Invalid user id' });
+	}
+
+	try {
+		const status = await db.getUserStatus(userId);
+		if (!status) {
+			return res.status(404).json({ error: 'User not found' });
+		}
+		res.json({ status });
+	} catch (err) {
+		console.error('[users] status error:', err);
+		res.status(500).json({ error: 'ステータス取得に失敗しました' });
+	}
+});
+
+router.put('/:userId/status', requireAuth, async (req, res) => {
+	const db = getDbAdapter(req);
+	const userId = parseInt(req.params.userId, 10);
+
+	if (!req.user.admin) {
+		return res.status(403).json({ error: 'Admin access required' });
+	}
+
+	if (!Number.isInteger(userId) || userId < 0) {
+		return res.status(400).json({ error: 'Invalid user id' });
+	}
+
+	try {
+		const { shadow } = req.body || {};
+		const status = await db.setUserStatus(userId, { shadow });
+		if (!status) {
+			return res.status(404).json({ error: 'User not found' });
+		}
+		res.json({ success: true, status });
+	} catch (err) {
+		console.error('[users] set status error:', err);
+		res.status(500).json({ error: 'ステータス更新に失敗しました' });
+	}
+});
+
+router.post('/:userId/follow', requireAuth, async (req, res) => {
+	const db = getDbAdapter(req);
+	const followerId = req.user.id;
+	const followingId = parseInt(req.params.userId, 10);
+
+	if (!Number.isInteger(followingId) || followingId <= 0) {
+		return res.status(400).json({ error: 'Invalid user id' });
+	}
+
+	try {
+		const result = await db.toggleFollow(followerId, followingId);
+
+			if (result.following) {
+				const notification = await db.createNotification({
+					userId: followingId,
+					type: 'follow',
+					fromUserId: followerId,
+					target: { kind: 'user', id: followingId },
+				});
+				await publishNewNotification(req, followingId, notification);
+			}
+
+		const updatedFollows = await db.getFollowIds(followerId);
+
+		res.json({
+			success: true,
+			following: result.following,
+			updated_follows: updatedFollows,
+		});
+	} catch (err) {
+		console.error('[users] follow error:', err);
+		res.status(400).json({
+			error: err.message || 'フォロー処理に失敗しました',
+		});
+	}
+});
+
+router.get('/:userId/:section(likes|stars)', optionalAuth, async (req, res) => {
+	const db = getDbAdapter(req);
+	const userId = parseInt(req.params.userId, 10);
+	const section = req.params.section;
+	const limit = Math.min(parseInt(req.query.limit, 10) || 30, 100);
+	const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
+	if (!Number.isInteger(userId) || userId < 0) return res.status(400).json({ error: 'Invalid user id' });
+
+	try {
+		const user = await db.getUserById(userId);
+		if (!user) return res.status(404).json({ error: 'User not found' });
+		if (!isProfileSectionVisible(user, req.user?.id ?? null, section)) return sendPrivateProfileSection(res, section);
+		const ids = section === 'likes'
+			? await db.getLikeIds(userId)
+			: await db.getStarIds(userId);
+		const orderedIds = [...(ids || [])].reverse();
+		const pageIds = orderedIds.slice(offset, offset + limit);
+		const posts = await serializePostsByIds(db, pageIds, req.user?.id ?? null, getPublicUrl(req));
+		res.json({
+			posts,
+			has_more: orderedIds.length > offset + limit,
+		});
+	} catch (err) {
+		console.error(`[users] ${section} error:`, err);
+		res.status(500).json({ error: 'プロフィール投稿の取得に失敗しました' });
+	}
+});
+
+router.get('/:userId/followers', optionalAuth, async (req, res) => {
+	const db = getDbAdapter(req);
+	const userId = parseInt(req.params.userId, 10);
+	const limit = Math.min(parseInt(req.query.limit, 10) || 50, 100);
+	const offset = parseInt(req.query.offset, 10) || 0;
+
+	if (!Number.isInteger(userId) || userId < 0) {
+		return res.status(400).json({ error: 'Invalid user id' });
+	}
+
+	try {
+		const target = await db.getUserById(userId);
+		if (!target) return res.status(404).json({ error: 'User not found' });
+		if (!isProfileSectionVisible(target, req.user?.id ?? null, 'followers')) return sendPrivateProfileSection(res, 'followers');
+		const followers = await db.getFollowers(userId, offset + limit);
+		const slice = followers.slice(offset, offset + limit);
+		res.json({
+			followers: slice.map((u) => serializeUserBrief(u)),
+			has_more: followers.length > offset + limit,
+		});
+	} catch (err) {
+		console.error('[users] followers error:', err);
+		res.status(500).json({ error: 'フォロワー取得に失敗しました' });
+	}
+});
+
+router.get('/:userId/following', optionalAuth, async (req, res) => {
+	const db = getDbAdapter(req);
+	const userId = parseInt(req.params.userId, 10);
+	const limit = Math.min(parseInt(req.query.limit, 10) || 50, 100);
+	const offset = parseInt(req.query.offset, 10) || 0;
+
+	if (!Number.isInteger(userId) || userId < 0) {
+		return res.status(400).json({ error: 'Invalid user id' });
+	}
+
+	try {
+		const target = await db.getUserById(userId);
+		if (!target) return res.status(404).json({ error: 'User not found' });
+		if (!isProfileSectionVisible(target, req.user?.id ?? null, 'following')) return sendPrivateProfileSection(res, 'following');
+		const following = await db.getFollowing(userId, offset + limit);
+		const slice = following.slice(offset, offset + limit);
+		res.json({
+			following: slice.map((u) => serializeUserBrief(u)),
+			has_more: following.length > offset + limit,
+		});
+	} catch (err) {
+		console.error('[users] following error:', err);
+		res.status(500).json({ error: 'フォロー中取得に失敗しました' });
+	}
+});
+
+router.get('/:userId/posts', optionalAuth, async (req, res) => {
+	const db = getDbAdapter(req);
+	const userId = parseInt(req.params.userId, 10);
+	const limit = Math.min(parseInt(req.query.limit, 10) || 30, 100);
+	const offset = parseInt(req.query.offset, 10) || 0;
+	const mode = req.query.mode || 'all';
+
+	if (!Number.isInteger(userId) || userId < 0) {
+		return res.status(400).json({ error: 'Invalid user id' });
+	}
+
+	try {
+		const all = await db.getPostsByUserId(
+			userId,
+			offset + limit + 1,
+			req.user ? req.user.id : null,
+		);
+		const currentUserId = req.user ? req.user.id : null;
+		let filtered = await filterViewablePosts(db, all, currentUserId);
+		if (mode === 'posts') {
+			filtered = filtered.filter((p) => !p.replyTo);
+		} else if (mode === 'replies') {
+			filtered = filtered.filter((p) => p.replyTo);
+		}
+		const slice = filtered.slice(offset, offset + limit);
+		const has_more = filtered.length > offset + limit;
+		res.json({
+			posts: await serializePostsBatch(db, slice, currentUserId, getPublicUrl(req)),
+			has_more,
+		});
+	} catch (err) {
+		console.error('[users] posts error:', err);
+		res.status(500).json({ error: 'ポスト取得に失敗しました' });
+	}
+});
+
+router.get('/:userId/pin', optionalAuth, async (req, res) => {
+	const db = getDbAdapter(req);
+	const userId = parseInt(req.params.userId, 10);
+
+	if (!Number.isInteger(userId) || userId < 0) {
+		return res.status(400).json({ error: 'Invalid user id' });
+	}
+
+	try {
+		const pinId = await db.getPinnedPostId(userId);
+		res.json({ pin_id: pinId });
+	} catch (err) {
+		console.error('[users] pin error:', err);
+		res.status(500).json({ error: 'ピン留め取得に失敗しました' });
+	}
+});
+
+router.put('/me', requireAuth, async (req, res) => {
+	const db = getDbAdapter(req);
+	const userId = req.user.id;
+	const { name, me, bio, header_image, icon_data, settings, block } =
+		req.body;
+
+	try {
+		const updated = await db.updateUserProfile(userId, {
+			name,
+			me,
+			bio,
+			header_image,
+			icon_data,
+			settings,
+			block,
+		});
+		if (!updated) {
+			return res.status(404).json({ error: 'User not found' });
+		}
+		res.json({
+			user: await serializeUser(db, updated, userId, getPublicUrl(req)),
+		});
+	} catch (err) {
+		console.error('[users] update profile error:', err);
+		res.status(500).json({ error: 'プロフィール更新に失敗しました' });
+	}
+});
+
+router.put('/:userId', requireAuth, async (req, res) => {
+	const db = getDbAdapter(req);
+	const userId = parseInt(req.params.userId, 10);
+
+	if (!req.user.admin) {
+		return res.status(403).json({ error: 'Admin access required' });
+	}
+
+	if (!Number.isInteger(userId) || userId < 0) {
+		return res.status(400).json({ error: 'Invalid user id' });
+	}
+
+	const { verify, freeze, admin } = req.body || {};
+
+	try {
+		const updated = await db.updateUserProfile(userId, {
+			verify,
+			freeze,
+			admin,
+		});
+		if (!updated) {
+			return res.status(404).json({ error: 'User not found' });
+		}
+		res.json({
+			user: await serializeUser(db, updated, req.user.id, getPublicUrl(req)),
+		});
+	} catch (err) {
+		console.error('[users] admin update error:', err);
+		res.status(500).json({ error: 'ユーザー更新に失敗しました' });
+	}
+});
+
+module.exports = router;

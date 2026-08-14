@@ -1,0 +1,29 @@
+{
+  "name": "nyaitter",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Nyaitter Server",
+  "scripts": {
+    "dev:server": "node server/index.js",
+    "start": "node server/index.js",
+    "server": "node server/index.js",
+    "build:emoji-mart": "node audit/build_emoji_mart_local.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1110.0",
+    "@aws-sdk/s3-request-presigner": "^3.1110.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "pg": "^8.23.0",
+    "web-push": "^3.6.7",
+    "ws": "^8.21.3"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "@emoji-mart/data": "1.2.1",
+    "emoji-mart": "5.6.0",
+    "esbuild": "0.25.0"
+  }
+}

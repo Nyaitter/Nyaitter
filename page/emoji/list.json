@@ -1,0 +1,438 @@
+[
+  {
+    "id": "neko",
+    "name": "猫"
+  },
+  {
+    "id": "smile",
+    "name": "にっこり"
+  },
+  {
+    "id": "he-",
+    "name": "へー"
+  },
+  {
+    "id": "huh",
+    "name": "えぇ..."
+  },
+  {
+    "id": "angry",
+    "name": "怒った猫"
+  },
+  {
+    "id": "good",
+    "name": "いいね!"
+  },
+  {
+    "id": "bad",
+    "name": "よくないね!"
+  },
+  {
+    "id": "right",
+    "name": "右"
+  },
+  {
+    "id": "left",
+    "name": "左"
+  },
+  {
+    "id": "sinu",
+    "name": "ﾀﾋぬ"
+  },
+  {
+    "id": "nemui",
+    "name": "ねむい"
+  },
+  {
+    "id": "kirakira",
+    "name": "目を輝かせた猫"
+  },
+  {
+    "id": "heart-neko",
+    "name": "ハートを出す猫"
+  },
+  {
+    "id": "run",
+    "name": "走る猫"
+  },
+  {
+    "id": "running",
+    "name": "走っている猫"
+  },
+  {
+    "id": "raia-dansa-",
+    "name": "ライアーダンサー"
+  },
+  {
+    "id": "taiko",
+    "name": "太鼓"
+  },
+  {
+    "id": "doyaruneko",
+    "name": "どや...?"
+  },
+  {
+    "id": "niramitukeru",
+    "name": "睨む猫"
+  },
+  {
+    "id": "atsukutetokeru",
+    "name": "暑くて溶けそう..."
+  },
+  {
+    "id": "toketawa",
+    "name": "溶けたわ()"
+  },
+  {
+    "id": "danger",
+    "name": "危険"
+  },
+  {
+    "id": "dame",
+    "name": "禁止"
+  },
+  {
+    "id": "nyaitter",
+    "name": "Nyaitterアイコン(小さい)"
+  },
+  {
+    "id": "crew",
+    "name": "クルー"
+  },
+  {
+    "id": "sitai",
+    "name": "ﾀﾋ体"
+  },
+  {
+    "id": "ecb",
+    "name": "緊急会議ボタン"
+  },
+  {
+    "id": "srb",
+    "name": "Supamu Rice Ball"
+  },
+  {
+    "id": "onigiri",
+    "name": "おにぎり"
+  },
+  {
+    "id": "sushi",
+    "name": "寿司"
+  },
+  {
+    "id": "tmt",
+    "name": "とまと"
+  },
+  {
+    "id": "semicolon",
+    "name": "セミコロン"
+  },
+  {
+    "id": "write",
+    "name": "ペン"
+  },
+  {
+    "id": "what",
+    "name": "What"
+  },
+  {
+    "id": "x",
+    "name": "X"
+  },
+  {
+    "id": "paper",
+    "name": "紙製の船"
+  },
+  {
+    "id": "like",
+    "name": "いいね"
+  },
+  {
+    "id": "star",
+    "name": "お気に入り"
+  },
+  {
+    "id": "reply",
+    "name": "返信"
+  },
+  {
+    "id": "repost",
+    "name": "リポスト"
+  },
+  {
+    "id": "nyaitterteam",
+    "name": "NyaitterTeam"
+  },
+  {
+    "id": "nyaitterteam-bug",
+    "name": "バグ修正を押し付けられるNyaitterTeam"
+  },
+  {
+    "id": "explosion",
+    "name": "Nyaitter爆破"
+  },
+  {
+    "id": "gf",
+    "name": "ガールフレンド"
+  },
+  {
+    "id": "gal-peace",
+    "name": "ギャルピ"
+  },
+  {
+    "id": "takocat",
+    "name": "タコ猫"
+  },
+  {
+    "id": "mottatakocat",
+    "name": "盛ったタコ猫"
+  },
+  {
+    "id": "fish-eating-splendid-garden-eel",
+    "name": "魚を食べるニシキアナゴ"
+  },
+  {
+    "id": "kimee-fox",
+    "name": "相棒らしい"
+  },
+  {
+    "id": "tubure-cat",
+    "name": "つぶれねこ"
+  },
+  {
+    "id": "himoji-cat",
+    "name": "ひもじいねこ"
+  },
+  {
+    "id": "katahaba-nukko",
+    "name": "肩幅ぬっこ"
+  },
+  {
+    "id": "long-sita-cat",
+    "name": "舌が長いねこ"
+  },
+  {
+    "id": "hige-asi-cat",
+    "name": "髭が足のねこ"
+  },
+  {
+    "id": "veryx2-long-cat",
+    "name": "Very Very Long Cat"
+  },
+  {
+    "id": "exclamation",
+    "name": "!"
+  },
+  {
+    "id": "question",
+    "name": "?"
+  },
+  {
+    "id": "vrc",
+    "name": "VRC"
+  },
+  {
+    "id": "sickle-and-hammer",
+    "name": "Sickle and Hammer"
+  },
+  {
+    "id": "emoji",
+    "name": "Emoji"
+  },
+  {
+    "id": "ikaneko-imomusi",
+    "name": "イカネコいもむし"
+  },
+  {
+    "id": "explosion-nx",
+    "name": "爆☆散☆"
+  },
+  {
+    "id": "fat-cat",
+    "name": "デブネコ"
+  },
+  {
+    "id": "3xneko",
+    "name": "3倍ねこ"
+  },
+  {
+    "id": "nuko",
+    "name": "ぬこ"
+  },
+  {
+    "id": "ee-----",
+    "name": "Eeーーーーー"
+  },
+  {
+    "id": "sliding-cat",
+    "name": "滑ってくる猫"
+  },
+  {
+    "id": "iya",
+    "name": "不服そうな猫"
+  },
+  {
+    "id": "puwaa",
+    "name": "ぷわぁ"
+  },
+  {
+    "id": "fx-cat",
+    "name": "FXで有り金溶かしてそうな猫"
+  },
+  {
+    "id": "sprite1rasii",
+    "name": "画質終わってるネッコ"
+  },
+  {
+    "id": "senaka-cat",
+    "name": "男は背中で"
+  },
+  {
+    "id": "gd-get",
+    "name": "ゲッ"
+  },
+  {
+    "id": "gd-down",
+    "name": "ダン"
+  },
+  {
+    "id": "middle-finger",
+    "name": "Middle Finger"
+  },
+  {
+    "id": "tsubureru",
+    "name": "つぶれる"
+  },
+  {
+    "id": "ha",
+    "name": "は?"
+  },
+  {
+    "id": "sunglasses-cat",
+    "name": "サングラスを掛けた猫"
+  },
+  {
+    "id": "kachimote",
+    "name": "勝ちまくりモテまくり"
+  },
+  {
+    "id": "chu",
+    "name": "投げキッス"
+  },
+  {
+    "id": "kaonai",
+    "name": "顔無い"
+  },
+  {
+    "id": "aseru",
+    "name": "焦る猫"
+  },
+  {
+    "id": "namida",
+    "name": "泣いている猫"
+  },
+  {
+    "id": "xnpa-neko",
+    "name": "んぱ-ねこ"
+  },
+  {
+    "id": "nosebleed-dabaa",
+    "name": "鼻血だばー"
+  },
+  {
+    "id": "nosebleed-busyaa",
+    "name": "鼻血ﾌﾞｼｬｧｰ"
+  },
+  {
+    "id": "neko-is-liquid",
+    "name": "猫は液体"
+  },
+  {
+    "id": "offline-cat",
+    "name": "オンラインのフレンドはいません"
+  },
+  {
+    "id": "friend-cat",
+    "name": "仲間って大切だよね"
+  },
+  {
+    "id": "owee",
+    "name": "おうぇぇい"
+  },
+  {
+    "id": "doge-cat",
+    "name": "どっかで見たような気がする猫"
+  },
+  {
+    "id": "goal-cat",
+    "name": "ゴールした猫"
+  },
+  {
+    "id": "answer-cat",
+    "name": "自信満々に回答する猫"
+  },
+  {
+    "id": "love-cat",
+    "name": "ハートを手に持っている猫"
+  },
+  {
+    "id": "kill",
+    "name": "抹殺"
+  },
+  {
+    "id": "now-sleeping",
+    "name": "寝坊して今これ"
+  },
+  {
+    "id": "sliding-cat-good",
+    "name": "滑ってきて親指を立てる猫"
+  },
+  {
+    "id": "i-came",
+    "name": "私がきた"
+  },
+  {
+    "id": "knife-cat",
+    "name": "包丁を持って回転している猫"
+  },
+  {
+    "id": "smile-cat-mf",
+    "name": "笑顔でなにかのハンドサインをしている猫"
+  },
+  {
+    "id": "uxnti",
+    "name": "う◯ち!(せいかいのおと)"
+  },
+  {
+    "id": "namidabaa",
+    "name": "なみだばー"
+  },
+  {
+    "id": "nekopi-",
+    "name": "ネコピー"
+  },
+  {
+    "id": "kixyupi-nn",
+    "name": "きゅぴーん"
+  },
+  {
+    "id": "bruh",
+    "name": "BRUH."
+  },
+  {
+    "id": "sus",
+    "name": "SUS"
+  },
+  {
+    "id": "nn",
+    "name": "ん?"
+  },
+  {
+    "id": "hmm",
+    "name": "ふーむ"
+  },
+  {
+    "id": "power-type-pien",
+    "name": "パワータイプのぴえん"
+  }
+]

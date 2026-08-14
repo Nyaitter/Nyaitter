@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="robots" content="noindex, nofollow, noarchive">
+    <title>Emoji一覧</title>
+    <link rel="icon" href="favicon.png" type="image/png">
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background-color: #f0f2f5;
+            color: #1c1e21;
+            margin: 0;
+            padding: 2rem;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        h1 {
+            color: #333;
+            margin-bottom: 2rem;
+            text-align: center;
+        }
+
+        #emoji-container {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+            gap: 1rem;
+            width: 100%;
+            max-width: 1200px;
+        }
+
+        .loading-text,
+        .error-text {
+            font-size: 1.2rem;
+            color: #657786;
+            text-align: center;
+            grid-column: 1 / -1;
+        }
+
+        .emoji-card {
+            background-color: #ffffff;
+            border: 1px solid #dddfe2;
+            border-radius: 12px;
+            padding: 1rem;
+            text-align: center;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: space-between;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+        }
+
+        .emoji-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 6px 12px rgba(0, 0, 0, 0.1);
+        }
+
+        .emoji-image {
+            width: 64px;
+            height: 64px;
+            object-fit: contain;
+            margin-bottom: 0.75rem;
+        }
+
+        .emoji-name {
+            font-weight: 600;
+            font-size: 1rem;
+            color: #1c1e21;
+            margin: 0 0 0.5rem 0;
+            word-break: break-word;
+        }
+
+        .id-wrapper {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+            width: 100%;
+        }
+
+        .emoji-id-code {
+            font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, Courier, monospace;
+            background-color: #f0f2f5;
+            padding: 0.2rem 0.4rem;
+            border-radius: 4px;
+            font-size: 0.8rem;
+            color: #657786;
+            flex-grow: 1;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .copy-button {
+            border: none;
+            background-color: #1877f2;
+            color: white;
+            padding: 0.3rem 0.6rem;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.8rem;
+            font-weight: bold;
+            transition: background-color 0.2s ease;
+            flex-shrink: 0;
+        }
+
+        .copy-button:hover {
+            background-color: #166fe5;
+        }
+
+        .copy-button:disabled {
+            background-color: #42b72a;
+            cursor: not-allowed;
+        }
+    </style>
+</head>
+<body>
+
+    <h1>Emoji一覧</h1>
+    <div id="emoji-container">
+        <p class="loading-text">読み込み中...</p>
+    </div>
+
+    <script src="emoji.js"></script>
+
+</body>
+</html>
