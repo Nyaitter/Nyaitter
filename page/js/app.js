@@ -1204,13 +1204,7 @@ export function initApp() {
 
         const data = getRecommendedUsersCache() || [];
 
-        const linkItems = [
-            { name: 'Nyaitterルール', link: '/rule' },
-            { name: '統計', link: '/stat' },
-            { name: '申請フォーム', link: '/forms' },
-            { name: 'Emoji一覧', link: '/emoji' },
-            { name: 'Discord鯖', link: '/discord' },
-        ];
+        const linkItems = [];
 
         const recommendedUsers = Array.isArray(data) ? data : [];
         if (error || recommendedUsers.length === 0) {
