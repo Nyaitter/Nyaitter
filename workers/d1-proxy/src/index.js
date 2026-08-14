@@ -529,6 +529,7 @@ export default {
 
 				if (body.name !== undefined) { sets.push('name = ?'); values.push(body.name); }
 				if (body.bio !== undefined) { sets.push('bio = ?'); values.push(body.bio); }
+				else if (body.me !== undefined) { sets.push('bio = ?'); values.push(body.me); }
 				if (body.header_image !== undefined) { sets.push('header_image = ?'); values.push(body.header_image); }
 				if (body.icon_data !== undefined) { sets.push('icon_data = ?'); values.push(body.icon_data); }
 				if (body.settings !== undefined) { sets.push('settings = ?'); values.push(JSON.stringify(body.settings || {})); }

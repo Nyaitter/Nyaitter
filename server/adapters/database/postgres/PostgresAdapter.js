@@ -1574,6 +1574,9 @@ class PostgresAdapter extends DatabaseAdapter {
 		if (profileData.bio !== undefined) {
 			fields.push(`bio = $${idx++}`);
 			values.push(profileData.bio);
+		} else if (profileData.me !== undefined) {
+			fields.push(`bio = $${idx++}`);
+			values.push(profileData.me);
 		}
 		if (profileData.header_image !== undefined) {
 			fields.push(`header_image = $${idx++}`);
