@@ -1,87 +1,78 @@
 # アダプターの考え方と切り替え方
 
-Nyaitter サーバーが、データベースやファイル保存の実装を切り替えられる仕組みについて説明します。
+Nyaitter は、保存先ごとの違いをアダプターへ閉じ込め、投稿・通知・DMなどのアプリケーション機能を同じ API 契約で動かします。
 
-## なぜアダプターを使うか
+## 役割の分離
 
-- 開発中は「すぐ動くもの」が欲しい → メモリ上の実装（InMemory）
-- 本番では「壊れにくく、長く使える」ものが欲しい → PostgreSQL と R2
-- 将来、Cloudflare の機能を使いたいとき → D1 と R2（Worker 経由）
+| 層 | 担当すること |
+|---|---|
+| ルート・サービス | 認証、入力検証、投稿公開範囲、検索除外、ブロック、通知配信、DM可視性 |
+| DB アダプター | 保存、検索、ページング、トランザクション、未読数などの永続化 |
+| ストレージアダプター | 添付ファイルの保存、削除、公開URLまたは署名URLの発行 |
 
-コードを大きく書き換えずに切り替えられるようにするのが目的です。
+> 非公開投稿、検索除外、ブロック関係のような利用者間ルールはアダプターより上位の共通層で処理します。保存先の違いで可視性が変わらないことが重要です。
 
-## 方針
+## 現在の実装
 
-- SQL の細かい書き方ではなく、「アプリが本当に必要な操作」をまとめる
-- 各データベースの違い（PostgreSQL と D1 など）は、各アダプターの中に閉じ込める
+| 種別 | 実装 | 状態 | 用途 |
+|---|---|---|---|
+| DB | `InMemoryAdapter` | 利用可能 | 開発・テスト。再起動で消去 |
+| DB | `PostgresAdapter` | 利用可能 | PostgreSQL を使う実運用 |
+| DB | `D1Adapter` | 利用可能 | 認証済み D1 Proxy Worker 経由 |
+| ストレージ | `LocalStorageAdapter` | 利用可能 | 開発・単一サーバー |
+| ストレージ | `R2StorageAdapter` | 利用可能 | R2 の公開・署名URL配信 |
 
-## いまあるアダプター
+## 設定方法
 
-| 種類 | 名前 | 状態 | 用途 |
-|------|------|------|------|
-| データベース | InMemoryAdapter | 完成 | 開発・テスト |
-| データベース | PostgresAdapter | 完成 | 本番のメイン |
-| データベース | D1Adapter | Worker 経由 | Cloudflare の補助 |
-| ストレージ | LocalStorageAdapter | 完成 | 開発用 |
-| ストレージ | R2StorageAdapter | 完成 | 本番のファイル保存 |
-
-## 切り替え方
-
-### データベース
-
-環境変数で簡単に変えられます。
+`server/config.json` の `database.adapter` と `storage.adapter` が既定値です。環境変数を設定すると、環境別に上書きできます。
 
 ```bash
 # 開発
-DB_ADAPTER=memory npm run dev:server
+DB_ADAPTER=memory
+STORAGE_ADAPTER=local
 
-# 本番（PostgreSQL）
-DB_ADAPTER=postgres DATABASE_URL="postgres://..." npm start
+# PostgreSQL
+DB_ADAPTER=postgres
+DATABASE_URL='postgres://user:password@host:5432/nyaitter'
+
+# D1 Proxy Worker
+DB_ADAPTER=d1
+D1_WORKER_URL='https://d1-proxy.example.workers.dev'
+D1_WORKER_TOKEN='shared-secret'
+
+# Cloudflare R2
+STORAGE_ADAPTER=r2
+R2_ACCOUNT_ID='...'
+R2_BUCKET='nyaitter-uploads'
+R2_ACCESS_KEY_ID='...'
+R2_SECRET_ACCESS_KEY='...'
 ```
 
-`config.json` で指定することもできます。
+## アダプター契約の注意点
 
-```json
-{
-  "database": {
-    "adapter": "postgres",
-    "postgres": { }
-  }
-}
-```
+アダプター間の互換性は、メソッドの有無だけでなく返却値も対象です。たとえばDM一覧では保存先によって未読情報が `unread` マップまたは `unread_count` として返る場合があるため、共通サービスで正規化します。
 
-### ストレージ
+新しいアダプターを追加する場合は、次を確認してください。
 
-```bash
-STORAGE_ADAPTER=local   # 開発
-STORAGE_ADAPTER=r2      # 本番
-```
+1. `DatabaseAdapter` または `StorageAdapter` の必要な操作を実装する。
+2. ID、日時、ページング結果、未読数、添付URLを既存の契約に揃える。
+3. 複数レコードを同時更新する操作は、保存先で原子的に実行する。
+4. 例外に秘密情報を含めず、接続・認可・一時障害を区別できるようにする。
+5. InMemory、PostgreSQL、D1 の差分を意識した回帰確認を行う。
 
-## 複数を同時に使う場合
+## 構成の選び方
 
-いまは「データベース1つ + ストレージ1つ」が基本です。
-
-将来、「メインは Postgres、補助は D1」のような形にしたいときは、D1 用のアダプターを別途用意し、サービス側で使い分ける想定です。必要になったら拡張できます。
-
-## 新しいアダプターを作るときのルール
-
-1. `DatabaseAdapter` または `StorageAdapter` のインターフェースをすべて実装する（未実装なら明確にエラーを出す）
-2. いいねの切り替えなど、まとめて扱う必要がある処理は実装側できちんと扱う
-3. エラーメッセージは分かりやすくする
-4. 接続情報はコンストラクタで受け取り、環境変数とも併用できるようにする
-
-## よくある質問
-
-**なぜ SQL ビルダーではなく、意味のあるメソッド単位で分けているのですか？**
-
-データベースごとに特性がかなり違うためです。細かいクエリ単位で共通化すると、結局それぞれの実装で大きく分岐しやすくなります。アプリの操作に近い単位の方が、長く直しやすいと判断しています。
-
-**Prisma などの ORM に変える予定はありますか？**
-
-いまのところありません。ORM を入れると D1 対応が難しくなったり、アダプターの切り替えがしにくくなったりするためです。
+| 構成 | 向いている場合 |
+|---|---|
+| InMemory + Local | UIやAPIを素早く試すローカル開発 |
+| PostgreSQL + R2 | 一般的な実運用。保存性と運用の分かりやすさを優先 |
+| D1 Worker + R2 | Cloudflare中心で運用し、Worker プロキシを管理できる場合 |
+| PostgreSQL + R2 + D1 | PostgreSQLを主データ、D1を必要な領域に限定して導入する場合 |
 
 ## 関連ドキュメント
 
 - [PostgreSQL のセットアップ](./database-postgres.md)
-- [D1 と Worker](./database-d1-worker.md)
-- [R2 ストレージ](./storage-r2.md)
+- [Cloudflare D1 と Worker](./database-d1-worker.md)
+- [Cloudflare R2 ストレージ](./storage-r2.md)
+- [ローカルストレージ](./storage-local.md)
+- [本番デプロイのチェックリスト](./production-checklist.md)

@@ -1,35 +1,23 @@
-# セットアップ・運用ガイド一覧
+# セットアップ・運用ガイド
 
-このフォルダには、サーバーの各部品のセットアップ手順と運用の注意をまとめています。
+このフォルダには、Nyaitter サーバーの保存先、Cloudflare 連携、本番運用を構成するための手順をまとめています。最初に [`../README.md`](../README.md) でサーバーの起動・API・環境変数の全体像を確認してください。
 
-コード内のコメントは短くしてあるので、実際の手順はここに書いてあります。
+## 保存先とアダプター
 
-## ドキュメント一覧
+| ガイド | 内容 | 主な対象 |
+|---|---|---|
+| [アダプターの設計と切り替え](./adapters-overview.md) | DB・ストレージアダプターの責務と選び方 | すべての構成 |
+| [PostgreSQL のセットアップ](./database-postgres.md) | PostgreSQL の作成、マイグレーション、接続設定 | Node.js + PostgreSQL |
+| [Cloudflare D1 と Worker](./database-d1-worker.md) | D1 Proxy Worker、トークン、D1 マイグレーション | Node.js + D1 |
+| [ローカルストレージ](./storage-local.md) | 開発用ローカルファイル保存 | ローカル開発 |
+| [Cloudflare R2](./storage-r2.md) | R2 の認証、公開配信、署名URL | 実運用のファイル保存 |
+| [ハイブリッド構成](./cloudflare-hybrid.md) | PostgreSQL・R2・D1 の組み合わせ方 | 段階的な Cloudflare 導入 |
 
-### データベース
+D1 Proxy Worker 自体のデプロイ手順は [`../../workers/d1-proxy/README.md`](../../workers/d1-proxy/README.md) も参照してください。
 
-- [PostgreSQL のセットアップ](./database-postgres.md)  
-  純粋な PostgreSQL 構成と、Worker を併用する場合の説明
+## 運用
 
-- [Cloudflare D1 と Worker](./database-d1-worker.md)  
-  D1 を使うときの設計、Worker の設定、スキーマ、キャッシュや再試行など
+- [本番デプロイのチェックリスト](./production-checklist.md) には、認証バイパス、リバースプロキシ、ヘルスチェック、キャッシュ、WebSocket、バックアップの確認項目があります。
+- PostgreSQL のスキーマ更新は [`../migrations/README.md`](../migrations/README.md) に従い、既存環境では番号順に適用します。
 
-### ストレージ
-
-- [Cloudflare R2](./storage-r2.md)  
-  トークン、公開ドメイン、署名付き URL、運用とセキュリティ
-
-- [ローカルストレージ](./storage-local.md)  
-  開発での使い方と、本番で使う場合の注意
-
-### Cloudflare 全体
-
-- [ハイブリッド構成の考え方](./cloudflare-hybrid.md)  
-  Postgres・R2・D1 をどう組み合わせるか、段階的な進め方
-
-### その他
-
-- [本番デプロイのチェックリスト](./production-checklist.md)
-- [アダプターの設計と切り替え方](./adapters-overview.md)
-
-アダプターの概要は [server/adapters/README.md](../adapters/README.md) も参照してください。
+> `server/.env`、DB 接続文字列、R2/D1 の認証情報、VAPID 秘密鍵は Git に登録しないでください。`server/.env.example` は値を含まない設定一覧です。

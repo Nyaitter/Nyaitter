@@ -1,158 +1,138 @@
-# Nyaitter サーバーについて
+# Nyaitter サーバー
 
-Nyaitter のバックエンドです。ブラウザは直接データベースに触れず、このサーバー経由でだけやり取りします。
+Nyaitter のバックエンドです。ブラウザはデータベースやストレージへ直接接続せず、この Express サーバーの API を介して認証、投稿、通知、DM、アップロード、リアルタイム配信を利用します。
 
-## 起動方法
+## 起動
 
-プロジェクトのルートで次を実行します。
+リポジトリのルートで依存関係を導入し、必要に応じて環境変数ファイルを用意します。
 
 ```bash
 npm install
+cp server/.env.example server/.env
 npm run dev:server
 ```
 
-ブラウザで http://localhost:3000/ を開きます。
+既定では <http://localhost:3000/> で起動します。監視・疎通確認には次のエンドポイントを使用できます。
 
-## URL の振り分け
+| パス | 用途 |
+|---|---|
+| `GET /server/health` | プロセスが応答できるかを確認するヘルスチェック |
+| `GET /server/ready` | 起動準備が完了しているかを確認するレディネスチェック |
+| `GET /server/api/status` | サーバー識別情報と認証関連の状態を取得する |
+
+> 開発時の `InMemoryAdapter` は再起動で全データを失います。実運用には PostgreSQL または D1 を設定してください。
+
+## ルーティング
 
 | パス | 内容 |
-|------|------|
-| `/server/health` | サーバーが動いているか確認する |
-| `/server/api/posts` | 投稿の取得・作成・いいねなど |
-| `/server/api/dm` | ダイレクトメッセージ |
-| `/server/api/users` | ユーザー検索・プロフィール |
-| `/server/auth/*` | ログイン関連 |
-| それ以外 | `page/` フォルダの静的ファイル（フロント画面） |
+|---|---|
+| `/server/api/posts` | 投稿、タイムライン、検索、リアクション |
+| `/server/api/users` | プロフィール、検索、フォロー、設定 |
+| `/server/api/dm` | グループ DM、未読数、E2E 公開鍵 |
+| `/server/api/notifications` | 通知の一覧、既読・クリック・削除 |
+| `/server/api/ui/summary` | ナビゲーション向け未読数の要約 |
+| `/server/api/push` | Web Push の設定と購読 |
+| `/server/api/ranking` | ランキング |
+| `/server/auth/*` | Scratch 認証、セッション、外部ログイン |
+| `/uploads/*` | ローカルストレージ使用時のアップロードファイル |
+| それ以外 | `page/` 配下の静的クライアント資産 |
 
-例：
+静的クライアント資産は ETag/Last-Modified を利用して毎回再検証されます。サービスワーカーもネットワーク優先で更新を確認するため、ファイル内容の変更時にクエリ文字列で手動バージョンを付け替える必要はありません。
 
-- `http://localhost:3000/` → `page/index.html`
-- `http://localhost:3000/js/main.js` → `page/js/main.js`
-- `http://localhost:3000/server/health` → ヘルスチェックの JSON
+## 設定
 
-## 環境変数
+基本設定は `server/config.json`、環境ごとの秘密情報や上書き値は `server/.env` に置きます。`server/.env` は Git の追跡対象外です。
 
-`server/.env.example` をコピーして `server/.env` を作り、必要な値を入れてください。
+| 分類 | 主な値 |
+|---|---|
+| 実行環境 | `PORT`、`NODE_ENV`、`TRUST_PROXY`、`LOG_LEVEL` |
+| データベース | `DB_ADAPTER`、`DATABASE_URL`、`D1_WORKER_URL`、`D1_WORKER_TOKEN` |
+| ストレージ | `STORAGE_ADAPTER`、`R2_*` |
+| 認証・ログイン保護 | `MULTI_ACCOUNT_COOKIE_SECRET`、`LOGIN_SECURITY_HMAC_SECRET`、`TURNSTILE_*` |
+| Push | `VAPID_SUBJECT`、`VAPID_PUBLIC_KEY`、`VAPID_PRIVATE_KEY` |
 
-開発時の初期設定：
+`server/.env.example` は利用可能な環境変数と安全上の注意の一覧です。
 
-- `DB_ADAPTER=memory`（メモリ上のデータベース）
-- `STORAGE_ADAPTER=local`（ローカルフォルダにファイル保存）
+### 開発用認証バイパス
 
-## 設定ファイル
+`DEV_BYPASS_AUTH=true` は Scratch コメント認証を省略する**ローカル開発専用**の設定です。本番環境では有効化してはいけません。`NODE_ENV=production` で有効化された構成は起動時に拒否されます。
 
-細かい設定は `server/config.json` にまとまっています。
+リバースプロキシの背後で運用する場合は、実際のプロキシ構成を確認した上で `TRUST_PROXY=true` を設定してください。
 
-主な項目：
+## アダプター
 
-- `server` … ポート番号など
-- `cors` … 許可するオリジン
-- `limits` … 投稿文字数やアップロードサイズの上限
-- `auth` … セッションの有効期間など
-- `database` / `storage` … 使うデータベース・ストレージの種類
-- `rateLimit` … アクセス制限
-- `security` … セキュリティヘッダ
+データベースとストレージはアダプターで切り替えます。
 
-重要な値の一部は環境変数の方が優先されます（`PORT` など）。
+| 種類 | 開発用 | 実運用向け |
+|---|---|---|
+| データベース | `memory`（InMemoryAdapter） | `postgres`、`d1` |
+| ストレージ | `local`（LocalStorageAdapter） | `r2`（R2StorageAdapter） |
 
-## 全体の仕組み
+詳細は [`server/adapters/README.md`](./adapters/README.md) と [`server/help/README.md`](./help/README.md) を参照してください。
 
-このサーバーは「フロント用の窓口（BFF）」です。
-
-- ブラウザは `/server/...` だけを呼び出す
-- データベースやファイル保存の実装はアダプターで切り替え可能
-  - 開発用：メモリ（InMemory）
-  - 本番向け：PostgreSQL、Cloudflare D1、R2 など
-
-詳細は `server/adapters/README.md` と `server/help/` を見てください。
-
-## 主な API
+## 主要 API
 
 ### 投稿
 
-- `GET /server/api/posts` … タイムライン
-- `POST /server/api/posts` … 投稿する（ログイン必要）
-- `GET /server/api/posts/:id` … 投稿の詳細
-- `POST /server/api/posts/:id/like` … いいねの切り替え
-- `POST /server/api/posts/:id/star` … スターの切り替え
-- `GET /server/api/posts/:id/replies` … 返信一覧
+| エンドポイント | 内容 |
+|---|---|
+| `GET /server/api/posts/page` | タイムライン、検索、おすすめ、プロフィールのページ取得 |
+| `GET /server/api/posts/search` | 投稿検索 |
+| `GET /server/api/posts/recommended` | おすすめ投稿 |
+| `GET /server/api/posts/:id` | 投稿詳細 |
+| `POST /server/api/posts` | 投稿、返信、引用の作成（認証必須） |
+| `POST /server/api/posts/:id/like` | いいねの切り替え（認証必須） |
+| `POST /server/api/posts/:id/star` | スターの切り替え（認証必須） |
+| `POST /server/api/posts/:id/repost` | リポストの切り替え（認証必須） |
 
-### ダイレクトメッセージ
+タイムライン、検索、おすすめなどの発見経路では、非公開投稿、検索除外、ブロック関係を共通の可視性層で判定します。検索除外中の投稿は、投稿者自身と投稿者をフォローしている利用者だけが発見できます。プロフィールでは検索除外のみを理由に投稿を隠しません。
 
-- `GET /server/api/dm` … 会話一覧（ログイン必要）
-- `GET /server/api/dm/unread` … 未読数（ログイン必要）
-- `POST /server/api/dm/:targetUserId` … 会話を開始／取得（ログイン必要）
-- `GET /server/api/dm/:channelId/messages` … メッセージ一覧（ログイン必要）
-- `POST /server/api/dm/:channelId/messages` … 送信（ログイン必要）
-- `PUT /server/api/dm/:channelId/read` … 既読にする（ログイン必要）
+### グループ DM
 
-### ユーザー
+| エンドポイント | 内容 |
+|---|---|
+| `GET /server/api/dm` | 会話一覧と未読合計 |
+| `GET /server/api/dm/unread` | 表示可能な会話の未読合計 |
+| `GET /server/api/dm/unread-counts` | 会話ごとの未読数 |
+| `GET /server/api/dm/:dmId` | 会話詳細 |
+| `POST /server/api/dm` | 会話を作成または既存会話を取得 |
+| `PUT /server/api/dm/:dmId` | タイトル・メンバー・ホストを更新 |
+| `POST /server/api/dm/:dmId/messages` | メッセージを送信 |
+| `POST /server/api/dm/:dmId/read` | 会話を既読にする |
+| `POST /server/api/dm/:dmId/leave` | 会話から退出する |
+| `GET` / `POST /server/api/dm/keys` | E2E 暗号化用公開鍵の取得・登録 |
 
-- `GET /server/api/users/search?q=...` … 検索
-- `GET /server/api/users/:userId` … プロフィール
-- `GET /server/api/users?ids=1,2,3` … 複数ユーザー取得
+ブロック関係にある利用者は同じ DM に新規招待できません。既存会話では相手のメッセージ、最新メッセージ要約、未読数、リアルタイム配信を閲覧者ごとに除外します。
 
-### 認証
+### ユーザー・通知
 
-- `POST /server/auth/scratch/generate` … 確認コード発行
-- `POST /server/auth/scratch/verify` … Scratch アカウント確認
-- `GET /server/auth/me` … 今ログインしているユーザー（ログイン必要）
-- `GET /server/auth/external/confirm-context` … 外部ログイン確認画面用の情報
-- `POST /server/auth/external/confirm` … 外部ログインを許可して proof を発行（ログイン必要）
-- `POST /server/auth/external/verify` … 他サーバーからの proof 検証
-- `POST /server/auth/external/init` … 外部サーバーへのログイン開始
-- `POST /server/auth/external/complete` … 外部ログイン完了処理
+- `GET /server/api/users/search?q=...` はユーザーを検索します。
+- `GET /server/api/users/:userId` は公開プロフィールと閲覧者との関係を返します。
+- `POST /server/api/users/:userId/follow` はフォロー状態を切り替えます。
+- `PUT /server/api/users/me` はプロフィール・設定・ブロックリストを更新します。
+- `GET /server/api/notifications` は通知一覧を返し、既読・クリック・削除用のエンドポイントを提供します。
 
+ブロック関係がある利用者由来の投稿通知・フォロー通知・クライアント作成通知は作成・Push・リアルタイム配信されません。
 
-## 新しい API を足すとき
+## リアルタイム配信
 
-1. `server/routes/` にファイルを作る（例：`posts.js`）
-2. `server/index.js` で登録する
+接続中の利用者には WebSocket で、通知、DM、新規のフォロー中投稿、DM 未読数などを配信します。投稿の配信対象は、投稿者をフォローしており、かつ投稿者とのブロック関係がない接続中の利用者に限定されます。
 
-```js
-app.use('/server/api/posts', require('./routes/posts'));
-```
+リアルタイム配信の失敗は、すでに保存済みの投稿やメッセージの API 成功を取り消しません。画面は必要に応じて通常の API 取得で整合します。
 
-3. データベースは `req.app.locals.dbAdapter` 経由で使う
+## 新しい API・アダプターを追加する場合
 
-## セキュリティの注意
-
-- セッション用のトークンは短めの有効期限にし、定期的に入れ替える
-- 権限が必要な処理は必ずこのサーバーを通す
-- 秘密のキーをブラウザに渡さない
+1. `server/routes/` にルートを追加し、`server/index.js` で `/server/api/...` に登録します。
+2. DB は `req.app.locals.dbAdapter`、ストレージは `req.app.locals.storageAdapter` 経由で利用します。
+3. 投稿・通知・DMの閲覧制御は、アダプター固有の処理ではなく共通サービス・ユーティリティを通してください。
+4. 認証が必要な操作には `requireAuth`、閲覧者によって結果が変わる公開取得には `optionalAuth` を適切に使います。
 
 ## 外部 Nyaitter アドレスでのログイン
 
-デフォルトでは `federation.allow_external_login` は有効です（`trusted_servers` が空のときはオープンモード）。このサーバーが確認側になる場合は `/auth/external` で許可画面を表示します。
+`federation.allow_external_login` を有効にすると、`#1234@example.com` 形式の Nyaitter アドレスによる外部ログインを受け付けます。`trusted_servers` が空ならオープンモード、指定されていればその一覧だけを受け付けます。
 
+外部ログインでは短時間で失効し一度だけ使える `state` と、相手サーバーが発行した `proof` を用います。proof は HTTPS 経由で相手サーバーに検証し、成功時だけローカルセッションを発行します。
 
-ログイン画面では、Scratch のユーザー名のほかに `#1234@example.com` 形式の Nyaitter アドレスも使えます。
+## 本番運用
 
-この形式が入力されると、サーバーは `POST /server/auth/external/init` を呼び出し、登録済みの外部サーバーの確認ページへ進みます。Scratch ユーザー名の場合は、これまでどおりコメント認証になります。
-
-外部ログインを使うには `server/config.json` の `federation` で次のようにします。
-
-- `allow_external_login` を有効にする
-- `trusted_servers` にサーバーを1件以上書くと、その一覧だけを受け付ける（ホワイトリスト）
-- `trusted_servers` を空にすると、任意の Nyaitter サーバーを受け付ける（オープン）
-
-どちらの場合も、証明（proof）は HTTPS でサーバー同士が確認します。
-
-```json
-{
-  "federation": {
-    "allow_external_login": true,
-    "trusted_servers": [
-      {
-        "domain": "remote.nyaitter.example",
-        "auth_endpoint": "https://remote.nyaitter.example/login/confirm",
-        "verify_endpoint": "https://remote.nyaitter.example/api/verify-login"
-      }
-    ]
-  }
-}
-```
-
-開始時に短い寿命の `state` と、コールバック先の URL を外部サーバーに渡します。外部サーバーは成功時に、同じ `state` と `proof` を付けて戻します。ログイン画面は `/server/auth/external/complete` を呼び、検証が成功したときだけセッションを作ります。
-
-`state` は約10分で無効になり、一度使うと消費されます。
+デプロイ前後の確認項目は [`help/production-checklist.md`](./help/production-checklist.md) を使用してください。秘密鍵、トークン、DB 接続文字列をクライアント・`config.json`・リポジトリへ含めてはいけません。

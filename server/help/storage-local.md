@@ -1,18 +1,25 @@
 # ローカルストレージの使い方
 
-ファイルをサーバーのディスクに保存する `LocalStorageAdapter` の説明です。
+`LocalStorageAdapter` は添付ファイルをサーバーのローカルディスクへ保存します。開発・テスト・単一サーバーでの小規模運用には便利ですが、複数台構成や長期運用では R2 などのオブジェクトストレージを推奨します。
 
-## 向いている用途
+## 用途と制約
 
-- 開発・テストでのアップロード確認
-- 小さな単一サーバーでの簡易保存
-- CI での一時ファイル
+| 用途 | 適性 | 注意点 |
+|---|---|---|
+| ローカル開発 | 適している | サーバー再作成・コンテナ再作成時のデータ消失に注意 |
+| CI・自動テスト | 適している | テスト終了後に一時ファイルを削除する |
+| 単一サーバーの小規模運用 | 条件付き | 永続ボリューム、バックアップ、容量監視が必要 |
+| 複数アプリサーバー | 適していない | 各サーバーのディスク内容が分離する |
 
-本番で長く使う場合は、Cloudflare R2 などオブジェクトストレージへの移行を強くおすすめします。
+## 設定
 
-## 基本設定
+`server/config.json` の既定値はローカルストレージです。環境変数で明示する場合は次のように設定します。
 
-### config.json
+```env
+STORAGE_ADAPTER=local
+```
+
+保存先は `server/config.json` の `storage.local.uploadDir` で設定します。相対パスはサーバープロセスの作業ディレクトリを基準に解決されます。
 
 ```json
 {
@@ -25,113 +32,49 @@
 }
 ```
 
-### 環境変数
+保存先ディレクトリは必要に応じてアダプターが作成します。コンテナやPaaSでは、書き込み可能かつ再起動後も保持されるボリュームを明示的に設定してください。
 
-```env
-STORAGE_ADAPTER=local
-```
+## 公開URL
 
-細かいパスは `config.json` の `local` で管理する方が分かりやすいです。
+ローカルストレージで保存したファイルはサーバーが `/uploads/*` として静的配信します。例えば `attachments/example.png` は通常 `/uploads/attachments/example.png` として参照されます。
 
-### フォルダを用意する
+アップロードディレクトリは `page/` の外側に置き、ユーザーが任意のアプリケーション資産を上書きできないようにしてください。ファイル名・パスはアダプターの安全なキー生成と検証を通して扱い、任意パスをそのまま公開URLへ連結しないでください。
 
-起動時に自動作成されますが、先に作っておくと安心です。
+## コードからの利用
 
-```bash
-mkdir -p uploads/attachments uploads/icons uploads/tmp
-```
-
-## ブラウザから見られるようにする
-
-アップロードしたファイルは、Express で静的配信する必要があります。`server/index.js` では次のような設定がされています。
-
-- `/uploads` で `uploadDir` の中身を公開
-- キャッシュや etag を有効にする
-
-これで `/uploads/attachments/xxxx.png` のような URL でアクセスできます。
-
-### セキュリティの注意
-
-- アップロード用フォルダは `page/` の外に置く
-- 実行できる種類のファイル（.php など）を配信しないよう、必要なら拡張子を制限する
-- 本番では可能なら R2 などに移す
-
-## コードからの使い方
+ルート・サービスでは、`req.app.locals.storageAdapter` を通じて操作します。
 
 ```js
 const storage = req.app.locals.storageAdapter;
 
-const result = await storage.upload({
+const uploaded = await storage.upload({
   file: buffer,
   fileName: 'photo.png',
   contentType: 'image/png',
   folder: 'attachments',
 });
 
-// result.id  … "attachments/abc123.png" のような識別子
-// result.url … "/uploads/attachments/abc123.png"
-
-await storage.delete(result.id);
-
-await storage.deleteMany([
-  'attachments/abc123.png',
-  'icons/user-456.jpg',
-]);
+await storage.delete(uploaded.id);
+await storage.deleteMany(['attachments/unused.png']);
 ```
 
-## おすすめのフォルダ分け
+アプリケーションコードから特定の保存先の絶対パスに依存しないでください。同じコードを R2 へ切り替えられるよう、保存・削除・公開URL取得はアダプターのメソッドを使います。
 
-```
-uploads/
-├── attachments/   # 投稿の添付
-├── icons/         # アイコン
-├── tmp/           # 一時ファイル（定期削除対象）
-└── exports/       # エクスポートなど
-```
+## 開発時の整理
 
-`folder` を指定すると、その下に自動でサブフォルダが作られます。
-
-## 開発時のヒント
-
-`.gitignore` に次を入れておくと便利です。
-
-```gitignore
-uploads/
-!uploads/.gitkeep
-```
-
-中身を消したいとき：
+`uploads/` は生成物として `.gitignore` に含めることを推奨します。開発データを削除する場合は、運用中のプロセスが参照していないことを確認してから対象ディレクトリだけを消去します。
 
 ```bash
 rm -rf uploads/attachments/* uploads/icons/* uploads/tmp/*
 ```
 
-## 本番で使う場合の注意（おすすめはしない）
+## 実運用で使う場合
 
-どうしても使う場合：
+ローカルストレージを使い続ける場合は、永続ディスク、ディスク容量監視、定期バックアップ、復旧手順、CDNまたはリバースプロキシのキャッシュ方針を用意してください。複数サーバー構成へ移行する予定がある場合は、早い段階でR2など共有可能なオブジェクトストレージへ移行する方が安全です。
 
-- `/uploads` を定期バックアップする
-- ディスク容量を監視する
-- 複数サーバーにするなら共有ディスクが必要
-- できれば CDN を前に置く
+## 関連ドキュメント
 
-長期的には次への移行を検討してください。
-
-- Cloudflare R2（おすすめ）
-- AWS S3
-- Google Cloud Storage
-- MinIO など社内の S3 互換
-
-## 困ったとき
-
-| 症状 | 確認すること |
-|------|----------------|
-| ファイルが保存されない | `uploadDir` の書き込み権限、コンテナならボリューム設定 |
-| ブラウザで 404 | `/uploads` の静的配信設定、パスが正しいか |
-| ディスクがいっぱい | `tmp/` の定期削除、または最初からオブジェクトストレージを使う |
-
-## 関連
-
-- [R2 ストレージ](./storage-r2.md)（本番向け）
-- [ハイブリッド構成](./cloudflare-hybrid.md)
-- [アダプター概要](../adapters/README.md)
+- [Cloudflare R2 ストレージ](./storage-r2.md)
+- [Cloudflare と組み合わせる構成](./cloudflare-hybrid.md)
+- [アダプターの設計と切り替え](./adapters-overview.md)
+- [本番デプロイのチェックリスト](./production-checklist.md)

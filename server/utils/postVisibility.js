@@ -1,5 +1,7 @@
 'use strict';
 
+const { hasBlockRelationship } = require('./blockRelationship');
+
 function getPostAuthorId(post) {
 	const value = post?.userId ?? post?.user_id ?? post?.userid;
 	const id = Number(value);
@@ -25,10 +27,17 @@ async function getAuthorsById(db, posts) {
 		authors = (await db.getUsersByIds(ids)).filter(Boolean);
 	}
 
-	// 一覧向けの軽量ユーザー取得では settings が省略されるアダプターがある。
-	// 非公開判定は設定欠落時に公開扱いへ後退してはならないため、該当者だけ完全レコードを再取得する。
+	// 一覧向けの軽量ユーザー取得では settings や shadow が省略されるアダプターがある。
+	// 非公開・検索除外の判定は属性欠落時に公開扱いへ後退してはならないため、
+	// 該当者だけ完全レコードを再取得する。
 	const byId = new Map(authors.map((author) => [Number(author.id), author]));
-	const idsNeedingFullRecord = ids.filter((id) => !Object.prototype.hasOwnProperty.call(byId.get(id) || {}, 'settings'));
+	const idsNeedingFullRecord = ids.filter((id) => {
+		const author = byId.get(id) || {};
+		return (
+			!Object.prototype.hasOwnProperty.call(author, 'settings') ||
+			!Object.prototype.hasOwnProperty.call(author, 'shadow')
+		);
+	});
 	if (typeof db.getUserById === 'function') {
 		const completeAuthors = await Promise.all(idsNeedingFullRecord.map((id) => db.getUserById(id)));
 		for (const author of completeAuthors.filter(Boolean)) byId.set(Number(author.id), author);
@@ -49,6 +58,13 @@ async function canViewPost(db, post, viewerId = null, author = null) {
 	const postAuthor = author && Object.prototype.hasOwnProperty.call(author, 'settings')
 		? author
 		: (typeof db.getUserById === 'function' ? await db.getUserById(authorId) : null);
+	if (
+		viewerId != null &&
+		Number(viewerId) !== authorId &&
+		await hasBlockRelationship(db, viewerId, authorId)
+	) {
+		return false;
+	}
 	if (!isPrivatePost(post, postAuthor)) return true;
 	if (viewerId == null) return false;
 	if (Number(viewerId) === authorId) return true;
@@ -76,9 +92,33 @@ async function filterViewablePosts(db, posts, viewerId = null) {
 	return values.filter((_, index) => visibility[index]);
 }
 
+/**
+ * 検索除外ユーザーの投稿を発見可能な一覧へ載せるか判定する。
+ *
+ * 検索除外は投稿自体の公開範囲を変えない。プロフィール等の直接一覧は
+ * 別途 `filterViewablePosts` を使うため、ここはタイムライン・おすすめ・
+ * 検索のような発見経路にだけ適用する。検索除外中の投稿者本人と、投稿者を
+ * フォローしているログイン済みユーザーは投稿を発見できる。
+ */
+async function filterDiscoverablePosts(db, posts, viewerId = null) {
+	const values = (posts || []).filter(Boolean);
+	const authorsById = await getAuthorsById(db, values);
+	const visibility = await Promise.all(values.map(async (post) => {
+		const authorId = getPostAuthorId(post);
+		const author = authorsById.get(authorId) || null;
+		if (!author?.shadow) return true;
+		if (viewerId == null) return false;
+		if (Number(viewerId) === Number(authorId)) return true;
+		if (typeof db.isFollowing !== 'function') return false;
+		return Boolean(await db.isFollowing(Number(viewerId), Number(authorId)));
+	}));
+	return values.filter((_, index) => visibility[index]);
+}
+
 module.exports = {
 	canViewPost,
 	filterViewablePosts,
+	filterDiscoverablePosts,
 	getPostAuthorId,
 	getAuthorsById,
 	isPrivatePost,

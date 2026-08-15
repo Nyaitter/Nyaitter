@@ -1,6 +1,7 @@
 const express = require('express');
 const crypto = require('crypto');
 const { requireAuth } = require('../middleware/auth');
+const { hasBlockRelationship } = require('../utils/blockRelationship');
 
 const router = express.Router();
 
@@ -12,8 +13,17 @@ async function publishDmMessage(req, userIds, dmId, message, sender = null) {
 	const realtime = req.app.locals.realtime;
 	if (!realtime) return;
 
+	const db = getDbAdapter(req);
+	const senderId = Number(message?.userid);
 	for (const userId of new Set((userIds || []).map(Number))) {
 		if (!Number.isInteger(userId) || userId < 0) continue;
+		if (
+			Number.isInteger(senderId) &&
+			userId !== senderId &&
+			await hasBlockRelationship(db, userId, senderId)
+		) {
+			continue;
+		}
 		try {
 			realtime.publishDmMessage(userId, dmId, message, sender);
 		} catch (error) {
@@ -46,7 +56,9 @@ function serializeDmMember(user) {
 }
 
 async function buildDmPayload(db, dms, userId, { includePosts = true } = {}) {
-	const records = (dms || []).map((dm) => serializeGroupDm(db, dm, userId, { includePosts }));
+	const records = await Promise.all(
+		(dms || []).map((dm) => serializeGroupDm(db, dm, userId, { includePosts })),
+	);
 	const memberIds = [...new Set(records.flatMap((dm) => dm.member || []))];
 	let users = [];
 	if (memberIds.length > 0) {
@@ -183,12 +195,41 @@ function validateMessageHistoryUpdate(existingMessages, requestedMessages, userI
 	}
 }
 
-function serializeGroupDm(db, dm, userId, { includePosts = true } = {}) {
-	const messages = (dm.post ? dm.post.slice() : []).map((message) => {
+async function getBlockedDmMemberIds(db, userId, memberIds) {
+	const blockedMemberIds = new Set();
+	for (const memberId of new Set((memberIds || []).map(Number))) {
+		if (memberId === Number(userId)) continue;
+		if (await hasBlockRelationship(db, userId, memberId)) {
+			blockedMemberIds.add(memberId);
+		}
+	}
+	return blockedMemberIds;
+}
+
+async function hasBlockedDmMemberPair(db, memberIds) {
+	const uniqueMemberIds = [...new Set((memberIds || []).map(Number))];
+	for (let index = 0; index < uniqueMemberIds.length; index += 1) {
+		for (let otherIndex = index + 1; otherIndex < uniqueMemberIds.length; otherIndex += 1) {
+			if (await hasBlockRelationship(db, uniqueMemberIds[index], uniqueMemberIds[otherIndex])) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+async function serializeGroupDm(db, dm, userId, { includePosts = true } = {}) {
+	const blockedMemberIds = await getBlockedDmMemberIds(db, userId, dm.member || []);
+	const messages = (dm.post ? dm.post.slice() : [])
+		.filter((message) => !blockedMemberIds.has(Number(message?.userid)))
+		.map((message) => {
 		const { time, createdAt, ...rest } = message || {};
 		return { ...rest, created_at: message?.created_at || createdAt || time || null };
 	});
 	const latestMessage = messages.length > 0 ? messages[messages.length - 1] : null;
+	const unreadCount = Number(
+		dm.unread?.[userId] ?? dm.unread?.[String(userId)] ?? dm.unread_count ?? 0,
+	);
 	return {
 		id: dm.id,
 		title: dm.title || '',
@@ -206,7 +247,8 @@ function serializeGroupDm(db, dm, userId, { includePosts = true } = {}) {
 				? '🔒 暗号化されたメッセージ'
 				: String(latestMessage.content || '').slice(0, 200),
 		} : null),
-		unread_count: (dm.unread && dm.unread[userId]) || 0,
+		// ブロックした相手の未読数から、メッセージの存在を推測できないようにする。
+		unread_count: blockedMemberIds.size > 0 ? 0 : unreadCount,
 	};
 }
 
@@ -227,11 +269,12 @@ router.get('/unread', requireAuth, async (req, res) => {
 	const db = getDbAdapter(req);
 	const userId = req.user.id;
 
-	try {
-		const count = await db.getGroupDmUnreadTotal(userId);
-		res.json({
-			unread_count: count,
-		});
+		try {
+			const dmList = await db.getGroupDmsForUser(userId);
+			const payload = await buildDmPayload(db, dmList, userId, { includePosts: false });
+			res.json({
+				unread_count: payload.unread_total,
+			});
 	} catch (err) {
 		console.error('[dm] unread error:', err);
 		res.status(500).json({ error: '未読数取得に失敗しました' });
@@ -242,11 +285,13 @@ router.get('/unread-counts', requireAuth, async (req, res) => {
 	const db = getDbAdapter(req);
 	const userId = req.user.id;
 
-	try {
-		const counts = await db.getGroupDmUnreadCounts(userId);
-		res.json({
-			counts,
-		});
+		try {
+			const dmList = await db.getGroupDmsForUser(userId);
+			const payload = await buildDmPayload(db, dmList, userId, { includePosts: false });
+			const counts = Object.fromEntries(
+				payload.dm.map((dm) => [String(dm.id), Number(dm.unread_count || 0)]),
+			);
+			res.json({ counts });
 	} catch (err) {
 		console.error('[dm] unread-counts error:', err);
 		res.status(500).json({ error: '未読数取得に失敗しました' });
@@ -269,9 +314,9 @@ router.get('/find', requireAuth, async (req, res) => {
 		if (dm && !dm.member.includes(req.user.id)) {
 			return res.status(403).json({ error: 'Forbidden' });
 		}
-		res.json({
-			dm: dm ? serializeGroupDm(db, dm, req.user.id) : null,
-		});
+			res.json({
+				dm: dm ? await serializeGroupDm(db, dm, req.user.id) : null,
+			});
 	} catch (err) {
 		console.error('[dm] find error:', err);
 		res.status(500).json({ error: 'DM 検索に失敗しました' });
@@ -346,22 +391,27 @@ router.post('/', requireAuth, async (req, res) => {
 		}
 
 		const membersToValidate = memberIds.filter((id) => id !== userId);
-		for (const memberId of membersToValidate) {
-			const user = await db.getUserById(memberId);
-			if (!user) {
-				return res
-					.status(404)
-					.json({ error: `User ${memberId} not found` });
+			for (const memberId of membersToValidate) {
+				const user = await db.getUserById(memberId);
+				if (!user) {
+					return res
+						.status(404)
+						.json({ error: `User ${memberId} not found` });
+				}
 			}
-		}
+			if (await hasBlockedDmMemberPair(db, memberIds)) {
+				return res.status(403).json({
+					error: 'ブロック関係のユーザーとDMを作成できません',
+				});
+			}
 
-		const existing = await db.findGroupDmByMembers(memberIds);
-		if (existing) {
-			return res.json({
-				dm: serializeGroupDm(db, existing, userId),
-				created: false,
-			});
-		}
+			const existing = await db.findGroupDmByMembers(memberIds);
+			if (existing) {
+				return res.json({
+					dm: await serializeGroupDm(db, existing, userId),
+					created: false,
+				});
+			}
 
 		const dm = await db.createGroupDm({
 			hostId: userId,
@@ -448,10 +498,15 @@ router.put('/:dmId', requireAuth, async (req, res) => {
 				) {
 					return res.status(400).json({ error: 'Invalid member ids' });
 				}
-				if (!memberIds.includes(userId)) {
-					return res.status(400).json({ error: 'Host must stay a member' });
-				}
-				updates.member = memberIds;
+					if (!memberIds.includes(userId)) {
+						return res.status(400).json({ error: 'Host must stay a member' });
+					}
+					if (await hasBlockedDmMemberPair(db, memberIds)) {
+						return res.status(403).json({
+							error: 'ブロック関係のユーザーをDMに招待できません',
+						});
+					}
+					updates.member = memberIds;
 			}
 			if (body.host_id !== undefined) {
 				if (!dm.member.includes(Number(body.host_id))) {
@@ -463,7 +518,7 @@ router.put('/:dmId', requireAuth, async (req, res) => {
 
 		if (Object.keys(updates).length === 0) {
 			return res.json({
-				dm: serializeGroupDm(db, dm, userId),
+				dm: await serializeGroupDm(db, dm, userId),
 			});
 		}
 
@@ -472,7 +527,7 @@ router.put('/:dmId', requireAuth, async (req, res) => {
 				await publishDmUnreadCounts(req, [...dm.member, ...updated.member], dmId);
 			}
 			res.json({
-			dm: serializeGroupDm(db, updated, userId),
+			dm: await serializeGroupDm(db, updated, userId),
 		});
 	} catch (err) {
 		console.error('[dm] update error:', err);
@@ -552,7 +607,7 @@ router.post('/:dmId/messages', requireAuth, async (req, res) => {
 				);
 
 			res.status(201).json({
-			dm: serializeGroupDm(db, updated, userId),
+			dm: await serializeGroupDm(db, updated, userId),
 			message: msg,
 		});
 	} catch (err) {

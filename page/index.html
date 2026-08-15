@@ -9,7 +9,7 @@
 			<meta name="apple-mobile-web-app-capable" content="yes" />
 			<meta name="apple-mobile-web-app-status-bar-style" content="default" />
 			<link rel="manifest" href="/manifest.webmanifest" />
-			<link rel="icon" href="favicon.png?v=v1" type="image/png" />
+			<link rel="icon" href="favicon.png" type="image/png" />
 			<link rel="apple-touch-icon" sizes="180x180" href="pwa-icon-192.png" />
 		<link
 			rel="stylesheet"
@@ -17,7 +17,7 @@
 			integrity="sha384-+JoywCPFwbtS2KrNLFu8EJHK+r5KPfqww25+fIBceLuhRk4muZy4TZR/4gXrk3qX"
 			crossorigin="anonymous"
 		/>
-			<link rel="stylesheet" href="./style.css?v=v1" />
+			<link rel="stylesheet" href="./style.css" />
 		<script src="https://cdn.jsdelivr.net/npm/@twemoji/api@15.1.0/dist/twemoji.min.js" integrity="sha384-o28+zJO3/45GHIy+9TFKGaYnbt0KQcFRzyBrb0WSSrz7bPGwGI1d64worBiXPgXw" crossorigin="anonymous"></script>
 		<script src="https://cdn.jsdelivr.net/npm/emojione@4.0.0/lib/js/emojione.min.js" integrity="sha384-1BsqfFBBtVbyYG2C3PTRFz+m1tERshCkrZnIAIhP8+ES00qPKe9EvOWpRb5Uoscd" crossorigin="anonymous"></script>
 		<script src="./vendor/emoji-mart.js"></script>
@@ -37,26 +37,29 @@
 				</header>
 				<div id="content-area">
 					<div id="main-screen" class="screen hidden">
-						<div class="timeline-tabs-sticky-container">
-							<div class="timeline-tabs">
-								<button
-									class="timeline-tab-button active"
-									data-tab="foryou"
-								>
-									すべて
-								</button>
-								<button
-									class="timeline-tab-button"
-									data-tab="following"
-								>
-									フォロー中
-								</button>
+							<div class="timeline-tabs-sticky-container">
+								<div class="timeline-tabs">
+									<button
+										class="timeline-tab-button active"
+										data-tab="foryou"
+									>
+										すべて
+									</button>
+									<button
+										class="timeline-tab-button"
+										data-tab="following"
+									>
+										フォロー中
+									</button>
+								</div>
 							</div>
-						</div>
-						<div class="post-form-sticky-container">
-							<div class="post-form-container"></div>
-						</div>
-						<div id="timeline"></div>
+							<div id="new-posts-indicator" class="new-posts-indicator hidden" aria-live="polite">
+								<button type="button" data-action="refresh-realtime-timeline">新しいポストを表示</button>
+							</div>
+							<div class="post-form-sticky-container">
+								<div class="post-form-container"></div>
+							</div>
+							<div id="timeline"></div>
 					</div>
 					<div id="explore-screen" class="screen hidden">
 						<div id="explore-content"></div>
@@ -202,15 +205,44 @@
 					<div id="account-switcher-modal-content"></div>
 				</div>
 			</div>
-			<div id="login-approval-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="login-approval-modal-title">
-				<div class="modal-content login-approval-modal-content">
-					<button type="button" class="modal-close-btn" aria-label="閉じる">×</button>
-					<div id="login-approval-modal-body"></div>
+				<div id="login-approval-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="login-approval-modal-title">
+					<div class="modal-content login-approval-modal-content">
+						<button type="button" class="modal-close-btn" aria-label="閉じる">×</button>
+						<div id="login-approval-modal-body"></div>
+					</div>
 				</div>
-			</div>
+				<div
+					id="app-dialog-modal"
+					class="modal-overlay app-dialog-overlay hidden"
+					role="dialog"
+					aria-modal="true"
+					aria-labelledby="app-dialog-title"
+					aria-describedby="app-dialog-message"
+				>
+					<div class="modal-content app-dialog-content">
+						<button
+							type="button"
+							id="app-dialog-close-btn"
+							class="modal-close-btn"
+							aria-label="閉じる"
+						>×</button>
+						<div class="login-modal-heading">
+							<h3 id="app-dialog-title">通知</h3>
+						</div>
+						<p id="app-dialog-message" class="app-dialog-message" role="alert"></p>
+						<div id="app-dialog-input-group" class="app-dialog-input-group hidden">
+							<label for="app-dialog-input">入力内容</label>
+							<input id="app-dialog-input" type="text" autocomplete="off" />
+						</div>
+						<div class="app-dialog-actions">
+							<button type="button" id="app-dialog-cancel-btn" class="login-secondary-button">キャンセル</button>
+							<button type="button" id="app-dialog-submit-btn" class="settings-primary-button">閉じる</button>
+						</div>
+					</div>
+				</div>
 
-		<div
-			id="connection-error-overlay"
+			<div
+				id="connection-error-overlay"
 			class="modal-overlay hidden"
 			style="z-index: 2000"
 		>
@@ -346,7 +378,7 @@
 			</div>
 		</div>
 
-				<script src="./login.js?v=v1"></script>
-				<script type="module" src="./js/main.js?v=v1"></script>
+				<script src="./login.js"></script>
+				<script type="module" src="./js/main.js"></script>
 	</body>
 </html>

@@ -3,6 +3,9 @@ const { requireAuth, optionalAuth } = require('../middleware/auth');
 const { createRateLimiter } = require('../middleware/rateLimit');
 const { NOTIFICATION_TYPES, normalizeTarget } = require('../utils/notification');
 const { serializeNotification } = require('../utils/serialize');
+const {
+	createNotificationIfAllowed,
+} = require('../services/NotificationDeliveryService');
 
 const router = express.Router();
 
@@ -139,15 +142,18 @@ router.post('/', requireAuth, notificationLimiter, async (req, res) => {
 	}
 
 	try {
-		const notification = await db.createNotification({
-			userId: recipientId,
-			type,
-			fromUserId: senderId,
-			target: normalizedTarget,
-		});
-		const serializedNotification = await serializeNotification(db, notification);
-		await publishNewNotification(req, recipientId, serializedNotification);
-		res.json({ success: true, notification: serializedNotification });
+			const notification = await createNotificationIfAllowed(db, {
+				userId: recipientId,
+				type,
+				fromUserId: senderId,
+				target: normalizedTarget,
+			});
+			if (!notification) {
+				return res.json({ success: true, notification: null });
+			}
+			const serializedNotification = await serializeNotification(db, notification);
+			await publishNewNotification(req, recipientId, serializedNotification);
+			res.json({ success: true, notification: serializedNotification });
 	} catch (err) {
 		console.error('[notifications] create error:', err);
 		res.status(500).json({ error: '通知の作成に失敗しました' });

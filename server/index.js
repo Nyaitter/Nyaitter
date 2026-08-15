@@ -306,22 +306,19 @@ app.use(
 		extensions: ['html'],
 			setHeaders: (res, filePath) => {
 				if (filePath.endsWith('/sw.js') || filePath.endsWith('\\sw.js')) {
-					// A service worker must be revalidated promptly so deployments activate predictably.
+					// A service worker must never remain stale after deployment.
 					res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-				} else if (filePath.endsWith('/main.js') || filePath.endsWith('\\main.js')) {
-					// The SPA entrypoint contains the current API contract and must not remain stale after deployment.
-					res.setHeader('Cache-Control', 'no-cache, must-revalidate');
-				} else if (filePath.endsWith('/index.html') || filePath.endsWith('\\index.html')) {
-					// The app shell selects the entry script version and must be revalidated after deployment.
-					res.setHeader('Cache-Control', 'no-cache, must-revalidate');
-				} else if (filePath.endsWith('.webmanifest')) {
-					res.setHeader('Content-Type', 'application/manifest+json; charset=utf-8');
-					res.setHeader('Cache-Control', 'no-cache');
-				} else if (filePath.endsWith('.js') || filePath.endsWith('.css')) {
-					res.setHeader('Cache-Control', `public, max-age=${config.static.jsCssCacheMaxAge}`);
-				} else if (/\.(png|jpg|jpeg|gif|svg|ico|webp)$/.test(filePath)) {
-					res.setHeader('Cache-Control', `public, max-age=${config.static.assetCacheMaxAge}`);
+					return;
 				}
+
+				if (filePath.endsWith('.webmanifest')) {
+					res.setHeader('Content-Type', 'application/manifest+json; charset=utf-8');
+				}
+
+				// Page assets retain validators (ETag / Last-Modified), but must be
+				// revalidated on every load. Changed files are therefore refreshed
+				// automatically without manually changing query-string versions.
+				res.setHeader('Cache-Control', 'public, max-age=0, must-revalidate');
 			},
 	}),
 );

@@ -1,5 +1,6 @@
 const express = require('express');
 const { requireAuth } = require('../middleware/auth');
+const { getVisibleDmUnreadCount } = require('../services/DmVisibilityService');
 
 const router = express.Router();
 
@@ -18,7 +19,7 @@ router.get('/summary', requireAuth, async (req, res) => {
   try {
     const [notificationUnreadCount, dmUnreadCount] = await Promise.all([
       db.getUnreadNotificationCount ? db.getUnreadNotificationCount(userId) : 0,
-      db.getGroupDmUnreadTotal ? db.getGroupDmUnreadTotal(userId) : 0,
+			getVisibleDmUnreadCount(db, userId),
     ]);
 
     res.json({

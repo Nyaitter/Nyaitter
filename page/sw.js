@@ -1,15 +1,5 @@
-const CACHE_NAME = 'nyaitter-client-v1';
-const NETWORK_FIRST_ASSETS = new Set([
-  '/index.html',
-  '/js/main.js',
-  '/js/app.js',
-  '/js/state.js',
-  '/js/api.js',
-  '/js/dom.js',
-  '/js/icons.js',
-  '/style.css',
-  '/manifest.webmanifest',
-]);
+const CACHE_NAME = 'nyaitter-client';
+const STATIC_ASSET_PATTERN = /\.(?:html|css|js|mjs|json|webmanifest|png|jpe?g|gif|svg|ico|webp|avif|woff2?|ttf|otf)$/i;
 const APP_SHELL = [
   '/',
   '/index.html',
@@ -60,7 +50,7 @@ self.addEventListener('activate', (event) => {
   event.waitUntil(
     caches.keys()
       .then((keys) => Promise.all(keys
-        .filter((key) => key.startsWith('nyaitter-app-shell-') && key !== CACHE_NAME)
+        .filter((key) => key.startsWith('nyaitter-client') && key !== CACHE_NAME)
         .map((key) => caches.delete(key))))
       .then(() => self.clients.claim()),
   );
@@ -75,7 +65,8 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  if (request.mode === 'navigate' || NETWORK_FIRST_ASSETS.has(url.pathname)) {
+  const isStaticAsset = STATIC_ASSET_PATTERN.test(url.pathname);
+  if (request.mode === 'navigate' || isStaticAsset) {
     event.respondWith(
       fetch(request)
         .then((response) => {

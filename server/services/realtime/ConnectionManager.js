@@ -1,3 +1,8 @@
+const { hasBlockRelationship } = require('../../utils/blockRelationship');
+const {
+  getVisibleDmUnreadCount,
+} = require('../DmVisibilityService');
+
 class ConnectionManager {
   constructor() {
     this.connectionsByUser = new Map();
@@ -97,13 +102,58 @@ class ConnectionManager {
   }
 
   async publishDmUnreadCount(userId, dbAdapter, dmId = null) {
-    const unreadCount = await dbAdapter.getGroupDmUnreadTotal(userId);
+    const unreadCount = await getVisibleDmUnreadCount(dbAdapter, userId);
     this.sendToUser(userId, {
       type: 'dm_unread_count',
       unread_count: unreadCount,
       ...(dmId ? { dm_id: String(dmId) } : {}),
     });
     return unreadCount;
+  }
+
+  async publishPostToFollowers(authorUserId, dbAdapter, postId) {
+    const authorId = Number(authorUserId);
+    if (!Number.isInteger(authorId) || authorId < 0 || !dbAdapter?.getFollowIds) {
+      return 0;
+    }
+
+    // オフラインユーザー向けのキューは持たず、接続中のユーザーだけを確認する。
+    // これにより全フォロワーを読み出す必要がなく、アダプターの取得上限にも依存しない。
+    const recipientIds = [...this.connectionsByUser.keys()].filter(
+      (userId) => Number(userId) !== authorId,
+    );
+    let deliveredCount = 0;
+
+    await Promise.all(
+      recipientIds.map(async (recipientId) => {
+        try {
+          const followingIds = await dbAdapter.getFollowIds(recipientId);
+          if (!(followingIds || []).some((id) => Number(id) === authorId)) {
+            return;
+          }
+          if (await hasBlockRelationship(dbAdapter, recipientId, authorId)) {
+            return;
+          }
+          if (
+            this.sendToUser(recipientId, {
+              type: 'timeline_post',
+              timeline: 'following',
+              author_id: authorId,
+              post_id: Number(postId),
+            })
+          ) {
+            deliveredCount += 1;
+          }
+        } catch (error) {
+          console.warn(
+            `[realtime] Failed to determine follow state for user ${recipientId}:`,
+            error.message,
+          );
+        }
+      }),
+    );
+
+    return deliveredCount;
   }
 
   closeAll(code = 1001, reason = 'Server shutting down') {

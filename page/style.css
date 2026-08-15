@@ -1426,6 +1426,96 @@ body.dark .recommend-user button {
     line-height: 1;
 }
 
+/* ブラウザ標準のalert/promptに代わるアプリ内ダイアログ */
+.app-dialog-overlay {
+    z-index: 3000;
+    padding: 1rem;
+    box-sizing: border-box;
+}
+
+.app-dialog-content {
+    box-sizing: border-box;
+    width: min(420px, 100%);
+    max-width: 420px;
+    padding: 1.7rem 1.25rem 1.25rem;
+    border: 1px solid var(--border-color);
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.2);
+}
+
+.app-dialog-message {
+    margin: 0;
+    color: var(--text-color);
+    line-height: 1.55;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.app-dialog-input-group {
+    display: flex;
+    flex-direction: column;
+    gap: 0.45rem;
+    margin-top: 1.1rem;
+    color: var(--text-color);
+    font-weight: 700;
+}
+
+.app-dialog-input-group.hidden {
+    display: none;
+}
+
+#app-dialog-input {
+    box-sizing: border-box;
+    width: 100%;
+    min-height: 3rem;
+    padding: 0.7rem 0.85rem;
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    background: var(--main-bg-color);
+    color: var(--text-color);
+    font: inherit;
+}
+
+#app-dialog-input:focus-visible {
+    outline: 2px solid var(--primary-color);
+    outline-offset: 2px;
+}
+
+.app-dialog-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.65rem;
+    margin-top: 1.35rem;
+}
+
+.app-dialog-actions .login-secondary-button,
+.app-dialog-actions .settings-primary-button {
+    min-height: 2.75rem;
+}
+
+.app-dialog-actions .login-secondary-button.hidden {
+    display: none;
+}
+
+@media (max-width: 480px) {
+    .app-dialog-overlay {
+        padding: 0.5rem;
+    }
+
+    .app-dialog-content {
+        width: 100%;
+        padding: 1.5rem 1rem 1rem;
+    }
+
+    .app-dialog-actions {
+        flex-direction: column-reverse;
+    }
+
+    .app-dialog-actions .login-secondary-button,
+    .app-dialog-actions .settings-primary-button {
+        width: 100%;
+    }
+}
+
 /* 画像プレビュー用モーダル */
 #image-preview-modal {
     align-items: center;
@@ -2883,6 +2973,8 @@ body.dark .recommend-user button {
 }
 
 .settings-group-button {
+    box-sizing: border-box;
+    display: block;
     width: 100%;
     padding: 0.75rem 0.8rem;
     border: 0;
@@ -2892,6 +2984,7 @@ body.dark .recommend-user button {
     font: inherit;
     font-weight: 700;
     text-align: left;
+    text-decoration: none;
     cursor: pointer;
     transition:
         background-color 0.2s,

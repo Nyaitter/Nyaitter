@@ -12,6 +12,9 @@ const {
 const { getPublicUrl } = require('../utils/nyaitterAddress');
 const { filterViewablePosts } = require('../utils/postVisibility');
 const { ScratchIconService } = require('../services/ScratchIconService');
+const {
+	createNotificationIfAllowed,
+} = require('../services/NotificationDeliveryService');
 
 const router = express.Router();
 
@@ -440,7 +443,7 @@ router.post('/:userId/follow', requireAuth, async (req, res) => {
 		const result = await db.toggleFollow(followerId, followingId);
 
 			if (result.following) {
-				const notification = await db.createNotification({
+				const notification = await createNotificationIfAllowed(db, {
 					userId: followingId,
 					type: 'follow',
 					fromUserId: followerId,

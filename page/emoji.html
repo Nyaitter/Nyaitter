@@ -116,6 +116,78 @@
             background-color: #42b72a;
             cursor: not-allowed;
         }
+
+        .emoji-dialog-overlay {
+            position: fixed;
+            inset: 0;
+            z-index: 1000;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 1rem;
+            box-sizing: border-box;
+            background: rgba(0, 0, 0, 0.4);
+        }
+
+        .emoji-dialog-overlay.hidden {
+            display: none;
+        }
+
+        .emoji-dialog-content {
+            position: relative;
+            box-sizing: border-box;
+            width: min(420px, 100%);
+            padding: 1.7rem 1.25rem 1.25rem;
+            border: 1px solid #dddfe2;
+            border-radius: 16px;
+            background: #ffffff;
+            box-shadow: 0 12px 32px rgba(0, 0, 0, 0.2);
+        }
+
+        .emoji-dialog-content h2 {
+            margin: 0 0 0.75rem;
+            font-size: 1.3rem;
+        }
+
+        .emoji-dialog-message {
+            margin: 0;
+            color: #1c1e21;
+            line-height: 1.55;
+            white-space: pre-wrap;
+        }
+
+        .emoji-dialog-close {
+            position: absolute;
+            top: 0.25rem;
+            right: 0.35rem;
+            width: 1.5rem;
+            height: 1.5rem;
+            border: none;
+            border-radius: 50%;
+            background: #888;
+            color: #ffffff;
+            font-size: 1.3rem;
+            line-height: 1;
+            cursor: pointer;
+        }
+
+        .emoji-dialog-action {
+            display: block;
+            min-height: 2.75rem;
+            margin: 1.25rem 0 0 auto;
+            padding: 0.6rem 1.2rem;
+            border: none;
+            border-radius: 9999px;
+            background: #ff9900;
+            color: #ffffff;
+            font: inherit;
+            font-weight: 700;
+            cursor: pointer;
+        }
+
+        .emoji-dialog-action:hover {
+            background: #e88b00;
+        }
     </style>
 </head>
 <body>
@@ -123,6 +195,21 @@
     <h1>Emoji一覧</h1>
     <div id="emoji-container">
         <p class="loading-text">読み込み中...</p>
+    </div>
+    <div
+        id="emoji-dialog-modal"
+        class="emoji-dialog-overlay hidden"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="emoji-dialog-title"
+        aria-describedby="emoji-dialog-message"
+    >
+        <div class="emoji-dialog-content">
+            <button type="button" id="emoji-dialog-close" class="emoji-dialog-close" aria-label="閉じる">×</button>
+            <h2 id="emoji-dialog-title">エラー</h2>
+            <p id="emoji-dialog-message" class="emoji-dialog-message" role="alert"></p>
+            <button type="button" id="emoji-dialog-action" class="emoji-dialog-action">閉じる</button>
+        </div>
     </div>
 
     <script src="emoji.js"></script>

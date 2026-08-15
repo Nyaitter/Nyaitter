@@ -5,6 +5,7 @@ const {
 } = require('./nyaitterAddress');
 const { normalizeNotificationRecord } = require('./notification');
 const { canViewPost, isPrivatePost } = require('./postVisibility');
+const { getVisibleDmUnreadCount } = require('../services/DmVisibilityService');
 
 function serializeUserBrief(user, publicUrl = null) {
 	if (!user) return null;
@@ -58,7 +59,7 @@ async function serializeUser(db, user, viewerId = null, publicUrl = null) {
 		db.getPinnedPostId ? db.getPinnedPostId(id) : null,
 		isSelf && db.getNotifications ? db.getNotifications(id, 200) : [],
 		isSelf && db.getUnreadNotificationCount ? db.getUnreadNotificationCount(id) : 0,
-		isSelf && db.getGroupDmUnreadTotal ? db.getGroupDmUnreadTotal(id) : 0,
+		isSelf ? getVisibleDmUnreadCount(db, id) : 0,
 	]);
 	const structuredNotifications = isSelf
 		? (await Promise.all(notifications.map((notification) => serializeNotification(db, notification, publicUrl)))).filter(Boolean)

@@ -80,6 +80,564 @@ const {
 
 export function initApp() {
     const METRICS_FALLBACK = '?';
+    let recommendedUsersRequest = null;
+
+    const appDialog = {
+        modal: document.getElementById('app-dialog-modal'),
+        title: document.getElementById('app-dialog-title'),
+        message: document.getElementById('app-dialog-message'),
+        inputGroup: document.getElementById('app-dialog-input-group'),
+        input: document.getElementById('app-dialog-input'),
+        closeButton: document.getElementById('app-dialog-close-btn'),
+        cancelButton: document.getElementById('app-dialog-cancel-btn'),
+        submitButton: document.getElementById('app-dialog-submit-btn'),
+    };
+    const appDialogQueue = [];
+    let isAppDialogActive = false;
+
+    function showNextAppDialog() {
+        const current = appDialogQueue.shift();
+        if (!current) {
+            isAppDialogActive = false;
+            return;
+        }
+
+        const {
+            type,
+            message,
+            defaultValue = '',
+            resolve,
+        } = current;
+        const isPrompt = type === 'prompt';
+        const isConfirm = type === 'confirm';
+        const previousFocus = document.activeElement;
+        let settled = false;
+
+        appDialog.title.textContent = isPrompt
+            ? '入力'
+            : isConfirm
+              ? '確認'
+              : '通知';
+        appDialog.message.textContent = String(message ?? '');
+        appDialog.inputGroup.classList.toggle('hidden', !isPrompt);
+        appDialog.cancelButton.classList.toggle('hidden', !(isPrompt || isConfirm));
+        appDialog.submitButton.textContent = isPrompt
+            ? '入力を確定'
+            : isConfirm
+              ? '実行する'
+              : '閉じる';
+        appDialog.closeButton.setAttribute(
+            'aria-label',
+            isPrompt || isConfirm ? 'キャンセル' : '閉じる',
+        );
+        appDialog.input.value = isPrompt ? String(defaultValue ?? '') : '';
+
+        const close = (result) => {
+            if (settled) return;
+            settled = true;
+            appDialog.modal.classList.add('hidden');
+            appDialog.closeButton.removeEventListener('click', onCancel);
+            appDialog.cancelButton.removeEventListener('click', onCancel);
+            appDialog.submitButton.removeEventListener('click', onSubmit);
+            appDialog.modal.removeEventListener('click', onBackdropClick);
+            appDialog.input.removeEventListener('keydown', onInputKeyDown);
+            document.removeEventListener('keydown', onKeyDown);
+            if (previousFocus instanceof HTMLElement) previousFocus.focus();
+            resolve(result);
+            setTimeout(showNextAppDialog, 0);
+        };
+
+        const onCancel = () =>
+            close(isPrompt ? null : isConfirm ? false : undefined);
+        const onSubmit = () =>
+            close(isPrompt ? appDialog.input.value : isConfirm ? true : undefined);
+        const onBackdropClick = (event) => {
+            if (event.target === appDialog.modal) onCancel();
+        };
+        const onInputKeyDown = (event) => {
+            if (event.key === 'Enter') {
+                event.preventDefault();
+                onSubmit();
+            }
+        };
+        const onKeyDown = (event) => {
+            if (event.key === 'Escape') {
+                event.preventDefault();
+                onCancel();
+            }
+        };
+
+        appDialog.closeButton.addEventListener('click', onCancel);
+        appDialog.cancelButton.addEventListener('click', onCancel);
+        appDialog.submitButton.addEventListener('click', onSubmit);
+        appDialog.modal.addEventListener('click', onBackdropClick);
+        appDialog.input.addEventListener('keydown', onInputKeyDown);
+        document.addEventListener('keydown', onKeyDown);
+        appDialog.modal.classList.remove('hidden');
+        requestAnimationFrame(() => {
+            (isPrompt ? appDialog.input : appDialog.submitButton).focus();
+        });
+    }
+
+    function openAppDialog(type, message, defaultValue) {
+        return new Promise((resolve) => {
+            appDialogQueue.push({ type, message, defaultValue, resolve });
+            if (!isAppDialogActive) {
+                isAppDialogActive = true;
+                showNextAppDialog();
+            }
+        });
+    }
+
+    function showAppAlert(message) {
+        return openAppDialog('alert', message);
+    }
+
+    function showAppPrompt(message, defaultValue = '') {
+        return openAppDialog('prompt', message, defaultValue);
+    }
+
+    function showAppConfirm(message) {
+        return openAppDialog('confirm', message);
+    }
+
+    const SETTINGS_GROUPS = new Set([
+        'profile',
+        'privacy',
+        'ui',
+        'notifications',
+        'api',
+        'resources',
+    ]);
+
+    function getSettingsGroupFromHash(hash = window.location.hash) {
+        const match = /^#settings(?:\/([^/?#]+))?$/.exec(hash);
+        const group = match?.[1];
+        return group && SETTINGS_GROUPS.has(group) ? group : 'profile';
+    }
+
+    const PAGE_CACHE_STORAGE_KEY = 'nyaitter_page_caches';
+    const timelinePageCaches = new Map();
+    const profilePostPageCaches = new Map();
+    const auxiliaryPostPageCaches = new Map();
+    const userPageCaches = new Map();
+    const screenDataCaches = new Map();
+    const MAX_TIMELINE_PAGE_CACHES = 30;
+    const MAX_PROFILE_POST_PAGE_CACHES = 30;
+    const MAX_AUXILIARY_PAGE_CACHES = 50;
+    const MAX_SCREEN_DATA_CACHES = 50;
+
+    function trimPageCacheMap(cacheMap, limit) {
+        while (cacheMap.size > limit) {
+            const oldestKey = cacheMap.keys().next().value;
+            if (oldestKey === undefined) break;
+            cacheMap.delete(oldestKey);
+        }
+    }
+
+    function serializePostPageCache(pageCache) {
+        return { pages: Array.from(pageCache?.pages?.entries?.() || []) };
+    }
+
+    function restorePostPageCache(serializedCache) {
+        const pages = new Map();
+        if (Array.isArray(serializedCache?.pages)) {
+            serializedCache.pages.forEach(([pageNumber, payload]) => {
+                const normalizedPageNumber = Number(pageNumber);
+                if (
+                    Number.isInteger(normalizedPageNumber) &&
+                    normalizedPageNumber >= 0 &&
+                    payload &&
+                    typeof payload === 'object'
+                )
+                    pages.set(normalizedPageNumber, payload);
+            });
+        }
+        return { pages };
+    }
+
+    function persistPageCaches() {
+        try {
+            const timelineCaches = Array.from(timelinePageCaches.entries()).map(
+                ([pageKey, pageCache]) => [
+                    pageKey,
+                    {
+                        timelines: Array.from(
+                            pageCache.timelines.entries(),
+                        ).map(([tab, tabCache]) => [
+                            tab,
+                            serializePostPageCache(tabCache),
+                        ]),
+                    },
+                ],
+            );
+            const profileCaches = Array.from(profilePostPageCaches.entries()).map(
+                ([pageKey, pageCache]) => [
+                    pageKey,
+                    serializePostPageCache(pageCache),
+                ],
+            );
+            const auxiliaryPostCaches = Array.from(
+                auxiliaryPostPageCaches.entries(),
+            ).map(([pageKey, pageCache]) => [
+                pageKey,
+                serializePostPageCache(pageCache),
+            ]);
+            const userCaches = Array.from(userPageCaches.entries()).map(
+                ([pageKey, pageCache]) => [
+                    pageKey,
+                    serializePostPageCache(pageCache),
+                ],
+            );
+            const screenData = Array.from(screenDataCaches.entries());
+            sessionStorage.setItem(
+                PAGE_CACHE_STORAGE_KEY,
+                JSON.stringify({
+                    timelineCaches,
+                    profileCaches,
+                    auxiliaryPostCaches,
+                    userCaches,
+                    screenData,
+                }),
+            );
+        } catch (_) {
+            // sessionStorageが無効・満杯の場合も、メモリ上のキャッシュは継続利用する。
+        }
+    }
+
+    function restorePageCaches() {
+        try {
+            const stored = JSON.parse(
+                sessionStorage.getItem(PAGE_CACHE_STORAGE_KEY) || '{}',
+            );
+            const timelineEntries = Array.isArray(stored?.timelineCaches)
+                ? stored.timelineCaches.slice(-MAX_TIMELINE_PAGE_CACHES)
+                : [];
+            timelineEntries.forEach(([pageKey, serializedCache]) => {
+                if (typeof pageKey !== 'string' || !serializedCache) return;
+                const timelines = new Map();
+                if (Array.isArray(serializedCache.timelines)) {
+                    serializedCache.timelines.forEach(([tab, tabCache]) => {
+                        if (typeof tab === 'string')
+                            timelines.set(tab, restorePostPageCache(tabCache));
+                    });
+                }
+                timelinePageCaches.set(pageKey, { timelines });
+            });
+            const profileEntries = Array.isArray(stored?.profileCaches)
+                ? stored.profileCaches.slice(-MAX_PROFILE_POST_PAGE_CACHES)
+                : [];
+            profileEntries.forEach(([pageKey, serializedCache]) => {
+                if (typeof pageKey !== 'string' || !serializedCache) return;
+                profilePostPageCaches.set(
+                    pageKey,
+                    restorePostPageCache(serializedCache),
+                );
+            });
+            const restoreSimplePageCaches = (serializedEntries, targetMap) => {
+                if (!Array.isArray(serializedEntries)) return;
+                serializedEntries
+                    .slice(-MAX_AUXILIARY_PAGE_CACHES)
+                    .forEach(([pageKey, serializedCache]) => {
+                        if (typeof pageKey !== 'string' || !serializedCache)
+                            return;
+                        targetMap.set(
+                            pageKey,
+                            restorePostPageCache(serializedCache),
+                        );
+                    });
+            };
+            restoreSimplePageCaches(
+                stored?.auxiliaryPostCaches,
+                auxiliaryPostPageCaches,
+            );
+            restoreSimplePageCaches(stored?.userCaches, userPageCaches);
+            if (Array.isArray(stored?.screenData)) {
+                stored.screenData
+                    .slice(-MAX_SCREEN_DATA_CACHES)
+                    .forEach(([cacheKey, payload]) => {
+                        if (typeof cacheKey === 'string' && payload !== undefined)
+                            screenDataCaches.set(cacheKey, payload);
+                    });
+            }
+            trimPageCacheMap(timelinePageCaches, MAX_TIMELINE_PAGE_CACHES);
+            trimPageCacheMap(
+                profilePostPageCaches,
+                MAX_PROFILE_POST_PAGE_CACHES,
+            );
+            trimPageCacheMap(
+                auxiliaryPostPageCaches,
+                MAX_AUXILIARY_PAGE_CACHES,
+            );
+            trimPageCacheMap(userPageCaches, MAX_AUXILIARY_PAGE_CACHES);
+            trimPageCacheMap(screenDataCaches, MAX_SCREEN_DATA_CACHES);
+        } catch (_) {
+            // 破損した保存値は使わず、空のキャッシュとして続行する。
+            timelinePageCaches.clear();
+            profilePostPageCaches.clear();
+            auxiliaryPostPageCaches.clear();
+            userPageCaches.clear();
+            screenDataCaches.clear();
+        }
+    }
+
+    function getTimelinePageCacheKey(hash = window.location.hash) {
+        const userScope = getCurrentUser()?.id ?? 'guest';
+        return `${userScope}:${hash || '#'}`;
+    }
+
+    function getTimelinePageCache(tab, { forceRefresh = false } = {}) {
+        const pageKey = getTimelinePageCacheKey();
+        if (!timelinePageCaches.has(pageKey)) {
+            timelinePageCaches.set(pageKey, { timelines: new Map() });
+            trimPageCacheMap(timelinePageCaches, MAX_TIMELINE_PAGE_CACHES);
+        }
+        const pageCache = timelinePageCaches.get(pageKey);
+        if (forceRefresh) {
+            pageCache.timelines.delete(tab);
+            persistPageCaches();
+        }
+        if (!pageCache.timelines.has(tab))
+            pageCache.timelines.set(tab, { pages: new Map() });
+        return pageCache.timelines.get(tab);
+    }
+
+    function savePostPageCache(pageCache, pageNumber, payload) {
+        pageCache.pages.set(pageNumber, payload);
+        persistPageCaches();
+    }
+
+    function getProfilePostPageCache(userId, subType, pinId = '') {
+        const userScope = getCurrentUser()?.id ?? 'guest';
+        const pageKey = `${userScope}:${window.location.hash || '#'}:${userId}:${subType}:${pinId || ''}`;
+        if (!profilePostPageCaches.has(pageKey)) {
+            profilePostPageCaches.set(pageKey, { pages: new Map() });
+            trimPageCacheMap(
+                profilePostPageCaches,
+                MAX_PROFILE_POST_PAGE_CACHES,
+            );
+        }
+        return profilePostPageCaches.get(pageKey);
+    }
+
+    function getAuxiliaryPostPageCache(cacheKey) {
+        if (!auxiliaryPostPageCaches.has(cacheKey)) {
+            auxiliaryPostPageCaches.set(cacheKey, { pages: new Map() });
+            trimPageCacheMap(
+                auxiliaryPostPageCaches,
+                MAX_AUXILIARY_PAGE_CACHES,
+            );
+        }
+        return auxiliaryPostPageCaches.get(cacheKey);
+    }
+
+    function getUserPageCache(cacheKey) {
+        if (!userPageCaches.has(cacheKey)) {
+            userPageCaches.set(cacheKey, { pages: new Map() });
+            trimPageCacheMap(userPageCaches, MAX_AUXILIARY_PAGE_CACHES);
+        }
+        return userPageCaches.get(cacheKey);
+    }
+
+    function getScreenDataCache(cacheKey) {
+        return screenDataCaches.get(cacheKey) ?? null;
+    }
+
+    function setScreenDataCache(cacheKey, payload) {
+        screenDataCaches.set(cacheKey, payload);
+        trimPageCacheMap(screenDataCaches, MAX_SCREEN_DATA_CACHES);
+        persistPageCaches();
+    }
+
+    function deleteScreenDataCache(cacheKey) {
+        if (screenDataCaches.delete(cacheKey)) persistPageCaches();
+    }
+
+    function getDmCacheKey(kind, dmId = '') {
+        const userScope = getCurrentUser()?.id ?? 'guest';
+        return `${userScope}:dm:${kind}:${dmId}`;
+    }
+
+    function invalidateDmCaches(dmId = null) {
+        const userScope = getCurrentUser()?.id ?? 'guest';
+        const prefix = `${userScope}:dm:`;
+        let changed = false;
+        screenDataCaches.forEach((_, cacheKey) => {
+            const matchesConversation =
+                dmId !== null &&
+                cacheKey === getDmCacheKey('conversation', String(dmId));
+            if (
+                cacheKey === getDmCacheKey('list') ||
+                (dmId === null && cacheKey.startsWith(prefix)) ||
+                matchesConversation
+            ) {
+                screenDataCaches.delete(cacheKey);
+                changed = true;
+            }
+        });
+        if (changed) persistPageCaches();
+    }
+
+    function invalidateTimelinePageCache() {
+        timelinePageCaches.clear();
+        profilePostPageCaches.clear();
+        auxiliaryPostPageCaches.clear();
+        userPageCaches.clear();
+        // DM・ユーザー検索の画面データは投稿の変更とは独立して保持する。
+        persistPageCaches();
+    }
+
+    restorePageCaches();
+
+    let pendingRealtimeTimelineUpdateUserId = null;
+
+    function hasPendingRealtimeTimelineUpdate() {
+        return (
+            Number.isInteger(Number(getCurrentUser()?.id)) &&
+            Number(pendingRealtimeTimelineUpdateUserId) ===
+                Number(getCurrentUser()?.id)
+        );
+    }
+
+    function updateRealtimeTimelineIndicator() {
+        const indicator = document.getElementById('new-posts-indicator');
+        const mainScreen = document.getElementById('main-screen');
+        if (!indicator || !mainScreen) return;
+        const shouldShow =
+            hasPendingRealtimeTimelineUpdate() &&
+            !mainScreen.classList.contains('hidden');
+        indicator.classList.toggle('hidden', !shouldShow);
+    }
+
+    function queueRealtimeTimelineUpdate() {
+        const userId = Number(getCurrentUser()?.id);
+        if (!Number.isInteger(userId)) return;
+        pendingRealtimeTimelineUpdateUserId = userId;
+        updateRealtimeTimelineIndicator();
+    }
+
+    function clearRealtimeTimelineUpdate() {
+        pendingRealtimeTimelineUpdateUserId = null;
+        updateRealtimeTimelineIndicator();
+    }
+
+    const SCROLL_POSITIONS_STORAGE_KEY = 'nyaitter_scroll_positions';
+    const MAX_SAVED_SCROLL_POSITIONS = 100;
+    let activeScrollRouteKey = null;
+    let scrollSaveTimer = null;
+    let scrollRestoreVersion = 0;
+    let routerGeneration = 0;
+
+    function getScrollRouteKey(hash = window.location.hash) {
+        const userScope = getCurrentUser()?.id ?? 'guest';
+        return `${userScope}:${hash || '#'}`;
+    }
+
+    function getSavedScrollPositions() {
+        try {
+            const parsed = JSON.parse(
+                sessionStorage.getItem(SCROLL_POSITIONS_STORAGE_KEY) || '{}',
+            );
+            return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+                ? parsed
+                : {};
+        } catch (_) {
+            return {};
+        }
+    }
+
+    function saveScrollPosition(routeKey = activeScrollRouteKey) {
+        if (!routeKey) return;
+        try {
+            const positions = getSavedScrollPositions();
+            positions[routeKey] = {
+                x: Math.max(0, Math.round(window.scrollX || 0)),
+                y: Math.max(0, Math.round(window.scrollY || 0)),
+                updatedAt: Date.now(),
+            };
+            const staleKeys = Object.entries(positions)
+                .sort(([, a], [, b]) =>
+                    Number(a?.updatedAt || 0) - Number(b?.updatedAt || 0),
+                )
+                .slice(0, -MAX_SAVED_SCROLL_POSITIONS)
+                .map(([key]) => key);
+            staleKeys.forEach((key) => delete positions[key]);
+            sessionStorage.setItem(
+                SCROLL_POSITIONS_STORAGE_KEY,
+                JSON.stringify(positions),
+            );
+        } catch (_) {
+            // sessionStorageが無効・満杯の場合も画面操作を妨げない。
+        }
+    }
+
+    function scheduleScrollPositionSave() {
+        const routeKey = activeScrollRouteKey;
+        if (!routeKey || scrollSaveTimer) return;
+        scrollSaveTimer = setTimeout(() => {
+            scrollSaveTimer = null;
+            // 遷移開始後に古いタイマーが実行されても、遷移先の描画状態で
+            // 直前ページのスクロール位置を上書きしない。
+            if (activeScrollRouteKey !== routeKey) return;
+            saveScrollPosition(routeKey);
+        }, 200);
+    }
+
+    function beginScrollRouteTransition() {
+        const previousRouteKey = activeScrollRouteKey;
+        if (scrollSaveTimer) {
+            clearTimeout(scrollSaveTimer);
+            scrollSaveTimer = null;
+        }
+        // 画面のDOMを切り替える前に直前ページの現在位置を確定する。
+        if (previousRouteKey) saveScrollPosition(previousRouteKey);
+        // 遷移先を描画するまで保存先を未設定にし、ローディング中のscrollイベントで
+        // 直前ページの位置が0,0に書き換えられることを防ぐ。
+        activeScrollRouteKey = null;
+    }
+
+    function restoreScrollPosition(routeKey) {
+        const saved = getSavedScrollPositions()[routeKey];
+        const x = Number(saved?.x);
+        const y = Number(saved?.y);
+        const targetX = Number.isFinite(x) && x >= 0 ? x : 0;
+        const targetY = Number.isFinite(y) && y >= 0 ? y : 0;
+        const version = ++scrollRestoreVersion;
+
+        const restoreAfterPaint = () => {
+            requestAnimationFrame(() => {
+                requestAnimationFrame(() => {
+                    if (
+                        version !== scrollRestoreVersion ||
+                        activeScrollRouteKey !== routeKey
+                    )
+                        return;
+                    window.scrollTo({
+                        left: targetX,
+                        top: targetY,
+                        behavior: 'auto',
+                    });
+                });
+            });
+        };
+
+        // ルーターが各ページの描画Promiseを完了した後、
+        // 次の描画フレームで一度だけ復元する。
+        restoreAfterPaint();
+    }
+
+    if ('scrollRestoration' in window.history)
+        window.history.scrollRestoration = 'manual';
+    window.addEventListener('scroll', scheduleScrollPositionSave, {
+        passive: true,
+    });
+    window.addEventListener('pagehide', () => {
+        if (scrollSaveTimer) {
+            clearTimeout(scrollSaveTimer);
+            scrollSaveTimer = null;
+        }
+        saveScrollPosition();
+    });
 
     // 認証状態はサーバー発行のHttpOnly Cookieだけで保持する。
     // アカウント一覧は表示補助用のプロフィール情報だけを保持する。
@@ -117,10 +675,43 @@ export function initApp() {
         return `#${formatNyaitterId(id)}`;
     }
 
-    function formatPostTimestamp(post) {
+    const POST_TIMESTAMP_FORMATS = new Set([
+        'relative',
+        'relative_detailed',
+        'absolute_24',
+        'absolute_12',
+    ]);
+
+    function normalizePostTimestampFormat(value) {
+        return POST_TIMESTAMP_FORMATS.has(value) ? value : 'relative';
+    }
+
+    function getPostTimestampFormat() {
+        return normalizePostTimestampFormat(
+            getCurrentUser()?.settings?.post_timestamp_format,
+        );
+    }
+
+    function formatPostTimestamp(post, format = getPostTimestampFormat()) {
         const value = post?.created_at;
         const date = value ? new Date(value) : null;
         if (!date || Number.isNaN(date.getTime())) return '日時不明';
+
+        const pad = (number) => String(number).padStart(2, '0');
+        const year = date.getFullYear();
+        const month = pad(date.getMonth() + 1);
+        const day = pad(date.getDate());
+        const hour = date.getHours();
+        const minute = pad(date.getMinutes());
+        const second = pad(date.getSeconds());
+
+        if (format === 'absolute_24')
+            return `${year}/${month}/${day} ${pad(hour)}:${minute}:${second}`;
+        if (format === 'absolute_12') {
+            const period = hour < 12 ? '午前' : '午後';
+            const hour12 = hour % 12 || 12;
+            return `${year}/${month}/${day} ${period} ${pad(hour12)}:${minute}:${second}`;
+        }
 
         const elapsedSeconds = Math.max(
             0,
@@ -139,7 +730,10 @@ export function initApp() {
         for (const [label, seconds] of units) {
             const amount = Math.floor(remaining / seconds);
             remaining %= seconds;
-            if (amount > 0) parts.push(`${amount}${label}`);
+            if (amount > 0) {
+                parts.push(`${amount}${label}`);
+                if (format === 'relative') break;
+            }
         }
         return `${parts.length > 0 ? parts.join('') : '0秒'}前`;
     }
@@ -519,7 +1113,7 @@ export function initApp() {
         const userId = Number(user?.id);
         return Number.isInteger(userId) && userId > 0
             ? `/server/api/users/${encodeURIComponent(userId)}/icon`
-            : '/logo.png?v=v1';
+            : '/logo.png';
     }
 
     function getUserHeaderImageUrl(user) {
@@ -952,14 +1546,9 @@ export function initApp() {
             if (
                 author &&
                 Array.isArray(author.block) &&
-                author.block.includes(getCurrentUser().id)
+                author.block.map(Number).includes(Number(getCurrentUser().id))
             ) {
-                // 自分がadminのときだけ規制を通過
-                if (getCurrentUser().admin) {
-                    return true;
-                } else {
-                    return false;
-                }
+                return false;
             }
             return true;
         });
@@ -1060,7 +1649,7 @@ export function initApp() {
             ],
             categoryIcons: {
                 nyaitter: {
-                    svg: `<svg viewBox="0 0 1 1" aria-label="Nyaitter"><image href="/logo.png?v=v1" width="1" height="1" preserveAspectRatio="xMidYMid meet"></image></svg>`,
+                    svg: `<svg viewBox="0 0 1 1" aria-label="Nyaitter"><image href="/logo.png" width="1" height="1" preserveAspectRatio="xMidYMid meet"></image></svg>`,
                 },
             },
             categories: [
@@ -1100,6 +1689,11 @@ export function initApp() {
     }
 
     async function router() {
+        const generation = ++routerGeneration;
+        beginScrollRouteTransition();
+        // 進行中の古い復元処理を無効化する。
+        scrollRestoreVersion += 1;
+        let routeKey = getScrollRouteKey();
         showLoading(true);
         setIsLoadingMore(false);
 
@@ -1114,7 +1708,11 @@ export function initApp() {
         }
 
         await updateNavAndSidebars();
+        // hashchangeと明示的なrouter()呼び出しが重なった場合、古いルーターは
+        // 新しい遷移のDOMやスクロール状態に触れない。
+        if (generation !== routerGeneration) return;
         const hash = window.location.hash || '#';
+        routeKey = getScrollRouteKey(hash);
         const activeDmMatch = hash.match(/^#dm\/([^/]+)$/);
         setActiveDmId(activeDmMatch ? activeDmMatch[1] : null);
         if (!getActiveDmId()) getPendingRealtimeDmMessages().clear();
@@ -1148,8 +1746,11 @@ export function initApp() {
             else if (hash.startsWith('#dm/') && getCurrentUser())
                 await showDmScreen(hash.substring(4));
             else if (hash === '#dm' && getCurrentUser()) await showDmScreen();
-            else if (hash === '#settings' && getCurrentUser())
-                await showSettingsScreen();
+            else if (
+                (hash === '#settings' || hash.startsWith('#settings/')) &&
+                getCurrentUser()
+            )
+                await showSettingsScreen(getSettingsGroupFromHash(hash));
             else if (hash.startsWith('#login-approval/') && getCurrentUser()) {
                 await showNotificationsScreen();
                 await openLoginApprovalModal(
@@ -1164,12 +1765,16 @@ export function initApp() {
                 await showStarsScreen();
             else await showMainScreen();
         } catch (error) {
+            if (generation !== routerGeneration) return;
             console.error('Routing error:', error);
             DOM.pageHeader.innerHTML = `<h2>エラー</h2>`;
             showScreen('main-screen');
             DOM.timeline.innerHTML = `<p class="error-message">ページの読み込み中にエラーが発生しました。</p>`;
         } finally {
             // `showAdminLogsScreen`内で個別にローディングを解除するため、ここでの一括解除は不要
+            if (generation !== routerGeneration) return;
+            activeScrollRouteKey = routeKey;
+            restoreScrollPosition(routeKey);
         }
     }
 
@@ -1189,17 +1794,29 @@ export function initApp() {
         }
 
         let error = null;
-        if (!getRecommendedUsersCache()) {
-            let query = api.from('user').select('id, name, scid, icon_data');
-            if (getCurrentUser()) query = query.neq('id', getCurrentUser().id);
-            const result = await query
-                .order('created_at', { ascending: false })
-                .limit(3);
+        if (getRecommendedUsersCache() === null) {
+            if (!recommendedUsersRequest) {
+                let query = api
+                    .from('user')
+                    .select('id, name, scid, icon_data');
+                if (getCurrentUser())
+                    query = query.neq('id', getCurrentUser().id);
+                recommendedUsersRequest = query
+                    .order('created_at', { ascending: false })
+                    .limit(3)
+                    .then((result) => {
+                        if (!result.error)
+                            setRecommendedUsersCache(
+                                Array.isArray(result.data) ? result.data : [],
+                            );
+                        return result;
+                    })
+                    .finally(() => {
+                        recommendedUsersRequest = null;
+                    });
+            }
+            const result = await recommendedUsersRequest;
             error = result.error;
-            if (!error)
-                setRecommendedUsersCache(
-                    Array.isArray(result.data) ? result.data : [],
-                );
         }
 
         const data = getRecommendedUsersCache() || [];
@@ -1282,7 +1899,11 @@ export function initApp() {
                     hash: `#profile/${getCurrentUser().id}`,
                     icon: ICONS.profile,
                 },
-                { name: '設定', hash: '#settings', icon: ICONS.settings },
+                {
+                    name: '設定',
+                    hash: '#settings/profile',
+                    icon: ICONS.settings,
+                },
             );
         }
 
@@ -1351,7 +1972,7 @@ export function initApp() {
                 AccountButton.classList.remove('hidden');
             }
         }
-        loadRightSidebar();
+        await loadRightSidebar();
     }
 
     function goToLoginPage() {
@@ -1361,8 +1982,8 @@ export function initApp() {
         }
         window.location.href = '/login';
     }
-    function handleLogout() {
-        if (!confirm('ログアウトしますか？')) return;
+    async function handleLogout() {
+        if (!(await showAppConfirm('ログアウトしますか？'))) return;
         const userId = getCurrentUser()?.id;
         if (userId) removeAccountFromList(userId);
         api.auth.signOut().then(() => {
@@ -1533,7 +2154,7 @@ export function initApp() {
             const userId = Number(item.dataset.id);
             item.onclick = async (event) => {
                 if (event.target.closest('.switcher-delete-btn')) {
-                    if (!confirm('この端末からアカウントを解除しますか？'))
+                    if (!await showAppConfirm('この端末からアカウントを解除しますか？'))
                         return;
                     const { data: result, error: removeError } =
                         await apiRequest(
@@ -1541,7 +2162,7 @@ export function initApp() {
                             { method: 'DELETE' },
                         );
                     if (removeError)
-                        return alert(
+                        return showAppAlert(
                             `アカウントの解除に失敗しました: ${removeError.message}`,
                         );
                     removeAccountFromList(userId);
@@ -1571,7 +2192,7 @@ export function initApp() {
                                 },
                             );
                             if (switchError) {
-                                alert(
+                                showAppAlert(
                                     `アカウントの切替に失敗しました: ${switchError.message}`,
                                 );
                             } else {
@@ -1593,7 +2214,7 @@ export function initApp() {
                     },
                 );
                 if (switchError)
-                    return alert(
+                    return showAppAlert(
                         `アカウントの切替に失敗しました: ${switchError.message}`,
                     );
                 modal.classList.add('hidden');
@@ -1691,7 +2312,7 @@ export function initApp() {
             if (decisionError) {
                 approve.disabled = false;
                 deny.disabled = false;
-                alert(
+                showAppAlert(
                     `ログイン要求の処理に失敗しました: ${decisionError.message}`,
                 );
                 return;
@@ -1803,7 +2424,7 @@ export function initApp() {
     }
 
     async function handleSimpleRepost(postId) {
-        if (!getCurrentUser()) return alert('ログインが必要です。');
+        if (!getCurrentUser()) return showAppAlert('ログインが必要です。');
         showLoading(true);
         try {
             const { data: originalPost, error: fetchError } = await api
@@ -1832,11 +2453,12 @@ export function initApp() {
                 id: postId,
             });
 
+            invalidateTimelinePageCache();
             router(); // タイムラインを更新
         } catch (e) {
             console.error(e);
             const friendlyMessage = e.message.replace(/^Error: /, '');
-            alert(`リポストに失敗しました: ${friendlyMessage}`);
+            showAppAlert(`リポストに失敗しました: ${friendlyMessage}`);
         } finally {
             showLoading(false);
         }
@@ -2082,11 +2704,11 @@ export function initApp() {
     }
 
     async function handlePostSubmit(container) {
-        if (!getCurrentUser()) return alert('ログインが必要です。');
+        if (!getCurrentUser()) return showAppAlert('ログインが必要です。');
         const contentEl = container.querySelector('textarea');
         const content = contentEl.value.trim();
         if (!content && getSelectedFiles().length === 0 && !getQuotingPost())
-            return alert('内容を入力するか、ファイルを添付してください。');
+            return showAppAlert('内容を入力するか、ファイルを添付してください。');
 
         const maskActive = container
             .querySelector('.post-mask-button')
@@ -2171,6 +2793,7 @@ export function initApp() {
             });
 
             const replyTargetId = getReplyingTo()?.id || null;
+            invalidateTimelinePageCache();
             setSelectedFiles([]);
             contentEl.value = '';
             container.querySelector('.file-preview-container').innerHTML = '';
@@ -2198,7 +2821,7 @@ export function initApp() {
                 );
                 await deleteFilesViaEdgeFunction(uploadedFileIds);
             }
-            alert(`投稿に失敗しました: ${e.message}`);
+            showAppAlert(`投稿に失敗しました: ${e.message}`);
         } finally {
             button.disabled = false;
             button.textContent = 'ポスト';
@@ -2308,7 +2931,7 @@ export function initApp() {
             setTimeout(() => window.URL.revokeObjectURL(url), 1000);
         } catch (e) {
             console.error('ダウンロードエラー:', e);
-            alert('ファイルのダウンロードに失敗しました。');
+            showAppAlert('ファイルのダウンロードに失敗しました。');
         }
     };
 
@@ -2808,7 +3431,7 @@ export function initApp() {
         // iframeを使った広告描画用のHTML
         adContainer.innerHTML = `
 	            <div class="user-icon-link">
-	                <img src="logo.png?v=v1" class="user-icon" alt="広告アイコン">
+	                <img src="logo.png" class="user-icon" alt="広告アイコン">
 	            </div>
 	            <div class="post-main">
 	                <div class="post-header">
@@ -2835,6 +3458,7 @@ export function initApp() {
     async function showMainScreen() {
         DOM.pageHeader.innerHTML = `<h2 id="page-title">ホーム</h2>`;
         showScreen('main-screen');
+        updateRealtimeTimelineIndicator();
 
         const tabsContainer = document.querySelector('.timeline-tabs');
         if (getCurrentUser()) {
@@ -2842,18 +3466,18 @@ export function initApp() {
 	                <button class="timeline-tab-button" data-tab="all">すべて</button>
 	                <button class="timeline-tab-button" data-tab="foryou">おすすめ</button>
 	                <button class="timeline-tab-button" data-tab="following">フォロー中</button>
-	                <button class="timeline-tab-button" data-tab="announce">お知らせ</button>
-	            `;
-            // ユーザー設定からデフォルトタブを取得。なければ 'all' を使用
+		                <button class="timeline-tab-button" data-tab="announce">お知らせ</button>
+		            `;
+	            // ユーザー設定からデフォルトタブを取得。なければ 'all' を使用
             setCurrentTimelineTab(
                 getCurrentUser().settings?.default_timeline_tab || 'all',
             );
         } else {
             tabsContainer.innerHTML = `
 	                <button class="timeline-tab-button" data-tab="all">すべて</button>
-	                <button class="timeline-tab-button" data-tab="announce">お知らせ</button>
-	            `;
-            // 未ログインユーザーのデフォルトは「すべて」固定
+		                <button class="timeline-tab-button" data-tab="announce">お知らせ</button>
+		            `;
+	            // 未ログインユーザーのデフォルトは「すべて」固定
             setCurrentTimelineTab('all');
         }
 
@@ -2984,25 +3608,32 @@ export function initApp() {
             contentDiv.appendChild(userResultsContainer);
             userResultsContainer.innerHTML = '<div class="spinner"></div>';
 
-            const filters = [
-                `name.ilike.%${query}%`,
-                `nyaitter_id.ilike.%${query}%`,
-                `scid.ilike.%${query}%`,
-                `me.ilike.%${query}%`,
-            ];
-            // #1234 と 1234 のどちらでもNyaitter IDを優先して検索する
-            const nyaitterIdQuery = String(query).replace(/^#/, '');
-            if (/^\d+$/.test(nyaitterIdQuery)) {
-                filters.unshift(`id.eq.${Number(nyaitterIdQuery)}`);
-            }
+            const userScope = getCurrentUser()?.id ?? 'guest';
+            const searchUsersCacheKey = `${userScope}:search:users:${query}`;
+            let users = getScreenDataCache(searchUsersCacheKey);
+            if (!Array.isArray(users)) {
+                const filters = [
+                    `name.ilike.%${query}%`,
+                    `nyaitter_id.ilike.%${query}%`,
+                    `scid.ilike.%${query}%`,
+                    `me.ilike.%${query}%`,
+                ];
+                // #1234 と 1234 のどちらでもNyaitter IDを優先して検索する
+                const nyaitterIdQuery = String(query).replace(/^#/, '');
+                if (/^\d+$/.test(nyaitterIdQuery)) {
+                    filters.unshift(`id.eq.${Number(nyaitterIdQuery)}`);
+                }
 
-            const { data: users, error: userError } = await api
-                .from('user')
-                .select('id, name, scid, me, icon_data, settings')
-                .or(filters.join(','))
-                .order('id', { ascending: true })
-                .limit(10);
-            if (userError) console.error('ユーザー検索エラー:', userError);
+                const { data, error: userError } = await api
+                    .from('user')
+                    .select('id, name, scid, me, icon_data, settings')
+                    .or(filters.join(','))
+                    .order('id', { ascending: true })
+                    .limit(10);
+                if (userError) console.error('ユーザー検索エラー:', userError);
+                users = Array.isArray(data) ? data : [];
+                if (!userError) setScreenDataCache(searchUsersCacheKey, users);
+            }
 
             userResultsContainer.innerHTML = '';
             if (users && users.length > 0) {
@@ -3049,8 +3680,12 @@ export function initApp() {
 
             const postResultsContainer = document.createElement('div');
             contentDiv.appendChild(postResultsContainer);
+            const userScope = getCurrentUser()?.id ?? 'guest';
             await loadPostsWithPagination(postResultsContainer, 'search', {
                 query,
+                pageCache: getAuxiliaryPostPageCache(
+                    `${userScope}:search:posts:${query}`,
+                ),
             });
             showLoading(false);
         }
@@ -3079,7 +3714,7 @@ export function initApp() {
         document
             .getElementById('mark-all-read-btn')
             .addEventListener('click', async () => {
-                if (!confirm('すべての通知を既読にしますか？')) return;
+                if (!await showAppConfirm('すべての通知を既読にしますか？')) return;
 
                 showLoading(true);
                 try {
@@ -3101,7 +3736,7 @@ export function initApp() {
                     await updateNavAndSidebars();
                 } catch (e) {
                     console.error('すべて既読処理でエラー:', e);
-                    alert('処理中にエラーが発生しました。');
+                    showAppAlert('処理中にエラーが発生しました。');
                 } finally {
                     showLoading(false);
                 }
@@ -3201,8 +3836,12 @@ export function initApp() {
         DOM.pageHeader.innerHTML = `<h2 id="page-title">いいね</h2>`;
         showScreen('likes-screen');
         DOM.likesContent.innerHTML = '';
+        const userScope = getCurrentUser()?.id ?? 'guest';
         await loadPostsWithPagination(DOM.likesContent, 'likes', {
             ids: getCurrentUser().like,
+            pageCache: getAuxiliaryPostPageCache(
+                `${userScope}:likes:${(getCurrentUser().like || []).join(',')}`,
+            ),
         });
         showLoading(false);
     }
@@ -3210,8 +3849,12 @@ export function initApp() {
         DOM.pageHeader.innerHTML = `<h2 id="page-title">お気に入り</h2>`;
         showScreen('stars-screen');
         DOM.starsContent.innerHTML = '';
+        const userScope = getCurrentUser()?.id ?? 'guest';
         await loadPostsWithPagination(DOM.starsContent, 'stars', {
             ids: getCurrentUser().star,
+            pageCache: getAuxiliaryPostPageCache(
+                `${userScope}:stars:${(getCurrentUser().star || []).join(',')}`,
+            ),
         });
         showLoading(false);
     }
@@ -3456,7 +4099,29 @@ export function initApp() {
                 { rootMargin: '200px' },
             );
 
-            repliesLoadObserver.observe(trigger);
+            const savedDetailPosition = getSavedScrollPositions()[
+                getScrollRouteKey()
+            ];
+            const savedDetailY = Number(savedDetailPosition?.y);
+            const restoreTargetY =
+                Number.isFinite(savedDetailY) && savedDetailY > 0
+                    ? savedDetailY
+                    : 0;
+
+            if (pagination.hasMore) {
+                await loadMoreReplies();
+                while (
+                    pagination.hasMore &&
+                    document.documentElement.scrollHeight <
+                        restoreTargetY + window.innerHeight
+                ) {
+                    await loadMoreReplies();
+                }
+            } else {
+                trigger.textContent = 'まだ返信はありません。';
+            }
+
+            if (pagination.hasMore) repliesLoadObserver.observe(trigger);
         } catch (err) {
             console.error('Post detail error:', err);
             contentDiv.innerHTML = `<p class="error-message">${err.message || 'ページの読み込みに失敗しました。'}</p>`;
@@ -3491,9 +4156,14 @@ export function initApp() {
             );
 
             try {
-                const { data: dmPayload, error } =
-                    await apiRequest('/server/api/dm');
-                if (error) throw error;
+                const dmListCacheKey = getDmCacheKey('list');
+                let dmPayload = getScreenDataCache(dmListCacheKey);
+                if (!dmPayload) {
+                    const { data, error } = await apiRequest('/server/api/dm');
+                    if (error) throw error;
+                    dmPayload = data || {};
+                    setScreenDataCache(dmListCacheKey, dmPayload);
+                }
                 const dmList = Array.isArray(dmPayload?.dm) ? dmPayload.dm : [];
                 const unreadCountsMap = getDmUnreadCounts();
                 unreadCountsMap.clear();
@@ -3565,9 +4235,26 @@ export function initApp() {
         let dmSelectedFiles = [];
 
         try {
-            const { data: dmPayload, error } = await apiRequest(
-                `/server/api/dm/${encodeURIComponent(dmId)}?mark_read=1`,
+            const dmConversationCacheKey = getDmCacheKey(
+                'conversation',
+                String(dmId),
             );
+            let dmPayload = getScreenDataCache(dmConversationCacheKey);
+            let error = null;
+            if (!dmPayload) {
+                const result = await apiRequest(
+                    `/server/api/dm/${encodeURIComponent(dmId)}?mark_read=1`,
+                );
+                dmPayload = result.data || {};
+                error = result.error;
+                if (!error) setScreenDataCache(dmConversationCacheKey, dmPayload);
+            } else {
+                // キャッシュ復元時も、会話を開いたことによる既読化は維持する。
+                void apiRequest(
+                    `/server/api/dm/${encodeURIComponent(dmId)}/read`,
+                    { method: 'POST' },
+                );
+            }
             const dm = Array.isArray(dmPayload?.dm) ? dmPayload.dm[0] : null;
             for (const member of dmPayload?.members || []) {
                 getAllUsersCache().set(member.id, member);
@@ -3578,7 +4265,10 @@ export function initApp() {
             getCurrentUser().unreadDmTotal = Number(
                 dmPayload?.unread_total || 0,
             );
-            if (dm) getDmUnreadCounts().set(String(dm.id), 0);
+            if (dm) {
+                getDmUnreadCounts().set(String(dm.id), 0);
+                deleteScreenDataCache(getDmCacheKey('list'));
+            }
             if (error || !dm || !dm.member.includes(getCurrentUser().id)) {
                 DOM.pageHeader.innerHTML = `
 	                    <div class="header-with-back-button">
@@ -3798,11 +4488,30 @@ export function initApp() {
                 profileHeader.innerHTML = `
 	                    <div class="header-top">
 	                        <img src="${getUserIconUrl(user)}" class="user-icon-large" alt="${escapeHTML(user.name)}'s icon">
+	                        <div id="profile-actions" class="profile-actions"></div>
 	                    </div>
 	                    <div class="profile-info">
 	                        <h2>${getEmoji(escapeHTML(user.name))}</h2>
-						<div class="user-id" title="Nyaitter ID">${getNyaitterId(user)}</div>
+							<div class="user-id" title="Nyaitter ID">${getNyaitterId(user)}</div>
 	                    </div>`;
+                const actionsContainer = profileHeader.querySelector(
+                    '#profile-actions',
+                );
+                if (
+                    actionsContainer &&
+                    getCurrentUser()?.admin &&
+                    Number(user.id) !== Number(getCurrentUser().id)
+                ) {
+                    const menuButton = document.createElement('button');
+                    menuButton.className = 'profile-menu-button dm-button';
+                    menuButton.innerHTML = '…';
+                    menuButton.title = '管理者メニュー';
+                    menuButton.onclick = (event) => {
+                        event.stopPropagation();
+                        openProfileMenu(user);
+                    };
+                    actionsContainer.appendChild(menuButton);
+                }
                 const freezeNotice = document.createElement('div');
                 freezeNotice.className = 'freeze-notice';
                 freezeNotice.innerHTML = `このユーザーは<a href="rule" target="_blank" rel="noopener noreferrer">Nyaitterルール</a>に違反したため凍結されています。`;
@@ -3960,7 +4669,11 @@ export function initApp() {
             profileTabs.querySelectorAll('.tab-button').forEach((button) => {
                 button.onclick = (e) => {
                     e.stopPropagation();
-                    loadProfileTabContent(user, button.dataset.tab);
+                    const tab = button.dataset.tab;
+                    window.location.hash =
+                        tab === 'posts'
+                            ? `#profile/${user.id}`
+                            : `#profile/${user.id}/${tab}`;
                 };
             });
 
@@ -4026,7 +4739,7 @@ export function initApp() {
                 .forEach((button) => {
                     button.onclick = (e) => {
                         e.stopPropagation();
-                        loadProfileTabContent(user, button.dataset.subTab);
+                        window.location.hash = `#profile/${user.id}/${button.dataset.subTab}`;
                     };
                 });
         } else {
@@ -4037,14 +4750,6 @@ export function initApp() {
                 );
         }
 
-        let newUrl =
-            subpage === 'posts'
-                ? `#profile/${user.id}`
-                : `#profile/${user.id}/${subpage}`;
-        if (window.location.hash !== newUrl) {
-            window.history.pushState({ path: newUrl }, '', newUrl);
-        }
-
         try {
             switch (subpage) {
                 case 'posts':
@@ -4052,12 +4757,21 @@ export function initApp() {
                         userId: user.id,
                         subType: 'posts_only',
                         pinId: user.pinned_post_id,
+                        pageCache: getProfilePostPageCache(
+                            user.id,
+                            'posts_only',
+                            user.pinned_post_id,
+                        ),
                     });
                     break;
                 case 'replies':
                     await loadPostsWithPagination(contentDiv, 'profile_posts', {
                         userId: user.id,
                         subType: 'replies_only',
+                        pageCache: getProfilePostPageCache(
+                            user.id,
+                            'replies_only',
+                        ),
                     });
                     break;
                 case 'likes':
@@ -4068,6 +4782,7 @@ export function initApp() {
                     }
                     await loadPostsWithPagination(contentDiv, 'likes', {
                         userId: user.id,
+                        pageCache: getProfilePostPageCache(user.id, 'likes'),
                     });
                     break;
                 case 'stars':
@@ -4078,6 +4793,7 @@ export function initApp() {
                     }
                     await loadPostsWithPagination(contentDiv, 'stars', {
                         userId: user.id,
+                        pageCache: getProfilePostPageCache(user.id, 'stars'),
                     });
                     break;
                 case 'following':
@@ -4088,6 +4804,9 @@ export function initApp() {
                     }
                     await loadUsersWithPagination(contentDiv, 'follows', {
                         userId: user.id,
+                        pageCache: getUserPageCache(
+                            `${getCurrentUser()?.id ?? 'guest'}:profile-users:${user.id}:following`,
+                        ),
                     });
                     break;
                 case 'followers':
@@ -4098,6 +4817,9 @@ export function initApp() {
                     }
                     await loadUsersWithPagination(contentDiv, 'followers', {
                         userId: user.id,
+                        pageCache: getUserPageCache(
+                            `${getCurrentUser()?.id ?? 'guest'}:profile-users:${user.id}:followers`,
+                        ),
                     });
                     break;
                 case 'media':
@@ -4110,7 +4832,7 @@ export function initApp() {
         }
     }
 
-    async function showSettingsScreen() {
+    async function showSettingsScreen(initialGroup = getSettingsGroupFromHash()) {
         if (!getCurrentUser()) return router();
         DOM.pageHeader.innerHTML = `<h2 id="page-title">設定</h2>`;
         showScreen('settings-screen');
@@ -4121,14 +4843,14 @@ export function initApp() {
 
         document.getElementById('settings-screen').innerHTML = `
 	                <div class="settings-layout">
-	                    <nav class="settings-group-list" aria-label="設定グループ">
-	                        <button type="button" class="settings-group-button active" data-settings-group="profile" data-settings-title="プロフィール">プロフィール</button>
-	                        <button type="button" class="settings-group-button" data-settings-group="privacy" data-settings-title="プライバシーとセキュリティ">プライバシーとセキュリティ</button>
-	                        <button type="button" class="settings-group-button" data-settings-group="ui" data-settings-title="UI / フォント">UI / フォント</button>
-	                        <button type="button" class="settings-group-button" data-settings-group="notifications" data-settings-title="通知">通知</button>
-	                        <button type="button" class="settings-group-button" data-settings-group="api" data-settings-title="API / Bot">API / Bot</button>
-	                        <button type="button" class="settings-group-button" data-settings-group="resources" data-settings-title="リソース">リソース</button>
-	                    </nav>
+			                    <nav class="settings-group-list" aria-label="設定グループ">
+			                        <a href="#settings/profile" class="settings-group-button" data-settings-group="profile">プロフィール</a>
+			                        <a href="#settings/privacy" class="settings-group-button" data-settings-group="privacy">プライバシーとセキュリティ</a>
+			                        <a href="#settings/ui" class="settings-group-button" data-settings-group="ui">UI / フォント</a>
+			                        <a href="#settings/notifications" class="settings-group-button" data-settings-group="notifications">通知</a>
+			                        <a href="#settings/api" class="settings-group-button" data-settings-group="api">API / Bot</a>
+			                        <a href="#settings/resources" class="settings-group-button" data-settings-group="resources">リソース</a>
+			                    </nav>
 	                    <form id="settings-form" class="settings-detail">
 	                        <div class="settings-detail-heading">
 	                            <h3 id="settings-group-title">プロフィール</h3>
@@ -4179,6 +4901,14 @@ export function initApp() {
 	                            <select id="setting-default-timeline" class="settings-select">
 	                                <option value="all">すべて</option><option value="foryou">おすすめ</option><option value="following">フォロー中</option>
 	                            </select>
+	                            <label for="setting-post-timestamp-format">ポスト日時の表示</label>
+	                            <select id="setting-post-timestamp-format" class="settings-select">
+	                                <option value="relative">相対</option>
+	                                <option value="relative_detailed">相対（詳細）</option>
+	                                <option value="absolute_24">絶対（24時間）</option>
+	                                <option value="absolute_12">絶対（12時間）</option>
+	                            </select>
+	                            <p class="settings-help-text">プロフィールの参加日時には適用されません。</p>
 	                            <label for="setting-emoji-kind">絵文字のフォント</label>
 	                            <select id="setting-emoji-kind" class="settings-select">
 	                                <option value="twemoji">Twemoji</option><option value="emojione">Emoji One</option><option value="default">デフォルト（端末絵文字）</option>
@@ -4284,6 +5014,10 @@ export function initApp() {
             getCurrentUser().settings?.default_timeline_tab || 'all';
         document.getElementById('setting-default-timeline').value =
             currentDefaultTab;
+        document.getElementById('setting-post-timestamp-format').value =
+            normalizePostTimestampFormat(
+                getCurrentUser().settings?.post_timestamp_format,
+            );
 
         const emoji_kind = getCurrentUser().settings?.emoji || 'twemoji';
         document.getElementById('setting-emoji-kind').value = emoji_kind;
@@ -4433,8 +5167,6 @@ export function initApp() {
                     selectSettingsGroup(button.dataset.settingsGroup),
                 );
             });
-        selectSettingsGroup('profile');
-
         const dangerZone = document.querySelector('.settings-danger-zone');
 
         let dangerZoneHTML = `
@@ -4499,7 +5231,7 @@ export function initApp() {
                 invalidateButton.textContent = '無効化';
                 invalidateButton.addEventListener('click', async () => {
                     if (
-                        !confirm(
+                        !await showAppConfirm(
                             session.current
                                 ? 'この端末のセッションを無効化してログアウトしますか？'
                                 : 'このセッションを無効化しますか？',
@@ -4512,7 +5244,7 @@ export function initApp() {
                             { method: 'DELETE' },
                         );
                     if (invalidateError)
-                        return alert(
+                        return showAppAlert(
                             `セッションの無効化に失敗しました: ${invalidateError.message}`,
                         );
                     if (result?.active_removed) {
@@ -4532,7 +5264,7 @@ export function initApp() {
                     revokeButton.textContent = '信頼を取り消す';
                     revokeButton.addEventListener('click', async () => {
                         if (
-                            !confirm(
+                            !await showAppConfirm(
                                 'このIPアドレスの信頼を取り消し、同じIPアドレスの全セッションを無効化しますか？',
                             )
                         )
@@ -4543,7 +5275,7 @@ export function initApp() {
                                 { method: 'POST' },
                             );
                         if (revokeError)
-                            return alert(
+                            return showAppAlert(
                                 `信頼の取り消しに失敗しました: ${revokeError.message}`,
                             );
                         if (result?.active_removed) {
@@ -4636,7 +5368,7 @@ export function initApp() {
                 revokeBtn.textContent = '無効化';
                 revokeBtn.addEventListener('click', async () => {
                     if (
-                        !confirm(
+                        !await showAppConfirm(
                             `APIキー「${token.name || token.tokenId}」を無効化しますか？\n無効化するとこのキーを使用したBotはアクセスできなくなります。`,
                         )
                     )
@@ -4647,7 +5379,7 @@ export function initApp() {
                         { method: 'DELETE' },
                     );
                     if (revokeError) {
-                        alert(
+                        showAppAlert(
                             `APIキーの無効化に失敗しました: ${revokeError.message}`,
                         );
                         revokeBtn.disabled = false;
@@ -4660,6 +5392,10 @@ export function initApp() {
                 botTokensList.appendChild(item);
             });
         };
+
+        // APIグループでも関数初期化後に選択するため、
+        // 直接ハッシュアクセス時にTemporal Dead Zoneへ入らない。
+        selectSettingsGroup(initialGroup);
 
         if (createBotTokenBtn) {
             createBotTokenBtn.addEventListener('click', async () => {
@@ -4675,7 +5411,7 @@ export function initApp() {
                         },
                     );
                     if (error) {
-                        alert(`APIキーの生成に失敗しました: ${error.message}`);
+                        showAppAlert(`APIキーの生成に失敗しました: ${error.message}`);
                         return;
                     }
                     if (data?.token) {
@@ -4861,7 +5597,7 @@ export function initApp() {
                                 error,
                             );
                             control.checked = false;
-                            alert(
+                            showAppAlert(
                                 '現在の端末を信頼済みにできなかったため、この設定は有効化されませんでした。',
                             );
                         }
@@ -5069,6 +5805,7 @@ export function initApp() {
 
     async function loadPostsWithPagination(container, type, options = {}) {
         let localPostLoadObserver;
+        const postPageCache = options.pageCache || null;
         setCurrentPagination({ page: 0, hasMore: true, type, options });
 
         const trigger = document.createElement('div');
@@ -5093,11 +5830,21 @@ export function initApp() {
             load_btn.classList.add('hide');
 
             try {
-                const optimizedPage = await fetchOptimizedPostPage(
-                    type,
-                    options,
-                    getCurrentPagination().page,
-                );
+                const pageNumber = getCurrentPagination().page;
+                let optimizedPage = postPageCache?.pages.get(pageNumber);
+                if (!optimizedPage) {
+                    optimizedPage = await fetchOptimizedPostPage(
+                        type,
+                        options,
+                        pageNumber,
+                    );
+                    if (postPageCache && optimizedPage)
+                        savePostPageCache(
+                            postPageCache,
+                            pageNumber,
+                            optimizedPage,
+                        );
+                }
                 let posts = optimizedPage?.posts || [];
                 let hasMoreItems = optimizedPage?.hasMore ?? true;
                 let showPinPost = optimizedPage?.showPinPost || false;
@@ -5342,10 +6089,13 @@ export function initApp() {
         load_btn.addEventListener('click', loadMore);
         trigger.after(load_btn);
 
-        localPostLoadObserver.observe(trigger);
+        await loadMore();
+        if (getCurrentPagination().hasMore)
+            localPostLoadObserver.observe(trigger);
     }
 
     async function loadUsersWithPagination(container, type, options = {}) {
+        const userPageCache = options.pageCache || null;
         setCurrentPagination({ page: 0, hasMore: true, type, options });
 
         let trigger = container.querySelector('.load-more-trigger');
@@ -5397,38 +6147,57 @@ export function initApp() {
 
             let users = [];
             let error = null;
+            let hasMoreForPage = true;
+            const pageNumber = getCurrentPagination().page;
+            const cachedPage = userPageCache?.pages.get(pageNumber);
 
-            const selectColumns =
-                'id, name, me, scid, icon_data, admin, verify';
+            if (cachedPage) {
+                users = Array.isArray(cachedPage.users)
+                    ? cachedPage.users
+                    : [];
+                hasMoreForPage = Boolean(cachedPage.hasMore);
+            } else {
+                const selectColumns =
+                    'id, name, me, scid, icon_data, admin, verify';
 
-            if (type === 'follows') {
-                if (options.userId) {
+                if (type === 'follows') {
+                    if (options.userId) {
+                        const result = await apiRequest(
+                            `/server/api/users/${encodeURIComponent(options.userId)}/following?limit=${POSTS_PER_PAGE}&offset=${from}`,
+                        );
+                        users = Array.isArray(result.data?.following)
+                            ? result.data.following
+                            : [];
+                        error = result.error;
+                    } else {
+                        const idsToFetch = (options.ids || []).slice(
+                            from,
+                            to + 1,
+                        );
+                        if (idsToFetch.length > 0) {
+                            const result = await api
+                                .from('user')
+                                .select(selectColumns)
+                                .in('id', idsToFetch);
+                            users = result.data;
+                            error = result.error;
+                        }
+                    }
+                } else if (type === 'followers') {
                     const result = await apiRequest(
-                        `/server/api/users/${encodeURIComponent(options.userId)}/following?limit=${POSTS_PER_PAGE}&offset=${from}`,
+                        `/server/api/users/${encodeURIComponent(options.userId)}/followers?limit=${POSTS_PER_PAGE}&offset=${from}`,
                     );
-                    users = Array.isArray(result.data?.following)
-                        ? result.data.following
+                    users = Array.isArray(result.data?.followers)
+                        ? result.data.followers
                         : [];
                     error = result.error;
-                } else {
-                    const idsToFetch = (options.ids || []).slice(from, to + 1);
-                    if (idsToFetch.length > 0) {
-                        const result = await api
-                            .from('user')
-                            .select(selectColumns)
-                            .in('id', idsToFetch);
-                        users = result.data;
-                        error = result.error;
-                    }
                 }
-            } else if (type === 'followers') {
-                const result = await apiRequest(
-                    `/server/api/users/${encodeURIComponent(options.userId)}/followers?limit=${POSTS_PER_PAGE}&offset=${from}`,
-                );
-                users = Array.isArray(result.data?.followers)
-                    ? result.data.followers
-                    : [];
-                error = result.error;
+                hasMoreForPage = users.length >= POSTS_PER_PAGE;
+                if (!error && userPageCache)
+                    savePostPageCache(userPageCache, pageNumber, {
+                        users,
+                        hasMore: hasMoreForPage,
+                    });
             }
 
             if (error) {
@@ -5440,7 +6209,7 @@ export function initApp() {
                         container.insertBefore(renderUserCard(u), trigger),
                     );
                     getCurrentPagination().page++;
-                    if (users.length < POSTS_PER_PAGE) {
+                    if (!hasMoreForPage) {
                         getCurrentPagination().hasMore = false;
                     }
                 } else {
@@ -5476,7 +6245,9 @@ export function initApp() {
             ),
         );
 
-        getPostLoadObserver().observe(trigger);
+        await loadMore();
+        if (getCurrentPagination().hasMore)
+            getPostLoadObserver().observe(trigger);
     }
 
     async function loadMediaGrid(container, options = {}) {
@@ -5570,11 +6341,20 @@ export function initApp() {
             ),
         );
 
-        getPostLoadObserver().observe(trigger);
+        await loadMore();
+        if (getCurrentPagination().hasMore)
+            getPostLoadObserver().observe(trigger);
     }
 
-    async function switchTimelineTab(tab) {
+    async function switchTimelineTab(
+        tab,
+        { forceRefresh = false, resetScroll = false } = {},
+    ) {
         if (tab === 'following' && !getCurrentUser()) return;
+        if (resetScroll) {
+            window.scrollTo({ left: 0, top: 0, behavior: 'auto' });
+            saveScrollPosition(activeScrollRouteKey);
+        }
         setIsLoadingMore(false); // 読み込み状態をリセット
         setCurrentTimelineTab(tab);
         document
@@ -5585,7 +6365,10 @@ export function initApp() {
 
         if (getPostLoadObserver()) getPostLoadObserver().disconnect();
         DOM.timeline.innerHTML = '';
-        await loadPostsWithPagination(DOM.timeline, 'timeline', { tab });
+        await loadPostsWithPagination(DOM.timeline, 'timeline', {
+            tab,
+            pageCache: getTimelinePageCache(tab, { forceRefresh }),
+        });
     }
 
     function requestSettingsSave(
@@ -5626,6 +6409,10 @@ export function initApp() {
                     default_timeline_tab: form.querySelector(
                         '#setting-default-timeline',
                     ).value,
+                    post_timestamp_format: normalizePostTimestampFormat(
+                        form.querySelector('#setting-post-timestamp-format')
+                            .value,
+                    ),
                     emoji: form.querySelector('#setting-emoji-kind').value,
                     theme: form.querySelector('#setting-theme').value,
                     color_theme: normalizeColorTheme(
@@ -5732,7 +6519,7 @@ export function initApp() {
     window.pinPost = async (postId) => {
         let cmessage, emessage;
 
-        if (!getCurrentUser()) return alert('ログインが必要です。');
+        if (!getCurrentUser()) return showAppAlert('ログインが必要です。');
         if (!getCurrentUser().pin || getCurrentUser().pin !== postId) {
             cmessage = 'このポストをピン留めしますか?';
             emessage = 'ポストのピン留め';
@@ -5740,7 +6527,7 @@ export function initApp() {
             cmessage = 'このポストのピン留めを解除しますか?';
             emessage = 'ポストのピン留めの解除';
         }
-        if (!confirm(cmessage)) return;
+        if (!await showAppConfirm(cmessage)) return;
         showLoading(true);
         try {
             const { data: pinId, error: fetchError } = await api.rpc(
@@ -5752,17 +6539,18 @@ export function initApp() {
                     `ポストのピン留め処理に失敗: ${fetchError.message}`,
                 );
             getCurrentUser().pin = pinId;
+            invalidateTimelinePageCache();
             router();
         } catch (e) {
             console.error(e);
-            alert(`${emessage}に失敗しました。`);
+            showAppAlert(`${emessage}に失敗しました。`);
         } finally {
             showLoading(false);
         }
     };
     window.deletePost = async (postId) => {
-        if (!getCurrentUser()) return alert('ログインが必要です。');
-        if (!confirm('このポストを削除しますか?')) return;
+        if (!getCurrentUser()) return showAppAlert('ログインが必要です。');
+        if (!await showAppConfirm('このポストを削除しますか?')) return;
         showLoading(true);
         try {
             const { data: postData, error: fetchError } = await api
@@ -5786,20 +6574,21 @@ export function initApp() {
                 .eq('id', postId);
             if (deleteError) throw deleteError;
 
+            invalidateTimelinePageCache();
             router();
         } catch (e) {
             console.error(e);
-            alert('削除に失敗しました。');
+            showAppAlert('削除に失敗しました。');
         } finally {
             showLoading(false);
         }
     };
     window.handleReplyClick = (postId, username) => {
-        if (!getCurrentUser()) return alert('ログインが必要です。');
+        if (!getCurrentUser()) return showAppAlert('ログインが必要です。');
         openPostModal({ id: postId, name: username });
     };
     window.handleLike = async (button, postId) => {
-        if (!getCurrentUser()) return alert('ログインが必要です。');
+        if (!getCurrentUser()) return showAppAlert('ログインが必要です。');
         button.disabled = true;
 
         const countSpan = button.querySelector('span:not(.icon)');
@@ -5814,6 +6603,7 @@ export function initApp() {
 
             const isLiked = data.liked;
             getCurrentUser().like = data.updated_likes;
+            invalidateTimelinePageCache();
 
             countSpan.textContent = isLiked
                 ? currentCount + 1
@@ -5821,13 +6611,13 @@ export function initApp() {
             button.classList.toggle('liked', isLiked);
         } catch (e) {
             console.error('いいね更新エラー:', e);
-            alert('いいねの更新に失敗しました。');
+            showAppAlert('いいねの更新に失敗しました。');
         } finally {
             button.disabled = false;
         }
     };
     window.handleStar = async (button, postId) => {
-        if (!getCurrentUser()) return alert('ログインが必要です。');
+        if (!getCurrentUser()) return showAppAlert('ログインが必要です。');
         button.disabled = true;
 
         const countSpan = button.querySelector('span:not(.icon)');
@@ -5842,6 +6632,7 @@ export function initApp() {
 
             const isStarred = data.starred;
             getCurrentUser().star = data.updated_stars;
+            invalidateTimelinePageCache();
 
             countSpan.textContent = isStarred
                 ? currentCount + 1
@@ -5849,7 +6640,7 @@ export function initApp() {
             button.classList.toggle('starred', isStarred);
         } catch (e) {
             console.error('お気に入り更新エラー:', e);
-            alert('お気に入りの更新に失敗しました。');
+            showAppAlert('お気に入りの更新に失敗しました。');
         } finally {
             button.disabled = false;
         }
@@ -5870,7 +6661,7 @@ export function initApp() {
         if (postContent) postContent.classList.remove('hidden');
     };
     window.handleFollowToggle = async (targetUserId, button, isLock) => {
-        if (!getCurrentUser()) return alert('ログインが必要です。');
+        if (!getCurrentUser()) return showAppAlert('ログインが必要です。');
         button.disabled = true;
 
         try {
@@ -5882,6 +6673,7 @@ export function initApp() {
 
             const isFollowing = data.following;
             getCurrentUser().follow = data.updated_follows;
+            invalidateTimelinePageCache();
 
             updateFollowButtonState(button, isFollowing, isLock);
 
@@ -5900,7 +6692,7 @@ export function initApp() {
             }
         } catch (e) {
             console.error('フォロー更新エラー:', e);
-            alert('フォロー状態の更新に失敗しました。');
+            showAppAlert('フォロー状態の更新に失敗しました。');
         } finally {
             button.disabled = false;
         }
@@ -6032,7 +6824,7 @@ export function initApp() {
             DOM.editPostModal.querySelector('#edit-post-textarea').focus();
         } catch (e) {
             console.error(e);
-            alert(e.message);
+            showAppAlert(e.message);
         } finally {
             showLoading(false);
         }
@@ -6205,9 +6997,9 @@ export function initApp() {
             .update({ title: newTitle.trim() })
             .eq('id', dmId);
         if (error) {
-            alert('タイトルの更新に失敗しました。');
+            showAppAlert('タイトルの更新に失敗しました。');
         } else {
-            alert('タイトルを更新しました。');
+            showAppAlert('タイトルを更新しました。');
             DOM.dmManageModal.classList.add('hidden');
             openDmManageModal(dmId); // モーダルを再描画
         }
@@ -6218,7 +7010,7 @@ export function initApp() {
         userIdToRemove,
         userNameToRemove,
     ) {
-        if (!confirm(`${userNameToRemove}さんをDMから削除しますか?`)) return;
+        if (!await showAppConfirm(`${userNameToRemove}さんをDMから削除しますか?`)) return;
 
         const { data: dm } = await api
             .from('dm')
@@ -6232,7 +7024,7 @@ export function initApp() {
             .update({ member: updatedMembers })
             .eq('id', dmId);
         if (error) {
-            alert('メンバーの削除に失敗しました。');
+            showAppAlert('メンバーの削除に失敗しました。');
         } else {
             await sendSystemDmMessage(
                 dmId,
@@ -6242,13 +7034,13 @@ export function initApp() {
                 kind: 'dm',
                 id: dmId,
             });
-            alert('メンバーを削除しました。');
+            showAppAlert('メンバーを削除しました。');
             openDmManageModal(dmId); // モーダルを再描画
         }
     }
 
     async function handleSetHostDmMember(dmId, userIdToHost, userNameToHost) {
-        if (!confirm(`${userNameToHost}さんに管理者権限を譲渡しますか?`))
+        if (!await showAppConfirm(`${userNameToHost}さんに管理者権限を譲渡しますか?`))
             return;
 
         // わんちゃん失敗するけど管理者権限無いとシステムメッセージ送れないので先に送信
@@ -6262,19 +7054,19 @@ export function initApp() {
             .update({ host_id: userIdToHost })
             .eq('id', dmId);
         if (error) {
-            alert('権限の譲渡に失敗しました。');
+            showAppAlert('権限の譲渡に失敗しました。');
         } else {
             void sendNotification(userIdToHost, 'dm_host_transfer', {
                 kind: 'dm',
                 id: dmId,
             });
-            alert('権限を譲渡しました。');
+            showAppAlert('権限を譲渡しました。');
             openDmManageModal(dmId); // モーダルを再描画
         }
     }
 
     async function handleAddDmMember(dmId, userIdToAdd, userNameToAdd) {
-        if (!confirm(`${userNameToAdd}さんをDMに追加しますか？`)) return;
+        if (!await showAppConfirm(`${userNameToAdd}さんをDMに追加しますか？`)) return;
 
         const { data: dm } = await api
             .from('dm')
@@ -6282,7 +7074,7 @@ export function initApp() {
             .eq('id', dmId)
             .single();
         if (dm.member.includes(userIdToAdd)) {
-            alert('このユーザーは既にメンバーです。');
+            showAppAlert('このユーザーは既にメンバーです。');
             return;
         }
         const updatedMembers = [...dm.member, userIdToAdd];
@@ -6292,7 +7084,7 @@ export function initApp() {
             .update({ member: updatedMembers })
             .eq('id', dmId);
         if (error) {
-            alert('メンバーの追加に失敗しました。');
+            showAppAlert('メンバーの追加に失敗しました。');
         } else {
             await sendSystemDmMessage(
                 dmId,
@@ -6302,13 +7094,13 @@ export function initApp() {
                 kind: 'dm',
                 id: dmId,
             });
-            alert('メンバーを追加しました。');
+            showAppAlert('メンバーを追加しました。');
             openDmManageModal(dmId); // モーダルを再描画
         }
     }
 
     async function handleLeaveDm(dmId) {
-        if (!confirm('本当にこのDMから退出しますか？')) return;
+        if (!await showAppConfirm('本当にこのDMから退出しますか？')) return;
         showLoading(true);
 
         try {
@@ -6326,21 +7118,22 @@ export function initApp() {
 
             if (error) throw error;
 
-            alert('DMから退出しました。');
+            invalidateDmCaches();
+            showAppAlert('DMから退出しました。');
             DOM.dmManageModal.classList.add('hidden');
 
             window.location.hash = '#dm';
             await showDmScreen();
         } catch (e) {
             console.error('DMからの退出に失敗しました:', e);
-            alert('DMからの退出に失敗しました。');
+            showAppAlert('DMからの退出に失敗しました。');
         } finally {
             showLoading(false);
         }
     }
 
     async function handleDisbandDm(dmId) {
-        if (!confirm('本当にこのDMを解散しますか？この操作は取り消せません。'))
+        if (!await showAppConfirm('本当にこのDMを解散しますか？この操作は取り消せません。'))
             return;
         showLoading(true);
         try {
@@ -6364,13 +7157,14 @@ export function initApp() {
             const { error } = await api.from('dm').delete().eq('id', dmId);
             if (error) throw error;
 
-            alert('DMを解散しました。');
+            invalidateDmCaches();
+            showAppAlert('DMを解散しました。');
             DOM.dmManageModal.classList.add('hidden');
             window.location.hash = '#dm';
             await showDmScreen();
         } catch (e) {
             console.error(e);
-            alert('DMの解散に失敗しました。');
+            showAppAlert('DMの解散に失敗しました。');
         } finally {
             showLoading(false);
         }
@@ -6426,7 +7220,7 @@ export function initApp() {
             '#edit-post-textarea',
         );
         if (!newContent)
-            return alert('内容を入力するか、ファイルを添付してください。');
+            return showAppAlert('内容を入力するか、ファイルを添付してください。');
 
         const button = DOM.editPostModal.querySelector('#update-post-button');
         button.disabled = true;
@@ -6476,10 +7270,11 @@ export function initApp() {
             if (postUpdateError) throw postUpdateError;
 
             DOM.editPostModal.classList.add('hidden');
-            router(); // 画面を再読み込みして変更を反映
+            invalidateTimelinePageCache();
+            router(); // 画面を再描画して変更を反映
         } catch (e) {
             console.error(e);
-            alert('ポストの更新に失敗しました。');
+            showAppAlert('ポストの更新に失敗しました。');
         } finally {
             button.disabled = false;
             button.textContent = '保存';
@@ -6774,7 +7569,7 @@ export function initApp() {
                 );
             }
             const targetUser = targetPayload.user;
-            if (!confirm(`${targetUser.name}さんとのDMを開始しますか？`))
+            if (!await showAppConfirm(`${targetUser.name}さんとのDMを開始しますか？`))
                 return;
 
             const members = [getCurrentUser().id, normalizedTargetUserId].sort(
@@ -6800,11 +7595,12 @@ export function initApp() {
                     id: result.dm.id,
                 });
             }
+            invalidateDmCaches();
             window.location.hash = `#dm/${result.dm.id}`;
             await router();
         } catch (error) {
             console.error('DMの作成に失敗しました:', error);
-            alert(`DMの作成に失敗しました: ${error.message}`);
+            showAppAlert(`DMの作成に失敗しました: ${error.message}`);
         } finally {
             showLoading(false);
         }
@@ -6926,7 +7722,7 @@ export function initApp() {
             DOM.editDmMessageModal.querySelector('.modal-close-btn').onclick =
                 () => DOM.editDmMessageModal.classList.add('hidden');
         } catch (e) {
-            alert(e.message);
+            showAppAlert(e.message);
         } finally {
             showLoading(false);
         }
@@ -7032,7 +7828,7 @@ export function initApp() {
             }
         } catch (e) {
             console.error(e);
-            alert('メッセージの更新に失敗しました。');
+            showAppAlert('メッセージの更新に失敗しました。');
         } finally {
             button.disabled = false;
             button.textContent = '保存';
@@ -7041,7 +7837,7 @@ export function initApp() {
     }
 
     async function handleDeleteDmMessage(dmId, messageId) {
-        if (!confirm('このメッセージを削除しますか?')) return;
+        if (!await showAppConfirm('このメッセージを削除しますか?')) return;
         showLoading(true);
         try {
             const { data: dm, error: fetchError } = await api
@@ -7080,7 +7876,7 @@ export function initApp() {
                 ?.remove();
         } catch (e) {
             console.error(e);
-            alert('メッセージの削除に失敗しました。');
+            showAppAlert('メッセージの削除に失敗しました。');
         } finally {
             showLoading(false);
         }
@@ -7161,7 +7957,7 @@ export function initApp() {
         const content = input.value.trim();
         if (!content && files.length === 0) return;
         if (content.length > 2000) {
-            alert('DMの内容は2000文字以下にしてください。');
+            showAppAlert('DMの内容は2000文字以下にしてください。');
             return;
         }
 
@@ -7237,6 +8033,7 @@ export function initApp() {
             if (error) {
                 throw error;
             } else {
+                invalidateDmCaches(dmId);
                 input.value = '';
                 const view = document.querySelector('.dm-conversation-view');
                 if (view) {
@@ -7247,7 +8044,7 @@ export function initApp() {
                 }
             }
         } catch (error) {
-            alert('メッセージの送信に失敗しました。');
+            showAppAlert('メッセージの送信に失敗しました。');
             console.error(error);
         } finally {
             input.disabled = false;
@@ -7292,10 +8089,17 @@ export function initApp() {
                         },
                     );
                     updateAccountData(getCurrentUser());
+                    // ブロック状態の変更後は、以前の閲覧権限で保存された投稿・DM・
+                    // プロフィールを再利用しない。
+                    invalidateTimelinePageCache();
+                    invalidateDmCaches();
+                    getPublicProfileCache().clear();
                     menu.remove();
-                    await showProfileScreen(targetUser.id);
+                    // 同じプロフィールを再描画する場合も、現在位置を保存・復元する
+                    // 共通ルーターを通す。
+                    await router();
                 } else {
-                    alert('ブロック操作に失敗しました');
+                    showAppAlert('ブロック操作に失敗しました');
                     blockBtn.disabled = false;
                 }
             };
@@ -7322,9 +8126,16 @@ export function initApp() {
             shadowBtn.onclick = () => adminToggleShadow(targetUser);
 
             const freezeBtn = document.createElement('button');
-            freezeBtn.textContent = 'アカウントを凍結';
-            freezeBtn.className = 'delete-btn';
-            freezeBtn.onclick = () => adminFreezeAccount(targetUser.id);
+            const isFrozen =
+                targetUser.account_state === 'frozen' || Boolean(targetUser.freeze);
+            freezeBtn.textContent = isFrozen
+                ? '凍結を解除'
+                : 'アカウントを凍結';
+            freezeBtn.className = isFrozen ? '' : 'delete-btn';
+            freezeBtn.onclick = () =>
+                isFrozen
+                    ? adminUnfreezeAccount(targetUser.id)
+                    : adminFreezeAccount(targetUser.id);
 
             menu.appendChild(verifyBtn);
             menu.appendChild(sendNoticeBtn);
@@ -7349,16 +8160,16 @@ export function initApp() {
         const newVerifyStatus = !targetUser.verify;
         const actionText = newVerifyStatus ? '認証' : '認証の取り消し';
 
-        if (confirm(`本当にこのユーザーの${actionText}を行いますか?`)) {
+        if (await showAppConfirm(`本当にこのユーザーの${actionText}を行いますか?`)) {
             const { error } = await api
                 .from('user')
                 .update({ verify: newVerifyStatus })
                 .eq('id', targetUser.id);
 
             if (error) {
-                alert(`${actionText}に失敗しました: ${error.message}`);
+                showAppAlert(`${actionText}に失敗しました: ${error.message}`);
             } else {
-                alert(
+                await showAppAlert(
                     `ユーザーの${actionText}が完了しました。\nページをリロードします。`,
                 );
                 window.location.reload();
@@ -7367,29 +8178,29 @@ export function initApp() {
     }
 
     async function adminSendNotice(targetUserId) {
-        if (!confirm('このユーザーへ管理者からのお知らせ通知を送信しますか？'))
+        if (!await showAppConfirm('このユーザーへ管理者からのお知らせ通知を送信しますか？'))
             return;
         await sendNotification(targetUserId, 'admin_notice', {
             kind: 'route',
             value: '#notifications',
         });
-        alert('通知を送信しました。');
+        showAppAlert('通知を送信しました。');
     }
 
     async function adminToggleShadow(targetUser) {
         const newShadowStatus = !targetUser.shadow;
         const actionText = newShadowStatus ? '有効' : '無効';
 
-        if (confirm(`本当にこのユーザーの検索除外を${actionText}にしますか?`)) {
+        if (await showAppConfirm(`本当にこのユーザーの検索除外を${actionText}にしますか?`)) {
             const { error } = await api.rpc('admin_set_status', {
                 p_id: targetUser.id,
                 p_shadow: newShadowStatus,
             });
 
             if (error) {
-                alert(`${actionText}に失敗しました: ${error.message}`);
+                showAppAlert(`${actionText}に失敗しました: ${error.message}`);
             } else {
-                alert(
+                await showAppAlert(
                     `ユーザーの検索除外の${actionText}化が完了しました。\nページをリロードします。`,
                 );
                 window.location.reload();
@@ -7398,27 +8209,45 @@ export function initApp() {
     }
 
     async function adminFreezeAccount(targetUserId) {
-        const reason = prompt('アカウントの凍結理由を入力してください (必須):');
+        const reason = await showAppPrompt(
+            'アカウントの凍結理由を入力してください (必須):',
+        );
         if (reason && reason.trim()) {
             if (
-                confirm(`本当にこのユーザーを凍結しますか？\n理由: ${reason}`)
+                await showAppConfirm(`本当にこのユーザーを凍結しますか？\n理由: ${reason}`)
             ) {
                 const { error } = await api
                     .from('user')
                     .update({ freeze: reason.trim() })
                     .eq('id', targetUserId);
                 if (error) {
-                    alert(`凍結に失敗しました: ${error.message}`);
+                    showAppAlert(`凍結に失敗しました: ${error.message}`);
                 } else {
-                    alert(
+                    await showAppAlert(
                         'アカウントを凍結しました。\nページをリロードします。',
                     );
                     window.location.reload();
                 }
             }
         } else {
-            alert('凍結理由の入力は必須です。');
+            showAppAlert('凍結理由の入力は必須です。');
         }
+    }
+
+    async function adminUnfreezeAccount(targetUserId) {
+        if (!await showAppConfirm('このユーザーの凍結を解除しますか？')) return;
+
+        const { error } = await api
+            .from('user')
+            .update({ freeze: null })
+            .eq('id', targetUserId);
+        if (error) {
+            showAppAlert(`凍結解除に失敗しました: ${error.message}`);
+            return;
+        }
+
+        await showAppAlert('凍結を解除しました。ページをリロードします。');
+        window.location.reload();
     }
 
     function markRealtimeSummaryFresh() {
@@ -7531,9 +8360,19 @@ export function initApp() {
             updateNavAndSidebars();
             return;
         }
+        if (event.type === 'timeline_post') {
+            if (
+                event.timeline === 'following' &&
+                Number(event.author_id) !== Number(getCurrentUser().id)
+            ) {
+                queueRealtimeTimelineUpdate();
+            }
+            return;
+        }
         if (event.type === 'dm_message') {
             if (Number(event.message?.userid) === Number(getCurrentUser().id))
                 return;
+            invalidateDmCaches(event.dm_id);
             void appendRealtimeDmMessage(
                 event.dm_id,
                 event.message,
@@ -7542,6 +8381,11 @@ export function initApp() {
             return;
         }
         if (event.type === 'dm_unread_count') {
+            invalidateDmCaches(
+                event.dm_id !== undefined && event.dm_id !== null
+                    ? event.dm_id
+                    : null,
+            );
             if (event.dm_id !== undefined && event.dm_id !== null) {
                 // 個別DM単位の未読数通知。dm一覧に見えている該当行だけを更新し、
                 // 全体合計はこのDM分の差分だけを反映する(他DMの未読数を巻き込まない)。
@@ -7644,8 +8488,43 @@ export function initApp() {
     // アプリケーション全体のクリックイベントを処理する単一のハンドラ
     document.addEventListener('click', (e) => {
         const target = e.target;
+        const hashLink = target.closest('a[href^="#"]');
+        const isPlainHashNavigation =
+            hashLink &&
+            e.button === 0 &&
+            !e.metaKey &&
+            !e.ctrlKey &&
+            !e.shiftKey &&
+            !e.altKey;
+        if (isPlainHashNavigation) {
+            // href="#" の既定動作はブラウザを直ちにページ先頭へ移動させる。
+            // 先にSPAのルーターへ遷移を委ね、保存済み位置の復元より後に0,0が
+            // 適用される競合を防ぐ。
+            e.preventDefault();
+            const destinationHash = hashLink.getAttribute('href') || '#';
+            const currentHash = window.location.hash || '#';
+            if (destinationHash !== currentHash) {
+                // ハッシュを書き換えるとブラウザが先頭へ移動することがあるため、
+                // その前に直前ページを確定保存し、保存対象を解除する。
+                // hashchangeで起動するrouter()はこのルートを0,0で再保存しない。
+                beginScrollRouteTransition();
+                window.location.hash = destinationHash;
+            }
+            return;
+        }
 
         const actionTarget = target.closest('[data-action]');
+        if (
+            actionTarget?.dataset.action === 'refresh-realtime-timeline'
+        ) {
+            e.preventDefault();
+            clearRealtimeTimelineUpdate();
+            void switchTimelineTab(getCurrentTimelineTab(), {
+                forceRefresh: true,
+                resetScroll: true,
+            });
+            return;
+        }
         if (actionTarget?.dataset.action === 'history-back') {
             e.preventDefault();
             window.history.back();
@@ -7899,7 +8778,7 @@ export function initApp() {
                 }).then(({ error }) => {
                     if (error) {
                         console.error('通知の削除に失敗:', error);
-                        alert('通知の削除に失敗しました。');
+                        showAppAlert('通知の削除に失敗しました。');
                     } else {
                         getCurrentUser().notice =
                             getCurrentUser().notice.filter(
@@ -7944,7 +8823,11 @@ export function initApp() {
 
         const timelineTab = target.closest('.timeline-tab-button');
         if (timelineTab) {
-            switchTimelineTab(timelineTab.dataset.tab);
+            clearRealtimeTimelineUpdate();
+            void switchTimelineTab(timelineTab.dataset.tab, {
+                forceRefresh: true,
+                resetScroll: true,
+            });
             return;
         }
 
