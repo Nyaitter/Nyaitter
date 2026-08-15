@@ -31,8 +31,14 @@
 		"botTokenPrefix": "bot_",
 		"sessionTokenBytes": 32,
 		"botTokenIdBytes": 16,
-		"verificationCodeBytes": 4
-	},
+			"verificationCodeBytes": 4,
+			"scratchVerification": {
+				"ipRestrictionEnabled": true,
+				"rejectNewScratcher": true,
+				"rejectStudentAccounts": true,
+				"minQualifiedFollowers": 25
+			}
+		},
 	"inMemory": {
 		"initialUserId": 0
 	},
@@ -70,9 +76,9 @@
 		"enabled": true,
 		"windowMs": 60000,
 		"max": 1000,
-		"auth": {
-			"windowMs": 60000,
-"max": 20
+			"auth": {
+				"windowMs": 60000,
+				"max": 120
 			}
 	},
 	"security": {

@@ -11,7 +11,7 @@ const BotTokenManager = require('../services/auth/BotTokenManager');
 const ExternalLoginStateStore = require('../services/auth/ExternalLoginStateStore');
 const ExternalLoginProofStore = require('../services/auth/ExternalLoginProofStore');
 const { normalizeExternalProfile } = require('../services/auth/ExternalProfileMapper');
-const { requireAuth, optionalAuth } = require('../middleware/auth');
+const { requireAuth, requireAuthAllowFrozen, optionalAuth } = require('../middleware/auth');
 
 const config = require('../config');
 const { serializeUser, serializeNotification } = require('../utils/serialize');
@@ -386,7 +386,7 @@ router.post('/login-approvals/:approvalId/poll', async (req, res) => {
 	});
 });
 
-router.get('/me', requireAuth, async (req, res) => {
+router.get('/me', requireAuthAllowFrozen, async (req, res) => {
   const db = getDbAdapter(req);
   const user = await db.getUserById(req.user.id);
 

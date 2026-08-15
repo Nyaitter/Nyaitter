@@ -88,9 +88,12 @@
 					<div id="dm-screen" class="screen hidden">
 						<div id="dm-content"></div>
 					</div>
-					<div id="admin-logs-screen" class="screen hidden">
-						<div id="admin-logs-content"></div>
-					</div>
+						<div id="admin-logs-screen" class="screen hidden">
+							<div id="admin-logs-content"></div>
+						</div>
+						<div id="admin-reports-screen" class="screen hidden">
+							<div id="admin-reports-content"></div>
+						</div>
 				</div>
 			</main>
 			<!-- 右側サイドバー -->
@@ -135,8 +138,21 @@
 					<p id="copy-message" class="login-modal-message login-modal-copy hidden" role="status">認証コードをコピーしました。</p>
 					<div id="login-loading-overlay" class="login-loading-overlay hidden" aria-live="polite"><div class="spinner"></div></div>
 				</div>
-			</div>
-			<div id="external-confirm-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="external-confirm-title">
+				</div>
+				<div id="login-approval-wait-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="login-approval-wait-title">
+					<section class="modal-content login-approval-modal-content login-approval-wait-content">
+						<div class="login-modal-heading">
+							<h3 id="login-approval-wait-title">ログインの許可を待っています</h3>
+						</div>
+						<p class="settings-help-text">ログイン済みの端末に許可リクエストを送信しました。そちらで許可されると、自動的にログインします。</p>
+						<div class="login-approval-wait-progress" aria-hidden="true"><div class="spinner"></div><span>確認中</span></div>
+						<p id="login-approval-wait-status" class="login-approval-detail login-approval-wait-status" role="status">許可を待機しています…</p>
+						<div class="login-approval-actions login-approval-wait-actions">
+							<button type="button" id="login-approval-wait-cancel-btn" class="login-secondary-button">ログインをキャンセル</button>
+						</div>
+					</section>
+				</div>
+				<div id="external-confirm-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="external-confirm-title">
 				<div class="modal-content login-modal-content">
 					<button type="button" class="modal-close-btn" aria-label="閉じる" id="external-confirm-close-btn">×</button>
 					<div class="login-modal-heading">
@@ -193,12 +209,31 @@
 				<div id="create-dm-modal-content"></div>
 			</div>
 		</div>
-		<div id="dm-manage-modal" class="modal-overlay hidden">
-			<div class="modal-content" style="max-width: 500px">
-				<button class="modal-close-btn">×</button>
-				<div id="dm-manage-modal-content"></div>
+			<div id="dm-manage-modal" class="modal-overlay hidden">
+				<div class="modal-content" style="max-width: 500px">
+					<button class="modal-close-btn">×</button>
+					<div id="dm-manage-modal-content"></div>
+				</div>
 			</div>
-		</div>
+			<div id="report-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="report-modal-title">
+				<div class="modal-content report-modal-content">
+					<button type="button" class="modal-close-btn" aria-label="閉じる">×</button>
+					<div class="report-modal-heading">
+						<h3 id="report-modal-title">報告する</h3>
+						<p id="report-modal-target" class="settings-help-text"></p>
+					</div>
+					<form id="report-form">
+						<label for="report-description">説明（任意）</label>
+						<textarea id="report-description" maxlength="2000" rows="5" placeholder="状況や確認してほしい点を入力してください"></textarea>
+						<p class="report-modal-note">報告者の情報は、対応する管理者には表示されません。</p>
+						<div class="report-modal-actions">
+							<button type="button" class="login-secondary-button" data-action="close-report-modal">キャンセル</button>
+							<button type="submit" class="settings-primary-button">送信</button>
+						</div>
+						<p id="report-modal-error" class="login-modal-message login-modal-error hidden" role="alert"></p>
+					</form>
+				</div>
+			</div>
 					<div id="account-switcher-modal" class="modal-overlay hidden">
 				<div class="modal-content" style="max-width: 400px">
 					<button class="modal-close-btn">×</button>
@@ -271,53 +306,38 @@
 				</button>
 			</div>
 		</div>
-		<div
-			id="freeze-overlay"
-			class="modal-overlay hidden"
-			style="z-index: 2000; background: rgba(240, 240, 240, 0.95)"
-		>
-			<div
-				style="
-					background: white;
-					padding: 2rem;
-					border-radius: 16px;
-					text-align: center;
-					max-width: 500px;
-					margin: 1rem;
-					box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
-				"
-			>
-				<h2 style="margin-top: 0; color: #d9534f">
-					あなたは凍結されています
-				</h2>
-				<p>
-					あなたは<a
-						href="rule"
-						target="_blank"
-						rel="noopener noreferrer"
-						>Nyaitterルール</a
-					>に違反したため凍結されました。
-				</p>
-				<p style="margin-top: 1.5rem">
-					<strong>凍結理由:</strong><br /><span
-						id="freeze-reason"
-						style="
-							display: inline-block;
-							margin-top: 0.5rem;
-							white-space: pre-wrap;
-						"
-					></span>
-				</p>
-				<small style="display: block; margin-top: 2rem"
-					><a
-						href="https://forms.gle/buZpMftRNWjfhqVz8"
-						target="_blank"
-						rel="noopener noreferrer"
-						>間違いですか? 異議申し立てをする</a
-					></small
-				>
+			<div id="freeze-overlay" class="modal-overlay freeze-overlay hidden">
+				<section class="freeze-panel" aria-labelledby="freeze-title">
+					<div class="freeze-panel-mark" aria-hidden="true">!</div>
+					<p class="freeze-panel-eyebrow">ACCOUNT RESTRICTED</p>
+					<h2 id="freeze-title">アカウントは凍結されています</h2>
+					<p class="freeze-panel-lead">現在、このアカウントからNyaitterの機能を利用することはできません。</p>
+					<div class="freeze-reason-card">
+						<span>凍結理由</span>
+						<p id="freeze-reason"></p>
+					</div>
+					<p id="freeze-appeal-status" class="freeze-appeal-status hidden" role="status"></p>
+					<button id="open-freeze-appeal-btn" type="button" class="freeze-appeal-button">異議申し立てを行う</button>
+					<p class="freeze-panel-help">判断に誤りがあると思われる場合は、説明を添えて再審査を申し立てられます。</p>
+				</section>
 			</div>
-		</div>
+			<div id="freeze-appeal-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="freeze-appeal-title">
+				<section class="modal-content freeze-appeal-modal-content">
+					<button type="button" class="modal-close-btn" data-action="close-freeze-appeal" aria-label="閉じる">×</button>
+					<p class="freeze-panel-eyebrow">REVIEW REQUEST</p>
+					<h2 id="freeze-appeal-title">異議申し立てを送信</h2>
+					<p>凍結の判断について、再審査を希望する理由を説明してください。内容は担当管理者が確認します。</p>
+					<form id="freeze-appeal-form">
+						<label for="freeze-appeal-description">説明 <span aria-hidden="true">*</span></label>
+						<textarea id="freeze-appeal-description" maxlength="2000" rows="7" required placeholder="再審査を希望する理由や、確認してほしい事情を入力してください。"></textarea>
+						<p id="freeze-appeal-error" class="login-modal-message login-modal-error hidden" role="alert"></p>
+						<div class="freeze-appeal-modal-actions">
+							<button type="button" class="cancel-button" data-action="close-freeze-appeal">キャンセル</button>
+							<button type="submit" class="freeze-appeal-button">送信する</button>
+						</div>
+					</form>
+				</section>
+			</div>
 		<div id="loading-overlay"><div class="spinner"></div></div>
 		<div id="edit-dm-message-modal" class="modal-overlay hidden">
 			<div class="modal-content">

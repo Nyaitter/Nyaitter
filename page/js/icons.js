@@ -19,4 +19,5 @@ export const ICONS = {
     mask: `<svg viewBox="0 0 10 10" fill="none" stroke="#000000" stroke-width="0.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="5" cy="5" r="4"/><line x1="5" y1="2.5" x2="5" y2="6"/><line x1="5" y1="7.6" x2="5" y2="7.6"/></svg>`,
     lock: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>`,
     megaphone: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 10v4a1 1 0 0 0 1 1h3l10 4V5L7 9H4a1 1 0 0 0-1 1z"/><path d="M17 9c1.6.7 3 1.7 4 3-1 1.3-2.4 2.3-4 3"/><path d="m7 15 1.6 5H6.5a1.5 1.5 0 0 1-1.4-1L4 15"/></svg>`,
+    more: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="5" cy="12" r="1"></circle><circle cx="12" cy="12" r="1"></circle><circle cx="19" cy="12" r="1"></circle></svg>`,
 };

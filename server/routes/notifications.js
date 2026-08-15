@@ -127,6 +127,9 @@ router.post('/', requireAuth, notificationLimiter, async (req, res) => {
 	if (!NOTIFICATION_TYPES.has(type)) {
 		return res.status(400).json({ error: 'A supported notification type is required' });
 	}
+	if (type === 'quote') {
+		return res.status(400).json({ error: 'Quote notifications are discontinued' });
+	}
 	if (type === 'admin_notice' && !req.user.admin) {
 		return res.status(403).json({ error: 'Admin access required for admin_notice' });
 	}
@@ -290,13 +293,28 @@ router.put('/read-all', requireAuth, async (req, res) => {
 	const userId = req.user.id;
 
 	try {
-				await db.markAllNotificationsAsRead(userId);
-				const unreadCount = await db.getUnreadNotificationCount(userId);
-				await publishNotificationUnreadCount(req, userId);
-				res.json({ success: true, notification_unread_count: unreadCount });
+		await db.markAllNotificationsAsRead(userId);
+		const unreadCount = await db.getUnreadNotificationCount(userId);
+		await publishNotificationUnreadCount(req, userId);
+		res.json({ success: true, notification_unread_count: unreadCount });
 	} catch (err) {
 		console.error('[notifications] mark all read error:', err);
-		res.status(500).json({ error: '一括既読処理に失敗しました' });
+		res.status(500).json({ error: '未読数のリセットに失敗しました' });
+	}
+});
+
+router.put('/click-all', requireAuth, async (req, res) => {
+	const db = getDbAdapter(req);
+	const userId = req.user.id;
+
+	try {
+		await db.markAllNotificationsAsClicked(userId);
+		const unreadCount = await db.getUnreadNotificationCount(userId);
+		await publishNotificationUnreadCount(req, userId);
+		res.json({ success: true, notification_unread_count: unreadCount });
+	} catch (err) {
+		console.error('[notifications] mark all clicked error:', err);
+		res.status(500).json({ error: '一括クリック済み処理に失敗しました' });
 	}
 });
 

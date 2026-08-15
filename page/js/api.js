@@ -386,6 +386,12 @@ export const api = (() => {
                         method: 'PUT',
                     }),
                 );
+            if (name === 'mark_all_notifications_as_clicked')
+                return withSingle(
+                    request('/server/api/notifications/click-all', {
+                        method: 'PUT',
+                    }),
+                );
             if (name === 'mark_notification_as_read')
                 return withSingle(
                     request(

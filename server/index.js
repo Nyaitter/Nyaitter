@@ -30,6 +30,10 @@ const { requestId, applyTrustProxy, requestLogger } = require('./middleware/syst
 const { generalLimiter, authLimiter } = require('./middleware/rateLimit');
 const ConnectionManager = require('./services/realtime/ConnectionManager');
 const PushNotificationService = require('./services/PushNotificationService');
+const { ModerationReportService } = require('./services/ModerationReportService');
+const { startModerationAssignmentScheduler } = require('./services/ModerationAssignmentScheduler');
+const { serializeNotification } = require('./utils/serialize');
+const { getPublicUrl } = require('./utils/nyaitterAddress');
 const { startOperatorControlServer } = require('./utils/operatorControl');
 
 const app = express();
@@ -47,20 +51,20 @@ app.locals.realtime = realtimeConnections;
 
 applyTrustProxy(app);
 
-app.use(express.json({ limit: config.server.jsonBodyLimit }));
-app.use(express.urlencoded({ extended: true, limit: config.server.jsonBodyLimit, parameterLimit: 100 }));
-
-app.use(requestId);
+// API以外の静的アセットには本文解析・ID生成・CORS/CSRF処理を行わない。
+// 高頻度のCSS・JS・画像配信で不要なCPU消費と短命オブジェクトの生成を抑える。
+app.use('/server', express.json({ limit: config.server.jsonBodyLimit }));
+app.use('/server', express.urlencoded({ extended: true, limit: config.server.jsonBodyLimit, parameterLimit: 100 }));
+app.use('/server', requestId);
 
 app.use(securityHeaders);
 
-app.use(flexibleCors);
-app.use(csrfProtection);
+app.use('/server', flexibleCors);
+app.use('/server', csrfProtection);
 
 app.use('/server', generalLimiter);
 app.use('/server/auth', authLimiter);
-
-app.use(requestLogger);
+app.use('/server', requestLogger);
 
 function isAllowedRealtimeOrigin(request) {
 	const origin = request.headers.origin;
@@ -234,6 +238,9 @@ app.use('/server/api/dm', require('./routes/dm'));
 app.use('/server/api/users', require('./routes/users'));
 
 app.use('/server/api/notifications', require('./routes/notifications'));
+app.use('/server/api/reports', require('./routes/reports'));
+app.use('/server/api/appeals', require('./routes/appeals'));
+app.use('/server/api/verification-applications', require('./routes/verificationApplications'));
 app.use('/server/api/push', require('./routes/push'));
 
 app.use('/server/auth', require('./routes/auth'));
@@ -365,17 +372,42 @@ app.use('/server', (req, res) => {
 const dbAdapter = createDatabaseAdapter();
 const storageAdapter = createStorageAdapter();
 let operatorControl = null;
+let moderationScheduler = null;
 const pushNotificationService = new PushNotificationService({
 	dbAdapter,
 	pushConfig: config.push,
 });
+
+async function publishModerationNotification(userId, notification) {
+	const structured = await serializeNotification(dbAdapter, notification, getPublicUrl());
+	if (!structured) return;
+	try {
+		await realtimeConnections.publishNewNotification(userId, structured, dbAdapter);
+	} catch (error) {
+		console.warn('[moderation] realtime notification delivery failed:', error.message);
+	}
+	if (pushNotificationService.enabled) {
+		void pushNotificationService.sendNotificationToUser(userId, structured).catch((error) => {
+			console.warn('[moderation] push notification delivery failed:', error.message);
+		});
+	}
+}
+
+const moderationReportService = new ModerationReportService({
+	dbAdapter,
+	storageAdapter,
+	publishNotification: publishModerationNotification,
+});
 app.locals.pushNotificationService = pushNotificationService;
+app.locals.moderationReportService = moderationReportService;
 
 async function startServer() {
 	await dbAdapter.connect();
 	app.locals.dbAdapter = dbAdapter;
 	app.locals.storageAdapter = storageAdapter;
 	app.locals.pushNotificationService = pushNotificationService;
+	app.locals.moderationReportService = moderationReportService;
+	moderationScheduler = startModerationAssignmentScheduler(moderationReportService);
 	operatorControl = await startOperatorControlServer({
 		dbAdapter,
 		shutdown,
@@ -420,8 +452,10 @@ async function shutdown(signal) {
   console.log(`\n[server] ${signal} received. Starting graceful shutdown...`);
 
 	try {
-		clearInterval(realtimeHeartbeat);
-		realtimeConnections.closeAll();
+			clearInterval(realtimeHeartbeat);
+			moderationScheduler?.stop();
+			moderationScheduler = null;
+			realtimeConnections.closeAll();
 		if (operatorControl) {
 			await operatorControl.close();
 			operatorControl = null;

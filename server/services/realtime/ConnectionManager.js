@@ -1,7 +1,14 @@
-const { hasBlockRelationship } = require('../../utils/blockRelationship');
 const {
   getVisibleDmUnreadCount,
 } = require('../DmVisibilityService');
+
+function getBlockedUserIds(user) {
+  return new Set(
+    (Array.isArray(user?.block) ? user.block : [])
+      .map(Number)
+      .filter(Number.isInteger),
+  );
+}
 
 class ConnectionManager {
   constructor() {
@@ -45,8 +52,8 @@ class ConnectionManager {
     }
 
     let delivered = false;
-    for (const socket of [...sockets]) {
-      // ws.OPEN is 1. 数値で確認し、ライブラリ実装への依存を最小化する。
+    // Setを直接走査することで、イベントごとのソケット配列複製を避ける。
+    for (const socket of sockets) {
       if (!socket || socket.readyState !== 1) {
         this.unregister(normalizedUserId, socket);
         continue;
@@ -80,13 +87,11 @@ class ConnectionManager {
 
   async publishNewNotification(userId, notification, dbAdapter) {
     const unreadCount = await dbAdapter.getUnreadNotificationCount(userId);
+    // notification_newに未読数を含める。クライアントは同イベントだけで
+    // 通知一覧とバッジを更新できるため、同一値の二重配信を避ける。
     this.sendToUser(userId, {
       type: 'notification_new',
       notification,
-      unread_count: unreadCount,
-    });
-    this.sendToUser(userId, {
-      type: 'notification_unread_count',
       unread_count: unreadCount,
     });
     return unreadCount;
@@ -113,45 +118,85 @@ class ConnectionManager {
 
   async publishPostToFollowers(authorUserId, dbAdapter, postId) {
     const authorId = Number(authorUserId);
-    if (!Number.isInteger(authorId) || authorId < 0 || !dbAdapter?.getFollowIds) {
+    if (!Number.isInteger(authorId) || authorId < 0 || !dbAdapter) {
       return 0;
     }
 
-    // オフラインユーザー向けのキューは持たず、接続中のユーザーだけを確認する。
-    // これにより全フォロワーを読み出す必要がなく、アダプターの取得上限にも依存しない。
-    const recipientIds = [...this.connectionsByUser.keys()].filter(
+    const connectedUserIds = [...this.connectionsByUser.keys()].filter(
       (userId) => Number(userId) !== authorId,
     );
-    let deliveredCount = 0;
+    if (connectedUserIds.length === 0) return 0;
 
-    await Promise.all(
-      recipientIds.map(async (recipientId) => {
-        try {
-          const followingIds = await dbAdapter.getFollowIds(recipientId);
-          if (!(followingIds || []).some((id) => Number(id) === authorId)) {
-            return;
-          }
-          if (await hasBlockRelationship(dbAdapter, recipientId, authorId)) {
-            return;
-          }
-          if (
-            this.sendToUser(recipientId, {
-              type: 'timeline_post',
-              timeline: 'following',
-              author_id: authorId,
-              post_id: Number(postId),
-            })
-          ) {
-            deliveredCount += 1;
-          }
-        } catch (error) {
-          console.warn(
-            `[realtime] Failed to determine follow state for user ${recipientId}:`,
-            error.message,
-          );
-        }
-      }),
+    let recipientIds = [];
+    try {
+      if (typeof dbAdapter.getFollowRelationshipSnapshot === 'function') {
+        const snapshot = await dbAdapter.getFollowRelationshipSnapshot(
+          authorId,
+          connectedUserIds,
+        );
+        recipientIds = Array.isArray(snapshot?.followerIds)
+          ? snapshot.followerIds.map(Number).filter(Number.isInteger)
+          : [];
+      } else if (typeof dbAdapter.getFollowIds === 'function') {
+        // 旧アダプター互換のフォールバック。
+        const following = await Promise.all(
+          connectedUserIds.map(async (recipientId) => ({
+            recipientId,
+            followingIds: await dbAdapter.getFollowIds(recipientId),
+          })),
+        );
+        recipientIds = following
+          .filter(({ followingIds }) =>
+            (followingIds || []).some((id) => Number(id) === authorId),
+          )
+          .map(({ recipientId }) => recipientId);
+      }
+    } catch (error) {
+      console.warn('[realtime] Failed to determine post recipients:', error.message);
+      return 0;
+    }
+
+    recipientIds = [...new Set(recipientIds)].filter((recipientId) =>
+      this.connectionsByUser.has(recipientId),
     );
+    if (recipientIds.length === 0) return 0;
+
+    // フォロー関係と同じく、ブロック判定に必要なユーザー情報も一括取得する。
+    let usersById = new Map();
+    try {
+      const userIds = [authorId, ...recipientIds];
+      const users = typeof dbAdapter.getUsersByIds === 'function'
+        ? await dbAdapter.getUsersByIds(userIds)
+        : await Promise.all(userIds.map((userId) => dbAdapter.getUserById(userId)));
+      usersById = new Map(
+        (users || [])
+          .filter(Boolean)
+          .map((user) => [Number(user.id), user]),
+      );
+    } catch (error) {
+      console.warn('[realtime] Failed to load post recipient visibility:', error.message);
+      return 0;
+    }
+
+    const authorBlocks = getBlockedUserIds(usersById.get(authorId));
+    let deliveredCount = 0;
+    for (const recipientId of recipientIds) {
+      const recipient = usersById.get(recipientId);
+      if (!recipient) continue;
+      if (authorBlocks.has(recipientId) || getBlockedUserIds(recipient).has(authorId)) {
+        continue;
+      }
+      if (
+        this.sendToUser(recipientId, {
+          type: 'timeline_post',
+          timeline: 'following',
+          author_id: authorId,
+          post_id: Number(postId),
+        })
+      ) {
+        deliveredCount += 1;
+      }
+    }
 
     return deliveredCount;
   }

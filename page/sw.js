@@ -1,4 +1,4 @@
-const CACHE_NAME = 'nyaitter-client';
+const CACHE_NAME = 'nyaitter-client-v2';
 const STATIC_ASSET_PATTERN = /\.(?:html|css|js|mjs|json|webmanifest|png|jpe?g|gif|svg|ico|webp|avif|woff2?|ttf|otf)$/i;
 const APP_SHELL = [
   '/',
@@ -30,6 +30,28 @@ function getSafeNotificationUrl(value) {
   } catch (_) {
     return new URL('#notifications', self.location.origin).href;
   }
+}
+
+function parsePushIdentifier(value, minimum) {
+  if (
+    (typeof value !== 'number' && typeof value !== 'string') ||
+    String(value).trim() === ''
+  )
+    return null;
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed >= minimum ? parsed : null;
+}
+
+function getPushOpenUrl(value, userId, notificationId) {
+  const url = new URL(getSafeNotificationUrl(value));
+  const parsedUserId = parsePushIdentifier(userId, 0);
+  const parsedNotificationId = parsePushIdentifier(notificationId, 1);
+  if (parsedUserId !== null && parsedNotificationId !== null) {
+    // URLはアプリ起動後ただちにHistory APIで消去される一時的な引き継ぎ情報。
+    url.searchParams.set('push_user_id', String(parsedUserId));
+    url.searchParams.set('push_notification_id', String(parsedNotificationId));
+  }
+  return url.href;
 }
 
 function isCacheableStaticResponse(response) {
@@ -109,6 +131,7 @@ self.addEventListener('push', (event) => {
     renotify: false,
     data: {
       url: getSafeNotificationUrl(payload.url),
+      userId: payload.user_id || null,
       notificationId: payload.notification_id || null,
     },
   };
@@ -118,7 +141,11 @@ self.addEventListener('push', (event) => {
 
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
-  const targetUrl = getSafeNotificationUrl(event.notification.data?.url);
+  const targetUrl = getPushOpenUrl(
+    event.notification.data?.url,
+    event.notification.data?.userId,
+    event.notification.data?.notificationId,
+  );
 
   event.waitUntil((async () => {
     const windows = await clients.matchAll({ type: 'window', includeUncontrolled: true });

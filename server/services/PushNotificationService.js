@@ -45,6 +45,7 @@ class PushNotificationService {
       body: getNotificationText(notification).slice(0, 240),
       tag: notification?.id ? `notification-${notification.id}` : 'notification',
       url: getNotificationTargetHash(notification?.target, notification?.from?.id),
+      user_id: userId,
       notification_id: notification?.id || null,
       icon: notification?.from?.id != null ? `/server/api/users/${notification.from.id}/icon` : null,
     });

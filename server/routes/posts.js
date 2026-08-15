@@ -382,31 +382,22 @@ router.post('/', requireAuth, async (req, res) => {
 			repostTo: repost_to || null,
 		});
 
-		if (reply_to && post.replyTo) {
-			const parent = await db.getPostById(post.replyTo);
-			if (parent && parent.userId !== userId) {
-					const notification = await createNotificationIfAllowed(db, {
-						userId: parent.userId,
-						type: 'reply',
-						fromUserId: userId,
+		const replyTargetId = Number(reply_to);
+		if (Number.isInteger(replyTargetId) && replyTargetId > 0) {
+			const parent = await db.getPostById(replyTargetId);
+			if (parent && Number(parent.userId) !== Number(userId)) {
+				const notification = await createNotificationIfAllowed(db, {
+					userId: parent.userId,
+					type: 'reply',
+					fromUserId: userId,
 					target: { kind: 'post', id: post.id },
-					});
+				});
+				if (notification) {
 					await publishNewNotification(req, parent.userId, notification);
+				}
 			}
 		}
 
-		if (repost_to && post.repostTo) {
-			const original = await db.getPostById(post.repostTo);
-			if (original && original.userId !== userId) {
-					const notification = await createNotificationIfAllowed(db, {
-						userId: original.userId,
-						type: 'quote',
-						fromUserId: userId,
-						target: { kind: 'post', id: post.id },
-					});
-					await publishNewNotification(req, original.userId, notification);
-			}
-		}
 
 		await publishNewTimelinePost(req, userId, post.id);
 

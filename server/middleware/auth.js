@@ -83,6 +83,23 @@ async function getAuthenticatedPrincipal(req) {
   return getSessionPrincipal(req, token);
 }
 
+async function requireAuthAllowFrozen(req, res, next) {
+  try {
+    const principal = await getAuthenticatedPrincipal(req);
+    if (!principal) {
+      return res.status(401).json({
+        error: 'Authentication required',
+        message: 'この操作にはログインが必要です。',
+      });
+    }
+    req.user = principal;
+    return next();
+  } catch (error) {
+    console.error('[auth] requireAuthAllowFrozen error:', error);
+    return res.status(500).json({ error: 'Authentication error' });
+  }
+}
+
 async function requireAuth(req, res, next) {
   try {
     const principal = await getAuthenticatedPrincipal(req);
@@ -224,6 +241,7 @@ function securityHeaders(req, res, next) {
 
 module.exports = {
   requireAuth,
+  requireAuthAllowFrozen,
   optionalAuth,
   csrfProtection,
   flexibleCors,

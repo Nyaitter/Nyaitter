@@ -1,7 +1,5 @@
 const config = require('../config');
 
-const store = new Map(); // key -> { count, resetTime }
-
 function createRateLimiter(options = {}) {
   const windowMs = options.windowMs || config.rateLimit.windowMs || 60000;
   const max = options.max || config.rateLimit.max || 1000;
@@ -12,6 +10,19 @@ function createRateLimiter(options = {}) {
     return req.ip || 'unknown';
   });
 
+  // リミッターごとに状態を分離する。認証系と一般APIの使用量を混在させず、
+  // IPが増えた場合も期限切れエントリーを定期的に回収する。
+  const store = new Map(); // key -> { count, resetTime }
+  let lastPrunedAt = 0;
+
+  function pruneExpiredEntries(now) {
+    if (now - lastPrunedAt < windowMs) return;
+    lastPrunedAt = now;
+    for (const [key, entry] of store) {
+      if (!entry || entry.resetTime <= now) store.delete(key);
+    }
+  }
+
   return function rateLimitMiddleware(req, res, next) {
     if (!config.rateLimit.enabled) {
       return next();
@@ -19,9 +30,10 @@ function createRateLimiter(options = {}) {
 
     const key = keyGenerator(req);
     const now = Date.now();
+    pruneExpiredEntries(now);
     let entry = store.get(key);
 
-    if (!entry || now > entry.resetTime) {
+    if (!entry || now >= entry.resetTime) {
       entry = { count: 0, resetTime: now + windowMs };
       store.set(key, entry);
     }
@@ -29,14 +41,13 @@ function createRateLimiter(options = {}) {
     entry.count++;
 
     if (entry.count > max) {
-      res.setHeader('Retry-After', Math.ceil((entry.resetTime - now) / 1000));
+      res.setHeader('Retry-After', Math.max(1, Math.ceil((entry.resetTime - now) / 1000)));
       return res.status(429).json({
         error: 'Too Many Requests',
         message: 'リクエストが多すぎます。しばらく待ってから再度お試しください。',
       });
     }
 
-    // Add rate limit headers (good practice)
     res.setHeader('X-RateLimit-Limit', max);
     res.setHeader('X-RateLimit-Remaining', Math.max(0, max - entry.count));
     res.setHeader('X-RateLimit-Reset', Math.ceil(entry.resetTime / 1000));

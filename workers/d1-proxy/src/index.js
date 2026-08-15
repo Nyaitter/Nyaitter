@@ -158,6 +158,28 @@ function normalizeGroupDmRow(row, viewerId = null) {
 	return res;
 }
 
+function normalizeModerationReportRow(row) {
+	if (!row) return null;
+	return {
+		id: Number(row.id),
+		reporterUserId: Number(row.reporter_user_id),
+		targetKind: row.target_kind,
+		targetId: String(row.target_id),
+		description: row.description || '',
+		targetSnapshot: parseJsonSafe(row.target_snapshot, {}),
+		assignmentType: row.assignment_type || 'report',
+		status: row.status,
+		assignedAdminId: row.assigned_admin_id == null ? null : Number(row.assigned_admin_id),
+		assignedAt: row.assigned_at || null,
+		excludedAdminIds: Array.isArray(parseJsonSafe(row.excluded_admin_ids, []))
+			? parseJsonSafe(row.excluded_admin_ids, []).map(Number).filter(Number.isInteger)
+			: [],
+		resolution: row.resolution ? parseJsonSafe(row.resolution, null) : null,
+		createdAt: row.created_at,
+		resolvedAt: row.resolved_at || null,
+	};
+}
+
 export default {
 	async fetch(request, env, ctx) {
 		if (request.method === 'OPTIONS') {
@@ -571,13 +593,169 @@ export default {
 				return json(normalizeUserRow(row));
 			}
 
-			if (method === 'GET' && pathname.match(/^\/users\/(\d+)$/)) {
-				const userId = Number(pathname.split('/')[2]);
-				const row = await db.prepare('SELECT * FROM users WHERE id = ?').bind(userId).first();
-				return json(normalizeUserRow(row));
-			}
+				if (method === 'GET' && pathname.match(/^\/users\/(\d+)$/)) {
+					const userId = Number(pathname.split('/')[2]);
+					const row = await db.prepare('SELECT * FROM users WHERE id = ?').bind(userId).first();
+					return json(normalizeUserRow(row));
+				}
 
-			if (method === 'POST' && pathname.match(/^\/users\/(\d+)\/follow$/)) {
+				if (method === 'POST' && pathname === '/moderation-reports') {
+					const body = await request.json();
+					const reporterUserId = Number(body.reporterUserId);
+					const targetKind = String(body.targetKind || '');
+						const targetId = ['dm', 'dm_message'].includes(targetKind)
+							? String(body.targetId || '').trim()
+							: Number(body.targetId);
+					const description = String(body.description || '');
+					const assignmentType = ['freeze_appeal', 'verification_application'].includes(body.assignmentType)
+						? body.assignmentType
+						: 'report';
+						const validTargetId = ['dm', 'dm_message'].includes(targetKind)
+							? targetId.length > 0 && targetId.length <= 256
+							: Number.isInteger(targetId);
+						if (!Number.isInteger(reporterUserId) || !validTargetId || !['user', 'post', 'dm', 'dm_message'].includes(targetKind)) {
+						return badRequest('Invalid moderation report');
+					}
+					const now = body.createdAt || new Date().toISOString();
+					const result = await db.prepare(
+						`INSERT INTO moderation_reports
+							(reporter_user_id, target_kind, target_id, description, target_snapshot, assignment_type, status, excluded_admin_ids, created_at)
+						 VALUES (?, ?, ?, ?, ?, ?, 'pending', '[]', ?)`
+					).bind(
+						reporterUserId,
+						targetKind,
+						targetId,
+						description,
+						JSON.stringify(body.targetSnapshot || {}),
+						assignmentType,
+						now,
+					).run();
+					const row = await db.prepare('SELECT * FROM moderation_reports WHERE id = ?').bind(result.meta.last_row_id).first();
+					return json(normalizeModerationReportRow(row), 201);
+				}
+
+				if (method === 'GET' && pathname.match(/^\/users\/(\d+)\/moderation-appeal\/open$/)) {
+					const userId = Number(pathname.split('/')[2]);
+					const row = await db.prepare(
+						`SELECT * FROM moderation_reports
+						 WHERE reporter_user_id = ? AND assignment_type = 'freeze_appeal' AND status <> 'resolved'
+						 ORDER BY created_at DESC LIMIT 1`
+					).bind(userId).first();
+					return json(normalizeModerationReportRow(row));
+				}
+
+				if (method === 'GET' && pathname.match(/^\/users\/(\d+)\/moderation-verification\/open$/)) {
+					const userId = Number(pathname.split('/')[2]);
+					const row = await db.prepare(
+						`SELECT * FROM moderation_reports
+						 WHERE reporter_user_id = ? AND assignment_type = 'verification_application' AND status <> 'resolved'
+						 ORDER BY created_at DESC LIMIT 1`
+					).bind(userId).first();
+					return json(normalizeModerationReportRow(row));
+				}
+
+				if (method === 'POST' && pathname === '/moderation-reports/admin-workloads') {
+					const body = await request.json();
+					const excluded = [...new Set((Array.isArray(body.excludedAdminIds) ? body.excludedAdminIds : [])
+						.map(Number)
+						.filter(Number.isInteger))];
+					const placeholders = excluded.map(() => '?').join(', ');
+					const exclusionClause = excluded.length > 0 ? `AND u.id NOT IN (${placeholders})` : '';
+					const { results } = await db.prepare(
+						`SELECT u.id AS admin_id, COUNT(r.id) AS active_count
+						 FROM users u
+						 LEFT JOIN moderation_reports r ON r.assigned_admin_id = u.id AND r.status = 'assigned'
+						 WHERE u.admin = 1 AND COALESCE(u.freeze, '') = '' ${exclusionClause}
+						 GROUP BY u.id`
+					).bind(...excluded).all();
+					return json((results || []).map((row) => ({
+						adminId: Number(row.admin_id),
+						activeCount: Number(row.active_count || 0),
+					})));
+				}
+
+				if (method === 'POST' && pathname === '/moderation-reports/overdue') {
+					const body = await request.json();
+					const cutoff = String(body.cutoff || '');
+					const { results } = await db.prepare(
+						`SELECT * FROM moderation_reports
+						 WHERE status = 'assigned' AND assigned_at IS NOT NULL AND assigned_at <= ?
+						 ORDER BY assigned_at ASC`
+					).bind(cutoff).all();
+					return json((results || []).map(normalizeModerationReportRow));
+				}
+
+				if (method === 'POST' && pathname === '/moderation-reports/unassigned') {
+					const body = await request.json();
+					const limit = Math.max(1, Math.min(Number(body.limit) || 100, 100));
+					const { results } = await db.prepare(
+						`SELECT * FROM moderation_reports
+						 WHERE status = 'pending' ORDER BY created_at ASC, id ASC LIMIT ?`
+					).bind(limit).all();
+					return json((results || []).map(normalizeModerationReportRow));
+				}
+
+				if (method === 'GET' && pathname.match(/^\/moderation-reports\/admin\/(\d+)$/)) {
+					const adminId = Number(pathname.split('/')[3]);
+					const status = url.searchParams.get('status') || 'assigned';
+					const limit = Math.max(1, Math.min(Number(url.searchParams.get('limit') || 50), 100));
+					const offset = Math.max(0, Number(url.searchParams.get('offset') || 0));
+					const { results } = await db.prepare(
+						`SELECT * FROM moderation_reports
+						 WHERE assigned_admin_id = ? AND (? = '' OR status = ?)
+						 ORDER BY COALESCE(assigned_at, created_at) DESC, id DESC LIMIT ? OFFSET ?`
+					).bind(adminId, status, status, limit, offset).all();
+					return json((results || []).map(normalizeModerationReportRow));
+				}
+
+				if (method === 'GET' && pathname.match(/^\/moderation-reports\/(\d+)$/)) {
+					const reportId = Number(pathname.split('/')[2]);
+					const row = await db.prepare('SELECT * FROM moderation_reports WHERE id = ?').bind(reportId).first();
+					return json(normalizeModerationReportRow(row));
+				}
+
+				if (method === 'POST' && pathname.match(/^\/moderation-reports\/(\d+)\/assign$/)) {
+					const reportId = Number(pathname.split('/')[2]);
+					const body = await request.json();
+					const existing = await db.prepare('SELECT * FROM moderation_reports WHERE id = ?').bind(reportId).first();
+					if (!existing || existing.status === 'resolved') return json(null);
+					if (Object.prototype.hasOwnProperty.call(body, 'expectedAdminId') && Number(existing.assigned_admin_id) !== Number(body.expectedAdminId)) {
+						return json(null);
+					}
+					const excluded = [...new Set((Array.isArray(body.excludedAdminIds) ? body.excludedAdminIds : parseJsonSafe(existing.excluded_admin_ids, []))
+						.map(Number)
+						.filter(Number.isInteger))];
+					const assignedAt = body.assignedAt || new Date().toISOString();
+					await db.prepare(
+						`UPDATE moderation_reports
+						 SET status = 'assigned', assigned_admin_id = ?, assigned_at = ?, excluded_admin_ids = ?
+						 WHERE id = ?`
+					).bind(Number(body.adminId), assignedAt, JSON.stringify(excluded), reportId).run();
+					const row = await db.prepare('SELECT * FROM moderation_reports WHERE id = ?').bind(reportId).first();
+					return json(normalizeModerationReportRow(row));
+				}
+
+				if (method === 'POST' && pathname.match(/^\/moderation-reports\/(\d+)\/resolve$/)) {
+					const reportId = Number(pathname.split('/')[2]);
+					const body = await request.json();
+					const now = new Date().toISOString();
+					const result = await db.prepare(
+						`UPDATE moderation_reports
+						 SET status = 'resolved', resolution = ?, resolved_at = ?
+						 WHERE id = ? AND assigned_admin_id = ? AND status = 'assigned'`
+					).bind(JSON.stringify(body.resolution || {}), now, reportId, Number(body.adminId)).run();
+					if (result.meta.changes === 0) return json(null);
+					const row = await db.prepare('SELECT * FROM moderation_reports WHERE id = ?').bind(reportId).first();
+					return json(normalizeModerationReportRow(row));
+				}
+
+				if (method === 'POST' && pathname.match(/^\/moderation-reports\/(\d+)\/delete$/)) {
+					const reportId = Number(pathname.split('/')[2]);
+					const result = await db.prepare('DELETE FROM moderation_reports WHERE id = ?').bind(reportId).run();
+					return json({ success: result.meta.changes > 0 });
+				}
+
+				if (method === 'POST' && pathname.match(/^\/users\/(\d+)\/follow$/)) {
 				const followingId = Number(pathname.split('/')[2]);
 				const body = await request.json();
 				const followerId = Number(body.followerId);
@@ -1590,13 +1768,14 @@ export default {
 				const type = String(body.type);
 				const fromUserId = body.fromUserId != null ? Number(body.fromUserId) : null;
 				const postId = body.postId != null ? Number(body.postId) : (body.target?.kind === 'post' ? Number(body.target.id) : null);
-				const target = body.target ? JSON.stringify(body.target) : null;
-				const now = new Date().toISOString();
+					const target = body.target ? JSON.stringify(body.target) : null;
+					const message = typeof body.message === 'string' ? body.message : null;
+					const now = new Date().toISOString();
 
-				const res = await db.prepare(
-					`INSERT INTO notifications (user_id, type, from_user_id, post_id, target, read, clicked, created_at)
-					 VALUES (?, ?, ?, ?, ?, 0, 0, ?)`
-				).bind(userId, type, fromUserId, postId, target, now).run();
+					const res = await db.prepare(
+						`INSERT INTO notifications (user_id, type, from_user_id, post_id, target, message, read, clicked, created_at)
+						 VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?)`
+					).bind(userId, type, fromUserId, postId, target, message, now).run();
 
 				const row = await db.prepare('SELECT * FROM notifications WHERE id = ?').bind(res.meta.last_row_id).first();
 				return json(row ? { ...row, target: parseJsonSafe(row.target, null), read: Boolean(row.read), clicked: Boolean(row.clicked) } : null);
@@ -1643,11 +1822,17 @@ export default {
 				return json({ success: res.meta.changes > 0 });
 			}
 
-			if (method === 'POST' && pathname.match(/^\/users\/(\d+)\/notifications\/read-all$/)) {
-				const userId = Number(pathname.split('/')[2]);
-				await db.prepare('UPDATE notifications SET read = 1 WHERE user_id = ? AND read = 0').bind(userId).run();
-				return json({ success: true });
-			}
+					if (method === 'POST' && pathname.match(/^\/users\/(\d+)\/notifications\/read-all$/)) {
+						const userId = Number(pathname.split('/')[2]);
+						await db.prepare('UPDATE notifications SET read = 1 WHERE user_id = ? AND read = 0').bind(userId).run();
+						return json({ success: true });
+					}
+
+					if (method === 'POST' && pathname.match(/^\/users\/(\d+)\/notifications\/click-all$/)) {
+						const userId = Number(pathname.split('/')[2]);
+						await db.prepare('UPDATE notifications SET read = 1, clicked = 1 WHERE user_id = ? AND (read = 0 OR clicked = 0)').bind(userId).run();
+						return json({ success: true });
+					}
 
 			if (method === 'GET' && pathname.match(/^\/users\/(\d+)\/notifications\/unread-count$/)) {
 				const userId = Number(pathname.split('/')[2]);

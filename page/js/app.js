@@ -1,5 +1,6 @@
 import * as state from './state.js';
 import { api, apiRequest } from './api.js';
+import { renderLimitedMarkdown } from './safeMarkdown.js';
 import { ICONS } from './icons.js';
 import { DOM, showMainJsError } from './dom.js';
 
@@ -64,8 +65,6 @@ const {
     setCurrentSearchTab,
     getCurrentPagination,
     setCurrentPagination,
-    getPOST_COUNT,
-    setPOST_COUNT,
     getIsDarkmode,
     setIsDarkmode,
     getEmoji_picker_theme,
@@ -81,6 +80,8 @@ const {
 export function initApp() {
     const METRICS_FALLBACK = '?';
     let recommendedUsersRequest = null;
+    let sidebarOverflowAbortController = null;
+    let sidebarOverflowResizeTimer = null;
 
     const appDialog = {
         modal: document.getElementById('app-dialog-modal'),
@@ -963,6 +964,7 @@ export function initApp() {
         })
         .catch(() => []);
 
+    let customEmojiIds = [];
     const custom_emoji = fetch('/emoji/list.json', {
         credentials: 'same-origin',
     })
@@ -973,17 +975,27 @@ export function initApp() {
                 );
             return res.json();
         })
-        .then((list) => (Array.isArray(list) ? list : []))
+        .then((list) => {
+            const emojiList = Array.isArray(list) ? list : [];
+            customEmojiIds = [...new Set(
+                emojiList
+                    .map((emoji) => String(emoji?.id || ''))
+                    .filter((id) => /^[A-Za-z0-9_-]{1,80}$/.test(id)),
+            )].sort((left, right) =>
+                right.length - left.length || left.localeCompare(right),
+            );
+            return emojiList;
+        })
         .catch((error) => {
             console.warn(
                 '[emoji] Custom emoji list could not be loaded:',
                 error,
             );
+            customEmojiIds = [];
             return [];
         });
 
     const POSTS_PER_PAGE = 30;
-    const AdPOST_PER_POSTS = 30;
 
     const COLOR_THEME_PRESETS = Object.freeze({
         nyaitter: Object.freeze({
@@ -1142,13 +1154,14 @@ export function initApp() {
         return getSafeHttpUrl(data?.publicUrl) || null;
     }
 
-    async function renderDmMessage(msg) {
+    async function renderDmMessage(msg, dmId = null) {
         const plaintext = await dmE2EDecryptMessage(msg, getCurrentUser().id);
         await ensureMentionedUsersCached([plaintext]);
         if (msg.type === 'system') {
             const formattedContent = formatPostContent(
                 plaintext,
                 getAllUsersCache(),
+                { allowMarkdown: true },
             );
             return `<div class="dm-system-message">${formattedContent}</div>`;
         }
@@ -1186,14 +1199,16 @@ export function initApp() {
         }
 
         const formattedContent = plaintext
-            ? formatPostContent(plaintext, getAllUsersCache())
+            ? formatPostContent(plaintext, getAllUsersCache(), {
+                  allowMarkdown: true,
+              })
             : '';
         const sent = msg.userid === getCurrentUser().id;
 
         if (sent) {
             return `<div class="dm-message-container sent" data-message-id="${escapeHTML(msg.id)}">
 	                <div class="dm-message-wrapper">
-	                    <button class="dm-message-menu-btn">…</button>
+	                    <button type="button" class="dm-message-menu-btn" title="メッセージメニュー" aria-label="メッセージメニュー">${ICONS.more}</button>
 	                    <div class="post-menu">
 	                        <button class="edit-dm-msg-btn">編集</button>
 	                        <button class="delete-dm-msg-btn delete-btn">削除</button>
@@ -1211,15 +1226,69 @@ export function initApp() {
 	                <a href="#profile/${user.id}" class="dm-user-link">
 	                    <img src="${getUserIconUrl(user)}" class="dm-message-icon">
 	                </a>
-	                <div class="dm-message-wrapper">
+                        <div class="dm-message-wrapper">
+	                    <div class="post-menu">
+	                        <button class="report-dm-message-btn" data-dm-id="${escapeHTML(String(dmId || ''))}" data-message-id="${escapeHTML(String(msg.id || ''))}">報告する</button>
+	                    </div>
 	                    <div class="dm-message-meta">
 	                        <a href="#profile/${user.id}" class="dm-user-link">${getEmoji(escapeHTML(user.name || '不明'))}</a>
-	                        ・${time}
+	                        <span class="dm-message-time">・${time}</span>
+	                        <button type="button" class="dm-message-menu-btn" title="メッセージメニュー" aria-label="メッセージメニュー">${ICONS.more}</button>
 	                    </div>
 	                    <div class="dm-message">${formattedContent}${attachmentsHTML}</div>
 	                </div>
 	            </div>`;
         }
+    }
+
+    function positionDmMessageMenu(menu, menuButton) {
+        const edgeMargin = 8;
+        const gap = 6;
+        const buttonRect = menuButton.getBoundingClientRect();
+        const opensRightPreferred = menuButton
+            .closest('.dm-message-container')
+            ?.classList.contains('received');
+
+        menu.classList.add('dm-message-menu-popover');
+        menu.style.maxWidth = `${Math.max(
+            0,
+            window.innerWidth - edgeMargin * 2,
+        )}px`;
+
+        const menuWidth = menu.offsetWidth;
+        const menuHeight = menu.offsetHeight;
+        let opensRight = Boolean(opensRightPreferred);
+        let left = opensRight
+            ? buttonRect.right + gap
+            : buttonRect.left - menuWidth - gap;
+
+        if (left + menuWidth > window.innerWidth - edgeMargin) {
+            opensRight = false;
+            left = buttonRect.left - menuWidth - gap;
+        }
+        if (left < edgeMargin) {
+            opensRight = true;
+            left = buttonRect.right + gap;
+        }
+        left = Math.max(
+            edgeMargin,
+            Math.min(left, window.innerWidth - menuWidth - edgeMargin),
+        );
+
+        let top = buttonRect.top;
+        if (top + menuHeight > window.innerHeight - edgeMargin) {
+            top = buttonRect.bottom - menuHeight;
+        }
+        top = Math.max(
+            edgeMargin,
+            Math.min(top, window.innerHeight - menuHeight - edgeMargin),
+        );
+
+        menu.classList.toggle('dm-message-menu-opens-right', opensRight);
+        menu.style.left = `${left}px`;
+        menu.style.top = `${top}px`;
+        menu.style.right = 'auto';
+        menu.style.bottom = 'auto';
     }
 
     function isActiveDmConversation(dmId) {
@@ -1283,7 +1352,7 @@ export function initApp() {
             return;
         }
 
-        const messageHtml = await renderDmMessage(message);
+        const messageHtml = await renderDmMessage(message, dmId);
         if (
             !isActiveDmConversation(dmId) ||
             hasRenderedDmMessage(view, message.id)
@@ -1369,6 +1438,10 @@ export function initApp() {
             notification.from && typeof notification.from === 'object'
                 ? notification.from
                 : null;
+        const targetPost =
+            notification.target_post && typeof notification.target_post === 'object'
+                ? notification.target_post
+                : null;
         return {
             id,
             type:
@@ -1377,8 +1450,12 @@ export function initApp() {
                     : 'admin_notice',
             from,
             target,
+            targetPost: targetPost && typeof targetPost.content === 'string'
+                ? { id: Number(targetPost.id), content: targetPost.content }
+                : null,
             read: Boolean(notification.read),
             clicked: Boolean(notification.clicked),
+            message: typeof notification.message === 'string' ? notification.message : null,
             created_at: notification.created_at || null,
         };
     }
@@ -1421,8 +1498,24 @@ export function initApp() {
     }
 
     function getNotificationDisplayText(notification) {
+        if (typeof notification.message === 'string' && notification.message.trim())
+            return notification.message.trim();
         if (notification.type === 'login_approval')
             return '不明な場所からのログイン承認が必要です。';
+        if (notification.type === 'moderation_assignment')
+            return '新しいリクエストが割り当てられました。';
+        if (notification.type === 'moderation_action_taken')
+            return 'あなたが報告したコンテンツは、審査により不適切であると判定されました。コミュニティの健全化へのご協力に感謝します。';
+        if (notification.type === 'moderation_no_action')
+            return 'あなたが報告したコンテンツは、審査により適切だと判定されたため対応されません。';
+        if (notification.type === 'appeal_approved')
+            return '異議申し立てが承認され、アカウントの凍結が解除されました。';
+        if (notification.type === 'appeal_rejected')
+            return '異議申し立ては審査の結果、承認されませんでした。';
+        if (notification.type === 'verification_approved')
+            return '認証申請が承認されました。プロフィールに認証バッジが表示されます。';
+        if (notification.type === 'verification_rejected')
+            return '認証申請は審査の結果、承認されませんでした。';
         const suffix = getNotificationMessageSuffix(notification);
         return suffix
             ? `${notificationActorLabel(notification)}${suffix}`
@@ -1430,18 +1523,48 @@ export function initApp() {
     }
 
     function appendNotificationDisplay(content, notification) {
-        const actorId = Number(notification.from?.id);
-        const suffix = getNotificationMessageSuffix(notification);
-        if (!Number.isInteger(actorId) || !suffix) {
-            content.textContent = getNotificationDisplayText(notification);
-            return;
-        }
+        content.replaceChildren();
 
-        const actorLink = document.createElement('a');
-        actorLink.className = 'notification-actor-link';
-        actorLink.href = `#profile/${actorId}`;
-        actorLink.textContent = notificationActorLabel(notification);
-        content.append(actorLink, document.createTextNode(suffix));
+        const timestamp = document.createElement('div');
+        timestamp.className = 'notification-timestamp';
+        timestamp.textContent = formatPostTimestamp({ created_at: notification.created_at });
+        content.appendChild(timestamp);
+
+        const message = document.createElement('div');
+        message.className = 'notification-message';
+        if (typeof notification.message === 'string' && notification.message.trim()) {
+            message.textContent = notification.message.trim();
+        } else {
+            const actorId = Number(notification.from?.id);
+            const suffix = getNotificationMessageSuffix(notification);
+            if (!Number.isInteger(actorId) || !suffix) {
+                message.textContent = getNotificationDisplayText(notification);
+            } else {
+                const actorLink = document.createElement('a');
+                actorLink.className = 'notification-actor-link';
+                actorLink.href = `#profile/${actorId}`;
+                actorLink.textContent = notificationActorLabel(notification);
+                message.append(actorLink, document.createTextNode(suffix));
+            }
+        }
+        content.appendChild(message);
+
+        if (
+            notification.target?.kind === 'post' &&
+            typeof notification.targetPost?.content === 'string'
+        ) {
+            const postPreview = notification.targetPost.content
+                .replace(/[\r\n]+/g, ' ')
+                .replace(/\s+/g, ' ')
+                .trim();
+            if (postPreview) {
+                const preview = document.createElement('div');
+                preview.className = 'notification-target-post';
+                preview.textContent = postPreview;
+                preview.title = postPreview;
+                content.appendChild(preview);
+            }
+        }
     }
 
     // 通知タイプごとの遷移先ハッシュを決めるハンドラ。target(サーバー指定)より優先して
@@ -1479,7 +1602,36 @@ export function initApp() {
         return '#notifications';
     }
 
-    function formatPostContent(text, userCache = new Map()) {
+    function formatPostContent(
+        text,
+        userCache = new Map(),
+        { allowMarkdown = false, editorSyntax = false } = {},
+    ) {
+        const renderSyntax = (syntax) =>
+            editorSyntax
+                ? `<span class="markdown-syntax">${escapeHTML(syntax)}</span>`
+                : '';
+        const createCustomEmojiMarkup = (emojiId) => {
+            const image = `<img src="/emoji/${encodeURIComponent(emojiId)}.svg" alt="_${emojiId}_" data-emoji-id="${emojiId}" style="height: 1.2em; vertical-align: -0.2em; margin: 0 0.05em;" class="nyaitter-emoji">`;
+            return editorSyntax
+                ? `${renderSyntax('_')}${image}${renderSyntax('_')}`
+                : image;
+        };
+        const replaceCustomEmoji = (value) => {
+            let processed = value;
+            for (const emojiId of customEmojiIds) {
+                const escapedId = emojiId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                const emojiPattern = new RegExp(
+                    `(?<![\\w-])_${escapedId}_(?![\\w-])`,
+                    'g',
+                );
+                processed = processed.replace(
+                    emojiPattern,
+                    createCustomEmojiMarkup(emojiId),
+                );
+            }
+            return processed;
+        };
         const processStandardText = (standardText) => {
             let processed = escapeHTML(standardText);
             const urls = [];
@@ -1492,10 +1644,7 @@ export function initApp() {
                 return placeholder;
             });
 
-            const emojiRegex = /(?<!\w)_([A-Za-z0-9_-]{1,80})_(?!\w)/g;
-            processed = processed.replace(emojiRegex, (match, emojiId) => {
-                return `<img src="/emoji/${encodeURIComponent(emojiId)}.svg" alt="_${emojiId}_" style="height: 1.2em; vertical-align: -0.2em; margin: 0 0.05em;" class="nyaitter-emoji">`;
-            });
+            processed = replaceCustomEmoji(processed);
 
             processed = getEmoji(processed);
 
@@ -1526,8 +1675,428 @@ export function initApp() {
             return processed.replace(/\n/g, '<br>');
         };
 
-        return processStandardText(text);
+        if (!allowMarkdown) return processStandardText(text);
+
+        return renderLimitedMarkdown(text, {
+            renderText: processStandardText,
+            renderLinkLabel: (label) =>
+                getEmoji(replaceCustomEmoji(escapeHTML(label))),
+            renderSyntax,
+            allowHeadings: !editorSyntax,
+            allowBlockquotes: !editorSyntax,
+        });
     }
+
+    const MARKDOWN_EDITOR_LINE_ANCHOR = '\u200B';
+
+    function isMarkdownEditorEmptyParagraph(node) {
+        if (
+            node?.nodeType !== Node.ELEMENT_NODE ||
+            !['P', 'DIV'].includes(node.tagName)
+        ) {
+            return false;
+        }
+        const children = Array.from(node.childNodes);
+        return (
+            children.some(
+                (child) =>
+                    child.nodeType === Node.ELEMENT_NODE &&
+                    child.tagName === 'BR',
+            ) &&
+            children.every(
+                (child) =>
+                    (child.nodeType === Node.ELEMENT_NODE &&
+                        child.tagName === 'BR') ||
+                    (child.nodeType === Node.TEXT_NODE &&
+                        child.data.replaceAll(
+                            MARKDOWN_EDITOR_LINE_ANCHOR,
+                            '',
+                        ).length === 0),
+            )
+        );
+    }
+
+    function markdownEditorNodeToText(node) {
+        if (node.nodeType === Node.TEXT_NODE)
+            return node.data.replaceAll(MARKDOWN_EDITOR_LINE_ANCHOR, '');
+        if (node.nodeType !== Node.ELEMENT_NODE) return '';
+        const element = node;
+        if (element.tagName === 'BR') return '\n';
+        if (
+            element.matches('img.nyaitter-emoji[data-emoji-id]')
+        ) {
+            return element.dataset.emojiId || '';
+        }
+
+        const children = Array.from(element.childNodes);
+        const content = children.map(markdownEditorNodeToText).join('');
+        if (isMarkdownEditorEmptyParagraph(element)) return '';
+        if (element.tagName === 'DIV' || element.tagName === 'P') {
+            return content;
+        }
+        if (element.tagName === 'LI') return `${content}\n`;
+        return content;
+    }
+
+    function markdownEditorNodesToText(nodes, { trimTrailing = true } = {}) {
+        const sourceNodes = Array.from(nodes);
+        const isEditorEmptyLineNode = (node) =>
+            isMarkdownEditorEmptyParagraph(node) ||
+            (node.nodeType === Node.ELEMENT_NODE && node.tagName === 'BR') ||
+            (node.nodeType === Node.TEXT_NODE &&
+                node.data.replaceAll(MARKDOWN_EDITOR_LINE_ANCHOR, '').length ===
+                    0);
+        // 全選択削除後にブラウザが残す空段落・BRは、入力値ではなく
+        // キャレットを置くためのDOMなので送信用Markdownには含めない。
+        if (
+            sourceNodes.length > 0 &&
+            sourceNodes.every(isEditorEmptyLineNode)
+        ) {
+            return '';
+        }
+        let value = '';
+        sourceNodes.forEach((node, index) => {
+            const previousNode = sourceNodes[index - 1];
+            const nodeValue = markdownEditorNodeToText(node);
+            const isStandaloneBreak =
+                node.nodeType === Node.ELEMENT_NODE && node.tagName === 'BR';
+            if (index > 0) {
+                const previousWasEmpty = isMarkdownEditorEmptyParagraph(
+                    previousNode,
+                );
+                const browserTrailingCaretBreak =
+                    isStandaloneBreak &&
+                    index === sourceNodes.length - 1 &&
+                    value.endsWith('\n');
+                // ブロック間には通常改行を補う。連続する空段落も実際の
+                // 連続改行なので、各段落境界を一つの改行として保持する。
+                // 末尾キャレットだけのBRは追加の改行として数えない。
+                if (
+                    !browserTrailingCaretBreak &&
+                    !(value.endsWith('\n') && !previousWasEmpty)
+                ) {
+                    value += '\n';
+                }
+            }
+            if (
+                !(
+                    isStandaloneBreak &&
+                    index === sourceNodes.length - 1 &&
+                    value.endsWith('\n')
+                )
+            ) {
+                value += nodeValue;
+            }
+        });
+        value = value.replace(/\r/g, '');
+        if (trimTrailing) value = value.replace(/\n+$/, '');
+        return value;
+    }
+
+    function getMarkdownEditorValue(editor) {
+        if (!editor) return '';
+        return markdownEditorNodesToText(editor.childNodes, {
+            trimTrailing: false,
+        });
+    }
+
+    function getEditorSelection(editor) {
+        const selection = window.getSelection();
+        if (!selection?.rangeCount) return null;
+        const range = selection.getRangeAt(0);
+        return editor.contains(range.commonAncestorContainer) ? range : null;
+    }
+
+    function getEditorSelectionOffsets(editor, source) {
+        const selection = getEditorSelection(editor);
+        if (!selection) return null;
+        const getOffset = (container, offset) => {
+            const range = document.createRange();
+            range.selectNodeContents(editor);
+            range.setEnd(container, offset);
+            return Math.min(
+                markdownEditorNodesToText(range.cloneContents().childNodes, {
+                    trimTrailing: false,
+                }).length,
+                source.length,
+            );
+        };
+        const start = getOffset(selection.startContainer, selection.startOffset);
+        const end = getOffset(selection.endContainer, selection.endOffset);
+        return { start, end };
+    }
+
+    function restoreEditorSelection(editor, markerStart, markerEnd) {
+        const replaceMarker = (marker, className) => {
+            const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT);
+            let textNode;
+            while ((textNode = walker.nextNode())) {
+                const index = textNode.data.indexOf(marker);
+                if (index === -1) continue;
+                const trailingNode = textNode.splitText(index);
+                trailingNode.data = trailingNode.data.slice(marker.length);
+                const markerElement = document.createElement('span');
+                markerElement.className = className;
+                markerElement.setAttribute('aria-hidden', 'true');
+                trailingNode.parentNode.insertBefore(markerElement, trailingNode);
+                return markerElement;
+            }
+            return null;
+        };
+        const getPosition = (markerElement, after = false) => ({
+            parent: markerElement.parentNode,
+            offset:
+                Array.prototype.indexOf.call(
+                    markerElement.parentNode.childNodes,
+                    markerElement,
+                ) + (after ? 1 : 0),
+        });
+        const ensureEditableLine = (parent) => {
+            const hasOnlyEmptyText = Array.from(parent?.childNodes || []).every(
+                (node) =>
+                    node.nodeType === Node.TEXT_NODE && node.data.length === 0,
+            );
+            if (parent?.tagName === 'P' && hasOnlyEmptyText) {
+                parent.replaceChildren(document.createElement('br'));
+            }
+        };
+
+        const start = replaceMarker(markerStart, 'markdown-editor-selection-marker');
+        const end = replaceMarker(markerEnd, 'markdown-editor-selection-marker');
+        if (!start) return;
+
+        const startPosition = getPosition(start, true);
+        const endPosition = end ? getPosition(end) : startPosition;
+        const sameParent = startPosition.parent === endPosition.parent;
+        const startsBeforeEnd =
+            sameParent && startPosition.offset <= endPosition.offset;
+        end?.remove();
+        start.remove();
+        if (sameParent && startsBeforeEnd && end) endPosition.offset -= 1;
+        startPosition.offset -= 1;
+        ensureEditableLine(startPosition.parent);
+        ensureEditableLine(endPosition.parent);
+
+        const normalizePosition = ({ parent, offset }) => {
+            const safeParent = parent?.isConnected ? parent : editor;
+            return {
+                parent: safeParent,
+                offset: Math.max(
+                    0,
+                    Math.min(offset, safeParent.childNodes.length),
+                ),
+            };
+        };
+        const safeStart = normalizePosition(startPosition);
+        const safeEnd = normalizePosition(endPosition);
+        const selection = window.getSelection();
+        const range = document.createRange();
+        try {
+            range.setStart(safeStart.parent, safeStart.offset);
+            range.setEnd(safeEnd.parent, safeEnd.offset);
+        } catch {
+            range.selectNodeContents(editor);
+            range.collapse(false);
+        }
+        selection?.removeAllRanges();
+        selection?.addRange(range);
+    }
+
+    function ensureMarkdownEditorTrailingLine(editor, source) {
+        if (!source.endsWith('\n')) return;
+        const line = editor.lastElementChild;
+        if (!line || isMarkdownEditorEmptyParagraph(line)) return;
+        const endsWithBreak =
+            line.lastElementChild?.tagName === 'BR' ||
+            line.lastChild?.nodeName === 'BR';
+        if (!endsWithBreak) return;
+        const trailingLine = document.createElement('p');
+        trailingLine.className = 'markdown-empty-line';
+        trailingLine.append(document.createElement('br'));
+        editor.append(trailingLine);
+    }
+
+    function restoreMarkdownEditorTrailingLineCaret(editor) {
+        const line = editor.lastElementChild;
+        if (!isMarkdownEditorEmptyParagraph(line)) return;
+        // Markdown描画が出力する末尾の空段落を、そのままキャレット用の
+        // 空行として再利用する。新しい段落を追加しないため空行は増殖しない。
+        line.classList.add('markdown-empty-line');
+        const range = document.createRange();
+        range.selectNodeContents(line);
+        range.collapse(false);
+        const selection = window.getSelection();
+        selection?.removeAllRanges();
+        selection?.addRange(range);
+    }
+
+    function attachMarkdownContentEditor(editor) {
+        if (!editor || editor.dataset.markdownContentEditor === 'true') return;
+        editor.dataset.markdownContentEditor = 'true';
+        editor.setAttribute('contenteditable', 'true');
+        editor.setAttribute('role', 'textbox');
+        editor.setAttribute('aria-multiline', 'true');
+        editor.setAttribute('spellcheck', 'true');
+
+        let composing = false;
+        const createMarker = () =>
+            `\uE000${Date.now().toString(36)}${Math.random().toString(36).slice(2)}\uE001`;
+        const render = ({ preserveSelection = false } = {}) => {
+            const source = getMarkdownEditorValue(editor);
+            const markerStart = createMarker();
+            const markerEnd = createMarker();
+            let sourceWithMarkers = source;
+            let restoreTrailingLineCaret = false;
+            if (preserveSelection) {
+                const offsets = getEditorSelectionOffsets(editor, source);
+                if (offsets) {
+                    // ブラウザは末尾空行のキャレットを、最後のBRの直後
+                    // （内部文字列上は末尾改行の一つ手前）へ置くことがある。
+                    // その位置も末尾空行として復元する。
+                    restoreTrailingLineCaret =
+                        source.endsWith('\n') &&
+                        offsets.start === offsets.end &&
+                        offsets.end >= source.length - 1;
+                    sourceWithMarkers =
+                        source.slice(0, offsets.end) +
+                        markerEnd +
+                        source.slice(offsets.end);
+                    sourceWithMarkers =
+                        sourceWithMarkers.slice(0, offsets.start) +
+                        markerStart +
+                        sourceWithMarkers.slice(offsets.start);
+                }
+            }
+
+            const maxLength = Number(editor.dataset.maxlength || 0);
+            const cleanSource = sourceWithMarkers
+                .replaceAll(markerStart, '')
+                .replaceAll(markerEnd, '');
+            if (maxLength > 0 && cleanSource.length > maxLength) {
+                editor.innerHTML = formatPostContent(
+                    cleanSource.slice(0, maxLength),
+                    getAllUsersCache(),
+                    { allowMarkdown: true, editorSyntax: true },
+                );
+                const limitedSource = cleanSource.slice(0, maxLength);
+                editor.dataset.markdownSource = limitedSource;
+                return;
+            }
+
+            editor.innerHTML = cleanSource
+                ? formatPostContent(sourceWithMarkers, getAllUsersCache(), {
+                      allowMarkdown: true,
+                      editorSyntax: true,
+                  })
+                : '';
+            editor.dataset.markdownSource = cleanSource;
+            ensureMarkdownEditorTrailingLine(editor, cleanSource);
+            if (preserveSelection && sourceWithMarkers !== cleanSource) {
+                restoreEditorSelection(editor, markerStart, markerEnd);
+            }
+            if (restoreTrailingLineCaret) {
+                restoreMarkdownEditorTrailingLineCaret(editor);
+            }
+        };
+
+        const renderAfterInput = () => {
+            if (composing) {
+                editor.dataset.markdownSource = getMarkdownEditorValue(editor);
+                return;
+            }
+            requestAnimationFrame(() => render({ preserveSelection: true }));
+        };
+
+        editor.addEventListener('input', renderAfterInput);
+        editor.addEventListener('compositionstart', () => {
+            composing = true;
+        });
+        editor.addEventListener('compositionend', () => {
+            composing = false;
+            requestAnimationFrame(() => render({ preserveSelection: true }));
+        });
+        editor.addEventListener('paste', (event) => {
+            const text = event.clipboardData?.getData('text/plain');
+            if (text === undefined) return;
+            event.preventDefault();
+            insertMarkdownEditorText(editor, text);
+        });
+        void custom_emoji.then(() => render());
+        render();
+    }
+
+    function setMarkdownEditorValue(editor, value, { focus = false } = {}) {
+        if (!editor) return;
+        editor.textContent = String(value || '');
+        if (focus) editor.focus();
+        editor.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+
+    function insertMarkdownEditorText(editor, value) {
+        if (!editor || !value) return;
+        editor.focus();
+        const selectionRange = getEditorSelection(editor);
+        if (!selectionRange) {
+            editor.append(document.createTextNode(value));
+        } else {
+            selectionRange.deleteContents();
+            const textNode = document.createTextNode(value);
+            selectionRange.insertNode(textNode);
+            const range = document.createRange();
+            range.setStartAfter(textNode);
+            range.collapse(true);
+            const nativeSelection = window.getSelection();
+            nativeSelection?.removeAllRanges();
+            nativeSelection?.addRange(range);
+        }
+        editor.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+
+    function toggleMarkdownSpoiler(spoiler) {
+        if (!spoiler) return;
+        const revealed = spoiler.classList.toggle('is-revealed');
+        spoiler.setAttribute('aria-expanded', String(revealed));
+        spoiler.setAttribute(
+            'aria-label',
+            revealed ? 'ネタバレを隠す' : 'ネタバレを表示',
+        );
+        spoiler
+            .querySelector('.markdown-spoiler-content')
+            ?.setAttribute('aria-hidden', String(!revealed));
+    }
+
+    document.addEventListener(
+        'click',
+        (event) => {
+            const target = event.target instanceof Element ? event.target : null;
+            const spoiler = target?.closest('.markdown-spoiler');
+            if (
+                !spoiler ||
+                target.closest('a') ||
+                spoiler.closest('.markdown-content-editor')
+            )
+                return;
+            event.stopPropagation();
+            toggleMarkdownSpoiler(spoiler);
+        },
+        true,
+    );
+
+    document.addEventListener(
+        'keydown',
+        (event) => {
+            if (event.key !== 'Enter' && event.key !== ' ') return;
+            const target = event.target instanceof Element ? event.target : null;
+            const spoiler = target?.closest('.markdown-spoiler');
+            if (spoiler?.closest('.markdown-content-editor')) return;
+            if (!spoiler) return;
+            event.preventDefault();
+            event.stopPropagation();
+            toggleMarkdownSpoiler(spoiler);
+        },
+        true,
+    );
+
     function filterBlockedPosts(posts) {
         if (!Array.isArray(posts)) return posts;
         return posts.filter((post) => {
@@ -1612,8 +2181,8 @@ export function initApp() {
 
         const picker = container.querySelector('#emoji-picker');
         const pickerButton = container.querySelector('.emoji-pic-button');
-        const textarea = container.querySelector('textarea');
-        if (!picker || !pickerButton || !textarea) return;
+        const editor = container.querySelector('[data-markdown-content-editor]');
+        if (!picker || !pickerButton || !editor) return;
 
         const emojiMart = window.EmojiMart;
         if (!emojiMart?.Picker) {
@@ -1624,33 +2193,13 @@ export function initApp() {
 
         const pickerOptions = {
             onEmojiSelect: (emoji) => {
-                const textStart = textarea.selectionStart;
-                const textEnd = textarea.selectionEnd;
-                const text = textarea.value;
-                let value;
-                if (
+                const value =
                     Array.isArray(emoji.keywords) &&
                     emoji.keywords.includes('NyaitterEmoji')
-                ) {
-                    const before = text.slice(0, textStart);
-                    const after = text.slice(textEnd);
-                    const prefix = isNotBlank(before.slice(-1)) ? ' ' : '';
-                    const suffix =
-                        isNotBlank(after.slice(0, 1)) || after.length === 0
-                            ? ' '
-                            : '';
-                    value = `${prefix}_${emoji.id}_${suffix}`;
-                } else {
-                    value = String(emoji.native || '');
-                }
+                        ? `_${emoji.id}_`
+                        : String(emoji.native || '');
                 if (!value) return;
-                textarea.value =
-                    text.slice(0, textStart) + value + text.slice(textEnd);
-                textarea.focus();
-                textarea.setSelectionRange(
-                    textStart + value.length,
-                    textStart + value.length,
-                );
+                insertMarkdownEditorText(editor, value);
                 picker.classList.add('hidden');
             },
             set: 'native',
@@ -1699,7 +2248,7 @@ export function initApp() {
                 picker.style.top = `${buttonRect.bottom + 8}px`;
             }
         });
-        textarea.addEventListener('focus', () =>
+        editor.addEventListener('focus', () =>
             picker.classList.add('hidden'),
         );
     }
@@ -1757,6 +2306,10 @@ export function initApp() {
                 await showProfileScreen(userId, subpage);
             } else if (hash.startsWith('#search/'))
                 await showSearchResults(decodeURIComponent(hash.substring(8)));
+            else if (hash.startsWith('#admin/reports/') && getCurrentUser()?.admin)
+                await showAdminReportDetailScreen(hash.substring('#admin/reports/'.length));
+            else if (hash === '#admin/reports' && getCurrentUser()?.admin)
+                await showAdminReportsScreen();
             else if (hash === '#admin/logs' && getCurrentUser()?.admin)
                 await showAdminLogsScreen();
             else if (hash.startsWith('#dm/') && getCurrentUser())
@@ -1880,6 +2433,119 @@ export function initApp() {
             .join('');
     }
 
+    function setupSidebarOverflowMenu() {
+        sidebarOverflowAbortController?.abort();
+        sidebarOverflowAbortController = new AbortController();
+        const { signal } = sidebarOverflowAbortController;
+        const sidebar = document.getElementById('left-nav');
+        sidebar?.classList.remove('sidebar-overflow-open');
+        const menu = DOM.navMenuTop;
+        const existingOverflow = menu?.querySelector('.nav-overflow-menu');
+        if (existingOverflow && menu) {
+            existingOverflow
+                .querySelectorAll(':scope > .nav-overflow-panel > a.nav-item')
+                .forEach((item) => menu.insertBefore(item, existingOverflow));
+            existingOverflow.remove();
+        }
+
+        if (window.matchMedia('(max-width: 680px)').matches) return;
+
+        const logo = DOM.navLogo;
+        const menuBottom = DOM.navMenuBottom;
+        const postButton = menu?.querySelector('.nav-item-post');
+        const menuLinks = menu
+            ? [...menu.querySelectorAll(':scope > a.nav-item')]
+            : [];
+        if (!sidebar || !menu || menuLinks.length === 0) return;
+
+        window.addEventListener('resize', () => {
+            window.clearTimeout(sidebarOverflowResizeTimer);
+            sidebarOverflowResizeTimer = window.setTimeout(setupSidebarOverflowMenu, 120);
+        }, { signal });
+
+        const availableMenuHeight = () => Math.max(
+            0,
+            sidebar.clientHeight
+                - (logo?.offsetHeight || 0)
+                - (menuBottom?.offsetHeight || 0)
+                - 24,
+        );
+        if (menu.scrollHeight <= availableMenuHeight()) return;
+
+        const overflow = document.createElement('div');
+        overflow.className = 'nav-overflow-menu';
+        overflow.innerHTML = `
+            <button type="button" class="nav-item nav-overflow-toggle" aria-expanded="false" aria-controls="nav-overflow-panel">
+                <span class="nav-item-icon-container">${ICONS.more}</span>
+                <span class="nav-item-text">その他</span>
+            </button>
+            <div id="nav-overflow-panel" class="nav-overflow-panel hidden" role="menu"></div>`;
+        const toggle = overflow.querySelector('.nav-overflow-toggle');
+        const panel = overflow.querySelector('.nav-overflow-panel');
+        menu.insertBefore(overflow, postButton || null);
+
+        const fitsInSidebar = () => menu.scrollHeight <= availableMenuHeight();
+
+        let visibleCount = menuLinks.length;
+        while (!fitsInSidebar() && visibleCount > 0) {
+            visibleCount -= 1;
+            panel.prepend(menuLinks[visibleCount]);
+        }
+
+        if (visibleCount === menuLinks.length) {
+            overflow.remove();
+            return;
+        }
+
+        const closeOverflow = () => {
+            overflow.classList.remove('is-open');
+            sidebar?.classList.remove('sidebar-overflow-open');
+            panel.classList.add('hidden');
+            toggle?.setAttribute('aria-expanded', 'false');
+        };
+        const positionOverflowPanel = () => {
+            if (!toggle || panel.classList.contains('hidden')) return;
+            const edgeMargin = 8;
+            const gap = 6;
+            const toggleRect = toggle.getBoundingClientRect();
+            const panelWidth = Math.min(240, Math.max(0, window.innerWidth - edgeMargin * 2));
+            panel.style.width = `${panelWidth}px`;
+            panel.style.maxHeight = `${Math.max(0, window.innerHeight - edgeMargin * 2)}px`;
+
+            const panelHeight = panel.offsetHeight;
+            const panelWidthAfterLayout = panel.offsetWidth;
+            let top = toggleRect.bottom + gap;
+            if (top + panelHeight > window.innerHeight - edgeMargin) {
+                top = toggleRect.top - panelHeight - gap;
+            }
+            top = Math.max(edgeMargin, Math.min(top, window.innerHeight - panelHeight - edgeMargin));
+            const left = Math.max(
+                edgeMargin,
+                Math.min(toggleRect.left, window.innerWidth - panelWidthAfterLayout - edgeMargin),
+            );
+            panel.style.top = `${top}px`;
+            panel.style.left = `${left}px`;
+        };
+        const toggleOverflow = () => {
+            const isOpen = overflow.classList.toggle('is-open');
+            sidebar?.classList.toggle('sidebar-overflow-open', isOpen);
+            panel.classList.toggle('hidden', !isOpen);
+            toggle?.setAttribute('aria-expanded', String(isOpen));
+            if (isOpen) positionOverflowPanel();
+        };
+
+        toggle?.addEventListener('click', (event) => {
+            event.stopPropagation();
+            toggleOverflow();
+        }, { signal });
+        document.addEventListener('click', (event) => {
+            if (!overflow.contains(event.target)) closeOverflow();
+        }, { signal });
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape') closeOverflow();
+        }, { signal });
+    }
+
     async function updateNavAndSidebars() {
         const hash = window.location.hash || '#';
         const menuItems = [
@@ -1921,6 +2587,13 @@ export function initApp() {
                     icon: ICONS.settings,
                 },
             );
+            if (getCurrentUser().admin) {
+                menuItems.push({
+                    name: 'リクエスト',
+                    hash: '#admin/reports',
+                    icon: ICONS.mask,
+                });
+            }
         }
 
         DOM.navLogo.innerHTML = `<a href="#" class="nav-logo-img">${ICONS.nyaitter_logo}</a>`;
@@ -1934,7 +2607,7 @@ export function initApp() {
                     isActive = hash.startsWith(item.hash);
                 }
                 return `
-	                <a href="${item.hash}" class="nav-item ${isActive ? 'active' : ''}">
+	                <a href="${item.hash}" class="nav-item ${item.hash === '#admin/reports' ? 'nav-item-request' : ''} ${isActive ? 'active' : ''}">
 	                    <div class="nav-item-icon-container">
 	                        ${item.icon}
 	                        ${item.badge && item.badge > 0 ? `<span class="notification-badge">${item.badge > 99 ? '99+' : item.badge}</span>` : ''}
@@ -1988,6 +2661,7 @@ export function initApp() {
                 AccountButton.classList.remove('hidden');
             }
         }
+        window.requestAnimationFrame(setupSidebarOverflowMenu);
         await loadRightSidebar();
     }
 
@@ -2009,7 +2683,7 @@ export function initApp() {
             router();
         });
     }
-    async function checkSession() {
+    async function checkSession({ route = true } = {}) {
         // 起動アセットの準備後は、アカウント確認の通信完了を待たずに
         // ローディング画面を表示する。確認結果に応じたrouter()が完了時に閉じる。
         showLoading(true);
@@ -2021,46 +2695,229 @@ export function initApp() {
         if (sessionError || !session) {
             setCurrentUser(null);
             unsubscribeFromChanges();
-            router();
+            if (route) router();
+            return false;
+        }
+
+        try {
+            const authUserId = session.user.id;
+
+            const { data, error } = await api
+                .from('user')
+                .select('*')
+                .eq('uuid', authUserId)
+                .single();
+
+            if (error || !data)
+                throw new Error('ユーザーデータの取得に失敗しました。');
+
+            setCurrentUser(data);
+
+            if (getCurrentUser().freeze) {
+                DOM.freezeReason.textContent = getCurrentUser().freeze;
+                DOM.freezeOverlay.classList.remove('hidden');
+                setupFreezeAppealUi();
+                await refreshFreezeAppealStatus();
+                showLoading(false);
+                return false;
+            }
+
+            // DM E2E暗号化用の鍵ペアを準備（公開鍵をサーバーに登録）。
+            void dmE2EEnsureKeyPairRegistered(getCurrentUser().id);
+
+            addAccountToList(getCurrentUser());
+            subscribeToChanges();
+            if (route) router();
+            return true;
+        } catch (error) {
+            console.error(error);
+            setCurrentUser(null);
+            DOM.connectionErrorOverlay.classList.remove('hidden');
+            return false;
+        }
+    }
+
+    function updateFreezeAppealStatus(appeal) {
+        const status = document.getElementById('freeze-appeal-status');
+        const button = document.getElementById('open-freeze-appeal-btn');
+        if (!status || !button) return;
+        if (!appeal) {
+            status.classList.add('hidden');
+            status.textContent = '';
+            button.disabled = false;
+            button.textContent = '異議申し立てを行う';
             return;
         }
+        status.textContent = appeal.status === 'assigned'
+            ? '異議申し立ては担当管理者に割り当てられ、確認中です。'
+            : '異議申し立てを受け付け、担当管理者への割当を待っています。';
+        status.classList.remove('hidden');
+        button.disabled = true;
+        button.textContent = '異議申し立てを確認中';
+    }
 
-        if (session) {
-            try {
-                const authUserId = session.user.id;
+    async function refreshFreezeAppealStatus() {
+        const { data, error } = await apiRequest('/server/api/appeals/me');
+        if (error) return;
+        updateFreezeAppealStatus(data?.appeal || null);
+    }
 
-                const { data, error } = await api
-                    .from('user')
-                    .select('*')
-                    .eq('uuid', authUserId)
-                    .single();
+    function closeFreezeAppealModal() {
+        document.getElementById('freeze-appeal-modal')?.classList.add('hidden');
+    }
 
-                if (error || !data)
-                    throw new Error('ユーザーデータの取得に失敗しました。');
+    function setupFreezeAppealUi() {
+        const openButton = document.getElementById('open-freeze-appeal-btn');
+        const modal = document.getElementById('freeze-appeal-modal');
+        const form = document.getElementById('freeze-appeal-form');
+        const description = document.getElementById('freeze-appeal-description');
+        const errorElement = document.getElementById('freeze-appeal-error');
+        if (!openButton || !modal || !form || !description) return;
 
-                setCurrentUser(data);
-
-                if (getCurrentUser().freeze) {
-                    DOM.freezeReason.textContent = getCurrentUser().freeze;
-                    DOM.freezeOverlay.classList.remove('hidden');
-                    return;
+        openButton.onclick = () => {
+            if (openButton.disabled) return;
+            form.reset();
+            errorElement?.classList.add('hidden');
+            modal.classList.remove('hidden');
+            description.focus();
+        };
+        modal.querySelectorAll('[data-action="close-freeze-appeal"]').forEach((button) => {
+            button.onclick = closeFreezeAppealModal;
+        });
+        modal.onclick = (event) => {
+            if (event.target === modal) closeFreezeAppealModal();
+        };
+        form.onsubmit = async (event) => {
+            event.preventDefault();
+            const submit = form.querySelector('button[type="submit"]');
+            submit.disabled = true;
+            errorElement?.classList.add('hidden');
+            const { data, error } = await apiRequest('/server/api/appeals', {
+                method: 'POST',
+                body: { description: description.value },
+            });
+            submit.disabled = false;
+            if (error) {
+                if (errorElement) {
+                    errorElement.textContent = error.message || String(error) || '異議申し立てを送信できませんでした。';
+                    errorElement.classList.remove('hidden');
                 }
-
-                // DM E2E暗号化用の鍵ペアを準備（公開鍵をサーバーに登録）。
-                void dmE2EEnsureKeyPairRegistered(getCurrentUser().id);
-
-                addAccountToList(getCurrentUser());
-                subscribeToChanges();
-                router();
-            } catch (error) {
-                console.error(error);
-                setCurrentUser(null);
-                DOM.connectionErrorOverlay.classList.remove('hidden');
+                return;
             }
-        } else {
-            setCurrentUser(null);
-            router();
+            closeFreezeAppealModal();
+            updateFreezeAppealStatus(data?.appeal || null);
+        };
+    }
+
+    function getPendingPushNotificationOpen() {
+        const url = new URL(window.location.href);
+        const userId = Number(url.searchParams.get('push_user_id'));
+        const notificationId = Number(
+            url.searchParams.get('push_notification_id'),
+        );
+        if (
+            !Number.isInteger(userId) || userId < 0 ||
+            !Number.isInteger(notificationId) || notificationId <= 0
+        )
+            return null;
+
+        return {
+            userId,
+            notificationId,
+            targetHash: url.hash.startsWith('#') ? url.hash : '#notifications',
+        };
+    }
+
+    function replaceCurrentLocation({ hash = window.location.hash, clearPush = false } = {}) {
+        const url = new URL(window.location.href);
+        if (clearPush) {
+            url.searchParams.delete('push_user_id');
+            url.searchParams.delete('push_notification_id');
         }
+        url.hash = hash || '#notifications';
+        window.history.replaceState(
+            window.history.state,
+            '',
+            `${url.pathname}${url.search}${url.hash}`,
+        );
+    }
+
+    async function handlePendingPushNotificationOpen() {
+        const pending = getPendingPushNotificationOpen();
+        if (!pending) return false;
+
+        // 一時パラメータを早期に消し、更新や再読み込みで同じ通知を再処理しない。
+        replaceCurrentLocation({ clearPush: true, hash: pending.targetHash });
+
+        // 先に現在のログイン状態を確定し、対象アカウントでなければ記憶済みセッションへ切り替える。
+        await checkSession({ route: false });
+        if (Number(getCurrentUser()?.id) !== pending.userId) {
+            const { error: switchError } = await apiRequest(
+                '/server/auth/accounts/switch',
+                {
+                    method: 'POST',
+                    body: { user_id: pending.userId },
+                },
+            );
+            if (switchError) {
+                console.error('プッシュ通知のアカウント切替に失敗:', switchError);
+                replaceCurrentLocation({ hash: '#' });
+                await router();
+                showAppAlert(
+                    '通知の対象アカウントへ切り替えられませんでした。ログイン状態を確認してください。',
+                );
+                return true;
+            }
+
+            setCurrentUser(null);
+            unsubscribeFromChanges();
+            const sessionReady = await checkSession({ route: false });
+            if (
+                !sessionReady ||
+                Number(getCurrentUser()?.id) !== pending.userId
+            ) {
+                replaceCurrentLocation({ hash: '#' });
+                await router();
+                showAppAlert(
+                    '通知の対象アカウントを確認できませんでした。ログイン状態を確認してください。',
+                );
+                return true;
+            }
+        }
+
+        const { data: readResult, error: readError } = await apiRequest(
+            `/server/api/notifications/${encodeURIComponent(String(pending.notificationId))}/read`,
+            { method: 'PUT' },
+        );
+        if (readError) {
+            console.error('プッシュ通知の既読化に失敗:', readError);
+            replaceCurrentLocation({ hash: '#notifications' });
+            await router();
+            showAppAlert('通知を既読にできなかったため、対象コンテンツは開きませんでした。');
+            return true;
+        }
+        if (getCurrentUser()) {
+            getCurrentUser().notification_unread_count = Number(
+                readResult?.notification_unread_count || 0,
+            );
+        }
+
+        const { error: clickedError } = await apiRequest(
+            `/server/api/notifications/${encodeURIComponent(String(pending.notificationId))}/clicked`,
+            { method: 'PUT' },
+        );
+        if (clickedError) {
+            console.error('プッシュ通知のクリック済み化に失敗:', clickedError);
+            replaceCurrentLocation({ hash: '#notifications' });
+            await router();
+            showAppAlert('通知をクリック済みにできなかったため、対象コンテンツは開きませんでした。');
+            return true;
+        }
+
+        // 既読・クリック済みの両方が成功した後にのみ対象コンテンツを描画する。
+        replaceCurrentLocation({ hash: pending.targetHash });
+        await router();
+        return true;
     }
 
     function getAccountList() {
@@ -2378,7 +3235,7 @@ export function initApp() {
 
         DOM.postModal.querySelector('.modal-close-btn').onclick =
             closePostModal;
-        modalContainer.querySelector('textarea').focus();
+        modalContainer.querySelector('#post-content').focus();
     }
     function closePostModal() {
         DOM.postModal.classList.add('hidden');
@@ -2490,8 +3347,8 @@ export function initApp() {
 	                ${isModal ? '<button class="modal-close-btn">×</button>' : ''}
 	                <div class="form-content">
 	                    <div id="reply-info" class="hidden" style="margin-bottom: 0.5rem; color: var(--secondary-text-color);"></div>
-	                    <textarea id="post-content" placeholder="いまどうしてる？" maxlength="280"></textarea>
-	                    <div class="file-preview-container"></div>
+                            <div id="post-content" class="markdown-content-editor post-content-editor" contenteditable="true" role="textbox" aria-multiline="true" spellcheck="true" data-markdown-content-editor data-maxlength="280" data-placeholder="いまどうしてる？"></div>
+                            <div class="file-preview-container"></div>
 	                    <div class="post-form-actions">
 	                        <button type="button" class="attachment-button float-left" title="ファイルを添付">
 	                            ${ICONS.attachment}
@@ -2542,9 +3399,9 @@ export function initApp() {
 		container
 			.querySelector('#post-submit-button')
             .addEventListener('click', () => handlePostSubmit(container));
-        container
-            .querySelector('textarea')
-            .addEventListener('keydown', handleCtrlEnter);
+        const editor = container.querySelector('#post-content');
+        editor.addEventListener('keydown', handleCtrlEnter);
+        attachMarkdownContentEditor(editor);
     }
 
     async function compressImage(file) {
@@ -2741,8 +3598,8 @@ export function initApp() {
 
 	async function handlePostSubmit(container) {
         if (!getCurrentUser()) return showAppAlert('ログインが必要です。');
-        const contentEl = container.querySelector('textarea');
-        const content = contentEl.value.trim();
+        const contentEl = container.querySelector('#post-content');
+        const content = getMarkdownEditorValue(contentEl).trim();
         if (!content && getSelectedFiles().length === 0 && !getQuotingPost())
             return showAppAlert('内容を入力するか、ファイルを添付してください。');
 
@@ -2835,7 +3692,7 @@ export function initApp() {
             const replyTargetId = getReplyingTo()?.id || null;
             invalidateTimelinePageCache();
             setSelectedFiles([]);
-            contentEl.value = '';
+            setMarkdownEditorValue(contentEl, '');
             container.querySelector('.file-preview-container').innerHTML = '';
             if (container.closest('.modal-overlay')) {
                 closePostModal();
@@ -2987,7 +3844,6 @@ export function initApp() {
             clampHeight = false,
         } = options;
 
-        setPOST_COUNT(getPOST_COUNT() + 1);
 
         const displayAuthor = author || post.author;
         if (!displayAuthor) return null;
@@ -3070,8 +3926,11 @@ export function initApp() {
                             getCurrentUser().admin)
                     ) {
                         const menuBtn = document.createElement('button');
+                        menuBtn.type = 'button';
                         menuBtn.className = 'post-menu-btn';
-                        menuBtn.innerHTML = '…';
+                        menuBtn.title = 'ポストメニュー';
+                        menuBtn.setAttribute('aria-label', 'ポストメニュー');
+                        menuBtn.innerHTML = ICONS.more;
                         const menu = document.createElement('div');
                         menu.className = 'post-menu';
                         const deleteBtn = document.createElement('button');
@@ -3181,10 +4040,13 @@ export function initApp() {
             postHeader.appendChild(lockIndicator);
         }
 
-        if (getCurrentUser() && !isNested) {
+        if (getCurrentUser()) {
             const menuBtn = document.createElement('button');
+            menuBtn.type = 'button';
             menuBtn.className = 'post-menu-btn';
-            menuBtn.innerHTML = '…';
+            menuBtn.title = 'ポストメニュー';
+            menuBtn.setAttribute('aria-label', 'ポストメニュー');
+            menuBtn.innerHTML = ICONS.more;
             const menu = document.createElement('div');
             menu.className = 'post-menu';
 
@@ -3192,6 +4054,22 @@ export function initApp() {
             shareBtn.className = 'share-btn';
             shareBtn.textContent = 'URLをコピー';
             menu.appendChild(shareBtn);
+
+            if (Number(getCurrentUser().id) !== Number(post.userid)) {
+                const reportBtn = document.createElement('button');
+                reportBtn.className = 'report-btn';
+                reportBtn.textContent = '報告する';
+                reportBtn.onclick = (event) => {
+                    event.stopPropagation();
+                    openReportModal({
+                        targetKind: 'post',
+                        targetId: post.id,
+                        targetLabel: 'このポスト',
+                    });
+                    menu.classList.remove('is-visible');
+                };
+                menu.appendChild(reportBtn);
+            }
 
             if (getCurrentUser().id === post.userid || getCurrentUser().admin) {
                 const pinBtn = document.createElement('button');
@@ -3234,22 +4112,26 @@ export function initApp() {
                     masktitle.innerHTML = formatPostContent(
                         post.content.split('\n')[0].slice(1),
                         userCache,
+                        { allowMarkdown: true },
                     );
                     postMain.appendChild(masktitle);
                     postContent.innerHTML = formatPostContent(
                         post.content.slice(1),
                         userCache,
+                        { allowMarkdown: true },
                     );
                 } else {
                     postContent.innerHTML = formatPostContent(
                         post.content,
                         userCache,
+                        { allowMarkdown: true },
                     );
                 }
             } else {
                 postContent.innerHTML = formatPostContent(
                     post.content,
                     userCache,
+                    { allowMarkdown: true },
                 );
             }
             postMain.appendChild(postContent);
@@ -3464,36 +4346,6 @@ export function initApp() {
         return postEl;
     }
 
-    function createAdPostHTML() {
-        const adContainer = document.createElement('div');
-        adContainer.className = 'post ad-post';
-
-        // iframeを使った広告描画用のHTML
-        adContainer.innerHTML = `
-	            <div class="user-icon-link">
-	                <img src="logo.png" class="user-icon" alt="広告アイコン">
-	            </div>
-	            <div class="post-main">
-	                <div class="post-header">
-	                    <span class="post-author">[広告]</span>
-	                </div>
-	                <div class="post-content">
-	                    <p>広告は新機能の準備のため停止中です。</p>
-	                </div>
-	            </div>
-	        `;
-
-        // 広告ポスト全体のクリックイベントを止める
-        adContainer.addEventListener(
-            'click',
-            (e) => {
-                e.stopPropagation();
-            },
-            true,
-        );
-
-        return adContainer;
-    }
 
     async function showMainScreen() {
         DOM.pageHeader.innerHTML = `<h2 id="page-title">ホーム</h2>`;
@@ -3759,7 +4611,7 @@ export function initApp() {
                 showLoading(true);
                 try {
                     const { data, error } = await api.rpc(
-                        'mark_all_notifications_as_read',
+                        'mark_all_notifications_as_clicked',
                         {
                             p_user_id: getCurrentUser().id,
                         },
@@ -3767,7 +4619,10 @@ export function initApp() {
                     if (error) throw error;
 
                     if (getCurrentUser().notice) {
-                        getCurrentUser().notice.forEach((n) => (n.read = true));
+                        getCurrentUser().notice.forEach((n) => {
+                            n.read = true;
+                            n.clicked = true;
+                        });
                     }
                     getCurrentUser().notification_unread_count = Number(
                         data?.notification_unread_count || 0,
@@ -4104,11 +4959,6 @@ export function initApp() {
                         repliesContainer.appendChild(replyNode);
                     }
 
-                    if (getPOST_COUNT() >= AdPOST_PER_POSTS) {
-                        setPOST_COUNT(0);
-                        const adPostEl = createAdPostHTML();
-                        if (adPostEl) repliesContainer.appendChild(adPostEl);
-                    }
                 }
 
                 pagination.page++;
@@ -4219,6 +5069,8 @@ export function initApp() {
                 getCurrentUser().unreadDmTotal = Number(
                     dmPayload?.unread_total || 0,
                 );
+                // メッセージ画面を開いた時点で、取得済みの未読合計をサイドメニューへ即時反映する。
+                void updateNavAndSidebars();
 
                 if (window.location.hash.startsWith('#dm/')) {
                     window.history.replaceState({ path: '#dm' }, '', '#dm');
@@ -4250,7 +5102,7 @@ export function initApp() {
                             return `
 	<div class="dm-list-item" data-action="open-dm" data-dm-id="${escapeHTML(String(dm.id))}">
 	                                <div class="dm-list-item-title"><span class="dm-list-item-unread-prefix">${titlePrefix}</span>${title}</div>
-	                                <button class="dm-manage-btn" data-action="open-dm-manage" data-dm-id="${escapeHTML(String(dm.id))}">…</button>
+	                                <button type="button" class="dm-manage-btn" title="DM管理メニュー" aria-label="DM管理メニュー" data-action="open-dm-manage" data-dm-id="${escapeHTML(String(dm.id))}">${ICONS.more}</button>
 	                            </div>
 	                        `;
                         })
@@ -4281,6 +5133,9 @@ export function initApp() {
             );
             let dmPayload = getScreenDataCache(dmConversationCacheKey);
             let error = null;
+            const usedCachedPayload = Boolean(dmPayload);
+            let cachedUnreadBefore = 0;
+            let readSucceeded = !usedCachedPayload;
             if (!dmPayload) {
                 const result = await apiRequest(
                     `/server/api/dm/${encodeURIComponent(dmId)}?mark_read=1`,
@@ -4289,11 +5144,24 @@ export function initApp() {
                 error = result.error;
                 if (!error) setScreenDataCache(dmConversationCacheKey, dmPayload);
             } else {
-                // キャッシュ復元時も、会話を開いたことによる既読化は維持する。
-                void apiRequest(
+                // キャッシュ復元時も既読化し、成功時はバッジを待たずにローカル状態へ反映する。
+                const key = String(dmId);
+                cachedUnreadBefore = Number(getDmUnreadCounts().get(key) || 0);
+                const { error: readError } = await apiRequest(
                     `/server/api/dm/${encodeURIComponent(dmId)}/read`,
                     { method: 'POST' },
                 );
+                if (readError) {
+                    console.error('DM既読化に失敗しました:', readError);
+                } else {
+                    readSucceeded = true;
+                    getDmUnreadCounts().set(key, 0);
+                    getCurrentUser().unreadDmTotal = Math.max(
+                        0,
+                        Number(getCurrentUser().unreadDmTotal || 0) - cachedUnreadBefore,
+                    );
+                    deleteScreenDataCache(getDmCacheKey('list'));
+                }
             }
             const dm = Array.isArray(dmPayload?.dm) ? dmPayload.dm[0] : null;
             for (const member of dmPayload?.members || []) {
@@ -4302,12 +5170,15 @@ export function initApp() {
             setActiveDmMemberIds(
                 Array.isArray(dm?.member) ? dm.member.map(Number) : [],
             );
-            getCurrentUser().unreadDmTotal = Number(
-                dmPayload?.unread_total || 0,
-            );
-            if (dm) {
+            if (!usedCachedPayload) {
+                getCurrentUser().unreadDmTotal = Number(
+                    dmPayload?.unread_total || 0,
+                );
+            }
+            if (dm && readSucceeded) {
                 getDmUnreadCounts().set(String(dm.id), 0);
                 deleteScreenDataCache(getDmCacheKey('list'));
+                if (!error) void updateNavAndSidebars();
             }
             if (error || !dm || !dm.member.includes(getCurrentUser().id)) {
                 DOM.pageHeader.innerHTML = `
@@ -4328,7 +5199,7 @@ export function initApp() {
 	                        <h2 id="page-title" style="font-size: 1.1rem; margin-bottom: 0;">${getEmoji(escapeHTML(dm.title))}</h2>
 	                        <small style="color: var(--secondary-text-color);">${dm.member.length}人のメンバー</small>
 	                    </div>
-	                    <button class="dm-manage-btn" style="font-size: 1.2rem;" data-action="open-dm-manage" data-dm-id="${escapeHTML(String(dm.id))}">…</button>
+	                    <button type="button" class="dm-manage-btn" title="DM管理メニュー" aria-label="DM管理メニュー" data-action="open-dm-manage" data-dm-id="${escapeHTML(String(dm.id))}">${ICONS.more}</button>
 	                </div>
 	            `;
 
@@ -4363,7 +5234,7 @@ export function initApp() {
                 posts
                     .slice()
                     .reverse()
-                    .map((msg) => renderDmMessage(msg)),
+                    .map((msg) => renderDmMessage(msg, dm.id)),
             );
             const messagesHTML = messagesHTMLArray.join('');
 
@@ -4371,8 +5242,8 @@ export function initApp() {
 	                <div class="dm-conversation-view">${messagesHTML}</div>
 	                <div class="dm-message-form">
 	                    <div class="dm-form-content">
-	                        <textarea id="dm-message-input" placeholder="メッセージを送信"></textarea>
-	                        <div class="file-preview-container dm-file-preview"></div>
+                            <div id="dm-message-input" class="markdown-content-editor dm-content-editor" contenteditable="true" role="textbox" aria-multiline="true" spellcheck="true" data-markdown-content-editor data-placeholder="メッセージを送信"></div>
+                            <div class="file-preview-container dm-file-preview"></div>
 	                    </div>
 	                    <div class="dm-form-actions">
 	                        <button id="dm-attachment-btn" class="attachment-button" title="ファイルを添付">${ICONS.attachment}</button>
@@ -4388,6 +5259,7 @@ export function initApp() {
             await flushRealtimeDmMessages(dm.id);
 
             const messageInput = document.getElementById('dm-message-input');
+            attachMarkdownContentEditor(messageInput);
             const fileInput = document.getElementById('dm-file-input');
             const previewContainer = container.querySelector(
                 '.file-preview-container',
@@ -4587,9 +5459,11 @@ export function initApp() {
                     Number(user.id) !== Number(getCurrentUser().id)
                 ) {
                     const menuButton = document.createElement('button');
+                    menuButton.type = 'button';
                     menuButton.className = 'profile-menu-button dm-button';
-                    menuButton.innerHTML = '…';
+                    menuButton.innerHTML = ICONS.more;
                     menuButton.title = '管理者メニュー';
+                    menuButton.setAttribute('aria-label', '管理者メニュー');
                     menuButton.onclick = (event) => {
                         event.stopPropagation();
                         openProfileMenu(user);
@@ -4725,8 +5599,11 @@ export function initApp() {
                     actionsContainer.appendChild(followButton);
 
                     const menuButton = document.createElement('button');
+                    menuButton.type = 'button';
                     menuButton.className = 'profile-menu-button dm-button'; // dm-buttonのスタイルを流用
-                    menuButton.innerHTML = '…';
+                    menuButton.innerHTML = ICONS.more;
+                    menuButton.title = 'プロフィールメニュー';
+                    menuButton.setAttribute('aria-label', 'プロフィールメニュー');
                     menuButton.onclick = (e) => {
                         e.stopPropagation();
                         openProfileMenu(user);
@@ -4972,6 +5849,12 @@ export function initApp() {
 	                                <label><input type="checkbox" id="setting-reject-unknown-login" ${(getCurrentUser().settings?.reject_unknown_login ?? true) ? 'checked' : ''}> 不明な場所からのログインを拒否</label>
 	                                <p class="settings-help-text">有効にすると、初めて利用するIPアドレスからのログインには、ログイン済み端末での許可が必要です。</p>
 	                            </fieldset>
+	                            <section class="settings-verification-application" aria-labelledby="settings-verification-title">
+	                                <h4 id="settings-verification-title">認証</h4>
+	                                <p class="settings-help-text">認証済みアカウントにはプロフィール上で認証バッジが表示されます。申請は担当管理者が審査します。</p>
+	                                <button type="button" id="open-verification-application-btn" class="settings-bot-secondary-button" ${getCurrentUser().verify ? 'disabled' : ''}>${getCurrentUser().verify ? '認証済み' : '認証を申請する'}</button>
+	                                <p id="verification-application-status" class="settings-help-text hidden" role="status"></p>
+	                            </section>
 	                            <section class="settings-sessions" aria-labelledby="settings-sessions-title">
 	                                <h4 id="settings-sessions-title">セッション</h4>
 	                                <p class="settings-help-text">有効なログイン端末を管理できます。IPアドレスは安全のため一部のみ表示されます。</p>
@@ -5079,6 +5962,24 @@ export function initApp() {
 	                        <section class="settings-group-panel" data-settings-panel="resources" hidden>
 	                        </section>
 	                    </form>
+	                    <div id="verification-application-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="verification-application-title">
+	                        <section class="modal-content verification-application-modal-content">
+	                            <button type="button" class="modal-close-btn" data-action="close-verification-application" aria-label="閉じる">×</button>
+	                            <div class="login-modal-heading">
+	                                <h3 id="verification-application-title">認証を申請する</h3>
+	                            </div>
+	                            <p class="settings-help-text">申請内容は担当管理者が確認します。追加の説明は必要ありません。</p>
+	                            <div class="verification-application-note">
+	                                <strong>申請について</strong>
+	                                <p>申請後は管理者への割り当てを待ちます。審査が完了すると通知でお知らせします。</p>
+	                            </div>
+	                            <p id="verification-application-error" class="login-modal-message login-modal-error hidden" role="alert"></p>
+	                            <div class="verification-application-actions">
+	                                <button type="button" class="login-secondary-button" data-action="close-verification-application">キャンセル</button>
+	                                <button type="button" id="submit-verification-application-btn" class="settings-primary-button login-auth-action">申請する</button>
+	                            </div>
+	                        </section>
+	                    </div>
 	                </div>
 	            `;
 
@@ -5249,6 +6150,71 @@ export function initApp() {
                 void loadUserBotTokens();
             }
         };
+        const verificationApplicationModal = document.getElementById('verification-application-modal');
+        const verificationApplicationButton = document.getElementById('open-verification-application-btn');
+        const verificationApplicationStatus = document.getElementById('verification-application-status');
+        const verificationApplicationError = document.getElementById('verification-application-error');
+        const verificationApplicationSubmit = document.getElementById('submit-verification-application-btn');
+        const closeVerificationApplicationModal = () => verificationApplicationModal?.classList.add('hidden');
+        const updateVerificationApplicationStatus = (application) => {
+            if (!verificationApplicationButton || !verificationApplicationStatus) return;
+            if (getCurrentUser().verify) {
+                verificationApplicationButton.disabled = true;
+                verificationApplicationButton.textContent = '認証済み';
+                verificationApplicationStatus.classList.add('hidden');
+                return;
+            }
+            if (!application) {
+                verificationApplicationButton.disabled = false;
+                verificationApplicationButton.textContent = '認証を申請する';
+                verificationApplicationStatus.classList.add('hidden');
+                verificationApplicationStatus.textContent = '';
+                return;
+            }
+            verificationApplicationButton.disabled = true;
+            verificationApplicationButton.textContent = '認証申請を確認中';
+            verificationApplicationStatus.textContent = application.status === 'assigned'
+                ? '認証申請は担当管理者に割り当てられ、確認中です。'
+                : '認証申請を受け付け、担当管理者への割当を待っています。';
+            verificationApplicationStatus.classList.remove('hidden');
+        };
+        const refreshVerificationApplicationStatus = async () => {
+            if (getCurrentUser().verify) return updateVerificationApplicationStatus(null);
+            const { data, error } = await apiRequest('/server/api/verification-applications/me');
+            if (!error) updateVerificationApplicationStatus(data?.application || null);
+        };
+        verificationApplicationButton?.addEventListener('click', () => {
+            if (!verificationApplicationButton.disabled) {
+                verificationApplicationError?.classList.add('hidden');
+                verificationApplicationModal?.classList.remove('hidden');
+            }
+        });
+        verificationApplicationModal?.querySelectorAll('[data-action="close-verification-application"]').forEach((button) => {
+            button.addEventListener('click', closeVerificationApplicationModal);
+        });
+        verificationApplicationModal?.addEventListener('click', (event) => {
+            if (event.target === verificationApplicationModal) closeVerificationApplicationModal();
+        });
+        verificationApplicationSubmit?.addEventListener('click', async () => {
+            verificationApplicationSubmit.disabled = true;
+            verificationApplicationError?.classList.add('hidden');
+            const { data, error } = await apiRequest('/server/api/verification-applications', {
+                method: 'POST',
+                body: {},
+            });
+            verificationApplicationSubmit.disabled = false;
+            if (error) {
+                if (verificationApplicationError) {
+                    verificationApplicationError.textContent = error.message || '認証申請を送信できませんでした。';
+                    verificationApplicationError.classList.remove('hidden');
+                }
+                return;
+            }
+            closeVerificationApplicationModal();
+            updateVerificationApplicationStatus(data?.application || null);
+        });
+        void refreshVerificationApplicationStatus();
+
         const dangerZone = document.querySelector('.settings-danger-zone');
 
         let dangerZoneHTML = `
@@ -5717,6 +6683,268 @@ export function initApp() {
         showLoading(false);
     }
 
+    function formatModerationDate(value) {
+        if (!value) return '日時不明';
+        const date = new Date(value);
+        return Number.isNaN(date.getTime()) ? '日時不明' : date.toLocaleString('ja-JP');
+    }
+
+    function moderationTargetLabel(kind) {
+        return ({ user: 'ユーザー', post: 'ポスト', dm: 'DM' })[kind] || 'コンテンツ';
+    }
+
+    function moderationEvidenceText(value) {
+        if (typeof value === 'string') return escapeHTML(value);
+        try { return escapeHTML(JSON.stringify(value, null, 2)); } catch (_) { return '表示できません'; }
+    }
+
+    function renderModerationSubject(user) {
+        if (!user) return '<p class="moderation-help-text">対象ユーザーの証跡はありません。</p>';
+        return `<div class="moderation-content-evidence"><strong>${escapeHTML(user.name || '名称未設定')}</strong><br><span class="moderation-help-text">@${escapeHTML(user.scid || user.handle || String(user.id))}</span></div>`;
+    }
+
+    async function showAdminReportsScreen() {
+        DOM.pageHeader.innerHTML = `
+            <div class="header-with-back-button">
+                <button class="header-back-btn" data-action="history-back">${ICONS.back}</button>
+                <h2 id="page-title">リクエスト</h2>
+            </div>`;
+        showScreen('admin-reports-screen');
+        const contentDiv = document.getElementById('admin-reports-content');
+        contentDiv.innerHTML = '<div class="admin-reports-container"><div class="spinner"></div></div>';
+        try {
+            const { data, error } = await apiRequest('/server/api/reports/assigned');
+            if (error) throw error;
+            const reports = Array.isArray(data?.reports) ? data.reports : [];
+            if (reports.length === 0) {
+                contentDiv.innerHTML = '<div class="admin-reports-container"><p class="moderation-help-text">現在、あなたに割り当てられているリクエストはありません。</p></div>';
+                return;
+            }
+            contentDiv.innerHTML = `
+                <div class="admin-reports-container">
+                    <div class="admin-reports-list">
+                        ${reports.map((report) => `
+                            <button type="button" class="moderation-report-card" data-action="open-admin-report" data-report-id="${Number(report.id)}">
+                                <strong>${report.assignment_type === 'freeze_appeal' ? '凍結異議申し立て' : report.assignment_type === 'verification_application' ? '認証申請' : `${moderationTargetLabel(report.target_kind)}の報告`}</strong>
+                                <div class="moderation-report-meta">
+                                    <span>割当: ${escapeHTML(formatModerationDate(report.assigned_at))}</span>
+                                    <span>リクエストID: ${Number(report.id)}</span>
+                                </div>
+                                <p>${escapeHTML(report.description || '説明は添付されていません。')}</p>
+                            </button>
+                        `).join('')}
+                    </div>
+                </div>`;
+        } catch (error) {
+            console.error('リクエスト一覧の取得に失敗:', error);
+            contentDiv.innerHTML = '<div class="admin-reports-container"><p class="error-message">リクエスト一覧の取得に失敗しました。</p></div>';
+        } finally {
+            showLoading(false);
+        }
+    }
+
+    async function showAdminReportDetailScreen(reportId) {
+        const normalizedReportId = Number(reportId);
+        if (!Number.isInteger(normalizedReportId) || normalizedReportId < 1) {
+            window.location.hash = '#admin/reports';
+            return;
+        }
+        DOM.pageHeader.innerHTML = `
+            <div class="header-with-back-button">
+                <button class="header-back-btn" data-action="history-back">${ICONS.back}</button>
+                <h2 id="page-title">報告を確認</h2>
+            </div>`;
+        showScreen('admin-reports-screen');
+        const contentDiv = document.getElementById('admin-reports-content');
+        contentDiv.innerHTML = '<div class="admin-reports-container"><div class="spinner"></div></div>';
+        try {
+            const { data, error } = await apiRequest(`/server/api/reports/${normalizedReportId}`);
+            if (error) throw error;
+            const report = data?.report;
+            if (!report) throw new Error('報告が見つかりません');
+            const snapshot = report.target_snapshot || {};
+            if (report.assignment_type === 'verification_application') {
+                DOM.pageHeader.querySelector('#page-title').textContent = '認証申請を確認';
+                contentDiv.innerHTML = `
+                    <div class="moderation-review-layout">
+                        <section class="moderation-review-section">
+                            <h3>申請者</h3>
+                            ${renderModerationSubject(snapshot.subjectUser)}
+                        </section>
+                        <section class="moderation-review-section">
+                            <h3>判断</h3>
+                            <p class="moderation-help-text">承認すると、申請者のプロフィールに認証バッジを付与します。拒否した場合、認証状態は変更されません。</p>
+                            <div class="moderation-form-actions">
+                                <button type="button" class="moderation-submit-button" data-verification-decision="approved">承認して認証する</button>
+                                <button type="button" class="delete-btn" data-verification-decision="rejected">拒否する</button>
+                            </div>
+                            <p id="verification-decision-error" class="login-modal-message login-modal-error hidden" role="alert"></p>
+                        </section>
+                    </div>`;
+                document.querySelectorAll('[data-verification-decision]').forEach((button) => {
+                    button.addEventListener('click', async () => {
+                        const decision = button.dataset.verificationDecision;
+                        if (!await showAppConfirm(decision === 'approved'
+                            ? 'この認証申請を承認し、認証バッジを付与しますか？'
+                            : 'この認証申請を拒否しますか？')) return;
+                        const errorElement = document.getElementById('verification-decision-error');
+                        document.querySelectorAll('[data-verification-decision]').forEach((item) => { item.disabled = true; });
+                        errorElement?.classList.add('hidden');
+                        const { error: decisionError } = await apiRequest(`/server/api/reports/${Number(report.id)}/verification-decision`, {
+                            method: 'POST',
+                            body: { decision },
+                        });
+                        if (decisionError) {
+                            document.querySelectorAll('[data-verification-decision]').forEach((item) => { item.disabled = false; });
+                            if (errorElement) {
+                                errorElement.textContent = decisionError.message || '認証申請を処理できませんでした。';
+                                errorElement.classList.remove('hidden');
+                            }
+                            return;
+                        }
+                        await showAppAlert(decision === 'approved' ? '認証申請を承認しました。' : '認証申請を拒否しました。');
+                        window.location.hash = '#admin/reports';
+                    });
+                });
+                return;
+            }
+            if (report.assignment_type === 'freeze_appeal') {
+                DOM.pageHeader.querySelector('#page-title').textContent = '異議申し立てを確認';
+                contentDiv.innerHTML = `
+                    <div class="moderation-review-layout">
+                        <section class="moderation-review-section">
+                            <h3>申立対象のアカウント</h3>
+                            ${renderModerationSubject(snapshot.subjectUser)}
+                        </section>
+                        <section class="moderation-review-section">
+                            <h3>現在の凍結理由</h3>
+                            <div class="moderation-content-evidence">${escapeHTML(snapshot.freezeReason || '理由は記録されていません。')}</div>
+                        </section>
+                        <section class="moderation-review-section">
+                            <h3>異議申し立ての説明</h3>
+                            <div class="moderation-content-evidence">${escapeHTML(report.description || '説明は添付されていません。')}</div>
+                        </section>
+                        <section class="moderation-review-section">
+                            <h3>判断</h3>
+                            <p class="moderation-help-text">承認すると直ちにアカウントの凍結を解除します。拒否した場合、凍結状態は維持されます。</p>
+                            <div class="moderation-form-actions" id="appeal-decision-actions">
+                                <button type="button" class="moderation-submit-button" data-appeal-decision="approved">承認して凍結を解除</button>
+                                <button type="button" class="delete-btn" data-appeal-decision="rejected">拒否する</button>
+                            </div>
+                            <p id="appeal-decision-error" class="login-modal-message login-modal-error hidden" role="alert"></p>
+                        </section>
+                    </div>`;
+                document.querySelectorAll('[data-appeal-decision]').forEach((button) => {
+                    button.addEventListener('click', async () => {
+                        const decision = button.dataset.appealDecision;
+                        if (!await showAppConfirm(decision === 'approved'
+                            ? 'この異議申し立てを承認し、アカウントの凍結を解除しますか？'
+                            : 'この異議申し立てを拒否しますか？')) return;
+                        const errorElement = document.getElementById('appeal-decision-error');
+                        document.querySelectorAll('[data-appeal-decision]').forEach((item) => { item.disabled = true; });
+                        errorElement?.classList.add('hidden');
+                        const { error: decisionError } = await apiRequest(`/server/api/reports/${Number(report.id)}/appeal-decision`, {
+                            method: 'POST',
+                            body: { decision },
+                        });
+                        if (decisionError) {
+                            document.querySelectorAll('[data-appeal-decision]').forEach((item) => { item.disabled = false; });
+                            if (errorElement) {
+                                errorElement.textContent = decisionError.message || '異議申し立てを処理できませんでした。';
+                                errorElement.classList.remove('hidden');
+                            }
+                            return;
+                        }
+                        await showAppAlert(decision === 'approved' ? '異議申し立てを承認し、凍結を解除しました。' : '異議申し立てを拒否しました。');
+                        window.location.hash = '#admin/reports';
+                    });
+                });
+                return;
+            }
+            const targetUsers = snapshot.subjectUser
+                ? [snapshot.subjectUser]
+                : (snapshot.dm?.members || []);
+            const selectableUsers = targetUsers.filter((user) => Number.isInteger(Number(user?.id)));
+            const targetOptions = selectableUsers.map((user) => (
+                `<option value="${Number(user.id)}">${escapeHTML(user.name || `@${user.id}`)} (@${escapeHTML(user.scid || user.handle || user.id)})</option>`
+            )).join('');
+            const dmEvidence = (snapshot.dm?.recentMessages || [])
+                .map((message) => `<div class="moderation-message-evidence">${moderationEvidenceText(message?.content || (message?.e2e ? '🔒 エンドツーエンド暗号化されたメッセージ' : message))}</div>`)
+                .join('') || 'メッセージ証跡はありません。';
+            const evidence = report.target_kind === 'post'
+                ? `<div class="moderation-review-section"><h3>報告されたポスト</h3>${renderModerationSubject(snapshot.subjectUser)}<div class="moderation-content-evidence">${moderationEvidenceText(snapshot.post?.content || '')}</div></div>`
+                : report.target_kind === 'dm_message'
+                    ? `<div class="moderation-review-section"><h3>報告されたDMメッセージ</h3>${renderModerationSubject(snapshot.subjectUser)}<div class="moderation-content-evidence">${moderationEvidenceText(snapshot.message?.content || (snapshot.message?.e2e ? '🔒 エンドツーエンド暗号化されたメッセージ' : '本文は記録されていません。'))}</div><p class="moderation-help-text">会話の前後関係として、サーバーに保存された直近${(snapshot.dm?.recentMessages || []).length}件のメッセージを表示します。</p><div class="moderation-content-evidence">${dmEvidence}</div></div>`
+                    : report.target_kind === 'dm'
+                        ? `<div class="moderation-review-section"><h3>報告されたDM</h3><p class="moderation-help-text">サーバーに保存された直近${(snapshot.dm?.recentMessages || []).length}件のメッセージです。エンドツーエンド暗号化された本文は暗号文のまま表示されます。</p><div class="moderation-content-evidence">${dmEvidence}</div></div>`
+                        : `<div class="moderation-review-section"><h3>報告されたユーザー</h3>${renderModerationSubject(snapshot.subjectUser)}</div>`;
+            contentDiv.innerHTML = `
+                <div class="moderation-review-layout">
+                    <section class="moderation-review-section">
+                        <h3>報告理由</h3>
+                        <div class="moderation-content-evidence">${escapeHTML(report.description || '説明は添付されていません。')}</div>
+                    </section>
+                    ${evidence}
+                    <section class="moderation-review-section">
+                        <h3>対応</h3>
+                        <p class="moderation-help-text">報告者の情報は表示されません。何も選択せずに完了すると、対応なしとして報告者へ通知します。</p>
+                        <form id="moderation-resolution-form" data-report-id="${Number(report.id)}" data-target-kind="${escapeHTML(report.target_kind)}">
+                            ${selectableUsers.length > 0 ? `<div class="moderation-action-field"><label for="moderation-target-user">対応対象ユーザー</label><select id="moderation-target-user" class="moderation-target-select"><option value="">選択してください</option>${targetOptions}</select></div>` : ''}
+                            <div class="moderation-action-grid">
+                                ${report.target_kind === 'post' ? '<label><input id="moderation-delete-post" type="checkbox"> 該当ポストを削除</label>' : ''}
+                                <label><input id="moderation-search-exclude" type="checkbox"> 検索から除外</label>
+                                <label><input id="moderation-freeze" type="checkbox"> アカウントを凍結</label>
+                            </div>
+                            <div class="moderation-action-field"><label for="moderation-freeze-reason">凍結理由</label><input id="moderation-freeze-reason" class="moderation-target-select" type="text" maxlength="2000" placeholder="凍結する場合のみ入力"></div>
+                            <div class="moderation-action-field"><label for="moderation-notice">対象ユーザーへの通知</label><textarea id="moderation-notice" class="moderation-textarea" maxlength="2000" rows="4" placeholder="任意の通知本文"></textarea></div>
+                            <div class="moderation-form-actions"><button type="submit" class="moderation-submit-button">対応を完了する</button></div>
+                            <p id="moderation-resolution-error" class="login-modal-message login-modal-error hidden" role="alert"></p>
+                        </form>
+                    </section>
+                </div>`;
+            const form = document.getElementById('moderation-resolution-form');
+            form?.addEventListener('submit', async (event) => {
+                event.preventDefault();
+                const errorElement = document.getElementById('moderation-resolution-error');
+                const targetUserId = document.getElementById('moderation-target-user')?.value || null;
+                const actions = {
+                    deletePost: Boolean(document.getElementById('moderation-delete-post')?.checked),
+                    searchExclude: Boolean(document.getElementById('moderation-search-exclude')?.checked),
+                    freeze: Boolean(document.getElementById('moderation-freeze')?.checked),
+                    freezeReason: document.getElementById('moderation-freeze-reason')?.value || '',
+                    notice: document.getElementById('moderation-notice')?.value || '',
+                    targetUserId: targetUserId ? Number(targetUserId) : null,
+                };
+                const requiresTarget = actions.searchExclude || actions.freeze || actions.notice.trim();
+                if (requiresTarget && !actions.targetUserId) {
+                    errorElement.textContent = '対応対象ユーザーを選択してください。';
+                    errorElement.classList.remove('hidden');
+                    return;
+                }
+                const submit = form.querySelector('button[type="submit"]');
+                submit.disabled = true;
+                errorElement.classList.add('hidden');
+                const { error: resolveError } = await apiRequest(`/server/api/reports/${Number(report.id)}/resolve`, {
+                    method: 'POST',
+                    body: { actions },
+                });
+                submit.disabled = false;
+                if (resolveError) {
+                    errorElement.textContent = resolveError.message || '対応を完了できませんでした。';
+                    errorElement.classList.remove('hidden');
+                    return;
+                }
+                await showAppAlert('報告への対応を完了しました。');
+                window.location.hash = '#admin/reports';
+            });
+        } catch (error) {
+            console.error('報告詳細の取得に失敗:', error);
+            contentDiv.innerHTML = '<div class="admin-reports-container"><p class="error-message">報告詳細の取得に失敗しました。</p></div>';
+        } finally {
+            showLoading(false);
+        }
+    }
+
     async function showAdminLogsScreen() {
         DOM.pageHeader.innerHTML = `
 	            <div class="header-with-back-button">
@@ -6112,11 +7340,6 @@ export function initApp() {
                             clampHeight: true,
                         });
                         if (postEl) currentTrigger.before(postEl);
-                        if (getPOST_COUNT() >= AdPOST_PER_POSTS) {
-                            setPOST_COUNT(0);
-                            const adPostEl = createAdPostHTML();
-                            if (adPostEl) currentTrigger.before(adPostEl);
-                        }
                     }
                 }
 
@@ -6837,8 +8060,8 @@ export function initApp() {
 	                    <img src="${getUserIconUrl(getCurrentUser())}" class="user-icon" alt="your icon">
 	                    <button class="modal-close-btn">×</button>
 	                    <div class="form-content">
-	                        <textarea id="edit-post-textarea" class="post-form-textarea">${escapeHTML(String(post.content || ''))}</textarea>
-	                        <div class="file-preview-container" style="display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 1rem;">${renderAttachments()}</div>
+	                                                <div id="edit-post-textarea" class="markdown-content-editor post-form-textarea" contenteditable="true" role="textbox" aria-multiline="true" spellcheck="true" data-markdown-content-editor>${escapeHTML(String(post.content || ''))}</div>
+                        <div class="file-preview-container" style="display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 1rem;">${renderAttachments()}</div>
 	                        <div class="post-form-actions" style="padding-top: 1rem;">
 	                            <button type="button" class="attachment-button float-left" title="ファイルを追加">${ICONS.attachment}</button>
 	                            <button type="button" class="emoji-pic-button float-left" title="絵文字を選択">${ICONS.emoji}</button>
@@ -6854,6 +8077,9 @@ export function initApp() {
 	            `;
 
             await emoji_picker_create(DOM.editPostModalContent);
+            attachMarkdownContentEditor(
+                DOM.editPostModalContent.querySelector('#edit-post-textarea'),
+            );
 
             DOM.editPostModal.querySelector('#update-post-button').onclick =
                 () =>
@@ -7297,9 +8523,9 @@ export function initApp() {
         filesToAdd,
         filesToDeleteIds,
     ) {
-        const newContent = DOM.editPostModal
-            .querySelector('#edit-post-textarea')
-            .value.trim();
+        const newContent = getMarkdownEditorValue(
+            DOM.editPostModal.querySelector('#edit-post-textarea'),
+        ).trim();
         const maskActive = DOM.editPostModal
             .querySelector('.post-mask-button')
             .classList.contains('active');
@@ -7753,8 +8979,8 @@ export function initApp() {
 	                <div class="post-form" style="padding: 1rem;">
 	                    <button class="modal-close-btn">×</button>
 	                    <div class="form-content">
-	                        <textarea id="edit-dm-textarea" style="min-height: 100px; font-size: 1rem;">${escapeHTML(String(messagePlaintext))}</textarea>
-	                        <div class="file-preview-container" style="display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 1rem;"></div>
+	                                                <div id="edit-dm-textarea" class="markdown-content-editor dm-content-editor" style="min-height: 100px; font-size: 1rem;" contenteditable="true" role="textbox" aria-multiline="true" spellcheck="true" data-markdown-content-editor>${escapeHTML(String(messagePlaintext))}</div>
+                        <div class="file-preview-container" style="display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 1rem;"></div>
 	                        <div class="post-form-actions" style="padding-top: 1rem;">
 	                            <button type="button" class="attachment-button float-left" title="ファイルを追加">${ICONS.attachment}</button>
 	                            <button type="button" class="emoji-pic-button float-left" title="絵文字を選択">${ICONS.emoji}</button>
@@ -7767,6 +8993,9 @@ export function initApp() {
 	                </div>`;
 
             await emoji_picker_create(DOM.editDmMessageModalContent);
+            attachMarkdownContentEditor(
+                DOM.editDmMessageModalContent.querySelector('#edit-dm-textarea'),
+            );
 
             updatePreview();
 
@@ -7825,9 +9054,9 @@ export function initApp() {
         filesToAdd,
         filesToDeleteIds,
     ) {
-        const newContent = DOM.editDmMessageModal
-            .querySelector('#edit-dm-textarea')
-            .value.trim();
+        const newContent = getMarkdownEditorValue(
+            DOM.editDmMessageModal.querySelector('#edit-dm-textarea'),
+        ).trim();
         const button = DOM.editDmMessageModal.querySelector(
             '#update-dm-message-button',
         );
@@ -7914,6 +9143,7 @@ export function initApp() {
             if (messageContainer) {
                 messageContainer.outerHTML = await renderDmMessage(
                     postArray[messageIndex],
+                    dmId,
                 );
             }
         } catch (e) {
@@ -8044,7 +9274,7 @@ export function initApp() {
 
     async function sendDmMessage(dmId, files = []) {
         const input = document.getElementById('dm-message-input');
-        const content = input.value.trim();
+        const content = getMarkdownEditorValue(input).trim();
         if (!content && files.length === 0) return;
         if (content.length > 2000) {
             showAppAlert('DMの内容は2000文字以下にしてください。');
@@ -8124,10 +9354,10 @@ export function initApp() {
                 throw error;
             } else {
                 invalidateDmCaches(dmId);
-                input.value = '';
+                setMarkdownEditorValue(input, '');
                 const view = document.querySelector('.dm-conversation-view');
                 if (view) {
-                    const msgHTML = await renderDmMessage(message);
+                    const msgHTML = await renderDmMessage(message, dmId);
                     view.insertAdjacentHTML('afterbegin', msgHTML);
                     setLastRenderedMessageId(message.id);
                     view.scrollTop = view.scrollHeight;
@@ -8141,6 +9371,60 @@ export function initApp() {
             sendButton.disabled = false;
             input.focus();
         }
+    }
+
+    function closeReportModal() {
+        const modal = document.getElementById('report-modal');
+        modal?.classList.add('hidden');
+    }
+
+    function openReportModal({ targetKind, targetId, targetLabel }) {
+        if (!getCurrentUser()) {
+            openLoginModal();
+            return;
+        }
+        const modal = document.getElementById('report-modal');
+        const form = document.getElementById('report-form');
+        const description = document.getElementById('report-description');
+        const target = document.getElementById('report-modal-target');
+        const errorElement = document.getElementById('report-modal-error');
+        if (!modal || !form || !description || !target) return;
+
+        form.reset();
+        errorElement?.classList.add('hidden');
+        target.textContent = `${targetLabel} を報告します。`;
+        modal.classList.remove('hidden');
+        description.focus();
+
+        modal.querySelector('.modal-close-btn').onclick = closeReportModal;
+        modal.querySelector('[data-action="close-report-modal"]').onclick = closeReportModal;
+        modal.onclick = (event) => {
+            if (event.target === modal) closeReportModal();
+        };
+        form.onsubmit = async (event) => {
+            event.preventDefault();
+            const submit = form.querySelector('button[type="submit"]');
+            submit.disabled = true;
+            errorElement?.classList.add('hidden');
+            const { error } = await apiRequest('/server/api/reports', {
+                method: 'POST',
+                body: {
+                    target_kind: targetKind,
+                    target_id: targetKind === 'dm' ? String(targetId) : Number(targetId),
+                    description: description.value,
+                },
+            });
+            submit.disabled = false;
+            if (error) {
+                if (errorElement) {
+                    errorElement.textContent = error.message || String(error) || '報告を送信できませんでした。';
+                    errorElement.classList.remove('hidden');
+                }
+                return;
+            }
+            closeReportModal();
+            await showAppAlert('報告を送信しました。ご協力ありがとうございます。');
+        };
     }
 
     function openProfileMenu(targetUser) {
@@ -8194,6 +9478,19 @@ export function initApp() {
                 }
             };
             menu.appendChild(blockBtn);
+
+            const reportBtn = document.createElement('button');
+            reportBtn.className = 'report-btn';
+            reportBtn.textContent = '報告する';
+            reportBtn.onclick = () => {
+                openReportModal({
+                    targetKind: 'user',
+                    targetId: targetUser.id,
+                    targetLabel: `ユーザー @${targetUser.scid || targetUser.id}`,
+                });
+                menu.remove();
+            };
+            menu.appendChild(reportBtn);
         }
 
         // NyaitterTeamのみのメニュー
@@ -8634,6 +9931,30 @@ export function initApp() {
             }
             return;
         }
+        const reportDmMessageButton = target.closest('.report-dm-message-btn');
+        if (reportDmMessageButton) {
+            const dmId = String(reportDmMessageButton.dataset.dmId || '').trim();
+            const messageId = String(reportDmMessageButton.dataset.messageId || '').trim();
+            if (dmId && messageId && dmId.length <= 128 && messageId.length <= 128) {
+                e.preventDefault();
+                e.stopPropagation();
+                openReportModal({
+                    targetKind: 'dm_message',
+                    targetId: `${dmId}:${messageId}`,
+                    targetLabel: 'このメッセージ',
+                });
+                reportDmMessageButton.closest('.post-menu')?.classList.remove('is-visible');
+            }
+            return;
+        }
+        if (actionTarget?.dataset.action === 'open-admin-report') {
+            const reportId = Number(actionTarget.dataset.reportId);
+            if (Number.isInteger(reportId) && reportId > 0) {
+                e.preventDefault();
+                window.location.hash = `#admin/reports/${reportId}`;
+            }
+            return;
+        }
         if (actionTarget?.dataset.action === 'open-dm') {
             const dmId = String(actionTarget.dataset.dmId || '').trim();
             if (dmId && dmId.length <= 128)
@@ -8736,17 +10057,26 @@ export function initApp() {
 
                 // ターゲットが閉じていた場合のみ開く
                 if (!isCurrentlyVisible) {
+                    if (menuButton.classList.contains('dm-message-menu-btn')) {
+                        positionDmMessageMenu(menuToToggle, menuButton);
+                    }
                     menuToToggle.classList.add('is-visible');
                 }
             }
             return; // メニュー開閉処理はここで終了
         }
         if (!target.closest('.post-menu')) {
-            document
-                .querySelectorAll('.post-menu.is-visible')
-                .forEach((menu) => {
+            const openMenus = [
+                ...document.querySelectorAll('.post-menu.is-visible'),
+            ];
+            if (openMenus.length > 0) {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+                openMenus.forEach((menu) => {
                     menu.classList.remove('is-visible');
                 });
+                return;
+            }
         }
 
         const dmEditBtn = target.closest('.edit-dm-msg-btn');
@@ -8946,5 +10276,8 @@ export function initApp() {
     DOM.freezeOverlay.classList.add('hidden');
     DOM.connectionErrorOverlay.classList.add('hidden');
     void registerPwaServiceWorker();
-    checkSession();
+    void (async () => {
+        const handledPushOpen = await handlePendingPushNotificationOpen();
+        if (!handledPushOpen) await checkSession();
+    })();
 }

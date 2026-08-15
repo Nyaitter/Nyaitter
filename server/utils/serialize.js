@@ -45,8 +45,17 @@ async function serializeNotifications(db, notifications, publicUrl = null) {
 	const fromUserIds = [...new Set(normalizedNotifications
 		.map((notification) => Number(notification.fromUserId))
 		.filter(Number.isInteger))];
-	const fromUsers = await fetchNotificationUsersByIds(db, fromUserIds);
+	const targetPostIds = [...new Set(normalizedNotifications
+		.map((notification) => (
+			notification.target?.kind === 'post' ? Number(notification.target.id) : null
+		))
+		.filter((postId) => Number.isInteger(postId) && postId > 0))];
+	const [fromUsers, targetPosts] = await Promise.all([
+		fetchNotificationUsersByIds(db, fromUserIds),
+		targetPostIds.length > 0 ? db.getPostsByIds(targetPostIds) : [],
+	]);
 	const fromUsersById = new Map(fromUsers.map((user) => [Number(user.id), user]));
+	const targetPostsById = new Map((targetPosts || []).map((post) => [Number(post.id), post]));
 
 	return normalizedNotifications.map((notification) => ({
 		id: notification.id,
@@ -58,8 +67,15 @@ async function serializeNotifications(db, notifications, publicUrl = null) {
 			publicUrl,
 		),
 		target: notification.target,
+		target_post: notification.target?.kind === 'post'
+			? (() => {
+				const post = targetPostsById.get(Number(notification.target.id));
+				return post ? { id: Number(post.id), content: String(post.content || '') } : null;
+			})()
+			: null,
 		read: notification.read,
 		clicked: notification.clicked,
+		message: notification.message || null,
 		created_at: notification.createdAt,
 	}));
 }
