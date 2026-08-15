@@ -390,21 +390,22 @@ class PostgresAdapter extends DatabaseAdapter {
 			return this._mapLoginApproval(rows[0]);
 		}
 
-	async createPost(postData) {
-		const { rows } = await this.pool.query(
-			`INSERT INTO posts (user_id, content, attachments, mask, lock, reply_to, repost_to, created_at)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-			 RETURNING *`,
-			[
-				postData.userId,
-				postData.content,
-				postData.attachments ? JSON.stringify(postData.attachments) : null,
-				!!postData.mask,
-				!!postData.lock,
-				postData.replyTo || null,
-				postData.repostTo || null
-			]
-		);
+		async createPost(postData) {
+			const { rows } = await this.pool.query(
+				`INSERT INTO posts (user_id, content, attachments, mask, lock, announcement, reply_to, repost_to, created_at)
+				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+				 RETURNING *`,
+				[
+					postData.userId,
+					postData.content,
+					postData.attachments ? JSON.stringify(postData.attachments) : null,
+					!!postData.mask,
+					!!postData.lock,
+					!!postData.announcement,
+					postData.replyTo || null,
+					postData.repostTo || null
+				]
+			);
 		return this._normalizePost(rows[0] || null);
 	}
 
@@ -677,12 +678,12 @@ class PostgresAdapter extends DatabaseAdapter {
 				}
 			} else if (tab === 'announce') {
 				if (normalizedBeforeId != null) {
-					query = `SELECT id FROM posts WHERE user_id = 2525 AND reply_to IS NULL
-						AND content LIKE '%#NXAnnounce%' AND id < $1 ORDER BY created_at DESC, id DESC LIMIT $2`;
+					query = `SELECT id FROM posts WHERE announcement = TRUE AND reply_to IS NULL
+						AND id < $1 ORDER BY created_at DESC, id DESC LIMIT $2`;
 					values = [normalizedBeforeId, normalizedLimit + 1];
 				} else {
-					query = `SELECT id FROM posts WHERE user_id = 2525 AND reply_to IS NULL
-						AND content LIKE '%#NXAnnounce%' ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2`;
+					query = `SELECT id FROM posts WHERE announcement = TRUE AND reply_to IS NULL
+						ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2`;
 					values = [normalizedLimit + 1, normalizedOffset];
 				}
 			} else if (normalizedBeforeId != null) {
@@ -701,64 +702,111 @@ class PostgresAdapter extends DatabaseAdapter {
 			};
 		}
 
-		async getRecommendedPostIds({ limit = 30, offset = 0, beforeId = null } = {}) {
+		async getRecommendedPostIds({ viewerId = null, limit = 30, offset = 0, beforeId = null } = {}) {
 			const normalizedLimit = Math.max(1, Math.min(Number(limit) || 30, 100));
 			const normalizedOffset = Math.max(0, Number(offset) || 0);
 			const normalizedBeforeId = Number.isInteger(Number(beforeId)) && Number(beforeId) > 0
 				? Number(beforeId)
 				: null;
-			const candidateLimit = Math.max(
-				500,
-				(normalizedBeforeId == null ? normalizedOffset : 0) + normalizedLimit + 1,
+			const normalizedViewerId = Number.isInteger(Number(viewerId)) ? Number(viewerId) : null;
+			const candidateLimit = Math.min(
+				1000,
+				Math.max(500, (normalizedBeforeId == null ? normalizedOffset : 0) + normalizedLimit + 1),
 			);
 			const values = [];
-			const candidateClauses = ['reply_to IS NULL'];
+			const candidateClauses = ['p.reply_to IS NULL'];
 			if (normalizedBeforeId != null) {
 				values.push(normalizedBeforeId);
-				candidateClauses.push(`id < $${values.length}`);
+				candidateClauses.push(`p.id < $${values.length}`);
 			}
 			values.push(candidateLimit);
 			const candidateLimitParam = values.length;
+			const personalScoreCtes = [];
+			if (normalizedViewerId != null) {
+				values.push(normalizedViewerId);
+				const likeViewerParam = values.length;
+				values.push(normalizedViewerId);
+				const starViewerParam = values.length;
+				values.push(normalizedViewerId);
+				const directViewerParam = values.length;
+				values.push(normalizedViewerId);
+				const secondDegreeViewerParam = values.length;
+				values.push(normalizedViewerId);
+				const secondDegreeExcludeParam = values.length;
+				personalScoreCtes.push(
+					`viewer_like_affinity AS (
+						SELECT p.user_id, COUNT(*)::int AS count
+						FROM likes l JOIN posts p ON p.id = l.post_id
+						WHERE l.user_id = $${likeViewerParam}
+						GROUP BY p.user_id
+					), viewer_star_affinity AS (
+						SELECT p.user_id, COUNT(*)::int AS count
+						FROM stars s JOIN posts p ON p.id = s.post_id
+						WHERE s.user_id = $${starViewerParam}
+						GROUP BY p.user_id
+					), direct_follows AS (
+						SELECT following_id AS user_id FROM follows WHERE follower_id = $${directViewerParam}
+					), second_degree_follows AS (
+						SELECT DISTINCT f2.following_id AS user_id
+						FROM follows f1 JOIN follows f2 ON f2.follower_id = f1.following_id
+						WHERE f1.follower_id = $${secondDegreeViewerParam}
+							AND f2.following_id <> $${secondDegreeExcludeParam}
+					)`,
+				);
+			}
 			values.push(normalizedLimit + 1);
 			const pageLimitParam = values.length;
-			let offsetSql = '';
-			if (normalizedBeforeId == null) {
-				values.push(normalizedOffset);
-				offsetSql = ` OFFSET $${values.length}`;
-			}
+			values.push(normalizedOffset);
+			const pageOffsetParam = values.length;
 			const { rows } = await this.pool.query(
-					`WITH candidates AS (
-						SELECT id, created_at FROM posts WHERE ${candidateClauses.join(' AND ')}
-						ORDER BY created_at DESC, id DESC LIMIT $${candidateLimitParam}
-					), like_counts AS (
-						SELECT l.post_id, COUNT(*)::int AS count
-						FROM likes l JOIN candidates c ON c.id = l.post_id
-						GROUP BY l.post_id
-					), star_counts AS (
-						SELECT s.post_id, COUNT(*)::int AS count
-						FROM stars s JOIN candidates c ON c.id = s.post_id
-						GROUP BY s.post_id
-					), repost_counts AS (
-						SELECT r.post_id, COUNT(*)::int AS count
-						FROM reposts r JOIN candidates c ON c.id = r.post_id
-						GROUP BY r.post_id
-					), scored AS (
-						SELECT c.id,
-							COALESCE(l.count, 0) + COALESCE(s.count, 0) * 2 + COALESCE(r.count, 0) * 3 AS score,
-							c.created_at
-						FROM candidates c
-						LEFT JOIN like_counts l ON l.post_id = c.id
-						LEFT JOIN star_counts s ON s.post_id = c.id
-						LEFT JOIN repost_counts r ON r.post_id = c.id
-					)
-					SELECT id FROM scored ORDER BY score DESC, created_at DESC, id DESC LIMIT $${pageLimitParam}${offsetSql}`,
+				`WITH candidates AS (
+					SELECT p.id, p.user_id, p.created_at
+					FROM posts p
+					WHERE ${candidateClauses.join(' AND ')}
+					ORDER BY p.created_at DESC, p.id DESC
+					LIMIT $${candidateLimitParam}
+				), like_counts AS (
+					SELECT l.post_id, COUNT(*)::int AS count
+					FROM likes l JOIN candidates c ON c.id = l.post_id
+					GROUP BY l.post_id
+				), star_counts AS (
+					SELECT s.post_id, COUNT(*)::int AS count
+					FROM stars s JOIN candidates c ON c.id = s.post_id
+					GROUP BY s.post_id
+				), repost_counts AS (
+					SELECT r.post_id, COUNT(*)::int AS count
+					FROM reposts r JOIN candidates c ON c.id = r.post_id
+					GROUP BY r.post_id
+				)${personalScoreCtes.length > 0 ? `, ${personalScoreCtes.join(', ')}` : ''}, scored AS (
+					SELECT c.id, c.created_at,
+						48.0 / (1.0 + GREATEST(0, EXTRACT(EPOCH FROM (NOW() - c.created_at)) / 3600.0) / 6.0)
+						+ LEAST(22.0,
+							COALESCE(l.count, 0) * 4.0 / (COALESCE(l.count, 0) + 4.0)
+							+ COALESCE(s.count, 0) * 8.0 / (COALESCE(s.count, 0) + 2.0)
+							+ COALESCE(r.count, 0) * 10.0 / (COALESCE(r.count, 0) + 2.0))
+						${normalizedViewerId != null ? `+ CASE WHEN df.user_id IS NOT NULL THEN 24.0 WHEN sdf.user_id IS NOT NULL THEN 10.0 ELSE 0.0 END
+						+ LEAST(20.0, COALESCE(vla.count, 0) * 4.0)
+						+ LEAST(32.0, COALESCE(vsa.count, 0) * 8.0)` : ''} AS score
+					FROM candidates c
+					LEFT JOIN like_counts l ON l.post_id = c.id
+					LEFT JOIN star_counts s ON s.post_id = c.id
+					LEFT JOIN repost_counts r ON r.post_id = c.id
+					${normalizedViewerId != null ? `LEFT JOIN viewer_like_affinity vla ON vla.user_id = c.user_id
+					LEFT JOIN viewer_star_affinity vsa ON vsa.user_id = c.user_id
+					LEFT JOIN direct_follows df ON df.user_id = c.user_id
+					LEFT JOIN second_degree_follows sdf ON sdf.user_id = c.user_id` : ''}
+				)
+				SELECT id FROM scored
+				ORDER BY score DESC, created_at DESC, id DESC
+				LIMIT $${pageLimitParam} OFFSET $${pageOffsetParam}`,
 				values,
 			);
 			const ids = rows.slice(0, normalizedLimit).map((row) => row.id);
 			return {
 				ids,
 				has_more: rows.length > normalizedLimit,
-				next_cursor: rows.length > normalizedLimit && ids.length > 0 ? ids[ids.length - 1] : null,
+				next_cursor: null,
+				use_offset_pagination: true,
 			};
 		}
 
@@ -1684,8 +1732,8 @@ class PostgresAdapter extends DatabaseAdapter {
 		const counts = new Map();
 		for (const row of rows) {
 			const matches = (row.content || '').match(/#([^<>/@#\s]+)/g) || [];
-			for (const match of matches) {
-				const tag = match.slice(1).toLowerCase();
+			const uniqueTags = new Set(matches.map((match) => match.slice(1).toLowerCase()));
+			for (const tag of uniqueTags) {
 				counts.set(tag, (counts.get(tag) || 0) + 1);
 			}
 		}
@@ -1905,6 +1953,7 @@ class PostgresAdapter extends DatabaseAdapter {
 		post.createdAt = post.createdAt ?? post.created_at ?? null;
 		post.mask = !!post.mask;
 		post.lock = !!post.lock;
+		post.announcement = !!post.announcement;
 		if (post.attachments && typeof post.attachments === 'string') {
 			try { post.attachments = JSON.parse(post.attachments); } catch (_) {}
 		}

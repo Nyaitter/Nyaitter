@@ -26,8 +26,11 @@ class InMemoryAdapter extends DatabaseAdapter {
 		this.likeCountByPost = new Map();
 		this.starCountByPost = new Map();
 		this.repostCountByPost = new Map();
-		this.likes = new Map(); // `${userId}:${postId}` -> true
-		this.stars = new Map();
+					this.likes = new Map(); // `${userId}:${postId}` -> true
+			this.stars = new Map();
+			this.likedPostIdsByUser = new Map(); // userId -> Set(postId)
+			this.starredPostIdsByUser = new Map(); // userId -> Set(postId)
+
 		this.dmChannels = new Map(); // channelId -> { id, participants, messages, ... }
 		this.groupDms = new Map(); // dmId -> { id, title, member, host_id, time, post, unread }
 		this.groupDmIdsByMember = new Map(); // userId -> Set(dmId)
@@ -129,7 +132,22 @@ class InMemoryAdapter extends DatabaseAdapter {
 		}
 	}
 
-	_updateFollowIndexes(followerId, followingId, following) {
+			_updateUserReactionIndex(index, userId, postId, active) {
+			const normalizedUserId = Number(userId);
+			const normalizedPostId = Number(postId);
+			if (active) {
+				if (!index.has(normalizedUserId)) index.set(normalizedUserId, new Set());
+				index.get(normalizedUserId).add(normalizedPostId);
+				return;
+			}
+			const postIds = index.get(normalizedUserId);
+			if (!postIds) return;
+			postIds.delete(normalizedPostId);
+			if (postIds.size === 0) index.delete(normalizedUserId);
+		}
+
+		_updateFollowIndexes(followerId, followingId, following) {
+
 		const follower = Number(followerId);
 		const followingUser = Number(followingId);
 		if (following) {
@@ -562,6 +580,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 			attachments: postData.attachments || null,
 			mask: !!postData.mask,
 			lock: !!postData.lock,
+			announcement: !!postData.announcement,
 			replyTo: postData.replyTo || null,
 			repostTo: postData.repostTo || null,
 			createdAt: new Date(),
@@ -683,13 +702,15 @@ class InMemoryAdapter extends DatabaseAdapter {
 		const currentlyLiked = this.likes.has(key);
 
 		const currentCount = this.likeCountByPost.get(postId) || 0;
-		if (currentlyLiked) {
-			this.likes.delete(key);
-			this.likeCountByPost.set(postId, Math.max(0, currentCount - 1));
-		} else {
-			this.likes.set(key, true);
-			this.likeCountByPost.set(postId, currentCount + 1);
-		}
+			if (currentlyLiked) {
+				this.likes.delete(key);
+				this._updateUserReactionIndex(this.likedPostIdsByUser, userId, postId, false);
+				this.likeCountByPost.set(postId, Math.max(0, currentCount - 1));
+			} else {
+				this.likes.set(key, true);
+				this._updateUserReactionIndex(this.likedPostIdsByUser, userId, postId, true);
+				this.likeCountByPost.set(postId, currentCount + 1);
+			}
 
 		const count = this.likeCountByPost.get(postId) || 0;
 
@@ -716,13 +737,15 @@ class InMemoryAdapter extends DatabaseAdapter {
 		const currentlyStarred = this.stars.has(key);
 
 		const currentCount = this.starCountByPost.get(postId) || 0;
-		if (currentlyStarred) {
-			this.stars.delete(key);
-			this.starCountByPost.set(postId, Math.max(0, currentCount - 1));
-		} else {
-			this.stars.set(key, true);
-			this.starCountByPost.set(postId, currentCount + 1);
-		}
+			if (currentlyStarred) {
+				this.stars.delete(key);
+				this._updateUserReactionIndex(this.starredPostIdsByUser, userId, postId, false);
+				this.starCountByPost.set(postId, Math.max(0, currentCount - 1));
+			} else {
+				this.stars.set(key, true);
+				this._updateUserReactionIndex(this.starredPostIdsByUser, userId, postId, true);
+				this.starCountByPost.set(postId, currentCount + 1);
+			}
 
 		const count = this.starCountByPost.get(postId) || 0;
 
@@ -1071,16 +1094,20 @@ class InMemoryAdapter extends DatabaseAdapter {
 			}
 		}
 
-		for (const key of Array.from(this.likes.keys())) {
-			if (key.endsWith(`:${postId}`)) {
-				this.likes.delete(key);
+			for (const key of Array.from(this.likes.keys())) {
+				if (key.endsWith(`:${postId}`)) {
+					const [reactionUserId] = key.split(':').map(Number);
+					this.likes.delete(key);
+					this._updateUserReactionIndex(this.likedPostIdsByUser, reactionUserId, postId, false);
+				}
 			}
-		}
-		for (const key of Array.from(this.stars.keys())) {
-			if (key.endsWith(`:${postId}`)) {
-				this.stars.delete(key);
+			for (const key of Array.from(this.stars.keys())) {
+				if (key.endsWith(`:${postId}`)) {
+					const [reactionUserId] = key.split(':').map(Number);
+					this.stars.delete(key);
+					this._updateUserReactionIndex(this.starredPostIdsByUser, reactionUserId, postId, false);
+				}
 			}
-		}
 		for (const key of Array.from(this.reposts.keys())) {
 			if (key.endsWith(`:${postId}`)) {
 				this.reposts.delete(key);
@@ -1109,12 +1136,20 @@ class InMemoryAdapter extends DatabaseAdapter {
 			}
 		}
 
-		for (const key of Array.from(this.likes.keys())) {
-			if (key.endsWith(`:${postId}`)) this.likes.delete(key);
-		}
-		for (const key of Array.from(this.stars.keys())) {
-			if (key.endsWith(`:${postId}`)) this.stars.delete(key);
-		}
+			for (const key of Array.from(this.likes.keys())) {
+				if (key.endsWith(`:${postId}`)) {
+					const [reactionUserId] = key.split(':').map(Number);
+					this.likes.delete(key);
+					this._updateUserReactionIndex(this.likedPostIdsByUser, reactionUserId, postId, false);
+				}
+			}
+			for (const key of Array.from(this.stars.keys())) {
+				if (key.endsWith(`:${postId}`)) {
+					const [reactionUserId] = key.split(':').map(Number);
+					this.stars.delete(key);
+					this._updateUserReactionIndex(this.starredPostIdsByUser, reactionUserId, postId, false);
+				}
+			}
 		for (const key of Array.from(this.reposts.keys())) {
 			if (key.endsWith(`:${postId}`)) this.reposts.delete(key);
 		}
@@ -1415,6 +1450,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 			'freeze',
 			'shadow',
 			'lock',
+			'admin',
 		];
 		for (const key of allowed) {
 			if (profileData[key] !== undefined) {
@@ -1428,23 +1464,13 @@ class InMemoryAdapter extends DatabaseAdapter {
 		return this._normalizeUserBlockList(user);
 	}
 
-	async getLikeIds(userId) {
-		const result = [];
-		for (const key of this.likes.keys()) {
-			const [uId, postId] = key.split(':').map(Number);
-			if (uId === userId) result.push(postId);
+		async getLikeIds(userId) {
+			return [...(this.likedPostIdsByUser.get(Number(userId)) || [])];
 		}
-		return result;
-	}
 
-	async getStarIds(userId) {
-		const result = [];
-		for (const key of this.stars.keys()) {
-			const [uId, postId] = key.split(':').map(Number);
-			if (uId === userId) result.push(postId);
+		async getStarIds(userId) {
+			return [...(this.starredPostIdsByUser.get(Number(userId)) || [])];
 		}
-		return result;
-	}
 
 	async getFollowIds(userId) {
 		const result = [];
@@ -1655,7 +1681,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 				const matches = tab === 'following'
 					? followSet.has(Number(post.userId))
 					: tab === 'announce'
-						? Number(post.userId) === 2525 && (post.content || '').includes('#NXAnnounce')
+						? post.announcement === true
 						: true;
 				if (!matches) continue;
 				matched.push(id);
@@ -1670,22 +1696,83 @@ class InMemoryAdapter extends DatabaseAdapter {
 			};
 		}
 
-		async getRecommendedPostIds({ limit = 30, offset = 0, beforeId = null } = {}) {
+		async getRecommendedPostIds({ viewerId = null, limit = 30, offset = 0, beforeId = null } = {}) {
 			const normalizedLimit = Math.max(1, Number(limit) || 30);
 			const normalizedBeforeId = Number.isInteger(Number(beforeId)) && Number(beforeId) > 0
 				? Number(beforeId)
 				: null;
 			const normalizedOffset = normalizedBeforeId == null ? Math.max(0, Number(offset) || 0) : 0;
-			const posts = await this.getTrendingPosts(this.posts.size);
-			const candidates = normalizedBeforeId == null
-				? posts
-				: posts.filter((post) => Number(post.id) < normalizedBeforeId);
-			const window = candidates.slice(normalizedOffset, normalizedOffset + normalizedLimit + 1);
-			const ids = window.slice(0, normalizedLimit).map((post) => post.id);
+			const candidateLimit = Math.min(
+				1000,
+				Math.max(500, normalizedOffset + normalizedLimit + 1),
+			);
+			const normalizedViewerId = Number.isInteger(Number(viewerId)) ? Number(viewerId) : null;
+			const directFollowIds = normalizedViewerId == null
+				? new Set()
+				: new Set(this.followingIdsByUser.get(normalizedViewerId) || []);
+			const secondDegreeFollowIds = new Set();
+			for (const followedUserId of directFollowIds) {
+				for (const candidateUserId of this.followingIdsByUser.get(followedUserId) || []) {
+					if (candidateUserId !== normalizedViewerId && !directFollowIds.has(candidateUserId)) {
+						secondDegreeFollowIds.add(candidateUserId);
+					}
+				}
+			}
+			const affinityByAuthor = new Map();
+			const addAffinity = (postIds, field) => {
+				for (const postId of postIds) {
+					const reactedPost = this.posts.get(postId);
+					if (!reactedPost) continue;
+					const authorId = Number(reactedPost.userId);
+					const affinity = affinityByAuthor.get(authorId) || { likes: 0, stars: 0 };
+					affinity[field] += 1;
+					affinityByAuthor.set(authorId, affinity);
+				}
+			};
+			if (normalizedViewerId != null) {
+				addAffinity(this.likedPostIdsByUser.get(normalizedViewerId) || [], 'likes');
+				addAffinity(this.starredPostIdsByUser.get(normalizedViewerId) || [], 'stars');
+			}
+
+			const candidates = [];
+			for (const id of this.postIdsNewest) {
+				const post = this.posts.get(id);
+				if (!post || post.replyTo != null || (normalizedBeforeId != null && Number(id) >= normalizedBeforeId)) continue;
+				candidates.push(post);
+				if (candidates.length >= candidateLimit) break;
+			}
+			const now = Date.now();
+			const scored = candidates.map((post) => {
+				const authorId = Number(post.userId);
+				const ageHours = Math.max(0, (now - new Date(post.createdAt || post.created_at).getTime()) / 3600000);
+				const recencyScore = 48 / (1 + ageHours / 6);
+				const affinity = affinityByAuthor.get(authorId) || { likes: 0, stars: 0 };
+				const affinityScore = Math.min(20, affinity.likes * 4) + Math.min(32, affinity.stars * 8);
+				const graphScore = directFollowIds.has(authorId)
+					? 24
+					: secondDegreeFollowIds.has(authorId)
+						? 10
+						: 0;
+				const engagementScore = Math.min(
+					22,
+					Math.log1p(this.likeCountByPost.get(Number(post.id)) || 0) * 2
+						+ Math.log1p(this.starCountByPost.get(Number(post.id)) || 0) * 4
+						+ Math.log1p(this.repostCountByPost.get(Number(post.id)) || 0) * 5,
+				);
+				return { post, score: recencyScore + graphScore + affinityScore + engagementScore };
+			});
+			scored.sort((left, right) => (
+				right.score - left.score
+				|| new Date(right.post.createdAt || right.post.created_at).getTime() - new Date(left.post.createdAt || left.post.created_at).getTime()
+				|| Number(right.post.id) - Number(left.post.id)
+			));
+			const window = scored.slice(normalizedOffset, normalizedOffset + normalizedLimit + 1);
+			const ids = window.slice(0, normalizedLimit).map(({ post }) => post.id);
 			return {
 				ids,
 				has_more: window.length > normalizedLimit,
-				next_cursor: window.length > normalizedLimit && ids.length > 0 ? ids[ids.length - 1] : null,
+				next_cursor: null,
+				use_offset_pagination: true,
 			};
 		}
 
@@ -1720,8 +1807,8 @@ class InMemoryAdapter extends DatabaseAdapter {
 		for (const post of this.posts.values()) {
 			const content = post.content || '';
 			const matches = content.match(/#([^<>/@#\s]+)/g) || [];
-			for (const match of matches) {
-				const tag = match.slice(1).toLowerCase();
+			const uniqueTags = new Set(matches.map((match) => match.slice(1).toLowerCase()));
+			for (const tag of uniqueTags) {
 				counts.set(tag, (counts.get(tag) || 0) + 1);
 			}
 		}

@@ -610,7 +610,8 @@ img.emoji {
 .attachment-button,
 .emoji-pic-button,
 .post-mask-button,
-.post-lock-button {
+.post-lock-button,
+.post-announcement-button {
     background: none;
     border: none;
     cursor: pointer;
@@ -624,7 +625,8 @@ img.emoji {
 .attachment-button:hover,
 .emoji-pic-button:hover,
 .post-mask-button:hover,
-.post-lock-button:hover {
+.post-lock-button:hover,
+.post-announcement-button:hover {
     background-color: var(--bg-color);
 }
 
@@ -648,7 +650,8 @@ img.emoji {
 }
 
 .post-mask-button.active svg,
-.post-lock-button.active svg {
+.post-lock-button.active svg,
+.post-announcement-button.active svg {
     stroke: var(--primary-color);
 }
 

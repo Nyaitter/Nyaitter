@@ -139,13 +139,14 @@ async function getDiscoverableModePage(
 					beforeId: candidateBeforeId,
 				});
 			}
-			if (mode === 'recommended') {
-				return db.getRecommendedPostIds({
-					limit: candidateLimit,
-					offset: candidateOffset,
-					beforeId: candidateBeforeId,
-				});
-			}
+				if (mode === 'recommended') {
+					return db.getRecommendedPostIds({
+						viewerId,
+						limit: candidateLimit,
+						offset: candidateOffset,
+						beforeId: candidateBeforeId,
+					});
+				}
 			if (mode === 'search') {
 					return db.searchPostIds(query, candidateLimit, candidateOffset, candidateBeforeId);
 			}
@@ -321,8 +322,16 @@ router.post('/', requireAuth, async (req, res) => {
 	const storage = getStorageAdapter(req);
 	const postService = new PostService({ dbAdapter: db, storageAdapter: storage });
 
-	const { content, attachments = [], mask, lock, reply_to, repost_to } = req.body;
+	const { content, attachments = [], mask, lock, announcement, reply_to, repost_to } = req.body;
 	const userId = req.user.id;
+	const isAnnouncement = announcement === true;
+
+	if (isAnnouncement && req.user.admin !== true) {
+		return res.status(403).json({ error: 'Only administrators can create announcements' });
+	}
+	if (isAnnouncement && (reply_to || repost_to)) {
+		return res.status(400).json({ error: 'Announcements cannot be replies or reposts' });
+	}
 
 	const hasContent =
 		typeof content === 'string' && content.trim().length > 0;
@@ -367,8 +376,9 @@ router.post('/', requireAuth, async (req, res) => {
 			content: trimmed,
 			attachments: processedAttachments,
 			mask: !!mask,
-			lock: !!lock,
-			replyTo: reply_to || null,
+				lock: !!lock,
+				announcement: isAnnouncement,
+				replyTo: reply_to || null,
 			repostTo: repost_to || null,
 		});
 

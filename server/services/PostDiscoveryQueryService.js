@@ -42,6 +42,7 @@ async function getDiscoverablePostPage({
 	let visibleOffset = 0;
 	const collectedIds = [];
 	let hasMore = false;
+	let requiresOffsetPagination = false;
 
 	while (true) {
 		const candidatePage = await fetchCandidatePage({
@@ -50,6 +51,7 @@ async function getDiscoverablePostPage({
 			beforeId: candidateBeforeId,
 		});
 		const candidateIds = normalizePostIds(candidatePage?.ids);
+		requiresOffsetPagination ||= candidatePage?.use_offset_pagination === true;
 		if (candidateIds.length === 0) break;
 
 		const postsById = new Map(
@@ -105,7 +107,9 @@ async function getDiscoverablePostPage({
 	return {
 		ids,
 		has_more: hasMore,
-		next_cursor: hasMore && ids.length > 0 ? ids[ids.length - 1] : null,
+		next_cursor: !requiresOffsetPagination && hasMore && ids.length > 0
+			? ids[ids.length - 1]
+			: null,
 	};
 }
 

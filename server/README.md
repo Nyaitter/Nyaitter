@@ -136,3 +136,25 @@ npm run dev:server
 ## 本番運用
 
 デプロイ前後の確認項目は [`help/production-checklist.md`](./help/production-checklist.md) を使用してください。秘密鍵、トークン、DB 接続文字列をクライアント・`config.json`・リポジトリへ含めてはいけません。
+
+## ローカル運用 CLI
+
+実行中のNyaitterサーバーは、同一OS利用者だけがアクセスできるUnixドメインソケットを作成します。CLIはこのローカルソケット経由で**現在接続されているアダプター**を操作するため、HTTP認証やブラウザ操作は必要ありません。
+
+```bash
+# サーバー状態
+npm run cli -- server status
+
+# サーバーの起動・停止・再起動
+npm run cli -- server start
+npm run cli -- server stop
+npm run cli -- server restart
+
+# 管理者権限の付与・解除（`#` は省略可能）
+npm run cli -- admin grant '#3480'
+npm run cli -- admin revoke 3480
+```
+
+管理者付与・解除は、実行中の `InMemoryAdapter`、PostgreSQL、D1のいずれでも、同じ`updateUserProfile`契約を通じて反映されます。`InMemoryAdapter`のデータはサーバー再起動時に失われるため、開発環境での付与も再起動後には必要に応じて再実行してください。
+
+> このCLIはネットワーク公開されません。制御ソケットは既定で`/tmp/nyaitter-operator.sock`に作成され、所有者のみ読み書き可能な`0600`権限です。必要な場合は`NYAITTER_OPERATOR_SOCKET`で別のローカルパスを指定できます。

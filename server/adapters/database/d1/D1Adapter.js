@@ -65,6 +65,7 @@ function normalizePost(post) {
 	post.createdAt = post.createdAt ?? post.created_at ?? null;
 	post.mask = !!post.mask;
 	post.lock = !!post.lock;
+	post.announcement = !!post.announcement;
 	if (post.attachments && typeof post.attachments === 'string') {
 		try {
 			post.attachments = JSON.parse(post.attachments);
@@ -579,8 +580,9 @@ class D1Adapter extends DatabaseAdapter {
 		return this._read('/posts/timeline/ids', { body, cacheSeconds: 0 });
 	}
 
-	async getRecommendedPostIds({ limit = 30, offset = 0, beforeId = null } = {}) {
+	async getRecommendedPostIds({ viewerId = null, limit = 30, offset = 0, beforeId = null } = {}) {
 		return this._read(this._query('/posts/recommended/ids', {
+			viewerId: viewerId == null ? null : requireId(viewerId, 'viewerId'),
 			limit: this._limit(limit, 30),
 			offset: this._offset(offset),
 			beforeId: beforeId == null ? null : requireId(beforeId, 'beforeId', 1),

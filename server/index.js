@@ -30,6 +30,7 @@ const { requestId, applyTrustProxy, requestLogger } = require('./middleware/syst
 const { generalLimiter, authLimiter } = require('./middleware/rateLimit');
 const ConnectionManager = require('./services/realtime/ConnectionManager');
 const PushNotificationService = require('./services/PushNotificationService');
+const { startOperatorControlServer } = require('./utils/operatorControl');
 
 const app = express();
 app.disable('x-powered-by'); // セキュリティ: Express バージョンを隠す
@@ -363,6 +364,7 @@ app.use('/server', (req, res) => {
 
 const dbAdapter = createDatabaseAdapter();
 const storageAdapter = createStorageAdapter();
+let operatorControl = null;
 const pushNotificationService = new PushNotificationService({
 	dbAdapter,
 	pushConfig: config.push,
@@ -374,6 +376,17 @@ async function startServer() {
 	app.locals.dbAdapter = dbAdapter;
 	app.locals.storageAdapter = storageAdapter;
 	app.locals.pushNotificationService = pushNotificationService;
+	operatorControl = await startOperatorControlServer({
+		dbAdapter,
+		shutdown,
+		getStatus: () => ({
+			pid: process.pid,
+			port: PORT,
+			databaseAdapter: config.database.adapter,
+			startedAt: new Date().toISOString(),
+		}),
+	});
+	console.log(`[operator-control] Listening on ${operatorControl.socketPath}`);
 
 	httpServer.listen(PORT, () => {
 		console.log(`
@@ -409,6 +422,10 @@ async function shutdown(signal) {
 	try {
 		clearInterval(realtimeHeartbeat);
 		realtimeConnections.closeAll();
+		if (operatorControl) {
+			await operatorControl.close();
+			operatorControl = null;
+		}
 		await new Promise((resolve) => {
 			if (!httpServer.listening) return resolve();
 			httpServer.close(() => resolve());

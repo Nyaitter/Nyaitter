@@ -127,6 +127,7 @@ function normalizePostRow(row) {
 		attachments: parseJsonSafe(row.attachments, []),
 		mask: Boolean(row.mask),
 		lock: Boolean(row.lock),
+		announcement: Boolean(row.announcement),
 		replyTo: row.reply_to || null,
 		reply_to: row.reply_to || null,
 		repostTo: row.repost_to || null,
@@ -672,15 +673,16 @@ export default {
 				const content = postData.content || '';
 				const attachments = postData.attachments ? JSON.stringify(postData.attachments) : null;
 				const mask = postData.mask ? 1 : 0;
-				const lock = postData.lock ? 1 : 0;
-				const replyTo = postData.replyTo ? Number(postData.replyTo) : null;
+					const lock = postData.lock ? 1 : 0;
+					const announcement = postData.announcement ? 1 : 0;
+					const replyTo = postData.replyTo ? Number(postData.replyTo) : null;
 				const repostTo = postData.repostTo ? Number(postData.repostTo) : null;
 				const now = new Date().toISOString();
 
 				const res = await db.prepare(
-					`INSERT INTO posts (user_id, content, attachments, mask, lock, reply_to, repost_to, created_at)
-					 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-				).bind(userId, content, attachments, mask, lock, replyTo, repostTo, now).run();
+						`INSERT INTO posts (user_id, content, attachments, mask, lock, announcement, reply_to, repost_to, created_at)
+						 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+					).bind(userId, content, attachments, mask, lock, announcement, replyTo, repostTo, now).run();
 
 				const created = await db.prepare('SELECT * FROM posts WHERE id = ?').bind(res.meta.last_row_id).first();
 				return json(normalizePostRow(created));
@@ -815,10 +817,10 @@ export default {
 				} else if (tab === 'announce') {
 					const queryRes = beforeId != null
 						? await db.prepare(
-							`SELECT id FROM posts WHERE user_id = 2525 AND reply_to IS NULL AND content LIKE '%#NXAnnounce%' AND id < ? ORDER BY created_at DESC, id DESC LIMIT ?`
+							`SELECT id FROM posts WHERE announcement = 1 AND reply_to IS NULL AND id < ? ORDER BY created_at DESC, id DESC LIMIT ?`
 						).bind(beforeId, limit + 1).all()
 						: await db.prepare(
-							`SELECT id FROM posts WHERE user_id = 2525 AND reply_to IS NULL AND content LIKE '%#NXAnnounce%' ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`
+							`SELECT id FROM posts WHERE announcement = 1 AND reply_to IS NULL ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`
 						).bind(limit + 1, offset).all();
 					results = queryRes.results || [];
 				} else {
@@ -840,19 +842,25 @@ export default {
 				});
 			}
 
-			if (method === 'GET' && pathname === '/posts/recommended/ids') {
-				const limit = Math.min(Number(url.searchParams.get('limit') || 30), 100);
-				const beforeId = Number.isSafeInteger(Number(url.searchParams.get('beforeId'))) && Number(url.searchParams.get('beforeId')) > 0
-					? Number(url.searchParams.get('beforeId'))
-					: null;
-				const offset = beforeId == null ? Number(url.searchParams.get('offset') || 0) : 0;
-				const candidateWhere = beforeId != null ? 'reply_to IS NULL AND id < ?' : 'reply_to IS NULL';
-				const pageSql = beforeId != null ? 'LIMIT ?' : 'LIMIT ? OFFSET ?';
-				const bindings = beforeId != null ? [beforeId, limit + 1] : [limit + 1, offset];
-
-				const { results } = await db.prepare(
-					`WITH candidates AS (
-						SELECT id, created_at FROM posts WHERE ${candidateWhere}
+				if (method === 'GET' && pathname === '/posts/recommended/ids') {
+					const limit = Math.min(Math.max(Number(url.searchParams.get('limit') || 30), 1), 100);
+					const beforeId = Number.isSafeInteger(Number(url.searchParams.get('beforeId'))) && Number(url.searchParams.get('beforeId')) > 0
+						? Number(url.searchParams.get('beforeId'))
+						: null;
+					const offset = beforeId == null ? Math.max(Number(url.searchParams.get('offset') || 0), 0) : 0;
+					const viewerIdParam = url.searchParams.get('viewerId');
+					const viewerId = viewerIdParam !== null && Number.isSafeInteger(Number(viewerIdParam))
+						? Number(viewerIdParam)
+						: null;
+					const candidateLimit = Math.min(1000, Math.max(500, offset + limit + 1));
+					const candidateWhere = beforeId != null ? 'p.reply_to IS NULL AND p.id < ?' : 'p.reply_to IS NULL';
+					const candidateBindings = beforeId != null ? [beforeId, candidateLimit] : [candidateLimit];
+					const commonCtes = `WITH candidates AS (
+						SELECT p.id, p.user_id, p.created_at
+						FROM posts p
+						WHERE ${candidateWhere}
+						ORDER BY p.created_at DESC, p.id DESC
+						LIMIT ?
 					), like_counts AS (
 						SELECT l.post_id, COUNT(*) AS count
 						FROM likes l JOIN candidates c ON c.id = l.post_id
@@ -865,25 +873,66 @@ export default {
 						SELECT r.post_id, COUNT(*) AS count
 						FROM reposts r JOIN candidates c ON c.id = r.post_id
 						GROUP BY r.post_id
-					)
-					SELECT c.id,
-						COALESCE(l.count, 0) + COALESCE(s.count, 0) * 2 + COALESCE(r.count, 0) * 3 AS score
-					FROM candidates c
-					LEFT JOIN like_counts l ON l.post_id = c.id
-					LEFT JOIN star_counts s ON s.post_id = c.id
-					LEFT JOIN repost_counts r ON r.post_id = c.id
-					ORDER BY score DESC, c.created_at DESC, c.id DESC
-					${pageSql}`
-				).bind(...bindings).all();
-
-				const rows = results || [];
-				const ids = rows.slice(0, limit).map((r) => r.id);
-				return json({
-					ids,
-					has_more: rows.length > limit,
-					next_cursor: rows.length > limit && ids.length > 0 ? ids[ids.length - 1] : null,
-				});
-			}
+					)`;
+					const engagementScore = `MIN(22.0,
+						COALESCE(l.count, 0) * 4.0 / (COALESCE(l.count, 0) + 4.0)
+						+ COALESCE(s.count, 0) * 8.0 / (COALESCE(s.count, 0) + 2.0)
+						+ COALESCE(r.count, 0) * 10.0 / (COALESCE(r.count, 0) + 2.0))`;
+					const recencyScore = `48.0 / (1.0 + MAX(0.0, (julianday('now') - julianday(c.created_at)) * 24.0) / 6.0)`;
+					const query = viewerId == null
+						? `${commonCtes}, scored AS (
+							SELECT c.id, c.created_at, ${recencyScore} + ${engagementScore} AS score
+							FROM candidates c
+							LEFT JOIN like_counts l ON l.post_id = c.id
+							LEFT JOIN star_counts s ON s.post_id = c.id
+							LEFT JOIN repost_counts r ON r.post_id = c.id
+						)
+						SELECT id FROM scored ORDER BY score DESC, created_at DESC, id DESC LIMIT ? OFFSET ?`
+						: `${commonCtes}, viewer_like_affinity AS (
+							SELECT p.user_id, COUNT(*) AS count
+							FROM likes l JOIN posts p ON p.id = l.post_id
+							WHERE l.user_id = ?
+							GROUP BY p.user_id
+						), viewer_star_affinity AS (
+							SELECT p.user_id, COUNT(*) AS count
+							FROM stars s JOIN posts p ON p.id = s.post_id
+							WHERE s.user_id = ?
+							GROUP BY p.user_id
+						), direct_follows AS (
+							SELECT following_id AS user_id FROM follows WHERE follower_id = ?
+						), second_degree_follows AS (
+							SELECT DISTINCT f2.following_id AS user_id
+							FROM follows f1 JOIN follows f2 ON f2.follower_id = f1.following_id
+							WHERE f1.follower_id = ? AND f2.following_id <> ?
+						), scored AS (
+							SELECT c.id, c.created_at,
+								${recencyScore} + ${engagementScore}
+								+ CASE WHEN df.user_id IS NOT NULL THEN 24.0 WHEN sdf.user_id IS NOT NULL THEN 10.0 ELSE 0.0 END
+								+ MIN(20.0, COALESCE(vla.count, 0) * 4.0)
+								+ MIN(32.0, COALESCE(vsa.count, 0) * 8.0) AS score
+							FROM candidates c
+							LEFT JOIN like_counts l ON l.post_id = c.id
+							LEFT JOIN star_counts s ON s.post_id = c.id
+							LEFT JOIN repost_counts r ON r.post_id = c.id
+							LEFT JOIN viewer_like_affinity vla ON vla.user_id = c.user_id
+							LEFT JOIN viewer_star_affinity vsa ON vsa.user_id = c.user_id
+							LEFT JOIN direct_follows df ON df.user_id = c.user_id
+							LEFT JOIN second_degree_follows sdf ON sdf.user_id = c.user_id
+						)
+						SELECT id FROM scored ORDER BY score DESC, created_at DESC, id DESC LIMIT ? OFFSET ?`;
+					const bindings = viewerId == null
+						? [...candidateBindings, limit + 1, offset]
+						: [...candidateBindings, viewerId, viewerId, viewerId, viewerId, viewerId, limit + 1, offset];
+					const { results } = await db.prepare(query).bind(...bindings).all();
+					const rows = results || [];
+					const ids = rows.slice(0, limit).map((r) => r.id);
+					return json({
+						ids,
+						has_more: rows.length > limit,
+						next_cursor: null,
+						use_offset_pagination: true,
+					});
+				}
 
 			if (method === 'GET' && pathname.match(/^\/users\/(\d+)\/post-ids$/)) {
 				const userId = Number(pathname.split('/')[2]);
@@ -1056,8 +1105,8 @@ export default {
 				const counts = new Map();
 				for (const row of results || []) {
 					const matches = (row.content || '').match(/#([^<>/@#\s]+)/g) || [];
-					for (const match of matches) {
-						const tag = match.slice(1).toLowerCase();
+					const uniqueTags = new Set(matches.map((match) => match.slice(1).toLowerCase()));
+					for (const tag of uniqueTags) {
 						counts.set(tag, (counts.get(tag) || 0) + 1);
 					}
 				}

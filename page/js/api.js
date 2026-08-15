@@ -326,6 +326,7 @@ export const api = (() => {
                                 attachments: params.p_attachments || [],
                                 mask: params.p_mask,
                                 lock: params.p_lock,
+                                announcement: params.p_announcement,
                             },
                         },
                         'post',

@@ -2010,6 +2010,9 @@ export function initApp() {
         });
     }
     async function checkSession() {
+        // 起動アセットの準備後は、アカウント確認の通信完了を待たずに
+        // ローディング画面を表示する。確認結果に応じたrouter()が完了時に閉じる。
+        showLoading(true);
         const {
             data: { session },
             error: sessionError,
@@ -2505,6 +2508,9 @@ export function initApp() {
 	                        <button type="button" class="post-lock-button float-right" title="プライベート" aria-pressed="false">
 	                            ${ICONS.lock}
 	                        </button>
+	                        ${getCurrentUser()?.admin ? `<button type="button" class="post-announcement-button float-right" title="アナウンス" aria-pressed="false">
+	                            ${ICONS.megaphone}
+	                        </button>` : ''}
 	                        <span class="float-clear"></span>
 	                    </div>
 	                </div>
@@ -2526,11 +2532,15 @@ export function initApp() {
         container
             .querySelector('.post-mask-button')
             .addEventListener('click', () => handlePostMask(container));
-        container
-            .querySelector('.post-lock-button')
-            .addEventListener('click', () => handlePostLock(container));
-        container
-            .querySelector('#post-submit-button')
+		container
+			.querySelector('.post-lock-button')
+			.addEventListener('click', () => handlePostLock(container));
+		const announcementButton = container.querySelector('.post-announcement-button');
+		if (announcementButton) {
+			announcementButton.addEventListener('click', () => handlePostAnnouncement(container));
+		}
+		container
+			.querySelector('#post-submit-button')
             .addEventListener('click', () => handlePostSubmit(container));
         container
             .querySelector('textarea')
@@ -2710,16 +2720,26 @@ export function initApp() {
         button.classList.toggle('active');
     }
 
-    function handlePostLock(container) {
-        const button = container.querySelector('.post-lock-button');
-        button.classList.toggle('active');
-        button.setAttribute(
-            'aria-pressed',
-            String(button.classList.contains('active')),
-        );
-    }
+	function handlePostLock(container) {
+		const button = container.querySelector('.post-lock-button');
+		button.classList.toggle('active');
+		button.setAttribute(
+			'aria-pressed',
+			String(button.classList.contains('active')),
+		);
+	}
 
-    async function handlePostSubmit(container) {
+	function handlePostAnnouncement(container) {
+		const button = container.querySelector('.post-announcement-button');
+		if (!button) return;
+		button.classList.toggle('active');
+		button.setAttribute(
+			'aria-pressed',
+			String(button.classList.contains('active')),
+		);
+	}
+
+	async function handlePostSubmit(container) {
         if (!getCurrentUser()) return showAppAlert('ログインが必要です。');
         const contentEl = container.querySelector('textarea');
         const content = contentEl.value.trim();
@@ -2729,11 +2749,14 @@ export function initApp() {
         const maskActive = container
             .querySelector('.post-mask-button')
             .classList.contains('active');
-        const lockActive = container
-            .querySelector('.post-lock-button')
-            .classList.contains('active');
+		const lockActive = container
+			.querySelector('.post-lock-button')
+			.classList.contains('active');
+		const announcementActive = container
+			.querySelector('.post-announcement-button')
+			?.classList.contains('active') || false;
 
-        const button = container.querySelector('#post-submit-button');
+		const button = container.querySelector('#post-submit-button');
         button.disabled = true;
         button.textContent = '投稿中...';
         showLoading(true);
@@ -2766,9 +2789,10 @@ export function initApp() {
                     p_repost_to: getQuotingPost()?.id || null,
                     p_attachments:
                         attachmentsData.length > 0 ? attachmentsData : null,
-                    p_mask: maskActive,
-                    p_lock: lockActive,
-                })
+	                    p_mask: maskActive,
+	                    p_lock: lockActive,
+	                    p_announcement: announcementActive,
+	                })
                 .single(); // .single()を追加して、返り値が1行であることを期待
 
             if (rpcError) {
@@ -5215,17 +5239,16 @@ export function initApp() {
                 meta.title;
             document.getElementById('settings-group-description').textContent =
                 meta.description;
+            if (group === 'privacy') {
+                void loadLoginSecuritySessions();
+            }
+            if (group === 'notifications') {
+                void loadPushSettingsState();
+            }
             if (group === 'api') {
                 void loadUserBotTokens();
             }
         };
-        document
-            .querySelectorAll('.settings-group-button')
-            .forEach((button) => {
-                button.addEventListener('click', () =>
-                    selectSettingsGroup(button.dataset.settingsGroup),
-                );
-            });
         const dangerZone = document.querySelector('.settings-danger-zone');
 
         let dangerZoneHTML = `
@@ -5352,7 +5375,6 @@ export function initApp() {
                 sessionsList.appendChild(item);
             });
         };
-        void loadLoginSecuritySessions();
 
         const botTokensList = document.getElementById(
             'settings-bot-tokens-list',
@@ -5683,7 +5705,6 @@ export function initApp() {
         document
             .getElementById('push-notification-action')
             .addEventListener('click', togglePushSubscription);
-        void loadPushSettingsState();
         document
             .getElementById('settings-account-switcher-btn')
             .addEventListener('click', openAccountSwitcherModal);
@@ -5973,8 +5994,7 @@ export function initApp() {
                                 idQuery = api
                                     .from('post')
                                     .select('id')
-                                    .eq('userid', 2525)
-                                    .ilike('content', '%#NXAnnounce%')
+                                    .eq('announcement', true)
                                     .is('reply_id', null)
                                     .order('time', { ascending: false });
                             }
