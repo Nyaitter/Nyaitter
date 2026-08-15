@@ -222,6 +222,7 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (
     expiration_time INTEGER,
     p256dh TEXT NOT NULL,
     auth TEXT NOT NULL,
+    session_token TEXT,
     created_at TEXT DEFAULT (datetime('now')),
     updated_at TEXT DEFAULT (datetime('now')),
     PRIMARY KEY(user_id, endpoint),

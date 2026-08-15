@@ -1458,13 +1458,14 @@ class PostgresAdapter extends DatabaseAdapter {
 	async upsertPushSubscription(userId, subscription) {
 		const { rows } = await this.pool.query(
 			`INSERT INTO push_subscriptions
-				(user_id, endpoint, expiration_time, p256dh, auth, created_at, updated_at)
-			 VALUES ($1, $2, to_timestamp($3 / 1000.0), $4, $5, NOW(), NOW())
+				(user_id, endpoint, expiration_time, p256dh, auth, session_token, created_at, updated_at)
+			 VALUES ($1, $2, to_timestamp($3 / 1000.0), $4, $5, $6, NOW(), NOW())
 			 ON CONFLICT (user_id, endpoint)
 			 DO UPDATE SET
 				expiration_time = EXCLUDED.expiration_time,
 				p256dh = EXCLUDED.p256dh,
 				auth = EXCLUDED.auth,
+				session_token = COALESCE(EXCLUDED.session_token, push_subscriptions.session_token),
 				updated_at = NOW()
 			 RETURNING *`,
 			[
@@ -1473,6 +1474,7 @@ class PostgresAdapter extends DatabaseAdapter {
 				subscription.expirationTime ?? null,
 				subscription.keys.p256dh,
 				subscription.keys.auth,
+				subscription.sessionToken ?? null,
 			],
 		);
 		return rows[0] || null;
@@ -1480,7 +1482,7 @@ class PostgresAdapter extends DatabaseAdapter {
 
 	async getPushSubscriptions(userId) {
 		const { rows } = await this.pool.query(
-			`SELECT endpoint, expiration_time, p256dh, auth
+			`SELECT endpoint, expiration_time, p256dh, auth, session_token
 			 FROM push_subscriptions
 			 WHERE user_id = $1`,
 			[userId],
@@ -1489,6 +1491,7 @@ class PostgresAdapter extends DatabaseAdapter {
 			endpoint: row.endpoint,
 			expirationTime: row.expiration_time ? new Date(row.expiration_time).getTime() : null,
 			keys: { p256dh: row.p256dh, auth: row.auth },
+			sessionToken: row.session_token || null,
 		}));
 	}
 

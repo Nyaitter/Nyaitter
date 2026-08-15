@@ -1493,28 +1493,31 @@ export default {
 				const expirationTime = body.expirationTime != null ? Number(body.expirationTime) : null;
 				const p256dh = String(body.keys?.p256dh || '');
 				const auth = String(body.keys?.auth || '');
+				const sessionToken = body.sessionToken != null ? String(body.sessionToken) : null;
 				const now = new Date().toISOString();
 
 				await db.prepare(
-					`INSERT INTO push_subscriptions (user_id, endpoint, expiration_time, p256dh, auth, created_at, updated_at)
-					 VALUES (?, ?, ?, ?, ?, ?, ?)
+					`INSERT INTO push_subscriptions (user_id, endpoint, expiration_time, p256dh, auth, session_token, created_at, updated_at)
+					 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 					 ON CONFLICT(user_id, endpoint) DO UPDATE SET
 					   expiration_time = excluded.expiration_time,
 					   p256dh = excluded.p256dh,
 					   auth = excluded.auth,
+					   session_token = COALESCE(excluded.session_token, push_subscriptions.session_token),
 					   updated_at = excluded.updated_at`
-				).bind(userId, endpoint, expirationTime, p256dh, auth, now, now).run();
+				).bind(userId, endpoint, expirationTime, p256dh, auth, sessionToken, now, now).run();
 
-				return json({ userId, endpoint, expirationTime, keys: { p256dh, auth } });
+				return json({ userId, endpoint, expirationTime, keys: { p256dh, auth }, sessionToken });
 			}
 
 			if (method === 'GET' && pathname.match(/^\/users\/(\d+)\/push-subscriptions$/)) {
 				const userId = Number(pathname.split('/')[2]);
-				const { results } = await db.prepare('SELECT endpoint, expiration_time, p256dh, auth FROM push_subscriptions WHERE user_id = ?').bind(userId).all();
+				const { results } = await db.prepare('SELECT endpoint, expiration_time, p256dh, auth, session_token FROM push_subscriptions WHERE user_id = ?').bind(userId).all();
 				return json((results || []).map((r) => ({
 					endpoint: r.endpoint,
 					expirationTime: r.expiration_time ? Number(r.expiration_time) : null,
 					keys: { p256dh: r.p256dh, auth: r.auth },
+					sessionToken: r.session_token || null,
 				})));
 			}
 

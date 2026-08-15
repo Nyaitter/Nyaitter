@@ -187,4 +187,5 @@ module.exports = {
   flexibleCors,
   securityHeaders,
   getAuthenticatedPrincipal,
+  extractToken,
 };

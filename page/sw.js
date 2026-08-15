@@ -109,9 +109,10 @@ self.addEventListener('push', (event) => {
   }
 
   const title = String(payload.title || 'Nyaitter').slice(0, 80);
+  const iconUrl = typeof payload.icon === 'string' && payload.icon.startsWith('/') ? payload.icon : '/pwa-icon-192.png';
   const options = {
     body: String(payload.body || '新しい通知があります').slice(0, 240),
-    icon: '/pwa-icon-192.png',
+    icon: iconUrl,
     badge: '/pwa-icon-192.png',
     tag: String(payload.tag || 'nyaitter-notification').slice(0, 64),
     renotify: false,

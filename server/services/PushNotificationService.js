@@ -46,10 +46,23 @@ class PushNotificationService {
       tag: notification?.id ? `notification-${notification.id}` : 'notification',
       url: getNotificationTargetHash(notification?.target, notification?.from?.id),
       notification_id: notification?.id || null,
+      icon: notification?.from?.id != null ? `/server/api/users/${notification.from.id}/icon` : null,
     });
 
-    const result = { attempted: subscriptions.length, delivered: 0, removed: 0 };
+    const result = { attempted: subscriptions.length, delivered: 0, removed: 0, skipped: 0 };
     await Promise.all(subscriptions.map(async (subscription) => {
+      const sessionValid = await this._isSessionValid(subscription.sessionToken);
+      if (!sessionValid) {
+        result.skipped += 1;
+        try {
+          await this.dbAdapter.deletePushSubscription(userId, subscription.endpoint);
+          result.removed += 1;
+        } catch (deleteError) {
+          console.warn('[push] Failed to remove stale subscription:', deleteError.message);
+        }
+        return;
+      }
+
       try {
         await webpush.sendNotification(subscription, payload, {
           TTL: 300,
@@ -73,6 +86,18 @@ class PushNotificationService {
     }));
 
     return result;
+  }
+
+  async _isSessionValid(sessionToken) {
+    if (!sessionToken) return true;
+    if (typeof this.dbAdapter.getSessionByToken !== 'function') return true;
+    try {
+      const session = await this.dbAdapter.getSessionByToken(sessionToken);
+      return Boolean(session);
+    } catch (error) {
+      console.warn('[push] Session validation failed:', error.message);
+      return true;
+    }
   }
 }
 

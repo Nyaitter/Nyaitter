@@ -1327,6 +1327,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 			expiration_time: subscription.expirationTime ?? null,
 			p256dh: subscription.keys.p256dh,
 			auth: subscription.keys.auth,
+			session_token: subscription.sessionToken || existing?.session_token || null,
 			created_at: existing?.created_at || now,
 			updated_at: now,
 		};
@@ -1336,7 +1337,13 @@ class InMemoryAdapter extends DatabaseAdapter {
 
 	async getPushSubscriptions(userId) {
 		const subscriptions = this.pushSubscriptions.get(Number(userId));
-		return subscriptions ? [...subscriptions.values()].map((subscription) => ({ ...subscription })) : [];
+		if (!subscriptions) return [];
+		return [...subscriptions.values()].map((subscription) => ({
+			endpoint: subscription.endpoint,
+			expirationTime: subscription.expiration_time,
+			keys: { p256dh: subscription.p256dh, auth: subscription.auth },
+			sessionToken: subscription.session_token || null,
+		}));
 	}
 
 	async deletePushSubscription(userId, endpoint) {
