@@ -33,7 +33,7 @@ function renderInlineMarkdown(
     { renderText, renderLinkLabel, sanitizeUrl, renderSyntax = () => '' },
 ) {
     // `_emoji_` は既存のカスタム絵文字記法なので、下線による斜体は採用しない。
-    const markdownPattern = /`([^`\r\n]{1,500})`|\[([^\]\r\n]{1,200})\]\((https?:\/\/[^\s<>"']{1,2048})\)|\*\*([^*\r\n]{1,500})\*\*|__([^_\r\n]{1,500})__|~~([^~\r\n]{1,500})~~|(?<!\*)\*([^*\r\n]{1,500})\*(?!\*)|\|\|([^|\r\n]{1,1000})\|\|/g;
+    const markdownPattern = /`([^`\r\n]{1,500})`|\[([^\]\r\n]{1,200})\]\((https?:\/\/[^\s<>"']{1,2048})\)|\*\*\*([^*\r\n]{1,500})\*\*\*|\*\*([^*\r\n]{1,500})\*\*|__([^_\r\n]{1,500})__|~~([^~\r\n]{1,500})~~|(?:(?<!\*)|(?<=\*\*))\*([^*\r\n]{1,500})\*(?=$|[^*]|\*\*)|\|\|([^|\r\n]{1,1000})\|\|/g;
     let output = '';
     let previousIndex = 0;
     let match;
@@ -47,15 +47,17 @@ function renderInlineMarkdown(
             output += safeUrl
                 ? `${renderSyntax('[')}<a href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener noreferrer">${renderLinkLabel(match[2])}</a>${renderSyntax('](')}${renderSyntax(match[3])}${renderSyntax(')')}`
                 : renderText(match[0]);
-        } else if (match[4] !== undefined || match[5] !== undefined) {
-            const marker = match[4] !== undefined ? '**' : '__';
-            output += `${renderSyntax(marker)}<strong>${renderText(match[4] ?? match[5])}</strong>${renderSyntax(marker)}`;
-        } else if (match[6] !== undefined) {
-            output += `${renderSyntax('~~')}<del>${renderText(match[6])}</del>${renderSyntax('~~')}`;
+        } else if (match[4] !== undefined) {
+            output += `${renderSyntax('***')}<strong><em>${renderText(match[4])}</em></strong>${renderSyntax('***')}`;
+        } else if (match[5] !== undefined || match[6] !== undefined) {
+            const marker = match[5] !== undefined ? '**' : '__';
+            output += `${renderSyntax(marker)}<strong>${renderText(match[5] ?? match[6])}</strong>${renderSyntax(marker)}`;
         } else if (match[7] !== undefined) {
-            output += `${renderSyntax('*')}<em>${renderText(match[7])}</em>${renderSyntax('*')}`;
+            output += `${renderSyntax('~~')}<del>${renderText(match[7])}</del>${renderSyntax('~~')}`;
         } else if (match[8] !== undefined) {
-            output += `${renderSyntax('||')}<span class="markdown-spoiler" role="button" tabindex="0" aria-expanded="false" aria-label="ネタバレを表示"><span class="markdown-spoiler-content" aria-hidden="true">${renderText(match[8])}</span></span>${renderSyntax('||')}`;
+            output += `${renderSyntax('*')}<em>${renderText(match[8])}</em>${renderSyntax('*')}`;
+        } else if (match[9] !== undefined) {
+            output += `${renderSyntax('||')}<span class="markdown-spoiler" role="button" tabindex="0" aria-expanded="false" aria-label="ネタバレを表示"><span class="markdown-spoiler-content" aria-hidden="true">${renderText(match[9])}</span></span>${renderSyntax('||')}`;
         }
         previousIndex = markdownPattern.lastIndex;
     }
@@ -66,7 +68,7 @@ function renderInlineMarkdown(
 /**
  * 生HTMLを一切許可しない、投稿・DM用の限定Markdown。
  * 許可記法:
- * - インライン: **太字** / __太字__ / *斜体* / ~~取り消し線~~ / `コード` / ||ネタバレ||
+ * - インライン: ***太字斜体*** / **太字** / __太字__ / *斜体* / ~~取り消し線~~ / `コード` / ||ネタバレ||
  * - リンク: [ラベル](https://example.com)
  * - ブロック: ## 見出し、> 引用、- 箇条書き、1. 番号付きリスト、```コードブロック```
  *

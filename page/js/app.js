@@ -1213,7 +1213,7 @@ export function initApp() {
 	                        <button class="edit-dm-msg-btn">編集</button>
 	                        <button class="delete-dm-msg-btn delete-btn">削除</button>
 	                    </div>
-	                    <div class="dm-message">${formattedContent}${attachmentsHTML}</div>
+	                    <div class="dm-message"><div class="dm-message-content">${formattedContent}</div>${attachmentsHTML}</div>
 	                </div>
 	            </div>`;
         } else {
@@ -1235,10 +1235,64 @@ export function initApp() {
 	                        <span class="dm-message-time">・${time}</span>
 	                        <button type="button" class="dm-message-menu-btn" title="メッセージメニュー" aria-label="メッセージメニュー">${ICONS.more}</button>
 	                    </div>
-	                    <div class="dm-message">${formattedContent}${attachmentsHTML}</div>
+	                    <div class="dm-message"><div class="dm-message-content">${formattedContent}</div>${attachmentsHTML}</div>
 	                </div>
 	            </div>`;
         }
+    }
+
+    function attachDmMessageClamp(messageEl) {
+        if (!(messageEl instanceof HTMLElement)) return;
+        if (messageEl.dataset.clampInitialized === 'true') return;
+        const contentEl = messageEl.querySelector('.dm-message-content');
+        if (!contentEl) return;
+        messageEl.dataset.clampInitialized = 'true';
+        messageEl.dataset.clampContent = '1';
+
+        const toggleBtn = document.createElement('button');
+        toggleBtn.type = 'button';
+        toggleBtn.className = 'dm-clamp-toggle';
+        toggleBtn.textContent = '続きを表示';
+        toggleBtn.setAttribute('aria-expanded', 'false');
+        toggleBtn.addEventListener('click', () => {
+            const expanded = contentEl.classList.toggle(
+                'dm-message-content-expanded',
+            );
+            toggleBtn.textContent = expanded ? '閉じる' : '続きを表示';
+            toggleBtn.setAttribute('aria-expanded', String(expanded));
+            toggleBtn.classList.toggle('expanded', expanded);
+        });
+        contentEl.after(toggleBtn);
+
+        const measure = () => {
+            if (!messageEl.isConnected || !contentEl.isConnected) return null;
+            const wasExpanded = contentEl.classList.contains(
+                'dm-message-content-expanded',
+            );
+            if (!wasExpanded)
+                contentEl.classList.add('dm-message-content-expanded');
+            const naturalHeight = contentEl.getBoundingClientRect().height;
+            if (!wasExpanded)
+                contentEl.classList.remove('dm-message-content-expanded');
+            const clampLimit = Number.parseFloat(
+                window.getComputedStyle(contentEl).maxHeight,
+            );
+            if (
+                Number.isFinite(clampLimit) &&
+                naturalHeight > clampLimit + 1
+            ) {
+                toggleBtn.classList.add('is-visible');
+            }
+            return true;
+        };
+        let attempts = 0;
+        const timer = setInterval(() => {
+            if (measure() === true || ++attempts >= 20) clearInterval(timer);
+        }, 50);
+    }
+
+    function initializeDmMessageClamps(root = document) {
+        root.querySelectorAll('.dm-message').forEach(attachDmMessageClamp);
     }
 
     function positionDmMessageMenu(menu, menuButton) {
@@ -1359,6 +1413,7 @@ export function initApp() {
         )
             return;
         view.insertAdjacentHTML('afterbegin', messageHtml);
+        initializeDmMessageClamps(view);
         setLastRenderedMessageId(message.id);
         await markOpenDmMessageRead(dmId, message);
     }
@@ -1613,18 +1668,14 @@ export function initApp() {
                 : '';
         const createCustomEmojiMarkup = (emojiId) => {
             const image = `<img src="/emoji/${encodeURIComponent(emojiId)}.svg" alt="_${emojiId}_" data-emoji-id="${emojiId}" style="height: 1.2em; vertical-align: -0.2em; margin: 0 0.05em;" class="nyaitter-emoji">`;
-            return editorSyntax
-                ? `${renderSyntax('_')}${image}${renderSyntax('_')}`
-                : image;
+            if (!editorSyntax) return image;
+            return `<span class="markdown-editor-emoji" data-emoji-id="${emojiId}">${renderSyntax('_')}${image}<span class="markdown-editor-emoji-id" hidden>${escapeHTML(emojiId)}</span>${renderSyntax('_')}</span>`;
         };
         const replaceCustomEmoji = (value) => {
             let processed = value;
             for (const emojiId of customEmojiIds) {
                 const escapedId = emojiId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-                const emojiPattern = new RegExp(
-                    `(?<![\\w-])_${escapedId}_(?![\\w-])`,
-                    'g',
-                );
+                const emojiPattern = new RegExp(`_${escapedId}_`, 'g');
                 processed = processed.replace(
                     emojiPattern,
                     createCustomEmojiMarkup(emojiId),
@@ -1687,368 +1738,504 @@ export function initApp() {
         });
     }
 
-    const MARKDOWN_EDITOR_LINE_ANCHOR = '\u200B';
-
-    function isMarkdownEditorEmptyParagraph(node) {
-        if (
-            node?.nodeType !== Node.ELEMENT_NODE ||
-            !['P', 'DIV'].includes(node.tagName)
-        ) {
-            return false;
-        }
-        const children = Array.from(node.childNodes);
-        return (
-            children.some(
-                (child) =>
-                    child.nodeType === Node.ELEMENT_NODE &&
-                    child.tagName === 'BR',
-            ) &&
-            children.every(
-                (child) =>
-                    (child.nodeType === Node.ELEMENT_NODE &&
-                        child.tagName === 'BR') ||
-                    (child.nodeType === Node.TEXT_NODE &&
-                        child.data.replaceAll(
-                            MARKDOWN_EDITOR_LINE_ANCHOR,
-                            '',
-                        ).length === 0),
-            )
-        );
-    }
-
-    function markdownEditorNodeToText(node) {
-        if (node.nodeType === Node.TEXT_NODE)
-            return node.data.replaceAll(MARKDOWN_EDITOR_LINE_ANCHOR, '');
-        if (node.nodeType !== Node.ELEMENT_NODE) return '';
-        const element = node;
-        if (element.tagName === 'BR') return '\n';
-        if (
-            element.matches('img.nyaitter-emoji[data-emoji-id]')
-        ) {
-            return element.dataset.emojiId || '';
-        }
-
-        const children = Array.from(element.childNodes);
-        const content = children.map(markdownEditorNodeToText).join('');
-        if (isMarkdownEditorEmptyParagraph(element)) return '';
-        if (element.tagName === 'DIV' || element.tagName === 'P') {
-            return content;
-        }
-        if (element.tagName === 'LI') return `${content}\n`;
-        return content;
-    }
-
-    function markdownEditorNodesToText(nodes, { trimTrailing = true } = {}) {
-        const sourceNodes = Array.from(nodes);
-        const isEditorEmptyLineNode = (node) =>
-            isMarkdownEditorEmptyParagraph(node) ||
-            (node.nodeType === Node.ELEMENT_NODE && node.tagName === 'BR') ||
-            (node.nodeType === Node.TEXT_NODE &&
-                node.data.replaceAll(MARKDOWN_EDITOR_LINE_ANCHOR, '').length ===
-                    0);
-        // 全選択削除後にブラウザが残す空段落・BRは、入力値ではなく
-        // キャレットを置くためのDOMなので送信用Markdownには含めない。
-        if (
-            sourceNodes.length > 0 &&
-            sourceNodes.every(isEditorEmptyLineNode)
-        ) {
-            return '';
-        }
-        let value = '';
-        sourceNodes.forEach((node, index) => {
-            const previousNode = sourceNodes[index - 1];
-            const nodeValue = markdownEditorNodeToText(node);
-            const isStandaloneBreak =
-                node.nodeType === Node.ELEMENT_NODE && node.tagName === 'BR';
-            if (index > 0) {
-                const previousWasEmpty = isMarkdownEditorEmptyParagraph(
-                    previousNode,
-                );
-                const browserTrailingCaretBreak =
-                    isStandaloneBreak &&
-                    index === sourceNodes.length - 1 &&
-                    value.endsWith('\n');
-                // ブロック間には通常改行を補う。連続する空段落も実際の
-                // 連続改行なので、各段落境界を一つの改行として保持する。
-                // 末尾キャレットだけのBRは追加の改行として数えない。
-                if (
-                    !browserTrailingCaretBreak &&
-                    !(value.endsWith('\n') && !previousWasEmpty)
-                ) {
-                    value += '\n';
-                }
-            }
-            if (
-                !(
-                    isStandaloneBreak &&
-                    index === sourceNodes.length - 1 &&
-                    value.endsWith('\n')
-                )
-            ) {
-                value += nodeValue;
-            }
-        });
-        value = value.replace(/\r/g, '');
-        if (trimTrailing) value = value.replace(/\n+$/, '');
-        return value;
+    function normalizeMarkdownEditorValue(value) {
+        return String(value || '').replace(/\r\n?/g, '\n');
     }
 
     function getMarkdownEditorValue(editor) {
-        if (!editor) return '';
-        return markdownEditorNodesToText(editor.childNodes, {
-            trimTrailing: false,
-        });
+        return editor instanceof HTMLTextAreaElement
+            ? normalizeMarkdownEditorValue(editor.value)
+            : '';
     }
 
-    function getEditorSelection(editor) {
-        const selection = window.getSelection();
-        if (!selection?.rangeCount) return null;
-        const range = selection.getRangeAt(0);
-        return editor.contains(range.commonAncestorContainer) ? range : null;
+    function getMarkdownEditorPreview(editor) {
+        return editor
+            ?.closest('.markdown-textarea-editor')
+            ?.querySelector('.markdown-editor-preview');
     }
 
-    function getEditorSelectionOffsets(editor, source) {
-        const selection = getEditorSelection(editor);
-        if (!selection) return null;
-        const getOffset = (container, offset) => {
-            const range = document.createRange();
-            range.selectNodeContents(editor);
-            range.setEnd(container, offset);
-            return Math.min(
-                markdownEditorNodesToText(range.cloneContents().childNodes, {
-                    trimTrailing: false,
-                }).length,
-                source.length,
-            );
-        };
-        const start = getOffset(selection.startContainer, selection.startOffset);
-        const end = getOffset(selection.endContainer, selection.endOffset);
-        return { start, end };
+    function getMarkdownEditorPaint(editor) {
+        return editor
+            ?.closest('.markdown-textarea-editor')
+            ?.querySelector('.markdown-editor-paint');
     }
 
-    function restoreEditorSelection(editor, markerStart, markerEnd) {
-        const replaceMarker = (marker, className) => {
-            const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT);
-            let textNode;
-            while ((textNode = walker.nextNode())) {
-                const index = textNode.data.indexOf(marker);
-                if (index === -1) continue;
-                const trailingNode = textNode.splitText(index);
-                trailingNode.data = trailingNode.data.slice(marker.length);
-                const markerElement = document.createElement('span');
-                markerElement.className = className;
-                markerElement.setAttribute('aria-hidden', 'true');
-                trailingNode.parentNode.insertBefore(markerElement, trailingNode);
-                return markerElement;
-            }
-            return null;
-        };
-        const getPosition = (markerElement, after = false) => ({
-            parent: markerElement.parentNode,
-            offset:
-                Array.prototype.indexOf.call(
-                    markerElement.parentNode.childNodes,
-                    markerElement,
-                ) + (after ? 1 : 0),
-        });
-        const ensureEditableLine = (parent) => {
-            const hasOnlyEmptyText = Array.from(parent?.childNodes || []).every(
-                (node) =>
-                    node.nodeType === Node.TEXT_NODE && node.data.length === 0,
-            );
-            if (parent?.tagName === 'P' && hasOnlyEmptyText) {
-                parent.replaceChildren(document.createElement('br'));
-            }
-        };
-
-        const start = replaceMarker(markerStart, 'markdown-editor-selection-marker');
-        const end = replaceMarker(markerEnd, 'markdown-editor-selection-marker');
-        if (!start) return;
-
-        const startPosition = getPosition(start, true);
-        const endPosition = end ? getPosition(end) : startPosition;
-        const sameParent = startPosition.parent === endPosition.parent;
-        const startsBeforeEnd =
-            sameParent && startPosition.offset <= endPosition.offset;
-        end?.remove();
-        start.remove();
-        if (sameParent && startsBeforeEnd && end) endPosition.offset -= 1;
-        startPosition.offset -= 1;
-        ensureEditableLine(startPosition.parent);
-        ensureEditableLine(endPosition.parent);
-
-        const normalizePosition = ({ parent, offset }) => {
-            const safeParent = parent?.isConnected ? parent : editor;
-            return {
-                parent: safeParent,
-                offset: Math.max(
-                    0,
-                    Math.min(offset, safeParent.childNodes.length),
-                ),
-            };
-        };
-        const safeStart = normalizePosition(startPosition);
-        const safeEnd = normalizePosition(endPosition);
-        const selection = window.getSelection();
-        const range = document.createRange();
-        try {
-            range.setStart(safeStart.parent, safeStart.offset);
-            range.setEnd(safeEnd.parent, safeEnd.offset);
-        } catch {
-            range.selectNodeContents(editor);
-            range.collapse(false);
+    function getMarkdownEditorSourceLength(node) {
+        if (node.nodeType === Node.TEXT_NODE) return node.data.length;
+        if (node.nodeType !== Node.ELEMENT_NODE) return 0;
+        const element = node;
+        if (
+            element.classList.contains('markdown-editor-sentinel') ||
+            element.classList.contains('markdown-editor-caret-anchor') ||
+            element.classList.contains('markdown-editor-emoji-id')
+        ) {
+            return 0;
         }
-        selection?.removeAllRanges();
-        selection?.addRange(range);
+        if (element.tagName === 'BR') return 1;
+        if (element.matches('img.nyaitter-emoji[data-emoji-id]')) {
+            return (element.dataset.emojiId || '').length;
+        }
+        return Array.from(element.childNodes).reduce(
+            (length, child) => length + getMarkdownEditorSourceLength(child),
+            0,
+        );
     }
 
-    function ensureMarkdownEditorTrailingLine(editor, source) {
-        if (!source.endsWith('\n')) return;
-        const line = editor.lastElementChild;
-        if (!line || isMarkdownEditorEmptyParagraph(line)) return;
-        const endsWithBreak =
-            line.lastElementChild?.tagName === 'BR' ||
-            line.lastChild?.nodeName === 'BR';
-        if (!endsWithBreak) return;
-        const trailingLine = document.createElement('p');
-        trailingLine.className = 'markdown-empty-line';
-        trailingLine.append(document.createElement('br'));
-        editor.append(trailingLine);
-    }
-
-    function restoreMarkdownEditorTrailingLineCaret(editor) {
-        const line = editor.lastElementChild;
-        if (!isMarkdownEditorEmptyParagraph(line)) return;
-        // Markdown描画が出力する末尾の空段落を、そのままキャレット用の
-        // 空行として再利用する。新しい段落を追加しないため空行は増殖しない。
-        line.classList.add('markdown-empty-line');
-        const range = document.createRange();
-        range.selectNodeContents(line);
-        range.collapse(false);
-        const selection = window.getSelection();
-        selection?.removeAllRanges();
-        selection?.addRange(range);
-    }
-
-    function attachMarkdownContentEditor(editor) {
-        if (!editor || editor.dataset.markdownContentEditor === 'true') return;
-        editor.dataset.markdownContentEditor = 'true';
-        editor.setAttribute('contenteditable', 'true');
-        editor.setAttribute('role', 'textbox');
-        editor.setAttribute('aria-multiline', 'true');
-        editor.setAttribute('spellcheck', 'true');
-
-        let composing = false;
-        const createMarker = () =>
-            `\uE000${Date.now().toString(36)}${Math.random().toString(36).slice(2)}\uE001`;
-        const render = ({ preserveSelection = false } = {}) => {
-            const source = getMarkdownEditorValue(editor);
-            const markerStart = createMarker();
-            const markerEnd = createMarker();
-            let sourceWithMarkers = source;
-            let restoreTrailingLineCaret = false;
-            if (preserveSelection) {
-                const offsets = getEditorSelectionOffsets(editor, source);
-                if (offsets) {
-                    // ブラウザは末尾空行のキャレットを、最後のBRの直後
-                    // （内部文字列上は末尾改行の一つ手前）へ置くことがある。
-                    // その位置も末尾空行として復元する。
-                    restoreTrailingLineCaret =
-                        source.endsWith('\n') &&
-                        offsets.start === offsets.end &&
-                        offsets.end >= source.length - 1;
-                    sourceWithMarkers =
-                        source.slice(0, offsets.end) +
-                        markerEnd +
-                        source.slice(offsets.end);
-                    sourceWithMarkers =
-                        sourceWithMarkers.slice(0, offsets.start) +
-                        markerStart +
-                        sourceWithMarkers.slice(offsets.start);
+    function getMarkdownEditorSourceSegments(preview) {
+        const segments = [];
+        let sourceOffset = 0;
+        const visit = (node) => {
+            if (node.nodeType === Node.TEXT_NODE) {
+                const length = node.data.length;
+                if (length > 0) {
+                    segments.push({
+                        start: sourceOffset,
+                        end: sourceOffset + length,
+                        node,
+                        kind: 'text',
+                    });
+                    sourceOffset += length;
                 }
-            }
-
-            const maxLength = Number(editor.dataset.maxlength || 0);
-            const cleanSource = sourceWithMarkers
-                .replaceAll(markerStart, '')
-                .replaceAll(markerEnd, '');
-            if (maxLength > 0 && cleanSource.length > maxLength) {
-                editor.innerHTML = formatPostContent(
-                    cleanSource.slice(0, maxLength),
-                    getAllUsersCache(),
-                    { allowMarkdown: true, editorSyntax: true },
-                );
-                const limitedSource = cleanSource.slice(0, maxLength);
-                editor.dataset.markdownSource = limitedSource;
                 return;
             }
+            if (node.nodeType !== Node.ELEMENT_NODE) return;
+            const element = node;
+            if (
+                element.classList.contains('markdown-editor-sentinel') ||
+                element.classList.contains('markdown-editor-caret-anchor') ||
+                element.classList.contains('markdown-editor-emoji-id')
+            ) {
+                return;
+            }
+            if (element.tagName === 'BR') {
+                segments.push({
+                    start: sourceOffset,
+                    end: sourceOffset + 1,
+                    node: element,
+                    kind: 'break',
+                });
+                sourceOffset += 1;
+                return;
+            }
+            if (element.matches('img.nyaitter-emoji[data-emoji-id]')) {
+                const length = (element.dataset.emojiId || '').length;
+                if (length > 0) {
+                    segments.push({
+                        start: sourceOffset,
+                        end: sourceOffset + length,
+                        node: element,
+                        kind: 'emoji',
+                    });
+                    sourceOffset += length;
+                }
+                return;
+            }
+            Array.from(element.childNodes).forEach(visit);
+        };
+        Array.from(preview.childNodes).forEach(visit);
+        return { segments, sourceLength: sourceOffset };
+    }
 
-            editor.innerHTML = cleanSource
-                ? formatPostContent(sourceWithMarkers, getAllUsersCache(), {
+    function getMarkdownEditorSegmentBoundary(segment, sourceOffset) {
+        if (segment.kind === 'text') {
+            return {
+                container: segment.node,
+                offset: Math.max(
+                    0,
+                    Math.min(sourceOffset - segment.start, segment.node.data.length),
+                ),
+            };
+        }
+        if (segment.kind === 'emoji') {
+            const label = segment.node
+                .closest('.markdown-editor-emoji')
+                ?.querySelector('.markdown-editor-emoji-id:not([hidden])');
+            if (label?.firstChild) {
+                return {
+                    container: label.firstChild,
+                    offset: Math.max(
+                        0,
+                        Math.min(
+                            sourceOffset - segment.start,
+                            label.firstChild.data.length,
+                        ),
+                    ),
+                };
+            }
+        }
+        const parent = segment.node.parentNode;
+        const index = Array.prototype.indexOf.call(parent.childNodes, segment.node);
+        return {
+            container: parent,
+            offset: index + (sourceOffset > segment.start ? 1 : 0),
+        };
+    }
+
+    function getMarkdownEditorBoundary(preview, sourceOffset) {
+        const { segments, sourceLength } = getMarkdownEditorSourceSegments(preview);
+        const offset = Math.max(0, Math.min(sourceOffset, sourceLength));
+        const activeEmojiSegment = segments.find((item) => {
+            if (item.kind !== 'emoji' || offset < item.start || offset > item.end) {
+                return false;
+            }
+            return Boolean(
+                item.node
+                    .closest('.markdown-editor-emoji')
+                    ?.querySelector('.markdown-editor-emoji-id:not([hidden])'),
+            );
+        });
+        if (activeEmojiSegment) {
+            return getMarkdownEditorSegmentBoundary(activeEmojiSegment, offset);
+        }
+        const segment = segments.find((item) => offset <= item.end);
+        if (segment) return getMarkdownEditorSegmentBoundary(segment, offset);
+        return { container: preview, offset: preview.childNodes.length };
+    }
+
+    function getMarkdownEditorCaretRect(preview, sourceOffset) {
+        const { sourceLength } = getMarkdownEditorSourceSegments(preview);
+        const offset = Math.max(0, Math.min(sourceOffset, sourceLength));
+        if (offset < sourceLength) {
+            const nextCharacterRect = getMarkdownEditorSelectionRects(
+                preview,
+                offset,
+                offset + 1,
+            ).at(0);
+            if (nextCharacterRect) {
+                return {
+                    left: nextCharacterRect.left,
+                    top: nextCharacterRect.top,
+                    height: nextCharacterRect.height,
+                };
+            }
+        }
+        if (offset > 0) {
+            const previousCharacterRect = getMarkdownEditorSelectionRects(
+                preview,
+                offset - 1,
+                offset,
+            ).at(-1);
+            if (previousCharacterRect) {
+                return {
+                    left: previousCharacterRect.right,
+                    top: previousCharacterRect.top,
+                    height: previousCharacterRect.height,
+                };
+            }
+        }
+
+        const boundary = getMarkdownEditorBoundary(preview, offset);
+        const range = document.createRange();
+        try {
+            range.setStart(boundary.container, boundary.offset);
+            range.collapse(true);
+        } catch {
+            return null;
+        }
+        const rect = Array.from(range.getClientRects()).at(-1) || range.getBoundingClientRect();
+        if (rect.height > 0) return rect;
+
+        const previewRect = preview.getBoundingClientRect();
+        const style = window.getComputedStyle(preview);
+        const fontSize = Number.parseFloat(style.fontSize) || 16;
+        const lineHeight = Number.parseFloat(style.lineHeight) || fontSize * 1.2;
+        return {
+            left: previewRect.left + (Number.parseFloat(style.paddingLeft) || 0),
+            top: previewRect.top + (Number.parseFloat(style.paddingTop) || 0),
+            height: lineHeight,
+        };
+    }
+
+    function getMarkdownEditorSelectionRects(preview, start, end) {
+        if (start >= end) return [];
+        const range = document.createRange();
+        const startBoundary = getMarkdownEditorBoundary(preview, start);
+        const endBoundary = getMarkdownEditorBoundary(preview, end);
+        try {
+            range.setStart(startBoundary.container, startBoundary.offset);
+            range.setEnd(endBoundary.container, endBoundary.offset);
+        } catch {
+            return [];
+        }
+        return Array.from(range.getClientRects()).filter(
+            (rect) => rect.width > 0 || rect.height > 0,
+        );
+    }
+
+    function getMarkdownEditorSelectionSnapshot(editor) {
+        const anchor = editor.selectionStart;
+        const focus = editor.selectionEnd;
+        return {
+            anchor,
+            focus,
+            start: Math.min(anchor, focus),
+            end: Math.max(anchor, focus),
+        };
+    }
+
+    function getMarkdownEditorCompositionRange(editor) {
+        const composition = editor._markdownEditorComposition;
+        if (!composition?.active || !composition.data) return null;
+        const source = editor.value;
+        const data = composition.data;
+        const preferredStart = Math.max(
+            0,
+            Math.min(composition.start, source.length - data.length),
+        );
+        let start =
+            source.slice(preferredStart, preferredStart + data.length) === data
+                ? preferredStart
+                : -1;
+        if (start < 0) {
+            const aroundCaret = Math.max(0, editor.selectionStart - data.length);
+            start = source.lastIndexOf(data, aroundCaret);
+        }
+        if (start < 0) return null;
+        return { start, end: start + data.length };
+    }
+
+    function getMarkdownEditorSelectedCompositionClause(editor, composition) {
+        const selection = getMarkdownEditorSelectionSnapshot(editor);
+        if (
+            selection.start >= selection.end ||
+            selection.start < composition.start ||
+            selection.end > composition.end
+        ) {
+            return null;
+        }
+        return selection;
+    }
+
+    function appendMarkdownEditorRect(layer, className, rect, paintRect) {
+        const element = document.createElement('span');
+        element.className = className;
+        element.style.left = `${rect.left - paintRect.left}px`;
+        element.style.top = `${rect.top - paintRect.top}px`;
+        element.style.width = `${Math.max(rect.width, 1)}px`;
+        element.style.height = `${rect.height}px`;
+        layer.append(element);
+    }
+
+    function syncMarkdownEditorCompositionDecoration(editor, preview, paint) {
+        const layer = paint.querySelector('.markdown-editor-composition');
+        if (!layer) return;
+        layer.replaceChildren();
+        const composition = getMarkdownEditorCompositionRange(editor);
+        if (!composition) return;
+        const paintRect = paint.getBoundingClientRect();
+        getMarkdownEditorSelectionRects(
+            preview,
+            composition.start,
+            composition.end,
+        ).forEach((rect) => {
+            appendMarkdownEditorRect(
+                layer,
+                'markdown-editor-composition-underline',
+                rect,
+                paintRect,
+            );
+        });
+
+        const selectedClause = getMarkdownEditorSelectedCompositionClause(
+            editor,
+            composition,
+        );
+        if (!selectedClause) return;
+        getMarkdownEditorSelectionRects(
+            preview,
+            selectedClause.start,
+            selectedClause.end,
+        ).forEach((rect) => {
+            appendMarkdownEditorRect(
+                layer,
+                'markdown-editor-selection-rect',
+                rect,
+                paintRect,
+            );
+        });
+    }
+
+    function syncMarkdownEditorEmojiLabels(editor, preview, selection) {
+        const { start: selectionStart, end: selectionEnd } = selection;
+        const { segments } = getMarkdownEditorSourceSegments(preview);
+        preview.querySelectorAll('.markdown-editor-emoji').forEach((token) => {
+            const image = token.querySelector('img.nyaitter-emoji[data-emoji-id]');
+            const label = token.querySelector('.markdown-editor-emoji-id');
+            const segment = segments.find((item) => item.node === image);
+            if (!image || !label || !segment) return;
+            const tokenStart = Math.max(0, segment.start - 1);
+            const tokenEnd = segment.end + 1;
+            const active =
+                selectionStart === selectionEnd
+                    ? selectionStart > tokenStart && selectionStart < tokenEnd
+                    : selectionStart < tokenEnd && selectionEnd > tokenStart;
+            image.hidden = active;
+            label.hidden = !active;
+        });
+    }
+
+    function syncMarkdownEditorDecoration(editor) {
+        const preview = getMarkdownEditorPreview(editor);
+        const paint = getMarkdownEditorPaint(editor);
+        if (!preview || !paint) return;
+        const selectionLayer = paint.querySelector('.markdown-editor-selection');
+        const caret = paint.querySelector('.markdown-editor-caret');
+        if (!selectionLayer || !caret) return;
+
+        const selection = getMarkdownEditorSelectionSnapshot(editor);
+        const expectedMode =
+            selection.start === selection.end &&
+            !editor._markdownEditorComposition?.active
+                ? 'formatted'
+                : 'raw';
+        if (preview.dataset.markdownEditorMode !== expectedMode) {
+            updateMarkdownEditorPreview(editor, selection);
+        }
+        syncMarkdownEditorEmojiLabels(editor, preview, selection);
+        paint.style.transform = `translate(${-editor.scrollLeft}px, ${-editor.scrollTop}px)`;
+        selectionLayer.replaceChildren();
+        syncMarkdownEditorCompositionDecoration(editor, preview, paint);
+        caret.hidden = true;
+
+        if (document.activeElement !== editor) return;
+
+        const { start, end } = selection;
+        const paintRect = paint.getBoundingClientRect();
+        if (start !== end) {
+            getMarkdownEditorSelectionRects(preview, start, end).forEach((rect) => {
+                const highlight = document.createElement('span');
+                highlight.className = 'markdown-editor-selection-rect';
+                highlight.style.left = `${rect.left - paintRect.left}px`;
+                highlight.style.top = `${rect.top - paintRect.top}px`;
+                highlight.style.width = `${Math.max(rect.width, 1)}px`;
+                highlight.style.height = `${rect.height}px`;
+                selectionLayer.append(highlight);
+            });
+            return;
+        }
+
+        const rect = getMarkdownEditorCaretRect(preview, start);
+        if (!rect || rect.height === 0) return;
+        caret.hidden = false;
+        caret.style.left = `${rect.left - paintRect.left}px`;
+        caret.style.top = `${rect.top - paintRect.top}px`;
+        caret.style.height = `${rect.height}px`;
+    }
+
+    function updateMarkdownEditorPreview(
+        editor,
+        selection = getMarkdownEditorSelectionSnapshot(editor),
+    ) {
+        const preview = getMarkdownEditorPreview(editor);
+        if (!preview) return;
+        const source = getMarkdownEditorValue(editor);
+        const rawTextMode =
+            selection.start !== selection.end ||
+            Boolean(editor._markdownEditorComposition?.active);
+        if (rawTextMode) {
+            preview.textContent = source;
+        } else {
+            preview.innerHTML = source
+                ? formatPostContent(source, getAllUsersCache(), {
                       allowMarkdown: true,
                       editorSyntax: true,
                   })
                 : '';
-            editor.dataset.markdownSource = cleanSource;
-            ensureMarkdownEditorTrailingLine(editor, cleanSource);
-            if (preserveSelection && sourceWithMarkers !== cleanSource) {
-                restoreEditorSelection(editor, markerStart, markerEnd);
-            }
-            if (restoreTrailingLineCaret) {
-                restoreMarkdownEditorTrailingLineCaret(editor);
-            }
-        };
+        }
+        preview.dataset.markdownEditorMode = rawTextMode ? 'raw' : 'formatted';
+        preview.classList.remove('hidden');
+        const placeholder = getMarkdownEditorPaint(editor)?.querySelector(
+            '.markdown-editor-placeholder',
+        );
+        if (placeholder) {
+            placeholder.textContent = editor.dataset.markdownPlaceholder || '';
+            placeholder.hidden = Boolean(source);
+        }
+        requestAnimationFrame(() => syncMarkdownEditorDecoration(editor));
+    }
 
-        const renderAfterInput = () => {
-            if (composing) {
-                editor.dataset.markdownSource = getMarkdownEditorValue(editor);
-                return;
-            }
-            requestAnimationFrame(() => render({ preserveSelection: true }));
-        };
+    function getContentEditorPreference() {
+        return getCurrentUser()?.settings?.content_editor === 'nyaitter'
+            ? 'nyaitter'
+            : 'textarea';
+    }
 
-        editor.addEventListener('input', renderAfterInput);
-        editor.addEventListener('compositionstart', () => {
-            composing = true;
-        });
+    function applyContentEditorPreference(editor) {
+        const host = editor.closest('.markdown-textarea-editor');
+        if (!host) return false;
+        if (editor.dataset.markdownPlaceholder === undefined) {
+            editor.dataset.markdownPlaceholder = editor.placeholder || '';
+        }
+        const useNyaitterEditor = getContentEditorPreference() === 'nyaitter';
+        host.classList.toggle('is-nyaitter-editor', useNyaitterEditor);
+        host.classList.toggle('is-plain-textarea', !useNyaitterEditor);
+        editor.placeholder = useNyaitterEditor
+            ? ''
+            : editor.dataset.markdownPlaceholder || '';
+        return useNyaitterEditor;
+    }
+
+    function refreshMarkdownContentEditors() {
+        document
+            .querySelectorAll('textarea[data-markdown-content-editor]')
+            .forEach((editor) => attachMarkdownContentEditor(editor));
+    }
+
+    function attachMarkdownContentEditor(editor) {
+        if (!(editor instanceof HTMLTextAreaElement)) return;
+        const useNyaitterEditor = applyContentEditorPreference(editor);
+        if (!useNyaitterEditor) return;
+        if (editor.dataset.markdownContentEditor === 'true') {
+            updateMarkdownEditorPreview(editor);
+            return;
+        }
+        editor.dataset.markdownContentEditor = 'true';
+        editor.spellcheck = true;
+        const sync = () => syncMarkdownEditorDecoration(editor);
+        const updateComposition = (event) => {
+            const previous = editor._markdownEditorComposition;
+            editor._markdownEditorComposition = {
+                active: true,
+                start: previous?.start ?? editor.selectionStart,
+                data: String(event.data || ''),
+            };
+            updateMarkdownEditorPreview(editor);
+        };
+        editor.addEventListener('compositionstart', updateComposition);
+        editor.addEventListener('compositionupdate', updateComposition);
         editor.addEventListener('compositionend', () => {
-            composing = false;
-            requestAnimationFrame(() => render({ preserveSelection: true }));
+            delete editor._markdownEditorComposition;
+            updateMarkdownEditorPreview(editor);
         });
-        editor.addEventListener('paste', (event) => {
-            const text = event.clipboardData?.getData('text/plain');
-            if (text === undefined) return;
-            event.preventDefault();
-            insertMarkdownEditorText(editor, text);
+        editor.addEventListener('input', () => updateMarkdownEditorPreview(editor));
+        editor.addEventListener('select', sync);
+        editor.addEventListener('keyup', sync);
+        editor.addEventListener('focus', sync);
+        editor.addEventListener('blur', sync);
+        editor.addEventListener('scroll', sync);
+        getMarkdownEditorPreview(editor)?.addEventListener('load', sync, true);
+
+        document.addEventListener('selectionchange', () => {
+            if (document.activeElement === editor) sync();
         });
-        void custom_emoji.then(() => render());
-        render();
+        void custom_emoji.then(() => updateMarkdownEditorPreview(editor));
+        updateMarkdownEditorPreview(editor);
     }
 
     function setMarkdownEditorValue(editor, value, { focus = false } = {}) {
-        if (!editor) return;
-        editor.textContent = String(value || '');
+        if (!(editor instanceof HTMLTextAreaElement)) return;
+        editor.value = normalizeMarkdownEditorValue(value);
         if (focus) editor.focus();
         editor.dispatchEvent(new Event('input', { bubbles: true }));
     }
 
     function insertMarkdownEditorText(editor, value) {
-        if (!editor || !value) return;
+        if (!(editor instanceof HTMLTextAreaElement) || !value) return;
         editor.focus();
-        const selectionRange = getEditorSelection(editor);
-        if (!selectionRange) {
-            editor.append(document.createTextNode(value));
-        } else {
-            selectionRange.deleteContents();
-            const textNode = document.createTextNode(value);
-            selectionRange.insertNode(textNode);
-            const range = document.createRange();
-            range.setStartAfter(textNode);
-            range.collapse(true);
-            const nativeSelection = window.getSelection();
-            nativeSelection?.removeAllRanges();
-            nativeSelection?.addRange(range);
-        }
+        const text = String(value);
+        const start = editor.selectionStart;
+        const end = editor.selectionEnd;
+        editor.setRangeText(text, start, end, 'end');
         editor.dispatchEvent(new Event('input', { bubbles: true }));
     }
 
@@ -3347,7 +3534,7 @@ export function initApp() {
 	                ${isModal ? '<button class="modal-close-btn">×</button>' : ''}
 	                <div class="form-content">
 	                    <div id="reply-info" class="hidden" style="margin-bottom: 0.5rem; color: var(--secondary-text-color);"></div>
-                            <div id="post-content" class="markdown-content-editor post-content-editor" contenteditable="true" role="textbox" aria-multiline="true" spellcheck="true" data-markdown-content-editor data-maxlength="280" data-placeholder="いまどうしてる？"></div>
+                            <div class="markdown-textarea-editor post-content-editor"><textarea id="post-content" class="markdown-content-editor" rows="3" maxlength="280" spellcheck="true" data-markdown-content-editor placeholder="いまどうしてる？"></textarea><div class="markdown-editor-paint" aria-hidden="true"><div class="markdown-editor-placeholder"></div><div class="markdown-editor-preview hidden"></div><div class="markdown-editor-selection"></div><div class="markdown-editor-composition"></div><div class="markdown-editor-caret"></div></div></div>
                             <div class="file-preview-container"></div>
 	                    <div class="post-form-actions">
 	                        <button type="button" class="attachment-button float-left" title="ファイルを添付">
@@ -4326,11 +4513,27 @@ export function initApp() {
                 });
                 contentEl.after(toggleBtn);
 
-                // 挿入後に実測し、はみ出している場合だけボタンを表示する。
+                // クランプを一時解除して本文そのものの実表示高さを測る。
+                // 見出しなどの子要素の内部レイアウトではなく、クランプ上限を
+                // 超えた本文だけに「続きを表示する」を付ける。
                 const measure = () => {
                     if (!postEl.isConnected || !contentEl.isConnected)
                         return null;
-                    if (contentEl.scrollHeight > contentEl.clientHeight + 1) {
+                    const wasExpanded = contentEl.classList.contains(
+                        'post-content-expanded',
+                    );
+                    if (!wasExpanded)
+                        contentEl.classList.add('post-content-expanded');
+                    const naturalHeight = contentEl.getBoundingClientRect().height;
+                    if (!wasExpanded)
+                        contentEl.classList.remove('post-content-expanded');
+                    const clampLimit = Number.parseFloat(
+                        window.getComputedStyle(contentEl).maxHeight,
+                    );
+                    if (
+                        Number.isFinite(clampLimit) &&
+                        naturalHeight > clampLimit + 1
+                    ) {
                         toggleBtn.classList.add('is-visible');
                     }
                     return true;
@@ -5242,7 +5445,7 @@ export function initApp() {
 	                <div class="dm-conversation-view">${messagesHTML}</div>
 	                <div class="dm-message-form">
 	                    <div class="dm-form-content">
-                            <div id="dm-message-input" class="markdown-content-editor dm-content-editor" contenteditable="true" role="textbox" aria-multiline="true" spellcheck="true" data-markdown-content-editor data-placeholder="メッセージを送信"></div>
+                            <div class="markdown-textarea-editor dm-content-editor"><textarea id="dm-message-input" class="markdown-content-editor" rows="2" spellcheck="true" data-markdown-content-editor placeholder="メッセージを送信"></textarea><div class="markdown-editor-paint" aria-hidden="true"><div class="markdown-editor-placeholder"></div><div class="markdown-editor-preview hidden"></div><div class="markdown-editor-selection"></div><div class="markdown-editor-composition"></div><div class="markdown-editor-caret"></div></div></div>
                             <div class="file-preview-container dm-file-preview"></div>
 	                    </div>
 	                    <div class="dm-form-actions">
@@ -5257,6 +5460,7 @@ export function initApp() {
             // 会話を再読込せずナビゲーションだけを更新する。
             void updateNavAndSidebars();
             await flushRealtimeDmMessages(dm.id);
+            initializeDmMessageClamps(container);
 
             const messageInput = document.getElementById('dm-message-input');
             attachMarkdownContentEditor(messageInput);
@@ -5875,11 +6079,17 @@ export function initApp() {
 	                                <option value="absolute_12">絶対（12時間）</option>
 	                            </select>
 	                            <p class="settings-help-text">プロフィールの参加日時には適用されません。</p>
-	                            <label for="setting-emoji-kind">絵文字のフォント</label>
-	                            <select id="setting-emoji-kind" class="settings-select">
-	                                <option value="twemoji">Twemoji</option><option value="emojione">Emoji One</option><option value="default">デフォルト（端末絵文字）</option>
-	                            </select>
-	                            <label for="setting-theme">テーマ</label>
+                            <label for="setting-emoji-kind">絵文字のフォント</label>
+                            <select id="setting-emoji-kind" class="settings-select">
+                                <option value="twemoji">Twemoji</option><option value="emojione">Emoji One</option><option value="default">デフォルト（端末絵文字）</option>
+                            </select>
+                            <label for="setting-content-editor">コンテンツエディタ</label>
+                            <select id="setting-content-editor" class="settings-select">
+                                <option value="textarea">Textarea</option>
+                                <option value="nyaitter">Nyaitterエディタ</option>
+                            </select>
+                            <p class="settings-help-text">Textareaはブラウザ標準の入力欄です。NyaitterエディタはMarkdownとカスタム絵文字を入力中に表示します。</p>
+                            <label for="setting-theme">テーマ</label>
 	                            <select id="setting-theme" class="settings-select">
 	                                <option value="auto">端末設定</option><option value="light">ライト</option><option value="dark">ダーク</option>
 	                            </select>
@@ -6005,6 +6215,10 @@ export function initApp() {
 
         const emoji_kind = getCurrentUser().settings?.emoji || 'twemoji';
         document.getElementById('setting-emoji-kind').value = emoji_kind;
+        document.getElementById('setting-content-editor').value =
+            getCurrentUser().settings?.content_editor === 'nyaitter'
+                ? 'nyaitter'
+                : 'textarea';
 
         const theme = getCurrentUser().settings?.theme || 'light';
         document.getElementById('setting-theme').value = theme;
@@ -7727,6 +7941,11 @@ export function initApp() {
                             .value,
                     ),
                     emoji: form.querySelector('#setting-emoji-kind').value,
+                    content_editor:
+                        form.querySelector('#setting-content-editor').value ===
+                        'nyaitter'
+                            ? 'nyaitter'
+                            : 'textarea',
                     theme: form.querySelector('#setting-theme').value,
                     color_theme: normalizeColorTheme(
                         form.querySelector('#setting-color-theme').value,
@@ -7805,6 +8024,7 @@ export function initApp() {
             updateAccountData(getCurrentUser());
             applyInterfaceTheme(getCurrentUser().settings?.theme || 'light');
             applyColorTheme(getCurrentUser().settings || {});
+            refreshMarkdownContentEditors();
             await updateNavAndSidebars();
             setNewIconDataUrl(null);
             setResetIconToDefault(false);
@@ -8060,7 +8280,7 @@ export function initApp() {
 	                    <img src="${getUserIconUrl(getCurrentUser())}" class="user-icon" alt="your icon">
 	                    <button class="modal-close-btn">×</button>
 	                    <div class="form-content">
-	                                                <div id="edit-post-textarea" class="markdown-content-editor post-form-textarea" contenteditable="true" role="textbox" aria-multiline="true" spellcheck="true" data-markdown-content-editor>${escapeHTML(String(post.content || ''))}</div>
+	                                                <div class="markdown-textarea-editor post-form-textarea"><textarea id="edit-post-textarea" class="markdown-content-editor" rows="5" maxlength="280" spellcheck="true" data-markdown-content-editor>${escapeHTML(String(post.content || ''))}</textarea><div class="markdown-editor-paint" aria-hidden="true"><div class="markdown-editor-placeholder"></div><div class="markdown-editor-preview hidden"></div><div class="markdown-editor-selection"></div><div class="markdown-editor-composition"></div><div class="markdown-editor-caret"></div></div></div>
                         <div class="file-preview-container" style="display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 1rem;">${renderAttachments()}</div>
 	                        <div class="post-form-actions" style="padding-top: 1rem;">
 	                            <button type="button" class="attachment-button float-left" title="ファイルを追加">${ICONS.attachment}</button>
@@ -8979,7 +9199,7 @@ export function initApp() {
 	                <div class="post-form" style="padding: 1rem;">
 	                    <button class="modal-close-btn">×</button>
 	                    <div class="form-content">
-	                                                <div id="edit-dm-textarea" class="markdown-content-editor dm-content-editor" style="min-height: 100px; font-size: 1rem;" contenteditable="true" role="textbox" aria-multiline="true" spellcheck="true" data-markdown-content-editor>${escapeHTML(String(messagePlaintext))}</div>
+	                                                <div class="markdown-textarea-editor dm-content-editor" style="min-height: 100px; font-size: 1rem;"><textarea id="edit-dm-textarea" class="markdown-content-editor" rows="5" spellcheck="true" data-markdown-content-editor>${escapeHTML(String(messagePlaintext))}</textarea><div class="markdown-editor-paint" aria-hidden="true"><div class="markdown-editor-placeholder"></div><div class="markdown-editor-preview hidden"></div><div class="markdown-editor-selection"></div><div class="markdown-editor-composition"></div><div class="markdown-editor-caret"></div></div></div>
                         <div class="file-preview-container" style="display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 1rem;"></div>
 	                        <div class="post-form-actions" style="padding-top: 1rem;">
 	                            <button type="button" class="attachment-button float-left" title="ファイルを追加">${ICONS.attachment}</button>
@@ -9144,6 +9364,9 @@ export function initApp() {
                 messageContainer.outerHTML = await renderDmMessage(
                     postArray[messageIndex],
                     dmId,
+                );
+                initializeDmMessageClamps(
+                    document.querySelector('.dm-conversation-view'),
                 );
             }
         } catch (e) {
@@ -9359,6 +9582,7 @@ export function initApp() {
                 if (view) {
                     const msgHTML = await renderDmMessage(message, dmId);
                     view.insertAdjacentHTML('afterbegin', msgHTML);
+                    initializeDmMessageClamps(view);
                     setLastRenderedMessageId(message.id);
                     view.scrollTop = view.scrollHeight;
                 }

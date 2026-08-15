@@ -261,7 +261,7 @@ textarea {
     fill: currentColor;
     stroke: none;
 }
-.nav-item[href='#settings'].active svg circle {
+.nav-item[href^='#settings'].active svg circle {
     stroke: none;
 }
 
@@ -279,14 +279,14 @@ textarea {
 }
 
 @media (prefers-color-scheme: dark) {
-    .nav-item[href='#settings'].active svg circle {
+    .nav-item[href^='#settings'].active svg circle {
         fill: black;
     }
 }
-body.light .nav-item[href='#settings'].active svg circle {
+body.light .nav-item[href^='#settings'].active svg circle {
     fill: white;
 }
-body.dark .nav-item[href='#settings'].active svg circle {
+body.dark .nav-item[href^='#settings'].active svg circle {
     fill: black;
 }
 .nav-item-post {
@@ -725,10 +725,136 @@ img.emoji {
     outline: none;
 }
 
-.markdown-content-editor:empty::before {
-    color: var(--secondary-text-color);
-    content: attr(data-placeholder);
+textarea.markdown-content-editor {
+    font: inherit;
+    line-height: inherit;
+    resize: none;
+}
+
+textarea.markdown-content-editor::placeholder {
+    color: transparent;
+    -webkit-text-fill-color: transparent;
+    opacity: 0;
+}
+
+.markdown-textarea-editor {
+    position: relative;
+    box-sizing: border-box;
+    width: 100%;
+    min-height: 60px;
+    overflow: hidden;
+}
+
+.markdown-textarea-editor .markdown-content-editor {
+    position: relative;
+    z-index: 2;
+    display: block;
+    width: 100%;
+    box-sizing: border-box;
+    color: transparent !important;
+    caret-color: transparent;
+    -webkit-text-fill-color: transparent;
+    border: 0 !important;
+    background: transparent !important;
+    pointer-events: auto;
+}
+
+.markdown-textarea-editor .markdown-content-editor::selection {
+    color: transparent;
+    background: transparent;
+}
+
+.markdown-textarea-editor .markdown-content-editor::placeholder {
+    color: transparent !important;
+    -webkit-text-fill-color: transparent;
+    opacity: 0;
+}
+
+.markdown-editor-paint {
+    position: absolute;
+    z-index: 1;
+    inset: 0;
+    overflow: visible;
     pointer-events: none;
+    transform-origin: top left;
+}
+
+.markdown-textarea-editor.is-plain-textarea .markdown-editor-paint {
+    display: none;
+}
+
+.markdown-textarea-editor.is-plain-textarea .markdown-content-editor {
+    z-index: auto;
+    color: var(--text-color) !important;
+    caret-color: auto;
+    -webkit-text-fill-color: currentColor;
+}
+
+.markdown-textarea-editor.is-plain-textarea .markdown-content-editor::selection {
+    color: var(--text-color);
+    background: color-mix(in srgb, var(--primary-color) 35%, transparent);
+}
+
+.markdown-textarea-editor.is-plain-textarea .markdown-content-editor::placeholder {
+    color: var(--secondary-text-color) !important;
+    -webkit-text-fill-color: var(--secondary-text-color);
+    opacity: 1;
+}
+
+.markdown-editor-preview,
+.markdown-editor-placeholder {
+    box-sizing: border-box;
+    min-width: 100%;
+    min-height: 100%;
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.markdown-editor-placeholder {
+    position: absolute;
+    inset: 0;
+    color: var(--secondary-text-color);
+}
+
+.markdown-editor-sentinel,
+.markdown-editor-caret-anchor {
+    color: transparent;
+    pointer-events: none;
+}
+
+.markdown-editor-selection,
+.markdown-editor-composition,
+.markdown-editor-caret {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+}
+
+.markdown-editor-selection-rect {
+    position: absolute;
+    border-radius: 2px;
+    background: color-mix(in srgb, var(--primary-color) 35%, transparent);
+}
+
+.markdown-editor-composition-underline {
+    position: absolute;
+    display: block;
+    box-sizing: border-box;
+    border-bottom: 2px solid var(--primary-color);
+}
+
+.markdown-editor-caret {
+    inset: auto;
+    width: 2px;
+    background: var(--text-color);
+    animation: markdown-editor-caret-blink 1s steps(1, end) infinite;
+}
+
+@keyframes markdown-editor-caret-blink {
+    50% {
+        opacity: 0;
+    }
 }
 
 .post-form .markdown-content-editor {
@@ -737,6 +863,25 @@ img.emoji {
     color: var(--text-color);
     padding: 0.5rem 0;
     font-size: 1.25rem;
+}
+
+.post-form .markdown-editor-preview,
+.post-form .markdown-editor-placeholder {
+    padding: 0.5rem 0;
+    font-size: 1.25rem;
+}
+
+.post-form .markdown-editor-preview {
+    color: var(--text-color);
+}
+
+.dm-form-content .markdown-textarea-editor,
+.markdown-textarea-editor.dm-content-editor {
+    flex-grow: 1;
+    min-height: 38px;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    background-color: var(--bg-color);
 }
 
 .dm-form-content .markdown-content-editor,
@@ -752,6 +897,20 @@ img.emoji {
     line-height: 1.2;
 }
 
+.dm-form-content .markdown-editor-preview,
+.markdown-textarea-editor.dm-content-editor .markdown-editor-preview,
+.dm-form-content .markdown-editor-placeholder,
+.markdown-textarea-editor.dm-content-editor .markdown-editor-placeholder {
+    padding: 0.5rem;
+    font-size: 1rem;
+    line-height: 1.2;
+}
+
+.dm-form-content .markdown-editor-preview,
+.markdown-textarea-editor.dm-content-editor .markdown-editor-preview {
+    color: var(--text-color);
+}
+
 .markdown-content-editor p,
 .markdown-content-editor h1,
 .markdown-content-editor h2,
@@ -759,63 +918,82 @@ img.emoji {
 .markdown-content-editor blockquote,
 .markdown-content-editor ul,
 .markdown-content-editor ol,
-.markdown-content-editor pre {
+.markdown-content-editor pre,
+.markdown-editor-preview p,
+.markdown-editor-preview h1,
+.markdown-editor-preview h2,
+.markdown-editor-preview h3,
+.markdown-editor-preview blockquote,
+.markdown-editor-preview ul,
+.markdown-editor-preview ol,
+.markdown-editor-preview pre {
     margin: 0;
 }
 
 .markdown-content-editor ul,
-.markdown-content-editor ol {
+.markdown-content-editor ol,
+.markdown-editor-preview ul,
+.markdown-editor-preview ol {
     padding-left: 0;
     list-style: none;
 }
 
-.markdown-content-editor .markdown-syntax {
+.markdown-content-editor .markdown-syntax,
+.markdown-editor-preview .markdown-syntax {
     color: color-mix(in srgb, var(--secondary-text-color) 72%, transparent);
     font-style: normal;
     font-weight: 400;
     text-decoration: none;
 }
 
-.markdown-content-editor a {
+.markdown-content-editor a,
+.markdown-editor-preview a {
     color: var(--primary-color);
     text-decoration: none;
 }
 
-.markdown-content-editor .markdown-spoiler {
+.markdown-content-editor .markdown-spoiler,
+.markdown-editor-preview .markdown-spoiler {
     position: relative;
     isolation: isolate;
     cursor: text;
 }
 
-.markdown-content-editor .markdown-spoiler::before {
+.markdown-content-editor .markdown-spoiler::before,
+.markdown-editor-preview .markdown-spoiler::before {
     position: absolute;
     z-index: 2;
     inset: 0;
     border-radius: inherit;
     background: var(--secondary-text-color);
     content: '';
-    opacity: 0.26;
+    opacity: 0.12;
     pointer-events: none;
 }
 
-.markdown-content-editor .markdown-spoiler-content {
+.markdown-content-editor .markdown-spoiler-content,
+.markdown-editor-preview .markdown-spoiler-content {
     position: relative;
     z-index: 1;
 }
 
 .markdown-content-editor .markdown-spoiler:not(.is-revealed),
-.markdown-content-editor .markdown-spoiler:not(.is-revealed) * {
+.markdown-content-editor .markdown-spoiler:not(.is-revealed) *,
+.markdown-editor-preview .markdown-spoiler:not(.is-revealed),
+.markdown-editor-preview .markdown-spoiler:not(.is-revealed) * {
     color: var(--text-color) !important;
     text-shadow: none !important;
 }
 
-.markdown-content-editor .markdown-spoiler:not(.is-revealed) img {
+.markdown-content-editor .markdown-spoiler:not(.is-revealed) img,
+.markdown-editor-preview .markdown-spoiler:not(.is-revealed) img {
     opacity: 1;
 }
 
 .markdown-content-editor::selection,
 .markdown-content-editor *::selection {
-    background: color-mix(in srgb, var(--primary-color) 35%, transparent);
+    color: transparent;
+    background: transparent;
 }
 
 
@@ -1102,10 +1280,41 @@ em-emoji-picker {
 }
 
 .post-clamp-toggle.is-visible {
-    display: inline-block;
+    display: inline-flex;
 }
 
-.post-clamp-toggle:hover {
+.dm-message[data-clamp-content] .dm-message-content {
+    max-height: 320px;
+    overflow: hidden;
+}
+
+.dm-message[data-clamp-content]
+    .dm-message-content.dm-message-content-expanded {
+    max-height: none;
+}
+
+.dm-clamp-toggle {
+    display: none;
+    margin: 0.35rem 0 0;
+    padding: 0;
+    border: none;
+    background: none;
+    color: inherit;
+    font: inherit;
+    font-weight: 700;
+    text-decoration: underline;
+    cursor: pointer;
+}
+
+.dm-clamp-toggle.is-visible {
+    display: inline-flex;
+}
+
+.dm-message-container.received .dm-clamp-toggle {
+    color: var(--primary-color);
+}
+
+.dm-clamp-toggle:hover {
     text-decoration: underline;
 }
 

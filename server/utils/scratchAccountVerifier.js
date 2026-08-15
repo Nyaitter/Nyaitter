@@ -3,6 +3,17 @@ const config = require('../config');
 
 const IphubAPIKey = process.env.IPHUB_KEY;
 const scratchVerificationPolicy = config.auth.scratchVerification;
+const SCRATCH_REQUEST_TIMEOUT_MS = 8000;
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = SCRATCH_REQUEST_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
 // Any operational exception must be explicit in environment configuration;
 // production code must not embed permanent authentication bypass accounts.
 const TrustedUsers = new Set(
@@ -25,7 +36,7 @@ async function checkIpWithIphub(ip) {
   }
 
   try {
-    const res = await fetch(`https://v2.api.iphub.info/ip/${ip}`, {
+    const res = await fetchWithTimeout(`https://v2.api.iphub.info/ip/${encodeURIComponent(ip)}`, {
       headers: { "X-Key": IphubAPIKey }
     });
 
@@ -53,7 +64,7 @@ async function checkIpWithIphub(ip) {
  */
 async function checkScratchProfile(username) {
   try {
-    const res = await fetch(`https://scratch.mit.edu/users/${encodeURIComponent(username)}/`);
+    const res = await fetchWithTimeout(`https://scratch.mit.edu/users/${encodeURIComponent(username)}/`);
     if (!res.ok) {
       return { ok: false, error: `Scratch profile fetch failed: ${res.status}` };
     }
@@ -105,7 +116,7 @@ async function countQualifiedFollowers(username, minimum = scratchVerificationPo
 
   while (hasMore && validFollowerCount < minimum) {
     try {
-      const res = await fetch(
+      const res = await fetchWithTimeout(
         `https://api.scratch.mit.edu/users/${encodeURIComponent(username)}/followers?limit=${limit}&offset=${offset}`
       );
       if (!res.ok) break;
