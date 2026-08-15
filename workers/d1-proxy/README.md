@@ -14,7 +14,8 @@ workers/d1-proxy/
 ├── wrangler.toml
 ├── migrations/
 │   ├── 0001_initial_schema.sql
-│   └── 0002_add_push_subscription_session_token.sql
+│   ├── 0002_add_push_subscription_session_token.sql
+│   └── 0003_add_user_block_lists.sql
 ├── src/
 │   └── index.js
 └── README.md
@@ -72,12 +73,12 @@ Workerはアプリケーションで必要な固定操作を提供します。�
 
 | 領域 | 対象 |
 |---|---|
-| ユーザー・認証 | ユーザー、プロフィール、セッション、信頼IP、ログイン承認、Botトークン |
+| ユーザー・認証 | ユーザー、プロフィール、ブロックリスト、セッション、信頼IP、ログイン承認、Botトークン |
 | 投稿 | 作成、タイムライン、ページング、検索、返信、集計、いいね、スター、ピン、リポスト |
 | コミュニケーション | グループDM、DM公開鍵、通知、Web Push購読 |
 | 運用 | ランキング、監査ログ |
 
-Workerは永続化を担います。非公開投稿、検索除外、ブロック関係、通知・DMの表示可否はNode.js側の共通サービスで判定されるため、Worker固有の実装で閲覧ルールを複製しないでください。
+Workerは永続化を担います。ブロックリストは `users.block` のJSON配列として保存し、WorkerとNode.jsアダプターで非負整数・重複なし・自分自身なし・昇順の共通形式へ正規化します。非公開投稿、検索除外、ブロック関係、通知・DMの表示可否はNode.js側の共通サービスで判定されるため、Worker固有の実装で閲覧ルールを複製しないでください。
 
 ## セキュリティと確認
 

@@ -470,6 +470,10 @@ class DatabaseAdapter {
 		throw new Error('getFollowIds() must be implemented');
 	}
 
+	async getFollowRelationshipSnapshot(userId, candidateUserIds) {
+		throw new Error('getFollowRelationshipSnapshot() must be implemented');
+	}
+
 	async getRepostCount(postId) {
 		throw new Error('getRepostCount() must be implemented');
 	}

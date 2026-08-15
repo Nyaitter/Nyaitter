@@ -1,8 +1,20 @@
 const crypto = require('crypto');
+const config = require('../../config');
+
+function hashSessionToken(token) {
+  return crypto
+    .createHash('sha256')
+    .update(String(token || ''), 'utf8')
+    .digest('base64url');
+}
 
 class SessionManager {
   constructor({ dbAdapter }) {
     this.db = dbAdapter;
+  }
+
+  static hashToken(token) {
+    return hashSessionToken(token);
   }
 
   async createSession(userId, meta = {}) {
@@ -10,19 +22,25 @@ class SessionManager {
       throw new Error('DatabaseAdapterがセッション機能に対応していません');
     }
 
-    const session = await this.db.createSession(userId, meta);
+    // Cookieへ返すランダムなBearer値と、DBへ保存する照合値を分離する。
+    // DB流出時にセッションをそのまま再利用されないよう、平文トークンは永続化しない。
+    const token = crypto.randomBytes(config.auth.sessionTokenBytes).toString('base64url');
+    const session = await this.db.createSession(userId, {
+      ...meta,
+      token: hashSessionToken(token),
+    });
     return {
       id: session.id || null,
-      token: session.token,
+      token,
       expiresAt: session.expiresAt,
       userId: session.userId || userId,
     };
   }
 
   async validateToken(token) {
-    if (!this.db || !this.db.getSessionByToken) return null;
+    if (!this.db || !this.db.getSessionByToken || !token) return null;
 
-    const session = await this.db.getSessionByToken(token);
+    const session = await this.db.getSessionByToken(hashSessionToken(token));
     if (!session) return null;
 
     return {
@@ -31,9 +49,9 @@ class SessionManager {
     };
   }
 
-  async invalidateSession(userId, token) {
-    if (!this.db || !this.db.invalidateSession) return false;
-    return this.db.invalidateSession(token);
+  async invalidateSession(_userId, token) {
+    if (!this.db || !this.db.invalidateSession || !token) return false;
+    return this.db.invalidateSession(hashSessionToken(token));
   }
 
   async getUserSessions(userId) {

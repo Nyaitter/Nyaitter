@@ -1,6 +1,7 @@
 const express = require('express');
 const config = require('../config');
 const { requireAuth, extractToken } = require('../middleware/auth');
+const SessionManager = require('../services/auth/SessionManager');
 
 const router = express.Router();
 
@@ -115,7 +116,7 @@ router.post('/subscriptions', requireAuth, requireSessionPrincipal, async (req, 
   try {
     const stored = await req.app.locals.dbAdapter.upsertPushSubscription(req.user.id, {
       ...subscription,
-      sessionToken,
+      sessionToken: SessionManager.hashToken(sessionToken),
     });
     if (!stored) return res.status(404).json({ error: 'User not found' });
     return res.status(201).json({ success: true });

@@ -2,7 +2,10 @@ const express = require('express');
 const { requireAuth, optionalAuth } = require('../middleware/auth');
 const { createRateLimiter } = require('../middleware/rateLimit');
 const { NOTIFICATION_TYPES, normalizeTarget } = require('../utils/notification');
-const { serializeNotification } = require('../utils/serialize');
+const {
+	serializeNotification,
+	serializeNotifications,
+} = require('../utils/serialize');
 const {
 	createNotificationIfAllowed,
 } = require('../services/NotificationDeliveryService');
@@ -174,10 +177,10 @@ router.get('/', requireAuth, async (req, res) => {
 			notifications = notifications.filter(n => new Date(n.created_at || n.createdAt) > since);
 		}
 
-		const [serializedNotifications, unreadCount] = await Promise.all([
-			Promise.all(notifications.map((notification) => serializeNotification(db, notification))),
-			db.getUnreadNotificationCount(userId),
-		]);
+			const [serializedNotifications, unreadCount] = await Promise.all([
+				serializeNotifications(db, notifications),
+				db.getUnreadNotificationCount(userId),
+			]);
 
 		res.json({
 			notifications: serializedNotifications.filter(Boolean),

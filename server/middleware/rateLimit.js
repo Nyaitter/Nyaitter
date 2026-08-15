@@ -48,7 +48,7 @@ function createRateLimiter(options = {}) {
 const generalLimiter = createRateLimiter();
 const authLimiter = createRateLimiter({
   windowMs: config.rateLimit.auth?.windowMs,
-  max: config.rateLimit.auth?.max || 100,
+  max: config.rateLimit.auth?.max || 20,
 });
 
 module.exports = {

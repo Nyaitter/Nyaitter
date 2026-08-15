@@ -29,9 +29,8 @@ function extractToken(req) {
   if (req.headers['x-api-key']) {
     return String(req.headers['x-api-key']).trim() || null;
   }
-  if (req.query && (req.query.token || req.query.api_key)) {
-    return String(req.query.token || req.query.api_key).trim() || null;
-  }
+  // URLクエリのトークンはアクセスログ・Referer・プロキシログに残るため受け付けない。
+  // スクリプト利用時は Authorization: Bearer または X-API-Key を使用する。
   const cookies = parseCookies(req);
   return cookies.nyaitter_session || cookies.session || null;
 }
@@ -67,13 +66,16 @@ async function getAuthenticatedPrincipal(req) {
     if (botInfo) {
       // Bot tokens can act as their owner for regular APIs but never obtain
       // administrative privileges, even if the owner is an administrator.
+      // 所有者が凍結済みの場合、Botトークン経由で制限を回避させない。
+      const owner = await req.app.locals.dbAdapter.getUserById(botInfo.userId);
+      if (!owner) return null;
       return {
         id: botInfo.userId,
         tokenType: 'bot',
         isBot: true,
         name: botInfo.name,
         admin: false,
-        frozen: false,
+        frozen: Boolean(owner.freeze),
       };
     }
   }
@@ -90,6 +92,12 @@ async function requireAuth(req, res, next) {
         message: 'この操作にはログインが必要です。',
       });
     }
+    if (principal.frozen) {
+      return res.status(403).json({
+        error: 'Account frozen',
+        message: '凍結中のアカウントではこの操作を実行できません。',
+      });
+    }
     req.user = principal;
     return next();
   } catch (error) {
@@ -104,6 +112,39 @@ async function optionalAuth(req, res, next) {
   } catch (error) {
     console.warn('[auth] optionalAuth validation failed:', error.message);
     req.user = null;
+  }
+  return next();
+}
+
+function isSameOriginRequest(req) {
+  const origin = req.headers.origin;
+  if (!origin) return true;
+
+  const protocol = req.protocol === 'https' ? 'https' : 'http';
+  const expectedOrigin = `${protocol}://${req.get('host')}`;
+  if (origin === expectedOrigin) return true;
+
+  if (config.federation?.publicUrl) {
+    try {
+      return origin === new URL(config.federation.publicUrl).origin;
+    } catch (_) {
+      return false;
+    }
+  }
+  return false;
+}
+
+/**
+ * SameSite Cookieだけに依存せず、Cookieが同送される状態変更要求は同一オリジンに限定する。
+ * Bearer / Botトークンのみのサーバー間リクエストはCookieを伴わないため影響を受けない。
+ */
+function csrfProtection(req, res, next) {
+  if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
+  const cookies = parseCookies(req);
+  const hasBrowserSession = Boolean(cookies.nyaitter_session || cookies.nyaitter_accounts);
+  const fetchSite = String(req.headers['sec-fetch-site'] || '').toLowerCase();
+  if (hasBrowserSession && (!isSameOriginRequest(req) || fetchSite === 'cross-site')) {
+    return res.status(403).json({ error: 'Cross-origin state-changing requests are not allowed' });
   }
   return next();
 }
@@ -184,6 +225,7 @@ function securityHeaders(req, res, next) {
 module.exports = {
   requireAuth,
   optionalAuth,
+  csrfProtection,
   flexibleCors,
   securityHeaders,
   getAuthenticatedPrincipal,

@@ -38,6 +38,7 @@ done
 | Nyaitterアドレス・モデレーション | `005_nyaitter_address_v2.sql`、`009_user_moderation_state.sql` |
 | 投稿公開範囲・検索性能 | `010_post_lock.sql`、`008_optimize_high_volume_post_reads.sql` |
 | ログイン保護・DM・監査 | `012_login_security.sql`、`013_group_dms.sql`、`014_dm_e2e_keys.sql`、`015_audit_logs.sql` |
+| ブロックリスト永続化 | `016_user_block_lists.sql`（`users.block` をJSONB配列として追加・既存値を正規化） |
 
 SQLファイルは変更履歴として扱います。すでに本番へ適用したファイルを直接書き換えず、追加の変更は新しいファイルとして作成してください。
 

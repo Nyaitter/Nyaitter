@@ -546,6 +546,22 @@ export function initApp() {
         }
     }
 
+    function clearSavedScrollPosition(routeKey) {
+        if (!routeKey) return;
+        try {
+            const positions = getSavedScrollPositions();
+            if (!Object.prototype.hasOwnProperty.call(positions, routeKey))
+                return;
+            delete positions[routeKey];
+            sessionStorage.setItem(
+                SCROLL_POSITIONS_STORAGE_KEY,
+                JSON.stringify(positions),
+            );
+        } catch (_) {
+            // sessionStorageが無効・満杯の場合も画面操作を妨げない。
+        }
+    }
+
     function saveScrollPosition(routeKey = activeScrollRouteKey) {
         if (!routeKey) return;
         try {
@@ -4447,6 +4463,50 @@ export function initApp() {
         return { data: result.data?.user || null, error: result.error };
     }
 
+    function resetProfileTabNavigation(userId, subpage) {
+        const normalizedUserId = Number(userId);
+        if (!Number.isInteger(normalizedUserId) || normalizedUserId < 0)
+            return;
+
+        const normalizedTab = String(subpage || 'posts');
+        const hash =
+            normalizedTab === 'posts'
+                ? `#profile/${normalizedUserId}`
+                : `#profile/${normalizedUserId}/${normalizedTab}`;
+        const userScope = getCurrentUser()?.id ?? 'guest';
+        const profileCachePrefix = `${userScope}:${hash}:${normalizedUserId}:`;
+        let cacheChanged = false;
+        profilePostPageCaches.forEach((_, cacheKey) => {
+            if (cacheKey.startsWith(profileCachePrefix)) {
+                profilePostPageCaches.delete(cacheKey);
+                cacheChanged = true;
+            }
+        });
+
+        if (normalizedTab === 'following' || normalizedTab === 'followers') {
+            cacheChanged =
+                userPageCaches.delete(
+                    `${userScope}:profile-users:${normalizedUserId}:${normalizedTab}`,
+                ) || cacheChanged;
+        }
+        if (getPublicProfileCache().delete(normalizedUserId)) {
+            cacheChanged = true;
+        }
+        if (cacheChanged) persistPageCaches();
+
+        const routeKey = getScrollRouteKey(hash);
+        clearSavedScrollPosition(routeKey);
+
+        if (window.location.hash === hash) {
+            // 同一タブではhashchangeが発火しないため、先頭へ移動してから再描画する。
+            // router()の遷移開始処理が0,0を保存するので、古い位置は復元されない。
+            window.scrollTo({ left: 0, top: 0, behavior: 'auto' });
+            void router();
+            return;
+        }
+        window.location.hash = hash;
+    }
+
     async function showProfileScreen(userId, subpage = 'posts') {
         DOM.pageHeader.innerHTML = `
 	            <div class="header-with-back-button">
@@ -4669,11 +4729,7 @@ export function initApp() {
             profileTabs.querySelectorAll('.tab-button').forEach((button) => {
                 button.onclick = (e) => {
                     e.stopPropagation();
-                    const tab = button.dataset.tab;
-                    window.location.hash =
-                        tab === 'posts'
-                            ? `#profile/${user.id}`
-                            : `#profile/${user.id}/${tab}`;
+                    resetProfileTabNavigation(user.id, button.dataset.tab);
                 };
             });
 
@@ -4739,7 +4795,10 @@ export function initApp() {
                 .forEach((button) => {
                     button.onclick = (e) => {
                         e.stopPropagation();
-                        window.location.hash = `#profile/${user.id}/${button.dataset.subTab}`;
+                        resetProfileTabNavigation(
+                            user.id,
+                            button.dataset.subTab,
+                        );
                     };
                 });
         } else {
@@ -4985,7 +5044,7 @@ export function initApp() {
 
 	                                <div class="settings-bot-docs-section">
 	                                    <h4 style="margin-top: 1.5rem; font-size: 1rem;">APIの使い方</h4>
-	                                    <p class="settings-help-text">HTTPリクエストの <code>Authorization</code> ヘッダー（または <code>X-API-Key</code> ヘッダー / クエリパラメータ <code>?token=</code>）に指定してください。</p>
+	                                    <p class="settings-help-text">HTTPリクエストの <code>Authorization</code> ヘッダー（または <code>X-API-Key</code> ヘッダー）に指定してください。トークンをURLのクエリパラメータへ含めないでください。</p>
 	                                    <pre class="settings-code-example"><code>curl -X POST ${window.location.origin}/server/api/posts \\
   -H "Authorization: Bearer bot_..." \\
   -H "Content-Type: application/json" \\
@@ -5729,11 +5788,15 @@ export function initApp() {
         showLoading(false); // 初回のローディング表示を解除
     }
 
-    async function fetchOptimizedPostPage(type, options, page) {
+    async function fetchOptimizedPostPage(type, options, page, beforeCursor = null) {
         const params = new URLSearchParams({
             limit: String(POSTS_PER_PAGE),
             offset: String(page * POSTS_PER_PAGE),
         });
+        if (beforeCursor != null) {
+            params.set('before_id', String(beforeCursor));
+            params.delete('offset');
+        }
         let showPinPost = false;
 
         if (type === 'timeline') {
@@ -5768,6 +5831,7 @@ export function initApp() {
                 return {
                     posts: data.posts || [],
                     hasMore: !!data.has_more,
+                    nextCursor: data.next_cursor ?? null,
                     showPinPost: false,
                     context: null,
                 };
@@ -5784,6 +5848,7 @@ export function initApp() {
             return {
                 posts: data.posts || [],
                 hasMore: ids.length > from + POSTS_PER_PAGE,
+                nextCursor: null,
                 showPinPost: false,
                 context: data.context || null,
             };
@@ -5798,6 +5863,7 @@ export function initApp() {
         return {
             posts: data.posts || [],
             hasMore: !!data.has_more,
+            nextCursor: data.next_cursor ?? null,
             showPinPost,
             context: data.context || null,
         };
@@ -5833,10 +5899,14 @@ export function initApp() {
                 const pageNumber = getCurrentPagination().page;
                 let optimizedPage = postPageCache?.pages.get(pageNumber);
                 if (!optimizedPage) {
+                    const previousPage = pageNumber > 0
+                        ? postPageCache?.pages.get(pageNumber - 1)
+                        : null;
                     optimizedPage = await fetchOptimizedPostPage(
                         type,
                         options,
                         pageNumber,
+                        previousPage?.nextCursor ?? null,
                     );
                     if (postPageCache && optimizedPage)
                         savePostPageCache(

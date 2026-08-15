@@ -1,4 +1,5 @@
 const {
+	createPostVisibilityContext,
 	filterDiscoverablePosts,
 	filterViewablePosts,
 } = require('../utils/postVisibility');
@@ -20,6 +21,7 @@ async function getDiscoverablePostPage({
 	viewerId = null,
 	limit = 30,
 	offset = 0,
+	beforeId = null,
 	fetchCandidatePage,
 }) {
 	if (typeof fetchCandidatePage !== 'function') {
@@ -27,12 +29,16 @@ async function getDiscoverablePostPage({
 	}
 
 	const normalizedLimit = Math.min(Math.max(Number(limit) || 30, 1), 100);
-	const normalizedOffset = Math.max(Number(offset) || 0, 0);
+	const normalizedBeforeId = Number.isInteger(Number(beforeId)) && Number(beforeId) > 0
+		? Number(beforeId)
+		: null;
+	const normalizedOffset = normalizedBeforeId == null ? Math.max(Number(offset) || 0, 0) : 0;
 	const candidateLimit = Math.min(
 		100,
 		Math.max(normalizedLimit + 1, normalizedLimit * 2),
 	);
 	let candidateOffset = 0;
+	let candidateBeforeId = normalizedBeforeId;
 	let visibleOffset = 0;
 	const collectedIds = [];
 	let hasMore = false;
@@ -41,6 +47,7 @@ async function getDiscoverablePostPage({
 		const candidatePage = await fetchCandidatePage({
 			limit: candidateLimit,
 			offset: candidateOffset,
+			beforeId: candidateBeforeId,
 		});
 		const candidateIds = normalizePostIds(candidatePage?.ids);
 		if (candidateIds.length === 0) break;
@@ -54,16 +61,23 @@ async function getDiscoverablePostPage({
 		const orderedPosts = candidateIds
 			.map((id) => postsById.get(id))
 			.filter(Boolean);
-		const viewablePosts = await filterViewablePosts(
-			db,
-			orderedPosts,
-			viewerId,
-		);
-		const discoverablePosts = await filterDiscoverablePosts(
-			db,
-			viewablePosts,
-			viewerId,
-		);
+			const visibilityContext = await createPostVisibilityContext(
+				db,
+				orderedPosts,
+				viewerId,
+			);
+			const viewablePosts = await filterViewablePosts(
+				db,
+				orderedPosts,
+				viewerId,
+				visibilityContext,
+			);
+			const discoverablePosts = await filterDiscoverablePosts(
+				db,
+				viewablePosts,
+				viewerId,
+				visibilityContext,
+			);
 
 		for (const post of discoverablePosts) {
 			if (visibleOffset < normalizedOffset) {
@@ -78,14 +92,20 @@ async function getDiscoverablePostPage({
 			break;
 		}
 
-		candidateOffset += candidateIds.length;
+		if (candidateBeforeId != null) {
+			candidateBeforeId = candidateIds[candidateIds.length - 1];
+		} else {
+			candidateOffset += candidateIds.length;
+		}
 		if (!candidatePage?.has_more || candidateIds.length < candidateLimit)
 			break;
 	}
 
+	const ids = collectedIds.slice(0, normalizedLimit);
 	return {
-		ids: collectedIds.slice(0, normalizedLimit),
+		ids,
 		has_more: hasMore,
+		next_cursor: hasMore && ids.length > 0 ? ids[ids.length - 1] : null,
 	};
 }
 

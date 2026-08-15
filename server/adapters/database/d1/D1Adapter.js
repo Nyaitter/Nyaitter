@@ -1,5 +1,7 @@
 const DatabaseAdapter = require('../DatabaseAdapter');
 
+const { normalizeBlockList } = require('../../../utils/blockList');
+
 const RETRYABLE_STATUS_CODES = new Set([408, 425, 429, 500, 502, 503, 504]);
 
 function boundedInteger(value, fallback, minimum, maximum) {
@@ -44,6 +46,14 @@ function mapLoginApproval(approval) {
 		expiresAt: approval.expiresAt ?? approval.expires_at,
 		decidedAt: approval.decidedAt ?? approval.decided_at,
 		consumedAt: approval.consumedAt ?? approval.consumed_at,
+	};
+}
+
+function normalizeUser(user) {
+	if (!user) return null;
+	return {
+		...user,
+		block: normalizeBlockList(user.block, user.id),
 	};
 }
 
@@ -380,24 +390,24 @@ class D1Adapter extends DatabaseAdapter {
 	}
 
 	async getUserByScid(scid) {
-		return this._read(`/users/scid/${encodeURIComponent(String(scid))}`);
+		return normalizeUser(await this._read(`/users/scid/${encodeURIComponent(String(scid))}`));
 	}
 
 	async getUserById(id) {
 		const userId = requireId(id, 'id');
-		return this._read(`/users/${userId}`);
+		return normalizeUser(await this._read(`/users/${userId}`));
 	}
 
 	async getUserByNyaitterAddress(address) {
-		return this._read(`/users/address/${encodeURIComponent(String(address))}`);
+		return normalizeUser(await this._read(`/users/address/${encodeURIComponent(String(address))}`));
 	}
 
 	async getOrCreateExternalUser(params) {
-		return this._write('/users/external', params);
+		return normalizeUser(await this._write('/users/external', params));
 	}
 
 	async createUser(userData) {
-		return this._write('/users', userData);
+		return normalizeUser(await this._write('/users', userData));
 	}
 
 	async searchUsers(query, limit = 20) {
@@ -409,12 +419,13 @@ class D1Adapter extends DatabaseAdapter {
 	async getUsersByIds(userIds) {
 		const ids = this._normalizeIds(userIds);
 		if (ids.length === 0) return [];
-		return this._read('/users/batch', { body: { ids } });
+		const users = await this._read('/users/batch', { body: { ids } });
+		return Array.isArray(users) ? users.map(normalizeUser).filter(Boolean) : [];
 	}
 
 	async getAllUsers() {
 		const users = await this._read('/users', { cacheSeconds: 0 });
-		return Array.isArray(users) ? users : [];
+		return Array.isArray(users) ? users.map(normalizeUser).filter(Boolean) : [];
 	}
 
 	async getUserStatus(userId) {
@@ -426,7 +437,10 @@ class D1Adapter extends DatabaseAdapter {
 	}
 
 	async updateUserProfile(userId, profileData) {
-		return this._write(`/users/${requireId(userId, 'userId')}/profile`, profileData);
+		return normalizeUser(await this._write(
+			`/users/${requireId(userId, 'userId')}/profile`,
+			profileData,
+		));
 	}
 
 	async toggleFollow(followerId, followingId) {
@@ -469,6 +483,25 @@ class D1Adapter extends DatabaseAdapter {
 	async getFollowIds(userId) {
 		const ids = await this._read(`/users/${requireId(userId, 'userId')}/following/ids`, { cacheSeconds: 0 });
 		return Array.isArray(ids) ? ids.map(Number) : [];
+	}
+
+	async getFollowRelationshipSnapshot(userId, candidateUserIds) {
+		const normalizedUserId = requireId(userId, 'userId');
+		const candidateIds = this._normalizeIds(candidateUserIds, { fieldName: 'candidateUserId' })
+			.filter((id) => id !== normalizedUserId);
+		if (candidateIds.length === 0) return { followingIds: [], followerIds: [] };
+		const result = await this._read('/users/follow-relationships', {
+			body: { userId: normalizedUserId, candidateIds },
+			cacheSeconds: 0,
+		});
+		return {
+			followingIds: Array.isArray(result?.following_ids ?? result?.followingIds)
+				? (result.following_ids ?? result.followingIds).map(Number).filter(Number.isInteger)
+				: [],
+			followerIds: Array.isArray(result?.follower_ids ?? result?.followerIds)
+				? (result.follower_ids ?? result.followerIds).map(Number).filter(Number.isInteger)
+				: [],
+		};
 	}
 
 	async createPost(postData) {
@@ -535,31 +568,40 @@ class D1Adapter extends DatabaseAdapter {
 		return { posts, hasMore: posts.length === limit };
 	}
 
-	async getTimelinePostIds({ tab = 'foryou', followIds = [], limit = 30, offset = 0 } = {}) {
+	async getTimelinePostIds({ tab = 'foryou', followIds = [], limit = 30, offset = 0, beforeId = null } = {}) {
 		const body = {
 			tab: String(tab),
 			followIds: this._normalizeIds(followIds),
 			limit: this._limit(limit, 30),
 			offset: this._offset(offset),
+			beforeId: beforeId == null ? null : requireId(beforeId, 'beforeId', 1),
 		};
 		return this._read('/posts/timeline/ids', { body, cacheSeconds: 0 });
 	}
 
-	async getRecommendedPostIds({ limit = 30, offset = 0 } = {}) {
+	async getRecommendedPostIds({ limit = 30, offset = 0, beforeId = null } = {}) {
 		return this._read(this._query('/posts/recommended/ids', {
-			limit: this._limit(limit, 30), offset: this._offset(offset),
+			limit: this._limit(limit, 30),
+			offset: this._offset(offset),
+			beforeId: beforeId == null ? null : requireId(beforeId, 'beforeId', 1),
 		}), { cacheSeconds: 0 });
 	}
 
-	async getProfilePostIds({ userId, subType = 'all', limit = 30, offset = 0 } = {}) {
+	async getProfilePostIds({ userId, subType = 'all', limit = 30, offset = 0, beforeId = null } = {}) {
 		return this._read(this._query(`/users/${requireId(userId, 'userId')}/post-ids`, {
-			subType: String(subType || 'all'), limit: this._limit(limit, 30), offset: this._offset(offset),
+			subType: String(subType || 'all'),
+			limit: this._limit(limit, 30),
+			offset: this._offset(offset),
+			beforeId: beforeId == null ? null : requireId(beforeId, 'beforeId', 1),
 		}), { cacheSeconds: 0 });
 	}
 
-	async searchPostIds(query, limit = 30, offset = 0) {
+	async searchPostIds(query, limit = 30, offset = 0, beforeId = null) {
 		return this._read(this._query('/posts/search/ids', {
-			q: String(query || ''), limit: this._limit(limit, 30), offset: this._offset(offset),
+			q: String(query || ''),
+			limit: this._limit(limit, 30),
+			offset: this._offset(offset),
+			beforeId: beforeId == null ? null : requireId(beforeId, 'beforeId', 1),
 		}), { cacheSeconds: 0 });
 	}
 

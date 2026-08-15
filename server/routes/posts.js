@@ -17,6 +17,7 @@ const {
 const { getPublicUrl } = require('../utils/nyaitterAddress');
 const {
 	canViewPost,
+	createPostVisibilityContext,
 	filterViewablePosts,
 	filterDiscoverablePosts,
 } = require('../utils/postVisibility');
@@ -115,7 +116,7 @@ async function getViewablePostIds(db, postIds, viewerId = null) {
 
 async function getDiscoverableModePage(
 	db,
-	{ mode, tab = 'foryou', query = '', viewerId = null, limit, offset },
+	{ mode, tab = 'foryou', query = '', viewerId = null, limit, offset, beforeId = null },
 ) {
 	const followIds =
 		mode === 'timeline' && tab === 'following' && viewerId != null && db.getFollowIds
@@ -127,23 +128,26 @@ async function getDiscoverableModePage(
 		viewerId,
 		limit,
 		offset,
-		fetchCandidatePage: ({ limit: candidateLimit, offset: candidateOffset }) => {
+		beforeId,
+		fetchCandidatePage: ({ limit: candidateLimit, offset: candidateOffset, beforeId: candidateBeforeId }) => {
 			if (mode === 'timeline') {
 				return db.getTimelinePostIds({
 					tab,
 					followIds,
 					limit: candidateLimit,
 					offset: candidateOffset,
+					beforeId: candidateBeforeId,
 				});
 			}
 			if (mode === 'recommended') {
 				return db.getRecommendedPostIds({
 					limit: candidateLimit,
 					offset: candidateOffset,
+					beforeId: candidateBeforeId,
 				});
 			}
 			if (mode === 'search') {
-				return db.searchPostIds(query, candidateLimit, candidateOffset);
+					return db.searchPostIds(query, candidateLimit, candidateOffset, candidateBeforeId);
 			}
 			throw new Error(`Unsupported discoverable mode: ${mode}`);
 		},
@@ -412,11 +416,18 @@ router.get('/', optionalAuth, async (req, res) => {
 	try {
 					const posts = await db.getRecentPosts(config.limits.timelineDefaultLimit);
 			const currentUserId = req.user ? req.user.id : null;
-			const viewablePosts = await filterViewablePosts(db, posts, currentUserId);
+			const visibilityContext = await createPostVisibilityContext(db, posts, currentUserId);
+				const viewablePosts = await filterViewablePosts(
+					db,
+					posts,
+					currentUserId,
+					visibilityContext,
+				);
 			const discoverablePosts = await filterDiscoverablePosts(
 				db,
 				viewablePosts,
 				currentUserId,
+				visibilityContext,
 			);
 
 			const enriched = await serializePostsBatch(
@@ -441,11 +452,18 @@ router.get('/trending', optionalAuth, async (req, res) => {
 	try {
 					const posts = await db.getTrendingPosts(limit);
 			const currentUserId = req.user ? req.user.id : null;
-			const viewablePosts = await filterViewablePosts(db, posts, currentUserId);
+			const visibilityContext = await createPostVisibilityContext(db, posts, currentUserId);
+				const viewablePosts = await filterViewablePosts(
+					db,
+					posts,
+					currentUserId,
+					visibilityContext,
+				);
 			const discoverablePosts = await filterDiscoverablePosts(
 				db,
 				viewablePosts,
 				currentUserId,
+				visibilityContext,
 			);
 			const hydrated = await serializePostsBatch(
 				db,
@@ -466,7 +484,8 @@ router.get('/search', optionalAuth, async (req, res) => {
 	const db = getDbAdapter(req);
 	const q = req.query.q || '';
 	const limit = Math.min(parseInt(req.query.limit, 10) || 30, 100);
-	const offset = parseInt(req.query.offset, 10) || 0;
+	const beforeId = safeParsePostId(req.query.before_id);
+	const offset = beforeId == null ? (parseInt(req.query.offset, 10) || 0) : 0;
 
 	if (!q.trim()) {
 		return res.json({ posts: [], has_next: false });
@@ -474,15 +493,16 @@ router.get('/search', optionalAuth, async (req, res) => {
 
 		try {
 			const currentUserId = req.user ? req.user.id : null;
-			const { ids, has_more } = await getDiscoverableModePage(db, {
-				mode: 'search',
-				query: q,
-				viewerId: currentUserId,
-				limit,
-				offset,
-			});
-			const posts = await serializePostsByIds(db, ids, currentUserId, getPublicUrl(req));
-			res.json({ posts, has_next: has_more });
+				const { ids, has_more, next_cursor } = await getDiscoverableModePage(db, {
+					mode: 'search',
+					query: q,
+					viewerId: currentUserId,
+					limit,
+					offset,
+					beforeId,
+				});
+				const posts = await serializePostsByIds(db, ids, currentUserId, getPublicUrl(req));
+				res.json({ posts, has_next: has_more, next_cursor });
 	} catch (err) {
 		console.error('[posts] search error:', err);
 		res.status(500).json({ error: '検索に失敗しました' });
@@ -492,18 +512,20 @@ router.get('/search', optionalAuth, async (req, res) => {
 router.get('/recommended', optionalAuth, async (req, res) => {
 	const db = getDbAdapter(req);
 	const limit = Math.min(parseInt(req.query.limit, 10) || 30, 100);
-	const offset = parseInt(req.query.offset, 10) || 0;
+	const beforeId = safeParsePostId(req.query.before_id);
+	const offset = beforeId == null ? (parseInt(req.query.offset, 10) || 0) : 0;
 
 		try {
 			const currentUserId = req.user ? req.user.id : null;
-			const { ids, has_more } = await getDiscoverableModePage(db, {
+			const { ids, has_more, next_cursor } = await getDiscoverableModePage(db, {
 				mode: 'recommended',
 				viewerId: currentUserId,
 				limit,
 				offset,
+				beforeId,
 			});
 			const posts = await serializePostsByIds(db, ids, currentUserId, getPublicUrl(req));
-			res.json({ posts, has_next: has_more });
+			res.json({ posts, has_next: has_more, next_cursor });
 	} catch (err) {
 		console.error('[posts] recommended error:', err);
 		res.status(500).json({ error: 'おすすめ投稿の取得に失敗しました' });
@@ -515,7 +537,8 @@ router.get('/page', optionalAuth, async (req, res) => {
 	const mode = String(req.query.mode || 'timeline');
 	const tab = String(req.query.tab || 'foryou');
 	const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 30, 1), 100);
-	const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+	const beforeId = safeParsePostId(req.query.before_id);
+	const offset = beforeId == null ? Math.max(parseInt(req.query.offset, 10) || 0, 0) : 0;
 	const currentUserId = req.user ? req.user.id : null;
 
 		try {
@@ -533,6 +556,7 @@ router.get('/page', optionalAuth, async (req, res) => {
 					viewerId: currentUserId,
 					limit,
 					offset,
+					beforeId,
 				});
 			} else if (mode === 'profile') {
 			const userId = safeParsePostId(req.query.user_id);
@@ -541,12 +565,13 @@ router.get('/page', optionalAuth, async (req, res) => {
 				? req.query.sub_type
 				: 'all';
 			if (db.getProfilePostIds) {
-				result = await db.getProfilePostIds({ userId, subType, limit, offset });
+				result = await db.getProfilePostIds({ userId, subType, limit, offset, beforeId });
 			} else {
 				const posts = await db.getPostsByUserId(userId, offset + limit + 1, currentUserId);
 				const filtered = posts.filter((post) => (
-					subType === 'posts_only' ? post.replyTo == null
-						: subType === 'replies_only' ? post.replyTo != null : true
+					(beforeId == null || Number(post.id) < beforeId) &&
+					(subType === 'posts_only' ? post.replyTo == null
+						: subType === 'replies_only' ? post.replyTo != null : true)
 				));
 				result = {
 					ids: filtered.slice(offset, offset + limit).map((post) => post.id),
@@ -554,7 +579,7 @@ router.get('/page', optionalAuth, async (req, res) => {
 				};
 			}
 			const pinId = safeParsePostId(req.query.pin_id);
-			if (offset === 0 && pinId && !result.ids.includes(pinId)) result.ids.push(pinId);
+			if (beforeId == null && offset === 0 && pinId && !result.ids.includes(pinId)) result.ids.push(pinId);
 		} else if (mode === 'ids') {
 			const ids = String(req.query.ids || '')
 				.split(',')
@@ -562,10 +587,15 @@ router.get('/page', optionalAuth, async (req, res) => {
 				.filter(Boolean)
 				.slice(offset, offset + limit);
 			result = { ids, has_more: false };
-		} else {
-			return res.status(400).json({ error: 'Unsupported post page mode' });
-		}
+			} else {
+				return res.status(400).json({ error: 'Unsupported post page mode' });
+			}
 
+			const nextCursor = result.next_cursor ?? (
+				result.has_more && result.ids?.length > 0
+					? result.ids[result.ids.length - 1]
+					: null
+			);
 			const viewableIds = isDiscoverableMode
 				? result.ids || []
 				: await getViewablePostIds(db, result.ids || [], currentUserId);
@@ -587,9 +617,10 @@ router.get('/page', optionalAuth, async (req, res) => {
 		];
 		
 		res.json({
-			posts,
-			has_more: !!result.has_more,
-			context: {
+				posts,
+				has_more: !!result.has_more,
+				next_cursor: nextCursor,
+				context: {
 				users: (contextUsers || []).map((user) => ({
 					id: user.id,
 					name: user.name || '',

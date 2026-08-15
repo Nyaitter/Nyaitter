@@ -21,6 +21,7 @@ if (process.env.DEV_BYPASS_AUTH === 'true') {
 
 const { createDatabaseAdapter, createStorageAdapter } = require('./adapters');
 const {
+	csrfProtection,
 	flexibleCors,
 	securityHeaders,
 	getAuthenticatedPrincipal,
@@ -46,13 +47,14 @@ app.locals.realtime = realtimeConnections;
 applyTrustProxy(app);
 
 app.use(express.json({ limit: config.server.jsonBodyLimit }));
-app.use(express.urlencoded({ extended: true }));
+app.use(express.urlencoded({ extended: true, limit: config.server.jsonBodyLimit, parameterLimit: 100 }));
 
 app.use(requestId);
 
 app.use(securityHeaders);
 
 app.use(flexibleCors);
+app.use(csrfProtection);
 
 app.use('/server', generalLimiter);
 app.use('/server/auth', authLimiter);
@@ -111,14 +113,12 @@ async function handleRealtimeUpgrade(request, socket, head) {
 		return rejectRealtimeUpgrade(socket, 403, 'Forbidden');
 	}
 
-	const token = parsedUrl.searchParams.get('token');
+	// ブラウザの同一オリジンWebSocketハンドシェイクではHttpOnly Cookieが自動送信される。
+	// URLクエリのBearerトークンはアクセスログ等に残るため受け付けない。
 	const authRequest = {
 		headers: { ...request.headers },
 		app,
 	};
-	if (token && !authRequest.headers.authorization) {
-		authRequest.headers.authorization = `Bearer ${token}`;
-	}
 
 	let principal;
 	try {

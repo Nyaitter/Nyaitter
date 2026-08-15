@@ -163,7 +163,7 @@ async function getValidRememberedAccounts(req, db) {
   const remembered = readRememberedAccounts(req);
   const valid = [];
   for (const account of remembered) {
-    const session = await db.getSessionByToken(account.token);
+    const session = await db.getSessionByToken(SessionManager.hashToken(account.token));
     if (!session || Number(session.userId) !== account.userId) continue;
     const user = await db.getUserById(account.userId);
     if (!user) continue;
@@ -264,14 +264,12 @@ function sendLoginResult(req, res, user, result, { external = false } = {}) {
   }
 
   const session = result.session;
-  return res.json({
-    success: true,
-    access_token: session.token,
-    token_type: 'Bearer',
-    expires_at: session.expiresAt,
-    user: serializeLoginUser(user, req),
-    ...(external ? { note: 'Logged in via external Nyaitter server. Profile was inherited from the external instance.' } : {}),
-  });
+	return res.json({
+		success: true,
+		expires_at: session.expiresAt,
+		user: serializeLoginUser(user, req),
+		...(external ? { note: 'Logged in via external Nyaitter server. Profile was inherited from the external instance.' } : {}),
+	});
 }
 
 router.post('/scratch/generate', (req, res) => {
@@ -381,13 +379,11 @@ router.post('/login-approvals/:approvalId/poll', async (req, res) => {
 
   await db.trustLoginIp(user.id, metadata);
   const session = await createAuthenticatedSession(req, res, user, metadata);
-  return res.json({
-    success: true,
-    access_token: session.token,
-    token_type: 'Bearer',
-    expires_at: session.expiresAt,
-    user: serializeLoginUser(user, req),
-  });
+	return res.json({
+		success: true,
+		expires_at: session.expiresAt,
+		user: serializeLoginUser(user, req),
+	});
 });
 
 router.get('/me', requireAuth, async (req, res) => {
@@ -450,13 +446,14 @@ router.post('/login-approvals/:approvalId/decision', requireAuth, requireInterac
 });
 
 function serializeSessionForOwner(session, currentToken) {
+  const currentTokenHash = currentToken ? SessionManager.hashToken(currentToken) : null;
   return {
     id: session.id,
     ip_masked: session.ipMasked || '旧セッション',
     user_agent: session.userAgent || '不明な端末',
     created_at: session.createdAt,
     expires_at: session.expiresAt,
-    current: Boolean(currentToken && session.token === currentToken),
+    current: Boolean(currentTokenHash && session.token === currentTokenHash),
     can_revoke_trust: Boolean(session.ipHash),
 	  };
 	}
@@ -496,9 +493,10 @@ router.delete('/sessions/:sessionId', requireAuth, requireInteractiveSession, as
 
   await db.invalidateSession(target.token);
   const currentToken = getCookieValue(req, 'nyaitter_session');
-  const remaining = readRememberedAccounts(req).filter((account) => account.token !== target.token);
+  const remaining = readRememberedAccounts(req)
+    .filter((account) => SessionManager.hashToken(account.token) !== target.token);
   setRememberedAccountsCookie(res, remaining);
-  const activeRemoved = currentToken === target.token;
+  const activeRemoved = Boolean(currentToken && SessionManager.hashToken(currentToken) === target.token);
   if (activeRemoved) clearSessionCookie(res);
   res.set('Cache-Control', 'no-store');
   return res.json({ success: true, invalidated: 1, active_removed: activeRemoved });
@@ -521,9 +519,9 @@ router.post('/sessions/:sessionId/revoke-ip', requireAuth, requireInteractiveSes
   const revokedTrust = await db.revokeTrustedLoginIp(req.user.id, target.ipHash);
   const invalidated = await db.invalidateSessionsByIp(req.user.id, target.ipHash);
   const currentToken = getCookieValue(req, 'nyaitter_session');
-  const activeRemoved = affectedTokens.includes(currentToken);
+  const activeRemoved = Boolean(currentToken && affectedTokens.includes(SessionManager.hashToken(currentToken)));
   setRememberedAccountsCookie(res, readRememberedAccounts(req)
-    .filter((account) => !affectedTokens.includes(account.token)));
+    .filter((account) => !affectedTokens.includes(SessionManager.hashToken(account.token))));
   if (activeRemoved) clearSessionCookie(res);
 
   res.set('Cache-Control', 'no-store');
@@ -772,15 +770,9 @@ router.delete('/bot-tokens/:tokenId', requireAuth, async (req, res) => {
 
 function resolveExternalServer(domain, nyaitterAddress) {
   const configuredServers = config.federation?.trusted_servers || [];
-  if (configuredServers.length === 0) {
-    const defaultProtocol = /^(localhost|127\.0\.0\.1)(?::\d{1,5})?$/i.test(domain) ? 'http' : 'https';
-    return {
-      domain,
-      auth_endpoint: `${defaultProtocol}://${domain}/auth/external`,
-      verify_endpoint: `${defaultProtocol}://${domain}/server/auth/external/verify`,
-      trust_mode: 'open',
-    };
-  }
+  // 未設定時に利用者入力のドメインへサーバーから接続すると、内部ネットワークを
+  // 参照できるSSRF経路になる。外部ログインは常に明示的な許可リストに限定する。
+  if (configuredServers.length === 0) return null;
 
   const configured = configuredServers.find((server) =>
     String(server.domain || '').toLowerCase() === domain || server.nyaitter_id === nyaitterAddress,
@@ -832,11 +824,9 @@ router.get('/external/trusted', (req, res) => {
   }));
   res.json({
     trusted_servers: trusted,
-    enabled: !!config.federation?.allow_external_login,
-    trust_mode: trusted.length === 0 ? 'open' : 'allowlist',
-    standard_endpoints: trusted.length === 0
-      ? { auth_path: '/auth/external', verify_path: '/server/auth/external/verify' }
-      : null,
+		enabled: Boolean(config.federation?.allow_external_login && trusted.length > 0),
+		trust_mode: 'allowlist',
+		standard_endpoints: null,
   });
 });
 

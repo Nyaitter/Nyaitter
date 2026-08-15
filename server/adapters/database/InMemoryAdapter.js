@@ -6,6 +6,7 @@ const {
 	formatNyaitterId,
 } = require('../../utils/nyaitterAddress');
 const { normalizeTarget } = require('../../utils/notification');
+const { normalizeBlockList } = require('../../utils/blockList');
 
 class InMemoryAdapter extends DatabaseAdapter {
 	constructor() {
@@ -156,19 +157,29 @@ class InMemoryAdapter extends DatabaseAdapter {
 
 	async disconnect() {}
 
+	_normalizeUserBlockList(user) {
+		if (!user) return null;
+		user.block = normalizeBlockList(user.block, user.id);
+		return user;
+	}
+
 	async getUserByScid(scid) {
 		const id = this.scidToId.get(scid);
-		return id !== undefined ? this.users.get(id) : null;
+		return id !== undefined
+			? this._normalizeUserBlockList(this.users.get(id))
+			: null;
 	}
 
 	async getUserById(id) {
-		return this.users.get(id) || null;
+		return this._normalizeUserBlockList(this.users.get(id));
 	}
 
 	async getUserByNyaitterAddress(address) {
 		if (!this.nyaitterAddressToId) return null;
 		const id = this.nyaitterAddressToId.get(address);
-		return id ? this.users.get(id) : null;
+		return id != null
+			? this._normalizeUserBlockList(this.users.get(id))
+			: null;
 	}
 
 	async getOrCreateExternalUser({
@@ -209,7 +220,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 
 	
 	_withUserDefaults(user) {
-		return {
+		const normalized = {
 			me: '',
 			icon_data: null,
 			header_image: null,
@@ -223,6 +234,8 @@ class InMemoryAdapter extends DatabaseAdapter {
 			lock: false,
 			...(user || {}),
 		};
+		normalized.block = normalizeBlockList(normalized.block, normalized.id);
+		return normalized;
 	}
 
 	async createUser(userData) {
@@ -307,7 +320,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 				name.includes(q) ||
 				profile.includes(q)
 			) {
-				results.push(user);
+				results.push(this._normalizeUserBlockList(user));
 
 				if (results.length >= limit) break;
 			}
@@ -320,7 +333,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 	async getUsersByIds(userIds) {
 		const results = [];
 		for (const id of userIds) {
-			const user = this.users.get(id);
+			const user = this._normalizeUserBlockList(this.users.get(id));
 			if (user) {
 				results.push(user);
 			}
@@ -330,11 +343,15 @@ class InMemoryAdapter extends DatabaseAdapter {
 
 	
 	async getAllUsers() {
-		return Array.from(this.users.values());
+		return Array.from(this.users.values()).map((user) =>
+			this._normalizeUserBlockList(user),
+		);
 	}
 
 	async createSession(userId, meta = {}) {
-		const token = crypto.randomBytes(config.auth.sessionTokenBytes).toString('hex');
+		const token = typeof meta.token === 'string' && meta.token
+			? meta.token
+			: crypto.randomBytes(config.auth.sessionTokenBytes).toString('hex');
 		const msPerDay = 1000 * 60 * 60 * 24;
 		const expiresAt = new Date(Date.now() + msPerDay * config.auth.sessionExpiryDays);
 		const session = {
@@ -1401,11 +1418,14 @@ class InMemoryAdapter extends DatabaseAdapter {
 		];
 		for (const key of allowed) {
 			if (profileData[key] !== undefined) {
-				user[key] = profileData[key];
+				user[key] =
+					key === 'block'
+						? normalizeBlockList(profileData[key], userId)
+						: profileData[key];
 			}
 		}
 
-		return user;
+		return this._normalizeUserBlockList(user);
 	}
 
 	async getLikeIds(userId) {
@@ -1433,6 +1453,20 @@ class InMemoryAdapter extends DatabaseAdapter {
 			if (followerId === userId) result.push(followingId);
 		}
 		return result;
+	}
+
+	async getFollowRelationshipSnapshot(userId, candidateUserIds) {
+		const normalizedUserId = Number(userId);
+		const candidates = [...new Set((candidateUserIds || [])
+			.map(Number)
+			.filter((id) => Number.isInteger(id) && id !== normalizedUserId))];
+		const followingIds = [];
+		const followerIds = [];
+		for (const candidateId of candidates) {
+			if (this.follows.has(`${normalizedUserId}:${candidateId}`)) followingIds.push(candidateId);
+			if (this.follows.has(`${candidateId}:${normalizedUserId}`)) followerIds.push(candidateId);
+		}
+		return { followingIds, followerIds };
 	}
 
 	async getPinnedPostId(userId) {
@@ -1586,81 +1620,99 @@ class InMemoryAdapter extends DatabaseAdapter {
 			}
 
 		
-			async getProfilePostIds({ userId, subType = 'all', limit = 30, offset = 0 } = {}) {
+			async getProfilePostIds({ userId, subType = 'all', limit = 30, offset = 0, beforeId = null } = {}) {
 			const normalizedLimit = Math.max(1, Number(limit) || 30);
-			const normalizedOffset = Math.max(0, Number(offset) || 0);
+			const normalizedBeforeId = Number.isInteger(Number(beforeId)) && Number(beforeId) > 0
+				? Number(beforeId)
+				: null;
+			const normalizedOffset = normalizedBeforeId == null ? Math.max(0, Number(offset) || 0) : 0;
 			const sourceIds = this.postIdsByUser.get(Number(userId)) || [];
-			if (subType === 'all') {
-				const window = sourceIds.slice(normalizedOffset, normalizedOffset + normalizedLimit + 1);
-				return { ids: window.slice(0, normalizedLimit), has_more: window.length > normalizedLimit };
-			}
-			const matched = [];
-			for (const id of sourceIds) {
+			const matched = sourceIds.filter((id) => {
 				const post = this.posts.get(id);
-				if (!post) continue;
-				const matches = subType === 'posts_only' ? post.replyTo == null : post.replyTo != null;
-				if (!matches) continue;
-				if (matched.length < normalizedOffset + normalizedLimit + 1) matched.push(id);
-				else break;
-			}
-			const window = matched.slice(normalizedOffset);
-			return { ids: window.slice(0, normalizedLimit), has_more: window.length > normalizedLimit };
+				if (!post || (normalizedBeforeId != null && Number(id) >= normalizedBeforeId)) return false;
+				return subType === 'all' || (subType === 'posts_only' ? post.replyTo == null : post.replyTo != null);
+			});
+			const window = matched.slice(normalizedOffset, normalizedOffset + normalizedLimit + 1);
+			const ids = window.slice(0, normalizedLimit);
+			return {
+				ids,
+				has_more: window.length > normalizedLimit,
+				next_cursor: window.length > normalizedLimit && ids.length > 0 ? ids[ids.length - 1] : null,
+			};
 		}
 
-		async getTimelinePostIds({ tab = 'foryou', followIds = [], limit = 30, offset = 0 } = {}) {
+		async getTimelinePostIds({ tab = 'foryou', followIds = [], limit = 30, offset = 0, beforeId = null } = {}) {
 			const normalizedLimit = Math.max(1, Number(limit) || 30);
-			const normalizedOffset = Math.max(0, Number(offset) || 0);
-			if (tab !== 'following' && tab !== 'announce') {
-				const matched = [];
-				for (const id of this.postIdsNewest) {
-					const post = this.posts.get(id);
-					if (!post || post.replyTo != null) continue;
-					if (matched.length < normalizedOffset + normalizedLimit + 1) matched.push(id);
-					else break;
-				}
-				const window = matched.slice(normalizedOffset);
-				return { ids: window.slice(0, normalizedLimit), has_more: window.length > normalizedLimit };
-			}
+			const normalizedBeforeId = Number.isInteger(Number(beforeId)) && Number(beforeId) > 0
+				? Number(beforeId)
+				: null;
+			const normalizedOffset = normalizedBeforeId == null ? Math.max(0, Number(offset) || 0) : 0;
 			const followSet = tab === 'following' ? new Set((followIds || []).map(Number)) : null;
 			const matched = [];
 			for (const id of this.postIdsNewest) {
 				const post = this.posts.get(id);
-				if (!post) continue;
+				if (!post || post.replyTo != null || (normalizedBeforeId != null && Number(id) >= normalizedBeforeId)) continue;
 				const matches = tab === 'following'
-					? followSet.has(Number(post.userId)) && post.replyTo === null
-					: Number(post.userId) === 2525 && post.replyTo === null && (post.content || '').includes('#NXAnnounce');
+					? followSet.has(Number(post.userId))
+					: tab === 'announce'
+						? Number(post.userId) === 2525 && (post.content || '').includes('#NXAnnounce')
+						: true;
 				if (!matches) continue;
-				if (matched.length < normalizedOffset + normalizedLimit + 1) matched.push(id);
-				else break;
+				matched.push(id);
+				if (matched.length >= normalizedOffset + normalizedLimit + 1) break;
 			}
-			const window = matched.slice(normalizedOffset);
-			return { ids: window.slice(0, normalizedLimit), has_more: window.length > normalizedLimit };
-	}
-
-	
-	async getRecommendedPostIds({ limit = 30, offset = 0 } = {}) {
-		const posts = await this.getTrendingPosts(offset + limit);
-		const ids = posts.slice(offset, offset + limit).map((p) => p.id);
-		const has_more = posts.length > offset + limit;
-		return { ids, has_more };
-	}
-
-	
-	async searchPostIds(query, limit = 30, offset = 0) {
-		if (!query || query.trim().length === 0) return { ids: [], has_more: false };
-		const q = query.toLowerCase().trim();
-		const normalizedLimit = Math.max(1, Number(limit) || 30);
-		const normalizedOffset = Math.max(0, Number(offset) || 0);
-		const matched = [];
-		for (const id of this.postIdsNewest) {
-			const post = this.posts.get(id);
-			if (!post || !(post.content || '').toLowerCase().includes(q)) continue;
-			if (matched.length < normalizedOffset + normalizedLimit + 1) matched.push(id);
-			else break;
+			const window = matched.slice(normalizedOffset, normalizedOffset + normalizedLimit + 1);
+			const ids = window.slice(0, normalizedLimit);
+			return {
+				ids,
+				has_more: window.length > normalizedLimit,
+				next_cursor: window.length > normalizedLimit && ids.length > 0 ? ids[ids.length - 1] : null,
+			};
 		}
-		const window = matched.slice(normalizedOffset);
-		return { ids: window.slice(0, normalizedLimit), has_more: window.length > normalizedLimit };
-	}
+
+		async getRecommendedPostIds({ limit = 30, offset = 0, beforeId = null } = {}) {
+			const normalizedLimit = Math.max(1, Number(limit) || 30);
+			const normalizedBeforeId = Number.isInteger(Number(beforeId)) && Number(beforeId) > 0
+				? Number(beforeId)
+				: null;
+			const normalizedOffset = normalizedBeforeId == null ? Math.max(0, Number(offset) || 0) : 0;
+			const posts = await this.getTrendingPosts(this.posts.size);
+			const candidates = normalizedBeforeId == null
+				? posts
+				: posts.filter((post) => Number(post.id) < normalizedBeforeId);
+			const window = candidates.slice(normalizedOffset, normalizedOffset + normalizedLimit + 1);
+			const ids = window.slice(0, normalizedLimit).map((post) => post.id);
+			return {
+				ids,
+				has_more: window.length > normalizedLimit,
+				next_cursor: window.length > normalizedLimit && ids.length > 0 ? ids[ids.length - 1] : null,
+			};
+		}
+
+		async searchPostIds(query, limit = 30, offset = 0, beforeId = null) {
+			if (!query || query.trim().length === 0) return { ids: [], has_more: false, next_cursor: null };
+			const q = query.toLowerCase().trim();
+			const normalizedLimit = Math.max(1, Number(limit) || 30);
+			const normalizedBeforeId = Number.isInteger(Number(beforeId)) && Number(beforeId) > 0
+				? Number(beforeId)
+				: null;
+			const normalizedOffset = normalizedBeforeId == null ? Math.max(0, Number(offset) || 0) : 0;
+			const matched = [];
+			for (const id of this.postIdsNewest) {
+				const post = this.posts.get(id);
+				if (!post || (normalizedBeforeId != null && Number(id) >= normalizedBeforeId)) continue;
+				if (!(post.content || '').toLowerCase().includes(q)) continue;
+				matched.push(id);
+				if (matched.length >= normalizedOffset + normalizedLimit + 1) break;
+			}
+			const window = matched.slice(normalizedOffset, normalizedOffset + normalizedLimit + 1);
+			const ids = window.slice(0, normalizedLimit);
+			return {
+				ids,
+				has_more: window.length > normalizedLimit,
+				next_cursor: window.length > normalizedLimit && ids.length > 0 ? ids[ids.length - 1] : null,
+			};
+		}
 
 	
 	async getTrendingHashtags(limit = 10) {

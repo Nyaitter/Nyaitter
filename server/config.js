@@ -1,3 +1,5 @@
+const isProduction = (process.env.NODE_ENV || 'development') === 'production';
+
 let rawConfig;
 try {
   rawConfig = require('./config.json');
@@ -106,13 +108,14 @@ const config = {
     max: get('rateLimit.max', 1000),
     auth: {
       windowMs: get('rateLimit.auth.windowMs', 60000),
-      max: get('rateLimit.auth.max', 100),
+      max: get('rateLimit.auth.max', 20),
     },
   },
 
   security: {
     hsts: {
-      enabled: get('security.hsts.enabled', false),
+      // HTTPS終端を前提とする本番ではHSTSを既定で有効化する。
+      enabled: get('security.hsts.enabled', isProduction),
       maxAge: get('security.hsts.maxAge', 31536000),
       includeSubDomains: get('security.hsts.includeSubDomains', true),
     },
@@ -143,7 +146,7 @@ const config = {
 
 function validateConfig() {
   const errors = [];
-  const isProd = (process.env.NODE_ENV || 'development') === 'production';
+  const isProd = isProduction;
 
   if (isProd) {
     if (!process.env.TURNSTILE_SECRET_KEY && !config.raw?.turnstile?.secret) {
@@ -156,6 +159,14 @@ function validateConfig() {
 
     if (config.database.adapter === 'memory') {
       console.warn('[config] WARNING: Using in-memory database in production is not recommended');
+    }
+
+    if (!process.env.PUBLIC_URL && !config.federation.publicUrl) {
+      errors.push('PUBLIC_URL or federation.publicUrl must be configured in production');
+    }
+
+    if (config.federation.allow_external_login && (config.federation.trusted_servers || []).length === 0) {
+      console.warn('[config] External login is configured but no trusted_servers are defined; it will remain disabled');
     }
   }
 
