@@ -10,6 +10,13 @@ function getBlockedUserIds(user) {
   );
 }
 
+function blocksUser(user, targetUserId) {
+  for (const blockedUserId of Array.isArray(user?.block) ? user.block : []) {
+    if (Number(blockedUserId) === targetUserId) return true;
+  }
+  return false;
+}
+
 class ConnectionManager {
   constructor() {
     this.connectionsByUser = new Map();
@@ -38,18 +45,10 @@ class ConnectionManager {
     }
   }
 
-  sendToUser(userId, event) {
+  _sendSerializedToUser(userId, serialized) {
     const normalizedUserId = Number(userId);
     const sockets = this.connectionsByUser.get(normalizedUserId);
     if (!sockets || sockets.size === 0) return false;
-
-    let serialized;
-    try {
-      serialized = JSON.stringify(event);
-    } catch (error) {
-      console.warn('[realtime] Event serialization failed:', error.message);
-      return false;
-    }
 
     let delivered = false;
     // Setを直接走査することで、イベントごとのソケット配列複製を避ける。
@@ -74,6 +73,17 @@ class ConnectionManager {
     }
 
     return delivered;
+  }
+
+  sendToUser(userId, event) {
+    let serialized;
+    try {
+      serialized = JSON.stringify(event);
+    } catch (error) {
+      console.warn('[realtime] Event serialization failed:', error.message);
+      return false;
+    }
+    return this._sendSerializedToUser(userId, serialized);
   }
 
   async publishNotificationUnreadCount(userId, dbAdapter) {
@@ -179,21 +189,28 @@ class ConnectionManager {
     }
 
     const authorBlocks = getBlockedUserIds(usersById.get(authorId));
+    let serializedEvent;
+    try {
+      // 同一イベントを全受信者へ送るため、JSON化は配信ごとに一度だけ行う。
+      serializedEvent = JSON.stringify({
+        type: 'timeline_post',
+        timeline: 'following',
+        author_id: authorId,
+        post_id: Number(postId),
+      });
+    } catch (error) {
+      console.warn('[realtime] Timeline event serialization failed:', error.message);
+      return 0;
+    }
+
     let deliveredCount = 0;
     for (const recipientId of recipientIds) {
       const recipient = usersById.get(recipientId);
       if (!recipient) continue;
-      if (authorBlocks.has(recipientId) || getBlockedUserIds(recipient).has(authorId)) {
+      if (authorBlocks.has(recipientId) || blocksUser(recipient, authorId)) {
         continue;
       }
-      if (
-        this.sendToUser(recipientId, {
-          type: 'timeline_post',
-          timeline: 'following',
-          author_id: authorId,
-          post_id: Number(postId),
-        })
-      ) {
+      if (this._sendSerializedToUser(recipientId, serializedEvent)) {
         deliveredCount += 1;
       }
     }

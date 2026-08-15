@@ -476,9 +476,15 @@ document.addEventListener('DOMContentLoaded', () => {
     const nyaitterAddress = params.get('nyaitter_address') || '';
     const state = params.get('state') || '';
     const redirect = params.get('redirect') || '';
-    if (!nyaitterAddress || !state || !redirect) {
+    if (
+      !nyaitterAddress ||
+      !state ||
+      !redirect ||
+      !isNyaitterAddress(nyaitterAddress) ||
+      !isSafeExternalAuthUrl(redirect, nyaitterAddress)
+    ) {
       openExternalConfirmModal();
-      showExternalConfirmError('外部ログイン確認に必要な情報が不足しています。');
+      showExternalConfirmError('外部ログイン確認に必要な情報、または遷移先URLが正しくありません。');
       return true;
     }
 
@@ -523,6 +529,9 @@ document.addEventListener('DOMContentLoaded', () => {
       if (!response.ok || data.error || !data.redirect_url) {
         throw new Error(data.error || 'ログイン許可に失敗しました。');
       }
+      if (!isSafeExternalAuthUrl(data.redirect_url, pendingExternalConfirm.nyaitter_address)) {
+        throw new Error('外部ログインの遷移先URLを検証できませんでした。');
+      }
       window.location.assign(data.redirect_url);
     } catch (error) {
       showExternalConfirmError(error.message);
@@ -536,6 +545,12 @@ document.addEventListener('DOMContentLoaded', () => {
       return;
     }
     try {
+      if (!isSafeExternalAuthUrl(
+        pendingExternalConfirm.redirect,
+        pendingExternalConfirm.nyaitter_address,
+      )) {
+        throw new Error('Unsafe external redirect');
+      }
       const target = new URL(pendingExternalConfirm.redirect);
       target.searchParams.set('external_login', '1');
       target.searchParams.set('state', pendingExternalConfirm.state || '');

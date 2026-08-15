@@ -1,7 +1,7 @@
 {
 	"server": {
 		"port": 3000,
-		"jsonBodyLimit": "2mb",
+		"jsonBodyLimit": "7mb",
 		"trustProxy": false
 	},
 	"static": {
@@ -23,8 +23,16 @@
 		"dmMessagesMaxLimit": 100,
 		"parentPostPreviewLength": 100,
 		"followingDefaultLimit": 100,
-		"maxFileUploadSizeMB": 10
-	},
+"maxFileUploadSizeMB": 5
+		},
+		"imageUpload": {
+			"maxWidth": 2560,
+			"maxHeight": 2560,
+			"maxPixels": 40000000,
+			"maxOutputSizeMB": 5,
+			"webpQuality": 82,
+			"minWebpQuality": 60
+		},
 	"auth": {
 		"sessionExpiryDays": 30,
 		"verificationCodeExpiryMinutes": 15,
@@ -54,8 +62,9 @@
 			"authToken": ""
 		}
 	},
-	"storage": {
-		"adapter": "local",
+		"storage": {
+			"adapter": "local",
+			"userQuotaMB": 1024,
 		"local": {
 			"uploadDir": "./uploads"
 		},

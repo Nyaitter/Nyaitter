@@ -1222,43 +1222,49 @@ export default {
 			if (method === 'GET' && pathname.match(/^\/posts\/(\d+)\/detail$/)) {
 				const postId = Number(pathname.split('/')[2]);
 				const currentUserId = url.searchParams.get('currentUserId') ? Number(url.searchParams.get('currentUserId')) : null;
+				const viewerId = currentUserId ? currentUserId : null;
 
-				const post = await db.prepare('SELECT * FROM posts WHERE id = ?').bind(postId).first();
-				if (!post) return json(null);
+				// 詳細画面で必要な関連情報を単一クエリへ集約し、WorkerとD1間の逐次往復をなくす。
+				const detail = await db.prepare(
+					`SELECT p.*,
+						author.id AS author_id,
+						author.name AS author_name,
+						author.scid AS author_scid,
+						COALESCE((SELECT COUNT(*) FROM likes WHERE post_id = p.id), 0) AS like_count,
+						COALESCE((SELECT COUNT(*) FROM stars WHERE post_id = p.id), 0) AS star_count,
+						EXISTS(SELECT 1 FROM likes WHERE user_id = ? AND post_id = p.id) AS liked_by_me,
+						EXISTS(SELECT 1 FROM stars WHERE user_id = ? AND post_id = p.id) AS starred_by_me,
+						parent.id AS parent_id,
+						parent.content AS parent_content,
+						parent_author.id AS parent_author_id,
+						parent_author.name AS parent_author_name
+					 FROM posts p
+					 LEFT JOIN users author ON author.id = p.user_id
+					 LEFT JOIN posts parent ON parent.id = p.reply_to
+					 LEFT JOIN users parent_author ON parent_author.id = parent.user_id
+					 WHERE p.id = ?`
+				).bind(viewerId, viewerId, postId).first();
+				if (!detail) return json(null);
 
-				const author = await db.prepare('SELECT id, name, scid FROM users WHERE id = ?').bind(post.user_id).first();
-				const likeCountRow = await db.prepare('SELECT COUNT(*) as count FROM likes WHERE post_id = ?').bind(postId).first();
-				const starCountRow = await db.prepare('SELECT COUNT(*) as count FROM stars WHERE post_id = ?').bind(postId).first();
-
-				let likedByMe = false;
-				let starredByMe = false;
-				if (currentUserId) {
-					const l = await db.prepare('SELECT 1 FROM likes WHERE user_id = ? AND post_id = ?').bind(currentUserId, postId).first();
-					const s = await db.prepare('SELECT 1 FROM stars WHERE user_id = ? AND post_id = ?').bind(currentUserId, postId).first();
-					likedByMe = Boolean(l);
-					starredByMe = Boolean(s);
-				}
-
-				let parentPost = null;
-				if (post.reply_to) {
-					const parent = await db.prepare('SELECT id, user_id, content FROM posts WHERE id = ?').bind(post.reply_to).first();
-					if (parent) {
-						const parentAuthor = await db.prepare('SELECT id, name FROM users WHERE id = ?').bind(parent.user_id).first();
-						parentPost = {
-							id: parent.id,
-							content: parent.content ? parent.content.substring(0, 100) : '',
-							author: parentAuthor ? { id: parentAuthor.id, name: parentAuthor.name } : null,
-						};
-					}
-				}
+				const parentPost = detail.parent_id == null
+					? null
+					: {
+						id: detail.parent_id,
+						content: detail.parent_content ? String(detail.parent_content).substring(0, 100) : '',
+						author: detail.parent_author_id == null
+							? null
+							: { id: detail.parent_author_id, name: detail.parent_author_name || '' },
+					};
 
 				return json({
-					...normalizePostRow(post),
-					author: author ? { id: author.id, name: author.name, scid: author.scid } : null,
-					like_count: Number(likeCountRow?.count || 0),
-					star_count: Number(starCountRow?.count || 0),
-					liked_by_me: likedByMe,
-					starred_by_me: starredByMe,
+					...normalizePostRow(detail),
+					author: detail.author_id == null
+						? null
+						: { id: detail.author_id, name: detail.author_name || '', scid: detail.author_scid || null },
+					like_count: Number(detail.like_count || 0),
+					star_count: Number(detail.star_count || 0),
+					liked_by_me: Boolean(detail.liked_by_me),
+					starred_by_me: Boolean(detail.starred_by_me),
 					parent_post: parentPost,
 				});
 			}

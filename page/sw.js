@@ -1,4 +1,3 @@
-const CACHE_NAME = 'nyaitter-client-v2';
 const STATIC_ASSET_PATTERN = /\.(?:html|css|js|mjs|json|webmanifest|png|jpe?g|gif|svg|ico|webp|avif|woff2?|ttf|otf)$/i;
 const APP_SHELL = [
   '/',
@@ -62,7 +61,7 @@ function isCacheableStaticResponse(response) {
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
-    caches.open(CACHE_NAME)
+    caches.open('nyaitter-client-v2')
       .then((cache) => cache.addAll(APP_SHELL))
       .then(() => self.skipWaiting()),
   );
@@ -72,7 +71,7 @@ self.addEventListener('activate', (event) => {
   event.waitUntil(
     caches.keys()
       .then((keys) => Promise.all(keys
-        .filter((key) => key.startsWith('nyaitter-client') && key !== CACHE_NAME)
+        .filter((key) => key.startsWith('nyaitter-client') && key !== 'nyaitter-client-v2')
         .map((key) => caches.delete(key))))
       .then(() => self.clients.claim()),
   );
@@ -94,7 +93,7 @@ self.addEventListener('fetch', (event) => {
         .then((response) => {
           if (isCacheableStaticResponse(response)) {
             const copy = response.clone();
-            caches.open(CACHE_NAME).then((cache) => cache.put(request.mode === 'navigate' ? '/index.html' : request, copy));
+            caches.open('nyaitter-client-v2').then((cache) => cache.put(request.mode === 'navigate' ? '/index.html' : request, copy));
           }
           return response;
         })
@@ -107,7 +106,7 @@ self.addEventListener('fetch', (event) => {
     caches.match(request).then((cached) => cached || fetch(request).then((response) => {
       if (!isCacheableStaticResponse(response)) return response;
       const copy = response.clone();
-      caches.open(CACHE_NAME).then((cache) => cache.put(request, copy));
+      caches.open('nyaitter-client-v2').then((cache) => cache.put(request, copy));
       return response;
     })),
   );

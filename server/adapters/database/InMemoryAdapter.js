@@ -631,26 +631,24 @@ class InMemoryAdapter extends DatabaseAdapter {
 	}
 
 	
-	async getPostDetail(id, currentUserId = null) {
-		const post = this.posts.get(id);
+		async getPostDetail(id, currentUserId = null) {
+		const postId = Number(id);
+		const post = this.posts.get(postId);
 		if (!post) return null;
 
-		const author = this.getUserById(post.userId);
-		const likeCount = this.getLikeCountForPost(id);
-		const starCount = this.getStarCountForPost(id);
-
-		const likedByMe = currentUserId
-			? this.hasUserLikedPost(currentUserId, id)
-			: false;
-		const starredByMe = currentUserId
-			? this.hasUserStarredPost(currentUserId, id)
-			: false;
-
+		// このアダプターでは関連データがすべてMap索引にあるため、非同期メソッドを
+		// 経由せず直接参照して、不要なPromise生成を避ける。
+		const author = this.users.get(Number(post.userId)) || null;
+		const likeCount = this.likeCountByPost.get(postId) || 0;
+		const starCount = this.starCountByPost.get(postId) || 0;
+		const viewerId = currentUserId == null ? null : Number(currentUserId);
+		const likedByMe = viewerId != null && this.likes.has(`${viewerId}:${postId}`);
+		const starredByMe = viewerId != null && this.stars.has(`${viewerId}:${postId}`);
 		let parentPost = null;
 		if (post.replyTo) {
-			const parent = this.posts.get(post.replyTo);
+			const parent = this.posts.get(Number(post.replyTo));
 			if (parent) {
-				const parentAuthor = this.getUserById(parent.userId);
+				const parentAuthor = this.users.get(Number(parent.userId)) || null;
 				parentPost = {
 					id: parent.id,
 					content: parent.content?.substring(

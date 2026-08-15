@@ -1,64 +1,57 @@
 # Cloudflare と組み合わせる構成
 
-Nyaitter は Node.js サーバーを API の窓口とし、データベース・ファイル保存をアダプター経由で接続します。Cloudflare を導入する場合も、ブラウザは Node.js サーバーの API を利用し、秘密情報を持つ接続はサーバー側へ閉じます。
+Nyaitter では、Node.jsサーバーがAPIと認証を担当します。Cloudflareを使う場合も、ブラウザはNode.jsサーバーへ接続し、D1やR2の鍵をブラウザへ渡しません。
 
-## 基本構成
+## 構成のイメージ
 
 ```text
 ブラウザ
-  │ HTTPS / WebSocket
-  ▼
+  ↓ HTTPS / WebSocket
 Nyaitter Node.js サーバー
-  ├── PostgreSQL または D1 Proxy Worker
-  ├── R2（添付ファイル）
-  └── Web Push / 外部認証先
+  ├─ PostgreSQL または D1 Proxy Worker
+  └─ R2（添付ファイル）
 ```
 
-| 領域 | 推奨する役割 |
-|---|---|
-| ユーザー、投稿、DM、通知 | PostgreSQL を主DBにするか、D1 Proxy Worker経由のD1に統一する |
-| 添付ファイル | R2 |
-| エッジ処理 | Cloudflare Worker。D1アクセスや将来の直接アップロードを必要な範囲で担当 |
-| 静的クライアント資産 | Node.js 配信の前段CDN、またはデプロイ構成に応じた静的配信 |
+## 段階的に導入する
 
-## 段階的な導入
+| 段階 | 設定 | 内容 |
+|---|---|---|
+| 1 | `memory` + `local` | 手元で機能を試します。データは再起動で消えます。 |
+| 2 | `postgres` + `r2` | DBとファイル保存を分ける、分かりやすい公開構成です。 |
+| 3 | `d1` + `r2` | D1 Proxy Workerを通してCloudflare D1を使います。 |
 
-### 1. PostgreSQL とローカルストレージで開発する
+## R2を使う
 
-`DB_ADAPTER=postgres` と `STORAGE_ADAPTER=local` を使い、機能・マイグレーション・バックアップを安定させます。ローカルストレージは単一サーバーの開発用途に限定し、実運用の永続ファイル保存には使わないことを推奨します。
+添付ファイルをR2へ保存する場合は、Node.jsサーバーへR2の接続情報を設定します。
 
-### 2. 添付ファイルを R2 へ移す
+```bash
+STORAGE_ADAPTER=r2
+STORAGE_USER_QUOTA_MB=1024
+```
 
-`STORAGE_ADAPTER=r2` と R2 の接続情報を設定します。R2 の公開ドメインを使う場合、オブジェクトキーは変更しない前提で長期キャッシュを設定できます。非公開バケットではサーバーが署名URLを発行します。
+ファイルはユーザーごとに管理されます。画像はEXIFを削除してから保存され、初期設定では1ユーザー当たり1 GBまでです。
 
-### 3. D1 Proxy Worker を導入する
+## D1を使う
 
-D1 を利用する場合、Node.js サーバーは `D1Adapter` を通じて認証済み Worker だけを呼びます。
+D1はNode.jsサーバーから直接ではなく、D1 Proxy Workerを通して使います。
 
 ```text
-Node.js サーバー -- Bearer トークン --> D1 Proxy Worker --> Cloudflare D1
+Node.js サーバー → Bearerトークン → D1 Proxy Worker → Cloudflare D1
 ```
 
-`AUTH_TOKEN` は Worker のシークレットと Node 側の `D1_WORKER_TOKEN` で一致させます。ブラウザから Worker に自由なSQLや認証トークンを送る構成にはしません。
+Workerの `AUTH_TOKEN` とNode.js側の `D1_WORKER_TOKEN` は同じ値にします。ブラウザからWorkerへDBトークンやSQLを送る構成にはしません。
 
-### 4. 必要に応じてエッジ処理を拡張する
+## 運用時の注意
 
-Worker の役割は段階的に増やします。たとえばD1プロキシ、R2の直接アップロード用署名、エッジ側のレート制限などです。Node.js の主API、認証、可視性ルールを一度に移行する必要はありません。
+- DBとストレージを切り替える前にバックアップを取ります。
+- Worker、D1マイグレーション、Node.jsの更新は順番に確認します。
+- R2/D1の鍵は `.env` またはデプロイ先のシークレット管理に置き、Gitへ追加しません。
+- 投稿・DM・通知は利用者ごとに見える内容が変わるため、キャッシュ設定は慎重に行います。
 
-## 運用上の判断
+## 関連文書
 
-| 判断 | 指針 |
-|---|---|
-| 主データの正本 | 機能ごとに PostgreSQL または D1 のどちらか一方を正本として決める |
-| リリース順 | Worker・DBマイグレーション・Node.js の互換性を段階的に確認する |
-| 秘密情報 | D1/R2 のトークンはWorkerシークレット、サーバー環境変数、デプロイ先のシークレット管理にのみ置く |
-| キャッシュ | クライアント資産は再検証可能なキャッシュ、投稿・DM・通知はAPIの可視性規則を優先する |
-| 障害対応 | R2/D1接続失敗時のログ、再試行、バックアップ、ロールバック手順を事前に用意する |
-
-## 関連ドキュメント
-
-- [Cloudflare D1 と Worker](./database-d1-worker.md)
-- [Cloudflare D1 Proxy Worker](../../workers/d1-proxy/README.md)
-- [Cloudflare R2 ストレージ](./storage-r2.md)
-- [PostgreSQL のセットアップ](./database-postgres.md)
+- [D1 と Worker](./database-d1-worker.md)
+- [D1 Proxy Worker](../../workers/d1-proxy/README.md)
+- [Cloudflare R2](./storage-r2.md)
+- [PostgreSQL](./database-postgres.md)
 - [本番デプロイのチェックリスト](./production-checklist.md)

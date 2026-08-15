@@ -293,22 +293,34 @@ async function serializePostsBatch(db, rootPosts, currentUserId = null, publicUr
 		Number(post.id),
 		canViewPostWithContext(post, visibilityContext),
 	]));
+	const briefUsersById = new Map();
+	const visitingPostIds = new Set();
 
-	function compose(post, depth = 0, visited = new Set()) {
-		if (!post || !visibleByPostId.get(Number(post.id)) || visited.has(Number(post.id))) return null;
-		const nextVisited = new Set(visited);
-		nextVisited.add(Number(post.id));
-		const metric = metricsByPostId.get(Number(post.id)) || {};
+	function getBriefUser(author) {
+		const authorId = Number(author?.id);
+		if (!briefUsersById.has(authorId)) {
+			briefUsersById.set(authorId, serializeUserBrief(author, publicUrl));
+		}
+		return briefUsersById.get(authorId);
+	}
+
+	function compose(post, depth = 0) {
+		const postId = Number(post?.id);
+		if (!post || !visibleByPostId.get(postId) || visitingPostIds.has(postId)) return null;
+
+		// 同じ再帰経路だけを追跡することで、各ノードでSetを複製する必要をなくす。
+		visitingPostIds.add(postId);
+		const metric = metricsByPostId.get(postId) || {};
 		const author = usersById.get(Number(post.userId)) || null;
 		const replyToPost = depth < 2 && post.replyTo != null
-			? compose(postsById.get(Number(post.replyTo)), depth + 1, nextVisited)
+			? compose(postsById.get(Number(post.replyTo)), depth + 1)
 			: null;
 		const repostedPost = depth < 2 && post.repostTo != null
-			? compose(postsById.get(Number(post.repostTo)), depth + 1, nextVisited)
+			? compose(postsById.get(Number(post.repostTo)), depth + 1)
 			: null;
-		const brief = serializeUserBrief(author, publicUrl);
+		const brief = getBriefUser(author);
 
-		return {
+		const serialized = {
 			id: post.id,
 			userid: post.userId,
 			content: post.content,
@@ -331,6 +343,8 @@ async function serializePostsBatch(db, rootPosts, currentUserId = null, publicUr
 			liked_by_me: !!metric.liked_by_me,
 			starred_by_me: !!metric.starred_by_me,
 		};
+		visitingPostIds.delete(postId);
+		return serialized;
 	}
 
 	return initialPosts.map((post) => compose(post)).filter(Boolean);

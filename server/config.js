@@ -62,8 +62,10 @@ const config = {
     dmMessagesMaxLimit: get('limits.dmMessagesMaxLimit', 100),
     parentPostPreviewLength: get('limits.parentPostPreviewLength', 100),
     followingDefaultLimit: get('limits.followingDefaultLimit', 100),
-    maxFileUploadSizeMB: get('limits.maxFileUploadSizeMB', 10),
+    maxFileUploadSizeMB: get('limits.maxFileUploadSizeMB', 5),
   },
+
+  imageUpload: get('imageUpload', {}),
 
 	  auth: {
 	    sessionExpiryDays: get('auth.sessionExpiryDays', 30),
@@ -121,9 +123,12 @@ const config = {
     },
   },
 
-	storage: {
-		adapter: process.env.STORAGE_ADAPTER || get('storage.adapter', 'local'),
-		local: get('storage.local', { uploadDir: './uploads' }),
+		storage: {
+			adapter: process.env.STORAGE_ADAPTER || get('storage.adapter', 'local'),
+			userQuotaMB: Math.min(102400, Math.max(1, Math.floor(Number(
+				process.env.STORAGE_USER_QUOTA_MB || get('storage.userQuotaMB', 1024),
+			) || 1024))),
+			local: get('storage.local', { uploadDir: './uploads' }),
 		r2: {
 			...get('storage.r2', {}),
 			cacheControl: process.env.R2_CACHE_CONTROL || get('storage.r2.cacheControl', 'public, max-age=31536000, immutable'),

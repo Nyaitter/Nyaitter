@@ -3,6 +3,7 @@ import { api, apiRequest } from './api.js';
 import { renderLimitedMarkdown } from './safeMarkdown.js';
 import { ICONS } from './icons.js';
 import { DOM, showMainJsError } from './dom.js';
+import { RESOURCE_LINKS, WIDGET_LINKS } from './linkSettings.js';
 
 const {
     getSelectedFiles,
@@ -207,6 +208,7 @@ export function initApp() {
         'privacy',
         'ui',
         'notifications',
+        'storage',
         'api',
         'resources',
     ]);
@@ -1218,10 +1220,7 @@ export function initApp() {
 	            </div>`;
         } else {
             const user = getAllUsersCache().get(msg.userid) || {};
-            const time = new Date(msg.created_at).toLocaleTimeString('ja-JP', {
-                hour: '2-digit',
-                minute: '2-digit',
-            });
+            const time = formatPostTimestamp(msg);
             return `<div class="dm-message-container received" data-message-id="${escapeHTML(msg.id)}">
 	                <a href="#profile/${user.id}" class="dm-user-link">
 	                    <img src="${getUserIconUrl(user)}" class="dm-message-icon">
@@ -1496,7 +1495,9 @@ export function initApp() {
         const targetPost =
             notification.target_post && typeof notification.target_post === 'object'
                 ? notification.target_post
-                : null;
+                : notification.targetPost && typeof notification.targetPost === 'object'
+                  ? notification.targetPost
+                  : null;
         return {
             id,
             type:
@@ -1604,10 +1605,7 @@ export function initApp() {
         }
         content.appendChild(message);
 
-        if (
-            notification.target?.kind === 'post' &&
-            typeof notification.targetPost?.content === 'string'
-        ) {
+        if (typeof notification.targetPost?.content === 'string') {
             const postPreview = notification.targetPost.content
                 .replace(/[\r\n]+/g, ' ')
                 .replace(/\s+/g, ' ')
@@ -2577,7 +2575,17 @@ export function initApp() {
 
         const data = getRecommendedUsersCache() || [];
 
-        const linkItems = [];
+        const linkItems = Array.isArray(WIDGET_LINKS) ? WIDGET_LINKS : [];
+        if (DOM.rightSidebar.links) {
+            DOM.rightSidebar.links.innerHTML = linkItems
+                .map((item) => {
+                    const name = escapeHTML(String(item?.name || 'リンク'));
+                    const url = escapeHTML(String(item?.url || item?.link || '#'));
+                    const external = /^https:\/\//i.test(String(item?.url || item?.link || ''));
+                    return `<a href="${url}" class="link"${external ? ' target="_blank" rel="noopener noreferrer"' : ''}>${name}</a>`;
+                })
+                .join('');
+        }
 
         const recommendedUsers = Array.isArray(data) ? data : [];
         if (error || recommendedUsers.length === 0) {
@@ -2611,13 +2619,6 @@ export function initApp() {
                 }
             });
 
-        DOM.rightSidebar.links.innerHTML = linkItems
-            .map((item) => {
-                return `
-	            <a href="${item.link}" class="link">${item.name}</a>
-	            `;
-            })
-            .join('');
     }
 
     function setupSidebarOverflowMenu() {
@@ -2743,8 +2744,8 @@ export function initApp() {
         if (getCurrentUser()) {
             // ページ遷移ではHTTPサマリーを取得しない。初期値と以後の更新はリアルタイムイベントが担う。
             totalUnreadDmCount = Number(
-                getCurrentUser().unreadDmTotal ||
-                    getCurrentUser().dm_unread_count ||
+                getCurrentUser().unreadDmTotal ??
+                    getCurrentUser().dm_unread_count ??
                     0,
             );
 
@@ -2790,6 +2791,8 @@ export function initApp() {
                 let isActive = false;
                 if (item.hash === '#') {
                     isActive = hash === '#' || hash === '';
+                } else if (item.hash === '#settings/profile') {
+                    isActive = hash === '#settings' || hash.startsWith('#settings/');
                 } else {
                     isActive = hash.startsWith(item.hash);
                 }
@@ -3588,6 +3591,32 @@ export function initApp() {
             .addEventListener('click', () => handlePostSubmit(container));
         const editor = container.querySelector('#post-content');
         editor.addEventListener('keydown', handleCtrlEnter);
+        editor.addEventListener('paste', (event) => {
+            const imageFiles = Array.from(event.clipboardData?.items || [])
+                .filter((item) => item.kind === 'file' && item.type.startsWith('image/'))
+                .map((item, index) => {
+                    const file = item.getAsFile();
+                    if (!file) return null;
+                    if (file.name) return file;
+                    const extension = item.type.split('/')[1]?.replace(/[^a-z0-9]/gi, '') || 'png';
+                    return new File(
+                        [file],
+                        `pasted-image-${Date.now()}-${index}.${extension}`,
+                        { type: item.type },
+                    );
+                })
+                .filter(Boolean);
+
+            // 画像はここではアップロードせず、通常の添付選択と同じリストに追加する。
+            // 実際のアップロードは投稿送信時のhandlePostSubmitで行われる。
+            if (imageFiles.length > 0) {
+                void handleFileSelection(
+                    { target: { files: imageFiles } },
+                    container,
+                    { append: true },
+                );
+            }
+        });
         attachMarkdownContentEditor(editor);
     }
 
@@ -3692,7 +3721,7 @@ export function initApp() {
         });
     }
 
-    async function handleFileSelection(event, container) {
+    async function handleFileSelection(event, container, { append = false } = {}) {
         const previewContainer = container.querySelector(
             '.file-preview-container',
         );
@@ -3713,7 +3742,17 @@ export function initApp() {
             }
         }
 
-        setSelectedFiles(compressedFiles);
+        setSelectedFiles(
+            append ? [...getSelectedFiles(), ...compressedFiles] : compressedFiles,
+        );
+
+        // 圧縮後のファイル一覧をhidden inputにも反映し、通常のファイル添付と同じ状態に保つ。
+        const fileInput = container.querySelector('#file-input');
+        if (fileInput && typeof DataTransfer !== 'undefined') {
+            const selectedFileList = new DataTransfer();
+            getSelectedFiles().forEach((file) => selectedFileList.items.add(file));
+            fileInput.files = selectedFileList.files;
+        }
 
         previewContainer.innerHTML = '';
 
@@ -6011,8 +6050,9 @@ export function initApp() {
 			                        <a href="#settings/profile" class="settings-group-button" data-settings-group="profile">プロフィール</a>
 			                        <a href="#settings/privacy" class="settings-group-button" data-settings-group="privacy">プライバシーとセキュリティ</a>
 			                        <a href="#settings/ui" class="settings-group-button" data-settings-group="ui">UI / フォント</a>
-			                        <a href="#settings/notifications" class="settings-group-button" data-settings-group="notifications">通知</a>
-			                        <a href="#settings/api" class="settings-group-button" data-settings-group="api">API / Bot</a>
+				                        <a href="#settings/notifications" class="settings-group-button" data-settings-group="notifications">通知</a>
+				                        <a href="#settings/storage" class="settings-group-button" data-settings-group="storage">ストレージ</a>
+				                        <a href="#settings/api" class="settings-group-button" data-settings-group="api">API / Bot</a>
 			                        <a href="#settings/resources" class="settings-group-button" data-settings-group="resources">リソース</a>
 			                    </nav>
 	                    <form id="settings-form" class="settings-detail">
@@ -6127,7 +6167,20 @@ export function initApp() {
 	                                <p class="settings-help-text">通知はこの端末・ブラウザごとに設定されます。HTTPS対応のブラウザで利用できます。</p>
 	                            </section>
 	                        </section>
-	                        <section class="settings-group-panel" data-settings-panel="api" hidden>
+		                        <section class="settings-group-panel" data-settings-panel="storage" hidden>
+		                            <section class="settings-storage" aria-labelledby="settings-storage-title">
+		                                <div class="settings-storage-heading">
+		                                    <div>
+		                                        <h4 id="settings-storage-title">保存済みファイル</h4>
+		                                        <p id="settings-storage-summary" class="settings-help-text" role="status">ストレージ使用量を読み込んでいます…</p>
+		                                    </div>
+		                                    <button type="button" id="settings-storage-refresh-btn" class="settings-bot-secondary-button">更新</button>
+		                                </div>
+		                                <div class="settings-storage-progress" aria-hidden="true"><div id="settings-storage-progress-value" class="settings-storage-progress-value"></div></div>
+		                                <div id="settings-storage-files" class="settings-sessions-list" aria-live="polite"></div>
+		                            </section>
+		                        </section>
+		                        <section class="settings-group-panel" data-settings-panel="api" hidden>
 	                            <div class="settings-bot-section">
 	                                <h4 id="settings-bot-title">Bot用 APIキー</h4>
 	                                <p class="settings-help-text">プログラムやスクリプトからNyaitter APIを操作するためのAPIキー（Botトークン）を生成・管理できます。</p>
@@ -6169,8 +6222,12 @@ export function initApp() {
 	                                </div>
 	                            </div>
 	                        </section>
-	                        <section class="settings-group-panel" data-settings-panel="resources" hidden>
-	                        </section>
+		                        <section class="settings-group-panel" data-settings-panel="resources" hidden>
+		                            <section class="settings-resource-links" aria-labelledby="settings-resource-links-title">
+		                                <h4 id="settings-resource-links-title">リンク</h4>
+		                                <div id="settings-resource-links" class="settings-sessions-list"></div>
+		                            </section>
+		                        </section>
 	                    </form>
 	                    <div id="verification-application-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="verification-application-title">
 	                        <section class="modal-content verification-application-modal-content">
@@ -6321,6 +6378,11 @@ export function initApp() {
                 description: 'この端末で受け取るプッシュ通知を管理します。',
                 saveable: false,
             },
+            storage: {
+                title: 'ストレージ',
+                description: 'アップロード済みファイルと保存容量を管理します。',
+                saveable: false,
+            },
             api: {
                 title: 'API / Bot',
                 description:
@@ -6359,6 +6421,9 @@ export function initApp() {
             }
             if (group === 'notifications') {
                 void loadPushSettingsState();
+            }
+            if (group === 'storage') {
+                void loadUserStorage();
             }
             if (group === 'api') {
                 void loadUserBotTokens();
@@ -6653,6 +6718,117 @@ export function initApp() {
                 botTokensList.appendChild(item);
             });
         };
+
+        const resourceLinksList = document.getElementById('settings-resource-links');
+        if (resourceLinksList) {
+            resourceLinksList.replaceChildren();
+            const resources = Array.isArray(RESOURCE_LINKS) ? RESOURCE_LINKS : [];
+            if (resources.length === 0) {
+                const empty = document.createElement('p');
+                empty.className = 'settings-help-text';
+                empty.textContent = '表示するリソースリンクはありません。';
+                resourceLinksList.appendChild(empty);
+            } else {
+                resources.forEach((resource) => {
+                    if (!resource || typeof resource.name !== 'string' || typeof resource.url !== 'string') return;
+                    const item = document.createElement('article');
+                    item.className = 'settings-session-item';
+                    const link = document.createElement('a');
+                    link.className = 'settings-session-title';
+                    link.textContent = resource.name;
+                    link.href = resource.url;
+                    if (/^https:\/\//i.test(resource.url)) {
+                        link.target = '_blank';
+                        link.rel = 'noopener noreferrer';
+                    }
+                    item.appendChild(link);
+                    resourceLinksList.appendChild(item);
+                });
+            }
+        }
+
+        const formatStorageSize = (value) => {
+            const bytes = Math.max(0, Number(value) || 0);
+            if (bytes < 1024) return `${bytes} B`;
+            if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+            if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+            return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+        };
+
+        const loadUserStorage = async () => {
+            const summary = document.getElementById('settings-storage-summary');
+            const progress = document.getElementById('settings-storage-progress-value');
+            const fileList = document.getElementById('settings-storage-files');
+            if (!summary || !progress || !fileList) return;
+
+            summary.textContent = 'ストレージ使用量を読み込んでいます…';
+            fileList.replaceChildren();
+            const { data, error } = await apiRequest('/server/api/posts/uploads/storage');
+            if (error) {
+                summary.textContent = 'ストレージ情報の取得に失敗しました。';
+                progress.style.width = '0%';
+                return;
+            }
+
+            const payload = data?.data || data || {};
+            const usedBytes = Math.max(0, Number(payload.used_bytes) || 0);
+            const limitBytes = Math.max(1, Number(payload.limit_bytes) || 1);
+            const percent = Math.min(100, Math.max(0, Number(payload.used_percent) || ((usedBytes / limitBytes) * 100)));
+            summary.textContent = `${formatStorageSize(usedBytes)} / ${formatStorageSize(limitBytes)}（${percent.toFixed(1)}% 使用）`;
+            progress.style.width = `${percent}%`;
+
+            const files = Array.isArray(payload.files) ? payload.files : [];
+            if (files.length === 0) {
+                const empty = document.createElement('p');
+                empty.className = 'settings-help-text';
+                empty.textContent = '保存済みファイルはありません。';
+                fileList.appendChild(empty);
+                return;
+            }
+
+            files.forEach((file) => {
+                const item = document.createElement('article');
+                item.className = 'settings-session-item settings-storage-file';
+                const details = document.createElement('div');
+                details.className = 'settings-session-details';
+                const title = document.createElement('div');
+                title.className = 'settings-session-title';
+                title.textContent = file.name || file.id || '名称不明のファイル';
+                const meta = document.createElement('p');
+                meta.className = 'settings-session-dates';
+                const updatedAt = file.updatedAt ? formatSecurityTimestamp(file.updatedAt) : '日時不明';
+                meta.textContent = `サイズ: ${formatStorageSize(file.size)} / 更新: ${updatedAt}`;
+                details.append(title, meta);
+
+                const actions = document.createElement('div');
+                actions.className = 'settings-session-actions';
+                const deleteButton = document.createElement('button');
+                deleteButton.type = 'button';
+                deleteButton.className = 'settings-session-revoke-button';
+                deleteButton.textContent = '削除';
+                deleteButton.addEventListener('click', async () => {
+                    if (!file.id || !await showAppConfirm(`ファイル「${file.name || file.id}」を削除しますか？\n投稿やプロフィールで使用中の場合、表示できなくなることがあります。`)) return;
+                    deleteButton.disabled = true;
+                    const { error: deleteError } = await apiRequest('/server/api/posts/uploads', {
+                        method: 'DELETE',
+                        body: { fileIds: [file.id] },
+                    });
+                    if (deleteError) {
+                        deleteButton.disabled = false;
+                        showAppAlert(`ファイルの削除に失敗しました: ${deleteError.message || '不明なエラー'}`);
+                        return;
+                    }
+                    await loadUserStorage();
+                });
+                actions.appendChild(deleteButton);
+                item.append(details, actions);
+                fileList.appendChild(item);
+            });
+        };
+
+        document.getElementById('settings-storage-refresh-btn')?.addEventListener('click', () => {
+            void loadUserStorage();
+        });
 
         // APIグループでも関数初期化後に選択するため、
         // 直接ハッシュアクセス時にTemporal Dead Zoneへ入らない。

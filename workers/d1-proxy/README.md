@@ -14,8 +14,8 @@ workers/d1-proxy/
 ├── wrangler.toml
 ├── migrations/
 │   ├── 0001_initial_schema.sql
-│   ├── 0002_add_push_subscription_session_token.sql
-│   └── 0003_add_user_block_lists.sql
+│   ├── …
+│   └── 0011_optimize_high_volume_reads.sql
 ├── src/
 │   └── index.js
 └── README.md
@@ -53,7 +53,7 @@ npm run deploy
 
 これらのスクリプトは既定で `nyaitter-d1` を対象にします。`wrangler.toml` の `database_name` を変更した場合は、`package.json` の `migrate:local` と `migrate:remote` の対象名も変更してから実行してください。
 
-本番マイグレーション前には、ステージング検証、バックアップ・エクスポート、未適用ファイルの確認、ロールバック手順の確認を行ってください。
+現在は `0011_optimize_high_volume_reads.sql` まであります。このマイグレーションは投稿、通知、DMの読み取りを速くするインデックスを追加します。本番マイグレーション前には、ステージング検証、バックアップ・エクスポート、未適用ファイルの確認、ロールバック手順の確認を行ってください。
 
 ## Node.js サーバー側の設定
 
@@ -74,7 +74,7 @@ Workerはアプリケーションで必要な固定操作を提供します。�
 | 領域 | 対象 |
 |---|---|
 | ユーザー・認証 | ユーザー、プロフィール、ブロックリスト、セッション、信頼IP、ログイン承認、Botトークン |
-| 投稿 | 作成、タイムライン、ページング、検索、返信、集計、いいね、スター、ピン、リポスト |
+| 投稿 | 作成、タイムライン、ページング、検索、返信、集計、いいね、スター、ピン、リポスト。投稿詳細は読み取り回数を減らす単一クエリで取得します。 |
 | コミュニケーション | グループDM、DM公開鍵、通知、Web Push購読 |
 | 運用 | ランキング、監査ログ |
 

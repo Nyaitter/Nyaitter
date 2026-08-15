@@ -77,13 +77,23 @@ async function getVisibleDmUnreadCount(db, userId) {
 		getUsersByIdsForDmVisibility(db, [...memberIds]),
 	]);
 
+	const viewerBlockedIds = new Set(normalizeBlockList(viewer?.block, viewer?.id));
+	const memberBlocksViewer = new Map();
 	let unreadCount = 0;
 	for (const dm of dms) {
 		const hasBlockedMember = (dm?.member || []).some((memberId) => {
 			const normalizedMemberId = Number(memberId);
 			if (!Number.isInteger(normalizedMemberId) || normalizedMemberId === normalizedUserId) return false;
-			const member = membersById.get(normalizedMemberId) || null;
-			return blocksUser(viewer, normalizedMemberId) || blocksUser(member, normalizedUserId);
+			if (viewerBlockedIds.has(normalizedMemberId)) return true;
+
+			if (!memberBlocksViewer.has(normalizedMemberId)) {
+				const member = membersById.get(normalizedMemberId) || null;
+				memberBlocksViewer.set(
+					normalizedMemberId,
+					new Set(normalizeBlockList(member?.block, member?.id)).has(normalizedUserId),
+				);
+			}
+			return memberBlocksViewer.get(normalizedMemberId);
 		});
 		if (hasBlockedMember) continue;
 		unreadCount += getDmUnreadCount(dm, normalizedUserId);

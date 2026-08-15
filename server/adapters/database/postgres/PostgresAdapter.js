@@ -839,30 +839,37 @@ class PostgresAdapter extends DatabaseAdapter {
 		}
 
 	async getPostDetail(id, currentUserId = null) {
-		const post = await this.getPostById(id);
-		if (!post) return null;
+			const post = await this.getPostById(id);
+			if (!post) return null;
 
-		const author = await this.getUserById(post.user_id);
-		const likeCount = await this.getLikeCount(id);
-		const starCount = await this.getStarCount(id);
+			// これらは相互に依存しないため、逐次クエリではなく並列に取得する。
+			const [author, likeCount, starCount, likedByMe, starredByMe] = await Promise.all([
+				this.getUserById(post.user_id),
+				this.getLikeCount(id),
+				this.getStarCount(id),
+				currentUserId ? this.hasUserLikedPost(currentUserId, id) : false,
+				currentUserId ? this.hasUserStarredPost(currentUserId, id) : false,
+			]);
 
-		let likedByMe = false;
-		let starredByMe = false;
-
-		if (currentUserId) {
-			likedByMe = await this.hasUserLikedPost(currentUserId, id);
-			starredByMe = await this.hasUserStarredPost(currentUserId, id);
-		}
-
-		let parentPost = null;
+			let parentPost = null;
 		if (post.reply_to) {
-			const parent = await this.getPostById(post.reply_to);
+			// 親投稿と投稿者を結合して取得し、詳細表示時の追加往復を1回に抑える。
+			const { rows: parentRows } = await this.pool.query(
+				`SELECT parent.id, parent.content,
+						author.id AS author_id, author.name AS author_name
+				 FROM posts parent
+				 LEFT JOIN users author ON author.id = parent.user_id
+				 WHERE parent.id = $1`,
+				[post.reply_to],
+			);
+			const parent = parentRows[0];
 			if (parent) {
-				const parentAuthor = await this.getUserById(parent.user_id);
 				parentPost = {
 					id: parent.id,
 					content: parent.content?.substring(0, 100),
-					author: parentAuthor ? { id: parentAuthor.id, name: parentAuthor.name } : null,
+					author: parent.author_id == null
+						? null
+						: { id: parent.author_id, name: parent.author_name || '' },
 				};
 			}
 		}

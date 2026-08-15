@@ -39,8 +39,10 @@ done
 | 投稿公開範囲・検索性能 | `010_post_lock.sql`、`008_optimize_high_volume_post_reads.sql` |
 | ログイン保護・DM・監査 | `012_login_security.sql`、`013_group_dms.sql`、`014_dm_e2e_keys.sql`、`015_audit_logs.sql` |
 | ブロックリスト永続化 | `016_user_block_lists.sql`（`users.block` をJSONB配列として追加・既存値を正規化） |
+| お知らせ・おすすめ・通報 | `017_post_announcements.sql`、`018_recommendation_candidate_index.sql`、`019_moderation_reports.sql` |
+| 通知・審査・DM通報 | `020_notification_message.sql`、`021_moderation_appeals.sql`、`022_verification_applications.sql`、`023_dm_message_reports.sql` |
 
-SQLファイルは変更履歴として扱います。すでに本番へ適用したファイルを直接書き換えず、追加の変更は新しいファイルとして作成してください。
+現在は `023_dm_message_reports.sql` が最新です。SQLファイルは変更履歴として扱います。すでに本番へ適用したファイルを直接書き換えず、追加の変更は新しいファイルとして作成してください。
 
 ## 新しいマイグレーションを追加する場合
 
