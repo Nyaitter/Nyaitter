@@ -9339,30 +9339,52 @@ export function initApp() {
         )
             return;
 
-        const { data: dm } = await api
-            .from('dm')
-            .select('member')
-            .eq('id', dmId)
-            .single();
-        const updatedMembers = dm.member.filter((id) => id !== userIdToRemove);
+        showLoading(true);
+        try {
+            const { data: dm, error: fetchError } = await api
+                .from('dm')
+                .select('member')
+                .eq('id', dmId)
+                .single();
+            if (fetchError) throw fetchError;
 
-        const { error } = await api
-            .from('dm')
-            .update({ member: updatedMembers })
-            .eq('id', dmId);
-        if (error) {
-            showAppAlert('メンバーの削除に失敗しました。');
-        } else {
+            const currentMembers = Array.isArray(dm?.member) ? dm.member : null;
+            if (!currentMembers)
+                throw new Error('DMのメンバー情報が取得できませんでした。');
+
+            const normalizedUserIdToRemove = Number(userIdToRemove);
+            if (!Number.isInteger(normalizedUserIdToRemove))
+                throw new Error('削除対象のユーザーIDが不正です。');
+
+            const updatedMembers = currentMembers.filter(
+                (id) => Number(id) !== normalizedUserIdToRemove,
+            );
+            if (updatedMembers.length === currentMembers.length) {
+                await showAppAlert('削除対象のユーザーは既にDMから退出しています。');
+                return;
+            }
+
+            const { error } = await api
+                .from('dm')
+                .update({ member: updatedMembers })
+                .eq('id', dmId);
+            if (error) throw error;
+
             await sendSystemDmMessage(
                 dmId,
-                `@${getCurrentUser().id}さんが@${userIdToRemove}さんを強制退出させました`,
+                `@${getCurrentUser().id}さんが@${normalizedUserIdToRemove}さんを強制退出させました`,
             );
-            void sendNotification(userIdToRemove, 'dm_removed', {
+            void sendNotification(normalizedUserIdToRemove, 'dm_removed', {
                 kind: 'dm',
                 id: dmId,
             });
-            showAppAlert('メンバーを削除しました。');
+            await showAppAlert('メンバーを削除しました。');
             openDmManageModal(dmId); // モーダルを再描画
+        } catch (error) {
+            console.error('DMメンバーの削除に失敗しました:', error);
+            await showAppAlert('メンバーの削除に失敗しました。');
+        } finally {
+            showLoading(false);
         }
     }
 
