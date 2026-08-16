@@ -83,6 +83,8 @@ APIの基準パスは `NYAITTER_API_ENDPOINT` または `server.apiEndpoint` で
 
 `NYAITTER_API_ENDPOINT=/` と設定した場合は、`/posts` と `/api/posts` のように公開されます。`/api` は互換用の別名であり、どちらも同じ処理を実行します。
 
+Clientの `config.js` でHTTPSの外部APIエンドポイントを指定した場合、リアルタイム接続は同じホストの `wss://` URLを使用します。ClientのCSPとServerが静的配信時に返すCSPは、HTTPS APIとWSS接続を許可しています。
+
 ## Push通知とセッション
 
 Push通知を有効にするには、`VAPID_SUBJECT`、`VAPID_PUBLIC_KEY`、`VAPID_PRIVATE_KEY` を設定します。ブラウザが `POST /push/subscriptions` を実行すると、Push購読はその時点で認証に使用したセッションと紐付けて保存されます。

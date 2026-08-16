@@ -229,7 +229,7 @@ function securityHeaders(req, res, next) {
 			"style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com",
 			"img-src 'self' data: https:",
 			"font-src 'self' data: https://fonts.gstatic.com",
-			"connect-src 'self'",
+			"connect-src 'self' https: wss:",
 			"worker-src 'self'",
 			"manifest-src 'self'",
 		].join('; ');
