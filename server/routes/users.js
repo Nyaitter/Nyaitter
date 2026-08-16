@@ -208,17 +208,21 @@ router.get('/search', optionalAuth, async (req, res) => {
 	const db = getDbAdapter(req);
 	const query = req.query.q || '';
 	const limit = Math.min(
-		parseInt(req.query.limit, 10) || config.limits.userSearchDefaultLimit,
+		Math.max(parseInt(req.query.limit, 10) || config.limits.userSearchDefaultLimit, 1),
 		config.limits.userSearchMaxLimit,
 	);
+	const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
 
 	if (query.trim().length === 0) {
 		return res.json({ users: [] });
 	}
 
 	try {
-					const users = await db.searchUsers(query, limit);
-			res.json({ users: users.map((user) => serializeUserCard(user, getPublicUrl(req))) });
+					const users = await db.searchUsers(query, limit, offset);
+				res.json({
+					users: users.map((user) => serializeUserCard(user, getPublicUrl(req))),
+					offset,
+				});
 
 	} catch (err) {
 		console.error('[users] search error:', err);

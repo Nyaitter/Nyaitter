@@ -449,9 +449,11 @@ class D1Adapter extends DatabaseAdapter {
 		return normalizeUser(await this._write('/users', userData));
 	}
 
-	async searchUsers(query, limit = 20) {
+	async searchUsers(query, limit = 20, offset = 0) {
 		return this._read(this._query('/users/search', {
-			q: String(query || ''), limit: this._limit(limit),
+			q: String(query || ''),
+			limit: this._limit(limit),
+			offset: Math.max(Number(offset) || 0, 0),
 		}));
 	}
 

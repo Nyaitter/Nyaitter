@@ -37,8 +37,12 @@
 				<header id="page-header">
 					<!-- ヘッダー内容はJSで動的に生成されます -->
 				</header>
-				<div id="content-area">
-					<div id="main-screen" class="screen hidden">
+			<div id="content-area">
+				<div id="pull-to-refresh-indicator" class="pull-to-refresh-indicator" role="status" aria-live="polite" aria-hidden="true">
+					<svg class="pull-to-refresh-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M12 4v15M6 13l6 6 6-6" /></svg>
+					<span class="pull-to-refresh-label">引いて更新</span>
+				</div>
+				<div id="main-screen" class="screen hidden">
 							<div class="timeline-tabs-sticky-container">
 								<div class="timeline-tabs">
 									<button
@@ -340,7 +344,7 @@
 					</form>
 				</section>
 			</div>
-		<div id="loading-overlay"><div class="spinner"></div></div>
+		<div id="loading-overlay" role="status" aria-live="polite" aria-label="読み込み中" aria-hidden="false" aria-busy="true"><div class="spinner"></div></div>
 		<div id="edit-dm-message-modal" class="modal-overlay hidden">
 			<div class="modal-content">
 				<!--<button class="modal-close-btn">×</button>-->

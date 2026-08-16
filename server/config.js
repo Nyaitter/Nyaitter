@@ -65,6 +65,11 @@ const config = {
     maxFileUploadSizeMB: get('limits.maxFileUploadSizeMB', 5),
   },
 
+  dm: {
+    // 一時的に既定で無効。DM_E2E_ENABLED=true で明示的に再有効化できる。
+    e2eEnabled: envBoolean('DM_E2E_ENABLED', get('dm.e2eEnabled', false)),
+  },
+
   imageUpload: get('imageUpload', {}),
 
 	  auth: {

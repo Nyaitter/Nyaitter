@@ -86,7 +86,18 @@ export const api = (() => {
             order() {
                 return chain;
             },
-            range() {
+            range(from, to) {
+                const start = Number(from);
+                const end = Number(to);
+                if (Number.isInteger(start) && start >= 0) {
+                    state.range = {
+                        from: start,
+                        to:
+                            Number.isInteger(end) && end >= start
+                                ? end
+                                : start,
+                    };
+                }
                 return chain;
             },
             not() {
@@ -144,11 +155,21 @@ export const api = (() => {
                     : idFilter
                       ? `#${idFilter.slice('id.eq.'.length)}`
                       : '';
-                return request(
-                    `/server/api/users/${query ? `search?q=${encodeURIComponent(query)}` : 'recommended'}`,
-                    {},
-                    'users',
-                );
+                const searchParams = new URLSearchParams();
+                if (query) searchParams.set('q', query);
+                if (state.range) {
+                    searchParams.set(
+                        'limit',
+                        String(state.range.to - state.range.from + 1),
+                    );
+                    searchParams.set('offset', String(state.range.from));
+                } else if (state.limit != null) {
+                    searchParams.set('limit', String(state.limit));
+                }
+                const path = query
+                    ? `search?${searchParams.toString()}`
+                    : 'recommended';
+                return request(`/server/api/users/${path}`, {}, 'users');
             }
             if (
                 table === 'post' ||

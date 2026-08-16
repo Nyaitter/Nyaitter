@@ -63,7 +63,7 @@ class DatabaseAdapter {
 	}
 
 	
-	async searchUsers(query, limit = 20) {
+	async searchUsers(query, limit = 20, offset = 0) {
 		throw new Error('searchUsers() must be implemented');
 	}
 

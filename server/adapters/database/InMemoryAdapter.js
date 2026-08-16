@@ -319,12 +319,14 @@ class InMemoryAdapter extends DatabaseAdapter {
 	}
 
 	
-	async searchUsers(query, limit = 20) {
+	async searchUsers(query, limit = 20, offset = 0) {
 		if (!query || query.trim().length === 0) {
 			return [];
 		}
 
 		const q = query.toLowerCase();
+		const safeLimit = Math.max(Number(limit) || 0, 0);
+		const safeOffset = Math.max(Number(offset) || 0, 0);
 		const results = [];
 
 		for (const user of this.users.values()) {
@@ -343,12 +345,12 @@ class InMemoryAdapter extends DatabaseAdapter {
 				profile.includes(q)
 			) {
 				results.push(this._normalizeUserBlockList(user));
-
-				if (results.length >= limit) break;
 			}
 		}
 
-		return results;
+		return results
+			.sort((left, right) => Number(left.id) - Number(right.id))
+			.slice(safeOffset, safeOffset + safeLimit);
 	}
 
 	

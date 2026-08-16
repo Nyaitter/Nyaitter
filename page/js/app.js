@@ -83,6 +83,8 @@ export function initApp() {
     let recommendedUsersRequest = null;
     let sidebarOverflowAbortController = null;
     let sidebarOverflowResizeTimer = null;
+    let activeProfilePullRefreshUser = null;
+    let activeSearchRequestVersion = 0;
 
     const appDialog = {
         modal: document.getElementById('app-dialog-modal'),
@@ -1083,6 +1085,241 @@ export function initApp() {
 
     function showLoading(show) {
         DOM.loadingOverlay.classList.toggle('hidden', !show);
+        DOM.loadingOverlay.setAttribute('aria-hidden', String(!show));
+        DOM.loadingOverlay.setAttribute('aria-busy', String(show));
+    }
+
+    function isPullToRefreshMobileViewport() {
+        return window.matchMedia('(max-width: 680px)').matches;
+    }
+
+    function getActivePullToRefreshContext() {
+        const screenIds = [
+            'main-screen',
+            'likes-screen',
+            'stars-screen',
+            'notifications-screen',
+            'profile-screen',
+        ];
+        const screenId = screenIds.find((id) => {
+            const screen = document.getElementById(id);
+            return screen && !screen.classList.contains('hidden');
+        });
+        if (!screenId) return null;
+
+        const screen = document.getElementById(screenId);
+        if (!screen) return null;
+        if (screenId !== 'profile-screen') return { screenId, screen };
+
+        const profileMatch = /^#profile\/(\d+)(?:\/([^/?#]+))?$/.exec(
+            window.location.hash || '',
+        );
+        const userId = Number(profileMatch?.[1]);
+        if (!Number.isInteger(userId) || userId < 0) return null;
+        return {
+            screenId,
+            screen,
+            userId,
+            subpage: profileMatch?.[2] || 'posts',
+        };
+    }
+
+    function updatePullToRefreshAvailability() {
+        const enabled = Boolean(
+            isPullToRefreshMobileViewport() && getActivePullToRefreshContext(),
+        );
+        document.documentElement.classList.toggle(
+            'pull-to-refresh-enabled',
+            enabled,
+        );
+        document.body.classList.toggle('pull-to-refresh-enabled', enabled);
+    }
+
+    function setupTimelinePullToRefresh() {
+        const indicator = document.getElementById('pull-to-refresh-indicator');
+        const label = indicator?.querySelector('.pull-to-refresh-label');
+        if (!indicator || !label || indicator.dataset.bound === 'true') return;
+        indicator.dataset.bound = 'true';
+
+        const PULL_THRESHOLD = 66;
+        const MAX_PULL_DISTANCE = 104;
+        let startX = 0;
+        let startY = 0;
+        let startScrollY = 0;
+        let trackingPull = false;
+        let pullActive = false;
+        let refreshInProgress = false;
+
+        const resetIndicator = () => {
+            pullActive = false;
+            indicator.style.setProperty('--pull-distance', '0px');
+            indicator.style.setProperty('--pull-opacity', '0');
+            indicator.classList.remove('is-pulling', 'is-ready', 'is-refreshing');
+            indicator.setAttribute('aria-hidden', 'true');
+            label.textContent = '引いて更新';
+        };
+
+        const showPullProgress = (distance) => {
+            const ready = distance >= PULL_THRESHOLD;
+            indicator.style.setProperty('--pull-distance', `${distance}px`);
+            indicator.style.setProperty(
+                '--pull-opacity',
+                String(Math.min(1, distance / 34)),
+            );
+            indicator.classList.add('is-pulling');
+            indicator.classList.toggle('is-ready', ready);
+            indicator.setAttribute('aria-hidden', 'false');
+            label.textContent = ready ? '離して更新' : '引いて更新';
+        };
+
+        const canStartPull = (target) => {
+            const context = getActivePullToRefreshContext();
+            if (!context) return false;
+            const mainContent = document.getElementById('main-content');
+            const isWithinActiveScreen = context.screen.contains(target);
+            const isWithinNotificationView =
+                context.screenId === 'notifications-screen' &&
+                mainContent?.contains(target);
+            if (!isWithinActiveScreen && !isWithinNotificationView) return false;
+
+            // ホームでは投稿本文・余白を含むタイムライン全体を開始対象にする。
+            // 投稿内の操作ボタンや投稿フォームからの開始だけは除外する。
+            if (context.screenId === 'main-screen') {
+                const timeline = document.getElementById('timeline');
+                if (!timeline?.contains(target)) return false;
+            }
+
+            // 通知が空の場合でも、タイトル付近を含む中央コンテンツから開始できる。
+            // 「すべて既読」などのボタンは共通の除外条件で保護する。
+            if (context.screenId === 'notifications-screen' && !mainContent) {
+                return false;
+            }
+
+            return !target.closest(
+                'button, input, textarea, select, option, [contenteditable="true"], .post-form-sticky-container',
+            );
+        };
+
+        const refreshTimeline = async () => {
+            refreshInProgress = true;
+            indicator.classList.remove('is-pulling', 'is-ready');
+            indicator.classList.add('is-refreshing');
+            indicator.style.setProperty('--pull-distance', '0px');
+            indicator.style.setProperty('--pull-opacity', '1');
+            indicator.setAttribute('aria-hidden', 'false');
+            label.textContent = '更新中';
+
+            try {
+                const context = getActivePullToRefreshContext();
+                if (!context) return;
+
+                // 明示的な更新では、表示中の投稿・ユーザー一覧を必ず再取得する。
+                invalidateTimelinePageCache();
+                if (context.screenId === 'main-screen') {
+                    clearRealtimeTimelineUpdate();
+                    await switchTimelineTab(getCurrentTimelineTab(), {
+                        forceRefresh: true,
+                        resetScroll: true,
+                    });
+                } else if (context.screenId === 'likes-screen') {
+                    await showLikesScreen();
+                } else if (context.screenId === 'stars-screen') {
+                    await showStarsScreen();
+                } else if (context.screenId === 'notifications-screen') {
+                    await showNotificationsScreen();
+                } else if (context.screenId === 'profile-screen') {
+                    // ヘッダー・タブは保持し、下部のタイムライン／ユーザー一覧だけ再取得する。
+                    const profileUser = activeProfilePullRefreshUser;
+                    if (Number(profileUser?.id) !== context.userId) return;
+                    await loadProfileTabContent(profileUser, context.subpage);
+                }
+            } catch (error) {
+                console.error('タイムラインの更新に失敗:', error);
+                label.textContent = '更新に失敗しました';
+            } finally {
+                window.setTimeout(() => {
+                    refreshInProgress = false;
+                    resetIndicator();
+                }, 220);
+            }
+        };
+
+        document.addEventListener(
+            'touchstart',
+            (event) => {
+                updatePullToRefreshAvailability();
+                if (refreshInProgress || !isPullToRefreshMobileViewport()) return;
+                const target = event.target instanceof Element ? event.target : null;
+                const touch = event.touches[0];
+                if (!target || !touch || !canStartPull(target)) return;
+                startX = touch.clientX;
+                startY = touch.clientY;
+                startScrollY = Math.max(0, window.scrollY || 0);
+                trackingPull = true;
+            },
+            { passive: true },
+        );
+
+        document.addEventListener(
+            'touchmove',
+            (event) => {
+                if (!trackingPull || refreshInProgress) return;
+                const touch = event.touches[0];
+                if (!touch) {
+                    trackingPull = false;
+                    resetIndicator();
+                    return;
+                }
+
+                const deltaX = touch.clientX - startX;
+                const deltaY = touch.clientY - startY;
+                if (deltaY <= 0 || Math.abs(deltaX) > deltaY) {
+                    if (pullActive) resetIndicator();
+                    return;
+                }
+
+                // 指を下へ動かしている間は追跡を維持する。途中から始めた場合は、
+                // 最上端へ戻るまでの移動量を差し引いた残りだけをPTRの引き量にする。
+                if (window.scrollY > 1) return;
+                const pullDistance = Math.max(0, deltaY - startScrollY);
+                const distance = Math.min(
+                    MAX_PULL_DISTANCE,
+                    pullDistance * 0.55,
+                );
+                if (distance < 4) return;
+                pullActive = true;
+                showPullProgress(distance);
+                if (event.cancelable) event.preventDefault();
+            },
+            { passive: false },
+        );
+
+        const finishPull = () => {
+            if (!trackingPull) return;
+            trackingPull = false;
+            startScrollY = 0;
+            const shouldRefresh =
+                pullActive &&
+                Number.parseFloat(
+                    indicator.style.getPropertyValue('--pull-distance'),
+                ) >= PULL_THRESHOLD;
+            if (!shouldRefresh) {
+                resetIndicator();
+                return;
+            }
+            void refreshTimeline();
+        };
+
+        document.addEventListener('touchend', finishPull, { passive: true });
+        document.addEventListener('touchcancel', () => {
+            trackingPull = false;
+            startScrollY = 0;
+            if (!refreshInProgress) resetIndicator();
+        }, { passive: true });
+        window.addEventListener('resize', updatePullToRefreshAvailability, {
+            passive: true,
+        });
+        updatePullToRefreshAvailability();
     }
 
     function showScreen(screenId) {
@@ -1095,6 +1332,8 @@ export function initApp() {
         if (targetScreen) {
             targetScreen.classList.remove('hidden');
         }
+        setupTimelinePullToRefresh();
+        updatePullToRefreshAvailability();
     }
 
     function escapeHTML(str) {
@@ -2912,8 +3151,10 @@ export function initApp() {
                 return false;
             }
 
-            // DM E2E暗号化用の鍵ペアを準備（公開鍵をサーバーに登録）。
-            void dmE2EEnsureKeyPairRegistered(getCurrentUser().id);
+            // E2E暗号化を再有効化した場合だけ、鍵ペアを準備して公開鍵を登録する。
+            if (DM_E2E_ENABLED) {
+                void dmE2EEnsureKeyPairRegistered(getCurrentUser().id);
+            }
 
             addAccountToList(getCurrentUser());
             subscribeToChanges();
@@ -4592,6 +4833,7 @@ export function initApp() {
     async function showMainScreen() {
         DOM.pageHeader.innerHTML = `<h2 id="page-title">ホーム</h2>`;
         showScreen('main-screen');
+        setupTimelinePullToRefresh();
         updateRealtimeTimelineIndicator();
 
         const tabsContainer = document.querySelector('.timeline-tabs');
@@ -4724,6 +4966,7 @@ export function initApp() {
     }
 
     async function loadSearchTabContent(query, tab) {
+        const searchRequestVersion = ++activeSearchRequestVersion;
         setCurrentSearchTab(tab);
         document
             .querySelectorAll('#search-tabs-container .tab-button')
@@ -4738,55 +4981,56 @@ export function initApp() {
         contentDiv.innerHTML = '';
 
         if (tab === 'users') {
-            const userResultsContainer = document.createElement('div');
-            contentDiv.appendChild(userResultsContainer);
-            userResultsContainer.innerHTML = '<div class="spinner"></div>';
+            const normalizedQuery = String(query || '')
+                .normalize('NFKC')
+                .trim()
+                .replace(/\s+/g, ' ');
+            // ORフィルターの区切り文字・ワイルドカードを検索語として解釈させない。
+            const filterQuery = normalizedQuery.replace(/[%,()]/g, ' ');
+            const filters = [
+                `name.ilike.%${filterQuery}%`,
+                `nyaitter_id.ilike.%${filterQuery}%`,
+                `scid.ilike.%${filterQuery}%`,
+                `me.ilike.%${filterQuery}%`,
+            ];
+            // #1234 と 1234 のどちらでもNyaitter IDを優先して検索する
+            const normalizedIdQuery = normalizedQuery.replace(/^#/, '');
+            if (/^\d+$/.test(normalizedIdQuery)) {
+                filters.unshift(`id.eq.${Number(normalizedIdQuery)}`);
+            }
 
             const userScope = getCurrentUser()?.id ?? 'guest';
-            const searchUsersCacheKey = `${userScope}:search:users:${query}`;
-            let users = getScreenDataCache(searchUsersCacheKey);
-            if (!Array.isArray(users)) {
-                const filters = [
-                    `name.ilike.%${query}%`,
-                    `nyaitter_id.ilike.%${query}%`,
-                    `scid.ilike.%${query}%`,
-                    `me.ilike.%${query}%`,
-                ];
-                // #1234 と 1234 のどちらでもNyaitter IDを優先して検索する
-                const nyaitterIdQuery = String(query).replace(/^#/, '');
-                if (/^\d+$/.test(nyaitterIdQuery)) {
-                    filters.unshift(`id.eq.${Number(nyaitterIdQuery)}`);
-                }
+            const searchUsersCacheKey = `${userScope}:search:users:${normalizedQuery.toLocaleLowerCase('ja-JP')}`;
+            const needle = normalizedQuery.toLocaleLowerCase('ja-JP');
+            const scoreUser = (user) => {
+                const id = String(user.id || '');
+                const values = [user.name, user.scid, user.me]
+                    .filter((value) => typeof value === 'string')
+                    .map((value) =>
+                        value.normalize('NFKC').toLocaleLowerCase('ja-JP'),
+                    );
+                if (id === normalizedIdQuery) return 0;
+                if (values.some((value) => value === needle)) return 1;
+                if (values.some((value) => value.startsWith(needle))) return 2;
+                return 3;
+            };
 
-                const { data, error: userError } = await api
-                    .from('user')
-                    .select('id, name, scid, me, icon_data, settings')
-                    .or(filters.join(','))
-                    .order('id', { ascending: true })
-                    .limit(10);
-                if (userError) console.error('ユーザー検索エラー:', userError);
-                users = Array.isArray(data) ? data : [];
-                if (!userError) setScreenDataCache(searchUsersCacheKey, users);
-            }
-
-            userResultsContainer.innerHTML = '';
-            if (users && users.length > 0) {
-                users.forEach((u) => {
-                    const userCard = document.createElement('div');
-                    userCard.className = 'profile-card widget-item';
-                    const userLink = document.createElement('a');
-                    userLink.href = `#profile/${u.id}`;
-                    userLink.className = 'profile-link';
-                    userLink.style.cssText =
-                        'display:flex; align-items:center; gap:0.8rem; text-decoration:none; color:inherit;';
-                    userLink.innerHTML = `<img src="${getUserIconUrl(u)}" style="width:48px; height:48px; border-radius:50%;" alt="${escapeHTML(u.name)}'s icon"><div><span class="name" style="font-weight:700;">${getEmoji(escapeHTML(u.name))}</span><span class="id" style="color:var(--secondary-text-color);">${getNyaitterId(u)}</span><p class="me" style="margin:0.2rem 0 0;">${getEmoji(escapeHTML(u.me || ''))}</p></div>`;
-                    userCard.appendChild(userLink);
-                    userResultsContainer.appendChild(userCard);
-                });
-            } else {
-                userResultsContainer.innerHTML = `<p style="padding:1rem; text-align:center;">ユーザーは見つかりませんでした。</p>`;
-            }
-            showLoading(false);
+            await loadUsersWithPagination(contentDiv, 'search', {
+                filters: filters.join(','),
+                pageSize: 15,
+                pageCache: getUserPageCache(searchUsersCacheKey),
+                sortResults: (left, right) =>
+                    scoreUser(left) - scoreUser(right) ||
+                    Number(left.id) - Number(right.id),
+                isCurrent: () =>
+                    searchRequestVersion === activeSearchRequestVersion &&
+                    getCurrentSearchTab() === 'users',
+            });
+            if (
+                searchRequestVersion === activeSearchRequestVersion &&
+                getCurrentSearchTab() === 'users'
+            )
+                showLoading(false);
         } else {
             if (getCurrentUser()) {
                 const tagPostButton = document.createElement('button');
@@ -5877,6 +6121,7 @@ export function initApp() {
                 };
             });
 
+            activeProfilePullRefreshUser = user;
             await loadProfileTabContent(user, subpage);
         } catch (err) {
             profileHeader.innerHTML =
@@ -7799,6 +8044,7 @@ export function initApp() {
 
     async function loadUsersWithPagination(container, type, options = {}) {
         const userPageCache = options.pageCache || null;
+        const pageSize = Number(options.pageSize) || POSTS_PER_PAGE;
         setCurrentPagination({ page: 0, hasMore: true, type, options });
 
         let trigger = container.querySelector('.load-more-trigger');
@@ -7845,8 +8091,9 @@ export function initApp() {
             setIsLoadingMore(true);
             trigger.innerHTML = '<div class="spinner"></div>';
 
-            const from = getCurrentPagination().page * POSTS_PER_PAGE;
-            const to = from + POSTS_PER_PAGE - 1;
+            const from = getCurrentPagination().page * pageSize;
+            // 検索では1件多く取得して、次ページの有無を余分な通信なしで判断する。
+            const to = from + pageSize - 1 + (type === 'search' ? 1 : 0);
 
             let users = [];
             let error = null;
@@ -7888,19 +8135,38 @@ export function initApp() {
                     }
                 } else if (type === 'followers') {
                     const result = await apiRequest(
-                        `/server/api/users/${encodeURIComponent(options.userId)}/followers?limit=${POSTS_PER_PAGE}&offset=${from}`,
+                        `/server/api/users/${encodeURIComponent(options.userId)}/followers?limit=${pageSize}&offset=${from}`,
                     );
                     users = Array.isArray(result.data?.followers)
                         ? result.data.followers
                         : [];
                     error = result.error;
+                } else if (type === 'search') {
+                    const result = await api
+                        .from('user')
+                        .select(selectColumns)
+                        .or(options.filters || '')
+                        .order('id', { ascending: true })
+                        .range(from, to);
+                    users = Array.isArray(result.data) ? result.data : [];
+                    error = result.error;
+                    hasMoreForPage = users.length > pageSize;
+                    users = users.slice(0, pageSize);
+                    if (typeof options.sortResults === 'function') {
+                        users.sort(options.sortResults);
+                    }
                 }
-                hasMoreForPage = users.length >= POSTS_PER_PAGE;
+                if (type !== 'search') hasMoreForPage = users.length >= pageSize;
                 if (!error && userPageCache)
                     savePostPageCache(userPageCache, pageNumber, {
                         users,
                         hasMore: hasMoreForPage,
                     });
+            }
+
+            if (typeof options.isCurrent === 'function' && !options.isCurrent()) {
+                setIsLoadingMore(false);
+                return;
             }
 
             if (error) {
@@ -7923,6 +8189,7 @@ export function initApp() {
                     const emptyMessages = {
                         follows: '誰もフォローしていません。',
                         followers: 'まだフォロワーがいません。',
+                        search: 'ユーザーは見つかりませんでした。',
                     };
                     trigger.innerHTML =
                         container.querySelectorAll('.profile-card').length === 0
@@ -9000,8 +9267,11 @@ export function initApp() {
     // 秘密鍵は端末の localStorage にのみ保存し、サーバーには公開鍵だけを登録する。
     // ============================================
 
-    const DM_E2E_INFO_PREFIX = 'nyaitter-dm-v1';
-    const DM_E2E_KEY_STORAGE_PREFIX = 'nyaitter_dm_key_';
+	// 複数デバイスでのDM利用を優先するため、E2E暗号化は一時的に停止する。
+	// 既存の暗号化メッセージは、端末に残る鍵で閲覧できるよう復号処理だけ保持する。
+	const DM_E2E_ENABLED = false;
+	const DM_E2E_INFO_PREFIX = 'nyaitter-dm-v1';
+	const DM_E2E_KEY_STORAGE_PREFIX = 'nyaitter_dm_key_';
 
     function dmE2EBytesToBase64url(bytes) {
         let binary = '';
@@ -9335,6 +9605,14 @@ export function initApp() {
                 message,
                 getCurrentUser().id,
             );
+            if (
+                message.e2e &&
+                messagePlaintext === '🔒 このメッセージは復号できません'
+            ) {
+                throw new Error(
+                    'この端末では復号できない以前の暗号化DMは編集できません。',
+                );
+            }
 
             let currentAttachments = message.attachments || [];
             let filesToDelete = new Set();
@@ -9505,24 +9783,9 @@ export function initApp() {
                 throw new Error('更新対象のメッセージが見つかりません。');
 
             const targetMessage = postArray[messageIndex];
-            // E2Eメッセージは編集後に全メンバー向けへ再暗号化する。
-            if (targetMessage.e2e) {
-                await dmE2EEnsureKeyPairRegistered(getCurrentUser().id);
-                const e2e = await dmE2EEncryptContent(
-                    newContent,
-                    getActiveDmMemberIds(),
-                    getCurrentUser().id,
-                );
-                if (e2e) {
-                    targetMessage.e2e = e2e;
-                    targetMessage.content = '';
-                } else {
-                    delete targetMessage.e2e;
-                    targetMessage.content = newContent;
-                }
-            } else {
-                targetMessage.content = newContent;
-            }
+            // 以前の暗号化DMを編集した場合も、以後は平文メッセージとして保存する。
+            delete targetMessage.e2e;
+            targetMessage.content = newContent;
             targetMessage.attachments = finalAttachments;
 
             const { error: updateError } = await api
@@ -9731,18 +9994,6 @@ export function initApp() {
                 attachments: attachmentsData,
                 read: [getCurrentUser().id],
             };
-
-            // E2E暗号化（全メンバーの公開鍵が揃っていれば平文を送信しない）
-            await dmE2EEnsureKeyPairRegistered(getCurrentUser().id);
-            const e2e = await dmE2EEncryptContent(
-                content,
-                getActiveDmMemberIds(),
-                getCurrentUser().id,
-            );
-            if (e2e) {
-                message.content = '';
-                message.e2e = e2e;
-            }
 
             const { error } = await api.rpc('append_to_dm_post', {
                 dm_id_in: dmId,

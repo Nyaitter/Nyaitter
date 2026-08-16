@@ -128,9 +128,11 @@ class PostgresAdapter extends DatabaseAdapter {
 		throw new Error('Could not allocate a unique Nyaitter ID');
 	}
 
-	async searchUsers(query, limit = 20) {
+	async searchUsers(query, limit = 20, offset = 0) {
 		const q = `%${query.toLowerCase()}%`;
 		const digits = String(query).replace(/^#/, '').replace(/\D/g, '');
+		const safeLimit = Math.max(Number(limit) || 0, 0);
+		const safeOffset = Math.max(Number(offset) || 0, 0);
 		const { rows } = await this.pool.query(
 			`SELECT id, name, scid, handle, nyaitter_address, auth_provider, provider_domain, external_id
 			 FROM users
@@ -139,8 +141,8 @@ class PostgresAdapter extends DatabaseAdapter {
 				OR LOWER(COALESCE(handle, '')) LIKE $1
 				OR CAST(id AS TEXT) LIKE $1
 				OR CAST(COALESCE(external_id, -1) AS TEXT) LIKE $1
-			 ORDER BY id DESC LIMIT $2`,
-			[digits ? `%${digits}%` : q, limit]
+			 ORDER BY id ASC LIMIT $2 OFFSET $3`,
+			[digits ? `%${digits}%` : q, safeLimit, safeOffset]
 		);
 		return rows;
 	}

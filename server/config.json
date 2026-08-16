@@ -23,7 +23,10 @@
 		"dmMessagesMaxLimit": 100,
 		"parentPostPreviewLength": 100,
 		"followingDefaultLimit": 100,
-"maxFileUploadSizeMB": 5
+	"maxFileUploadSizeMB": 5
+		},
+		"dm": {
+			"e2eEnabled": false
 		},
 		"imageUpload": {
 			"maxWidth": 2560,
