@@ -2426,6 +2426,7 @@ body.dark .recommend-user button {
     border-radius: 8px;
     font-size: 1rem;
     box-sizing: border-box;
+    max-width: 100%;
 }
 
 #settings-form fieldset {
