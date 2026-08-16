@@ -51,8 +51,8 @@ const {
     startModerationAssignmentScheduler,
 } = require('./services/ModerationAssignmentScheduler');
 const {
-    GeminiPostModerationService,
-} = require('./services/GeminiPostModerationService');
+    AutoModerationService,
+} = require('./services/AutoModerationService');
 const { serializeNotification } = require('./utils/serialize');
 const { getPublicUrl } = require('./utils/nyaitterAddress');
 const { startOperatorControlServer } = require('./utils/operatorControl');
@@ -540,7 +540,7 @@ const moderationReportService = new ModerationReportService({
     storageAdapter,
     publishNotification: publishModerationNotification,
 });
-const geminiPostModerationService = new GeminiPostModerationService({
+const autoModerationService = new AutoModerationService({
     dbAdapter,
     storageAdapter,
     publishNotification: publishModerationNotification,
@@ -548,7 +548,7 @@ const geminiPostModerationService = new GeminiPostModerationService({
 });
 app.locals.pushNotificationService = pushNotificationService;
 app.locals.moderationReportService = moderationReportService;
-app.locals.geminiPostModerationService = geminiPostModerationService;
+app.locals.autoModerationService = autoModerationService;
 
 async function startServer() {
     await dbAdapter.connect();
@@ -556,7 +556,7 @@ async function startServer() {
     app.locals.storageAdapter = storageAdapter;
     app.locals.pushNotificationService = pushNotificationService;
     app.locals.moderationReportService = moderationReportService;
-    app.locals.geminiPostModerationService = geminiPostModerationService;
+    app.locals.autoModerationService = autoModerationService;
     moderationScheduler = startModerationAssignmentScheduler(
         moderationReportService,
     );
@@ -586,7 +586,7 @@ async function startServer() {
 ║
 ║  DB Adapter:      ${process.env.DB_ADAPTER || 'memory'}
 ║  Storage Adapter: ${process.env.STORAGE_ADAPTER || 'local'}
-║  Gemini moderation: ${geminiPostModerationService.enabled ? 'enabled' : 'disabled'}
+║  Gemini moderation: ${autoModerationService.enabled ? 'enabled' : 'disabled'}
 ╚══════════════════════════════════════════════════════════════
 `);
         if (userFilesServer) {
@@ -618,7 +618,7 @@ async function shutdown(signal) {
         clearInterval(realtimeHeartbeat);
         moderationScheduler?.stop();
         moderationScheduler = null;
-        geminiPostModerationService.stop();
+        autoModerationService.stop();
         realtimeConnections.closeAll();
         if (operatorControl) {
             await operatorControl.close();

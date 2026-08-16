@@ -8,7 +8,7 @@ const MODERATION_LEVELS = Object.freeze({
 const MODERATION_MESSAGES = Object.freeze({
   low: '自動システムが不適切な可能性があるとして報告したため、ポストにワンクッションを付与しました。',
   middle: '自動システムが不適切な可能性があるとして報告したため、ポストを限定公開にしました。',
-  high: '自動システムが不適切な可能性があるとして報告したため、ポストを限定公開にしました。',
+  high: '自動システムが不適切な可能性があるとして報告したため、ポストを限定公開にしワンクッションを付与しました。',
 });
 
 const RATE_LIMIT_BACKOFF_MS = 90 * 1000;
@@ -73,7 +73,7 @@ function getImageMimeType(attachment, sourceContentType) {
   return null;
 }
 
-class GeminiPostModerationService {
+class AutoModerationService {
   constructor({ dbAdapter, storageAdapter, publishNotification, moderationConfig = {} }) {
     this.db = dbAdapter;
     this.storage = storageAdapter;
@@ -196,12 +196,13 @@ class GeminiPostModerationService {
           signal: controller.signal,
           body: JSON.stringify({
             systemInstruction: {
-              parts: [{ text: String(this.config.prompt) }],
+              parts: [{ text: `判定の基準は以下を参考にしてください:\n${this.config.prompt}` }],
             },
             contents: [{ parts }],
             generationConfig: {
               candidateCount: 1,
               maxOutputTokens: 64,
+              temperature: 0.0,
             },
           }),
         },
@@ -246,7 +247,7 @@ class GeminiPostModerationService {
 }
 
 module.exports = {
-  GeminiPostModerationService,
+  AutoModerationService,
   MODERATION_LEVELS,
   getPrivateLevel,
   parseModerationLevel,

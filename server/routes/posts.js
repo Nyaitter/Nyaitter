@@ -81,7 +81,7 @@ function getStorageAdapter(req) {
 }
 
 function enqueueGeminiModeration(req, post) {
-	const service = req.app.locals.geminiPostModerationService;
+	const service = req.app.locals.autoModerationService;
 	if (!service?.enabled || !post) return;
 	try {
 		service.enqueue(post);
