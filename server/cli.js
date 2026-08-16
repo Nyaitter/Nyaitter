@@ -17,7 +17,7 @@ const POLL_INTERVAL_MS = 100;
 
 function printUsage() {
   console.log(`
-Nyaitter ローカル運用CLI
+Nyaitter ローカル管理CLI
 
 使用方法:
   npm run cli -- admin grant <#ユーザーID>
@@ -105,7 +105,7 @@ async function restartServer() {
 
 async function setAdministrator(userIdArgument, admin) {
   const userId = parseUserId(userIdArgument);
-  if (userId == null) throw new Error('ユーザーIDは #3480 または 3480 形式の非負整数で指定してください');
+  if (userId == null) throw new Error('ユーザーIDは #0000 または 0000 形式の非負整数で指定してください');
 
   const response = await requestOperatorCommand({
     action: 'set-admin',
