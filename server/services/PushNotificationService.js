@@ -15,9 +15,10 @@ function getPushIconUrl(notification, publicUrl = null) {
 }
 
 class PushNotificationService {
-  constructor({ dbAdapter, pushConfig = {} }) {
+  constructor({ dbAdapter, pushConfig = {}, realtime = null }) {
     this.dbAdapter = dbAdapter;
     this.config = pushConfig;
+    this.realtime = realtime;
     this.enabled = Boolean(
       pushConfig.vapidSubject
       && pushConfig.vapidPublicKey
@@ -79,6 +80,13 @@ class PushNotificationService {
             console.warn('[push] Failed to remove stale subscription:', deleteError.message);
           }
         }
+        return;
+      }
+
+      // 同じブラウザーセッションがWebSocketで接続中なら、画面内のリアルタイム通知で
+      // 受信できるため、その購読へのWeb Pushは送らない。他セッションの購読は維持する。
+      if (this.realtime?.hasActiveSession?.(userId, subscription.sessionToken)) {
+        result.skipped += 1;
         return;
       }
 

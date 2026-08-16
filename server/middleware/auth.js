@@ -48,6 +48,8 @@ async function getSessionPrincipal(req, token) {
   return {
     id: user.id,
     tokenType: 'session',
+    // Push購読と同じハッシュを使い、WebSocket接続中の同一セッションを判定する。
+    sessionTokenHash: SessionManager.hashToken(token),
     isBot: false,
     admin: user.admin === true,
     frozen: Boolean(user.freeze),

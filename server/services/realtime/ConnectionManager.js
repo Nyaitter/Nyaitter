@@ -20,9 +20,11 @@ function blocksUser(user, targetUserId) {
 class ConnectionManager {
   constructor() {
     this.connectionsByUser = new Map();
+    // 生のセッショントークンを保持せず、Push購読に保存されている値と同じハッシュだけを紐付ける。
+    this.sessionHashBySocket = new WeakMap();
   }
 
-  register(userId, socket) {
+  register(userId, socket, sessionTokenHash = null) {
     const normalizedUserId = Number(userId);
     if (!Number.isInteger(normalizedUserId) || normalizedUserId < 0 || !socket) {
       return;
@@ -32,6 +34,9 @@ class ConnectionManager {
       this.connectionsByUser.set(normalizedUserId, new Set());
     }
     this.connectionsByUser.get(normalizedUserId).add(socket);
+    if (typeof sessionTokenHash === 'string' && sessionTokenHash) {
+      this.sessionHashBySocket.set(socket, sessionTokenHash);
+    }
   }
 
   unregister(userId, socket) {
@@ -40,9 +45,29 @@ class ConnectionManager {
     if (!sockets) return;
 
     sockets.delete(socket);
+    this.sessionHashBySocket.delete(socket);
     if (sockets.size === 0) {
       this.connectionsByUser.delete(normalizedUserId);
     }
+  }
+
+  hasActiveSession(userId, sessionTokenHash) {
+    const normalizedUserId = Number(userId);
+    if (!Number.isInteger(normalizedUserId) || normalizedUserId < 0) return false;
+    if (typeof sessionTokenHash !== 'string' || !sessionTokenHash) return false;
+
+    const sockets = this.connectionsByUser.get(normalizedUserId);
+    if (!sockets || sockets.size === 0) return false;
+
+    for (const socket of sockets) {
+      if (!socket || socket.readyState !== 1) {
+        this.unregister(normalizedUserId, socket);
+        continue;
+      }
+      if (this.sessionHashBySocket.get(socket) === sessionTokenHash) return true;
+    }
+
+    return false;
   }
 
   _sendSerializedToUser(userId, serialized) {

@@ -199,7 +199,7 @@ httpServer.on('upgrade', (request, socket, head) => {
 realtimeServer.on('connection', (webSocket, _request, principal) => {
     const userId = principal.id;
     webSocket.isAlive = true;
-    realtimeConnections.register(userId, webSocket);
+    realtimeConnections.register(userId, webSocket, principal.sessionTokenHash);
 
     webSocket.on('pong', () => {
         webSocket.isAlive = true;
@@ -498,6 +498,7 @@ let moderationScheduler = null;
 const pushNotificationService = new PushNotificationService({
     dbAdapter,
     pushConfig: config.push,
+    realtime: realtimeConnections,
 });
 
 async function publishModerationNotification(userId, notification) {
