@@ -19,6 +19,7 @@ npm run dev:server
 | `/server/health` | サーバーが応答しているか確認する |
 | `/server/ready` | 起動準備が完了したか確認する |
 | `/server/api/status` | サーバーと認証の状態を確認する |
+| `/server/apidocs` | 各APIに関する情報を取得する(β) |
 
 > 初期設定のメモリDBは、再起動するとデータが消えます。公開運用ではPostgreSQLまたはD1を使ってください。
 
@@ -63,6 +64,8 @@ npm run dev:server
 `DEV_BYPASS_AUTH=true` はScratch認証を省略する開発専用設定です。公開サーバーでは絶対に使わないでください。`NODE_ENV=production` で有効にすると、サーバーは起動を拒否します。
 
 `TRUST_PROXY=true` は、信頼できるリバースプロキシの背後で動かす場合だけ設定します。直接公開するサーバーで安易に有効化しないでください。
+
+APIを更新した際には`npm run swagger`を用いてAPI Docsの更新を行ってください。
 
 ## DM暗号化の一時停止
 
