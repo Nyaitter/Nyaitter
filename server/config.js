@@ -399,9 +399,41 @@ const config = {
 	    },
 	  },
 
-	  // VAPID private keys must only be supplied through environment variables
-	  // in production. The public key is exposed only to authenticated clients.
-	  push: {
+	  		  geminiModeration: (() => {
+		    const apiKey = readSetting(
+		      ['GEMINI_API_KEY'],
+		      ['geminiModeration.apiKey', 'GEMINI_API_KEY'],
+		      '',
+		    );
+		    const model = readSetting(
+		      ['GEMINI_MODEL'],
+		      ['geminiModeration.model', 'GEMINI_MODEL'],
+		      '',
+		    );
+		    const prompt = readSetting(
+		      ['GEMINI_MOD_PROMPT'],
+		      ['geminiModeration.prompt', 'GEMINI_MOD_PROMPT'],
+		      '',
+		    );
+		    return {
+		      apiKey,
+		      model,
+		      prompt,
+		      maxImages: exactIntegerSetting(
+		        'Gemini moderation max images',
+		        ['GEMINI_MOD_MAX_IMAGES'],
+		        ['geminiModeration.maxImages', 'GEMINI_MOD_MAX_IMAGES'],
+		        0,
+		        0,
+		      ),
+		      enabled: Boolean(apiKey && model && prompt),
+		    };
+		  })(),
+
+		  // VAPID private keys must only be supplied through environment variables
+		  // in production. The public key is exposed only to authenticated clients.
+		  push: {
+
 	    vapidSubject: process.env.VAPID_SUBJECT || get('push.vapidSubject', ''),
 	    vapidPublicKey: process.env.VAPID_PUBLIC_KEY || get('push.vapidPublicKey', ''),
 	    vapidPrivateKey: process.env.VAPID_PRIVATE_KEY || get('push.vapidPrivateKey', ''),
@@ -584,6 +616,15 @@ function validateConfig() {
     if (config.federation.allow_external_login && (config.federation.trusted_servers || []).length === 0) {
       console.warn('[config] External login is configured but no trusted_servers are defined; it will remain disabled');
     }
+  }
+
+  const geminiSettings = [
+    config.geminiModeration.apiKey,
+    config.geminiModeration.model,
+    config.geminiModeration.prompt,
+  ].filter(Boolean);
+  if (geminiSettings.length > 0 && !config.geminiModeration.enabled) {
+    console.warn('[config] Gemini moderation is disabled until GEMINI_API_KEY, GEMINI_MODEL, and GEMINI_MOD_PROMPT are all configured');
   }
 
   if (config.server.port < 1 || config.server.port > 65535) {

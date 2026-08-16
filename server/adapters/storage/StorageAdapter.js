@@ -31,6 +31,15 @@ class StorageAdapter {
   }
 
   /**
+   * 保存済みファイルを読み取る。
+   * @param {string} fileId
+   * @returns {Promise<{buffer: Buffer, contentType: string|null}>}
+   */
+  async read(fileId) {
+    throw new Error('read() must be implemented');
+  }
+
+  /**
    * 複数ファイルを一括削除
    * @param {string[]} fileIds
    * @returns {Promise<void>}

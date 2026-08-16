@@ -45,7 +45,7 @@
 		"dm": {
 			"e2eEnabled": false
 		},
-		"imageUpload": {
+				"imageUpload": {
 			"maxWidth": 2560,
 			"maxHeight": 2560,
 			"maxPixels": 40000000,
@@ -53,7 +53,14 @@
 			"webpQuality": 82,
 			"minWebpQuality": 60
 		},
-	"auth": {
+		"geminiModeration": {
+			"apiKey": "",
+			"model": "",
+			"prompt": "",
+			"maxImages": 0
+		},
+		"auth": {
+
 		"sessionExpiryDays": 30,
 		"verificationCodeExpiryMinutes": 15,
 		"botTokenPrefix": "bot_",

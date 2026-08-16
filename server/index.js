@@ -50,6 +50,9 @@ const {
 const {
     startModerationAssignmentScheduler,
 } = require('./services/ModerationAssignmentScheduler');
+const {
+    GeminiPostModerationService,
+} = require('./services/GeminiPostModerationService');
 const { serializeNotification } = require('./utils/serialize');
 const { getPublicUrl } = require('./utils/nyaitterAddress');
 const { startOperatorControlServer } = require('./utils/operatorControl');
@@ -537,8 +540,15 @@ const moderationReportService = new ModerationReportService({
     storageAdapter,
     publishNotification: publishModerationNotification,
 });
+const geminiPostModerationService = new GeminiPostModerationService({
+    dbAdapter,
+    storageAdapter,
+    publishNotification: publishModerationNotification,
+    moderationConfig: config.geminiModeration,
+});
 app.locals.pushNotificationService = pushNotificationService;
 app.locals.moderationReportService = moderationReportService;
+app.locals.geminiPostModerationService = geminiPostModerationService;
 
 async function startServer() {
     await dbAdapter.connect();
@@ -546,6 +556,7 @@ async function startServer() {
     app.locals.storageAdapter = storageAdapter;
     app.locals.pushNotificationService = pushNotificationService;
     app.locals.moderationReportService = moderationReportService;
+    app.locals.geminiPostModerationService = geminiPostModerationService;
     moderationScheduler = startModerationAssignmentScheduler(
         moderationReportService,
     );
@@ -575,6 +586,7 @@ async function startServer() {
 ║
 ║  DB Adapter:      ${process.env.DB_ADAPTER || 'memory'}
 ║  Storage Adapter: ${process.env.STORAGE_ADAPTER || 'local'}
+║  Gemini moderation: ${geminiPostModerationService.enabled ? 'enabled' : 'disabled'}
 ╚══════════════════════════════════════════════════════════════
 `);
         if (userFilesServer) {
@@ -606,6 +618,7 @@ async function shutdown(signal) {
         clearInterval(realtimeHeartbeat);
         moderationScheduler?.stop();
         moderationScheduler = null;
+        geminiPostModerationService.stop();
         realtimeConnections.closeAll();
         if (operatorControl) {
             await operatorControl.close();

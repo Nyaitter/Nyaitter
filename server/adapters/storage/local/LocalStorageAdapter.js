@@ -9,6 +9,14 @@ const {
   normalizeStorageKey,
 } = require('../safeStoragePath');
 
+const IMAGE_CONTENT_TYPES_BY_EXTENSION = new Map([
+  ['.jpg', 'image/jpeg'],
+  ['.jpeg', 'image/jpeg'],
+  ['.png', 'image/png'],
+  ['.gif', 'image/gif'],
+  ['.webp', 'image/webp'],
+]);
+
 class LocalStorageAdapter extends StorageAdapter {
   constructor(options = {}) {
     super();
@@ -77,6 +85,15 @@ class LocalStorageAdapter extends StorageAdapter {
   async getPublicUrl(fileId) {
     const { normalizedKey } = this._resolveStorageKey(fileId);
     return this._getPublicUrl(normalizedKey);
+  }
+
+  async read(fileId) {
+    const { normalizedKey, resolvedPath } = this._resolveStorageKey(fileId);
+    const buffer = await fs.readFile(resolvedPath);
+    return {
+      buffer,
+      contentType: IMAGE_CONTENT_TYPES_BY_EXTENSION.get(path.extname(normalizedKey).toLowerCase()) || null,
+    };
   }
 
   async deleteMany(fileIds) {

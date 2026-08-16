@@ -175,6 +175,31 @@ class R2StorageAdapter extends StorageAdapter {
     return this._getSignedUrlCached(`download:${key}:${expiresIn}`, command, expiresIn);
   }
 
+  async read(fileId) {
+    const key = normalizeStorageKey(fileId);
+    const result = await this._send(new GetObjectCommand({
+      Bucket: this.bucket,
+      Key: key,
+    }));
+    const body = result?.Body;
+    if (!body) throw new Error('R2 object body is unavailable');
+
+    let buffer;
+    if (Buffer.isBuffer(body) || body instanceof Uint8Array) {
+      buffer = Buffer.from(body);
+    } else if (typeof body.transformToByteArray === 'function') {
+      buffer = Buffer.from(await body.transformToByteArray());
+    } else {
+      const chunks = [];
+      for await (const chunk of body) chunks.push(Buffer.from(chunk));
+      buffer = Buffer.concat(chunks);
+    }
+    return {
+      buffer,
+      contentType: result.ContentType || null,
+    };
+  }
+
   async deleteMany(fileIds) {
     const keys = [...new Set((fileIds || []).map((fileId) => normalizeStorageKey(fileId)))];
     if (keys.length === 0) return;

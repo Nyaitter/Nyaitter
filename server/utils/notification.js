@@ -10,6 +10,7 @@ const NOTIFICATION_TYPES = new Set([
   'dm_removed',
   'dm_host_transfer',
   'admin_notice',
+  'auto_moderation',
   'login_approval',
   'moderation_assignment',
   'moderation_action_taken',
@@ -78,6 +79,7 @@ function getNotificationText(notification) {
     case 'dm_removed': return `${actor} さんによってDMから削除されました。`;
     case 'dm_host_transfer': return `${actor} さんからDMの管理者権限を受け取りました。`;
     case 'admin_notice': return `${actor} さんからお知らせがあります。`;
+    case 'auto_moderation': return '自動モデレーションによりポストの公開範囲が変更されました。';
     case 'login_approval': return '不明な場所からのログイン承認が必要です。';
     case 'moderation_assignment': return '新しい報告があなたに割り当てられました。';
     case 'moderation_action_taken': return 'あなたが報告したコンテンツは、審査により不適切であると判定されました。コミュニティの健全化へのご協力に感謝します。';

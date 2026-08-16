@@ -117,6 +117,7 @@ Push通知の送信者アイコンは、現在の公開API URLを基準にした
 | DB | `DB_ADAPTER`、`DATABASE_URL`、`D1_WORKER_URL`、`D1_WORKER_TOKEN` |
 | ストレージ | `STORAGE_ADAPTER`、`STORAGE_USER_QUOTA_MB`、`R2_*` |
 | Push通知 | `VAPID_SUBJECT`、`VAPID_PUBLIC_KEY`、`VAPID_PRIVATE_KEY` |
+| Gemini自動モデレーション | `GEMINI_API_KEY`、`GEMINI_MODEL`、`GEMINI_MOD_PROMPT`、`GEMINI_MOD_MAX_IMAGES`、`geminiModeration` |
 
 CORSで別ドメインに配置したClientからAPIを利用する場合は、許可する**オリジン**を設定します。`server/config.json` では `cors.allowedOrigins` に配列で指定し、環境変数では `NYAITTER_CORS_ALLOWED_ORIGINS` にカンマ区切りで指定します。オリジンには `https://client.example.com` のようにスキーム・ホスト・必要なポートだけを含め、パス、クエリ、フラグメントは含めません。
 
@@ -139,6 +140,31 @@ NYAITTER_CORS_CREDENTIALS=true
 環境変数が設定されている場合は `cors.allowedOrigins` より優先されます。既存の `ALLOWED_ORIGINS` も互換性のため引き続き利用できますが、新規の設定では `NYAITTER_CORS_ALLOWED_ORIGINS` を使用してください。
 
 Cookieを含む要求を別オリジンのClientから送る場合は、`cors.credentials` または `NYAITTER_CORS_CREDENTIALS=true` を設定します。この場合、許可オリジンはワイルドカードにせず、`https://nyaitter.jp` のように信頼するClientを明示指定してください。許可されたオリジンには `Access-Control-Allow-Credentials: true` を返し、Cookieを伴う状態変更要求もそのオリジンだけを受け付けます。
+
+### Gemini自動モデレーション
+
+Gemini APIを使って、投稿の作成・編集後に自動判定できます。`GEMINI_API_KEY`、`GEMINI_MODEL`、`GEMINI_MOD_PROMPT` の3項目がすべて設定されている場合だけ有効です。各値は `server/.env` または `config.json` の `geminiModeration` に設定できますが、APIキーは秘密情報のため `server/.env` を推奨します。
+
+```dotenv
+GEMINI_API_KEY=...
+GEMINI_MODEL=gemini-2.0-flash
+GEMINI_MOD_PROMPT=投稿をコミュニティルールに基づいて判定してください。
+# 0は本文のみを送信します。
+GEMINI_MOD_MAX_IMAGES=0
+```
+
+`config.json` では、`geminiModeration.apiKey`、`geminiModeration.model`、`geminiModeration.prompt`、`geminiModeration.maxImages` に同じ設定を指定できます。環境変数が設定されている場合は環境変数が優先されます。
+
+投稿はメモリ上のキューで1件ずつ判定します。Geminiの応答では、思考用の部分を除いた応答文に最初に現れる `<safe>`、`<low>`、`<middle>`、`<high>` のラベルを使用します。該当ラベルがない場合は `<safe>` として扱います。本文に加えて送信する添付画像の数は `GEMINI_MOD_MAX_IMAGES` または `geminiModeration.maxImages` で設定し、`0` は画像を送信しません。
+
+| ラベル | MODレベル | 現在の公開範囲より高い場合の処理 |
+|---|---:|---|
+| `<safe>` | 1 | 何もしません。 |
+| `<low>` | 2 | 対象ポストへの通知を送り、ワンクッションを付与します。 |
+| `<middle>` | 3 | 対象ポストへの通知を送り、鍵を付与します。 |
+| `<high>` | 4 | 対象ポストへの通知を送り、鍵とワンクッションを付与します。 |
+
+公開、公開＋ワンクッション、鍵、鍵＋ワンクッションはそれぞれレベル1から4として扱います。自動モデレーションは既存の制限を弱めず、より強い制限が必要な場合だけ適用します。Gemini APIがレート制限を返した場合は90秒、その他の失敗時は10秒待ってから、同じ投稿の処理を再開します。メモリキューのため、Serverを再起動すると未処理の投稿は保持されません。
 
 ### 制限値とレート制限
 

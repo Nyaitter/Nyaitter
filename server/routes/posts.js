@@ -80,6 +80,17 @@ function getStorageAdapter(req) {
 	return req.app.locals.storageAdapter;
 }
 
+function enqueueGeminiModeration(req, post) {
+	const service = req.app.locals.geminiPostModerationService;
+	if (!service?.enabled || !post) return;
+	try {
+		service.enqueue(post);
+	} catch (error) {
+		// 投稿・編集は永続化済みのため、キュー投入失敗でAPIを失敗させない。
+		console.warn('[posts] Gemini moderation enqueue failed:', error.message);
+	}
+}
+
 function contentLengthError(range) {
 	return `content must be ${describeIntegerRange(range)} characters`;
 }
@@ -325,9 +336,13 @@ router.post('/', requireAuth, postWriteLimiter, async (req, res) => {
 		}
 
 
-			await publishNewTimelinePost(req, post);
+			
 
-		res.status(201).json({
+				await publishNewTimelinePost(req, post);
+			enqueueGeminiModeration(req, post);
+
+			res.status(201).json({
+
 			success: true,
 			post: await serializePost(db, post, userId, 0, getPublicUrl(req)),
 		});
@@ -974,7 +989,7 @@ router.put('/:id', requireAuth, postWriteLimiter, async (req, res) => {
 			return res.status(403).json({ error: 'You can only edit your own posts' });
 		}
 
-		const updated = await db.updatePost(postId, {
+				const updated = await db.updatePost(postId, {
 			content: content.trim(),
 			attachments:
 				Array.isArray(attachments) && attachments.length > 0
@@ -983,11 +998,13 @@ router.put('/:id', requireAuth, postWriteLimiter, async (req, res) => {
 				mask: !!mask,
 				lock: !!lock,
 			});
-
+		const moderatedPost = updated || post;
+		enqueueGeminiModeration(req, moderatedPost);
 		res.json({
 			success: true,
-			post: await serializePost(db, updated || post, userId, 0, getPublicUrl(req)),
+			post: await serializePost(db, moderatedPost, userId, 0, getPublicUrl(req)),
 		});
+
 	} catch (err) {
 		console.error('[posts] edit error:', err);
 		res.status(500).json({ error: '投稿の更新に失敗しました' });
