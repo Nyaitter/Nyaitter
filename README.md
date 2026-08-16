@@ -1,48 +1,40 @@
 # Nyaitter
 
-Nyaitter は、NyaXがベースのオープンソースScratcher向けSNSです。
+Nyaitter は、NyaX をベースにした Scratcher 向けのオープンソース SNS です。ブラウザ用のシングルページアプリケーションと、認証・API・WebSocket を提供する Node.js サーバーで構成されています。
 
-- **NyaitterClient** … ブラウザ側の画面（`page/`）
-- **NyaitterServer** … API と認証などのサーバー（`server/`）
+| 区分 | 配置 | 内容 |
+|---|---|---|
+| NyaitterClient | `page/` | バニラ JavaScript による画面、PWA、サービスワーカー |
+| NyaitterServer | `server/` | Express API、認証、リアルタイム配信、DB・ストレージアダプター |
+| D1 Proxy Worker | `workers/d1-proxy/` | Cloudflare D1 を利用する場合の認証済みプロキシ |
 
-## ライセンス
+## 主な機能
 
-NyaitterClient および NyaitterServer は **MIT ライセンス** です。
+投稿、返信、引用、リポスト、いいね、スター、検索、フォロー、通知、グループ DM、Web Push、外部 Nyaitter アドレスでのログインを提供します。投稿の公開範囲、検索除外、双方向のブロック関係はサーバー側の共通可視性ルールで判定されます。
 
-クレジット（著作権表示）を残していれば、誰でも自由に利用・改変・再配布できます。  
-詳細は同梱の `LICENSE` を見てください。
-
-## クライアントについて
-
-クライアントは [nyantorusabu/NyaX](https://github.com/nyantorusabu/NyaX) をベースにしています。
+> ブロック関係にある利用者同士では、相互の投稿・投稿通知・DMメッセージを表示しません。DMへの新規招待やメンバー追加も拒否されます。
 
 ## クイックスタート
 
-必要なもの: Node.js（目安として 18 以上）
+Node.js 18 以上を用意し、リポジトリのルートで実行します。
 
 ```bash
-# 1. 依存関係を入れる
 npm install
-
-# 2. サーバーを起動する（開発用）
 npm run dev:server
 ```
 
-ブラウザで http://localhost:3000/ を開きます。
+ブラウザで <http://localhost:3000/> を開きます。稼働確認には <http://localhost:3000/server/health> を利用できます。
 
-開発時の初期設定では、データベースはメモリ上、ファイルはローカルフォルダに保存されます。  
-本格運用の手順は `server/README.md` と `server/help/` を参照してください。
+開発時の既定値は `InMemoryAdapter` と `LocalStorageAdapter` です。**メモリ上のデータはサーバー再起動時に失われます。** 実運用の手順は `server/README.md` と `server/help/` を参照してください。
 
-## 主な構成
+## ライセンス
 
-| フォルダ | 内容 |
-|----------|------|
-| `page/` | フロントエンド（HTML / CSS / JS） |
-| `server/` | Node.js サーバー（API・認証・アダプター） |
-| `workers/` | Cloudflare D1 用の Worker（任意） |
+NyaitterClient と NyaitterServer は **MIT ライセンス**です。著作権表示を保持する限り、利用・改変・再配布できます。詳細は同梱の `LICENSE` を確認してください。
 
-## もう少し詳しく
+## ドキュメント
 
-- サーバーの起動・API・外部ログイン: `server/README.md`
-- データベースやストレージの切り替え: `server/help/`
-- 本番向けの確認項目: `server/help/production-checklist.md`
+- サーバーの起動、API、認証、リアルタイム配信: [`server/README.md`](./server/README.md)
+- DB・ストレージアダプター: [`server/adapters/README.md`](./server/adapters/README.md)
+- PostgreSQL、D1、R2、ローカルストレージ、本番運用: [`server/help/README.md`](./server/help/README.md)
+- PostgreSQL マイグレーション: [`server/migrations/README.md`](./server/migrations/README.md)
+- Cloudflare D1 Proxy Worker: [`workers/d1-proxy/README.md`](./workers/d1-proxy/README.md)

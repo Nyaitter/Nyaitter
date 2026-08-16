@@ -1,6 +1,7 @@
 const express = require('express');
 const config = require('../config');
-const { requireAuth } = require('../middleware/auth');
+const { requireAuth, extractToken } = require('../middleware/auth');
+const SessionManager = require('../services/auth/SessionManager');
 
 const router = express.Router();
 
@@ -107,8 +108,16 @@ router.post('/subscriptions', requireAuth, requireSessionPrincipal, async (req, 
     return res.status(400).json({ error: 'Invalid PushSubscription' });
   }
 
+  const sessionToken = extractToken(req);
+  if (!sessionToken) {
+    return res.status(401).json({ error: 'セッショントークンが見つかりません' });
+  }
+
   try {
-    const stored = await req.app.locals.dbAdapter.upsertPushSubscription(req.user.id, subscription);
+    const stored = await req.app.locals.dbAdapter.upsertPushSubscription(req.user.id, {
+      ...subscription,
+      sessionToken: SessionManager.hashToken(sessionToken),
+    });
     if (!stored) return res.status(404).json({ error: 'User not found' });
     return res.status(201).json({ success: true });
   } catch (error) {

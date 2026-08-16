@@ -7,6 +7,7 @@ const {
 } = require('../../../utils/nyaitterAddress');
 const appConfig = require('../../../config');
 const { normalizeTarget } = require('../../../utils/notification');
+const { normalizeBlockList } = require('../../../utils/blockList');
 
 class PostgresAdapter extends DatabaseAdapter {
 	constructor(options = {}) {
@@ -43,12 +44,20 @@ class PostgresAdapter extends DatabaseAdapter {
 		}
 	}
 
+	_normalizeUserBlockList(user) {
+		if (!user) return null;
+		return {
+			...user,
+			block: normalizeBlockList(user.block, user.id),
+		};
+	}
+
 	async getUserByScid(scid) {
 		const { rows } = await this.pool.query(
 			'SELECT * FROM users WHERE scid = $1 LIMIT 1',
 			[scid]
 		);
-		return rows[0] || null;
+		return this._normalizeUserBlockList(rows[0]);
 	}
 
 	async getUserById(id) {
@@ -56,7 +65,7 @@ class PostgresAdapter extends DatabaseAdapter {
 			'SELECT * FROM users WHERE id = $1 LIMIT 1',
 			[id]
 		);
-		return rows[0] || null;
+		return this._normalizeUserBlockList(rows[0]);
 	}
 
 	async getUserByNyaitterAddress(address) {
@@ -64,7 +73,7 @@ class PostgresAdapter extends DatabaseAdapter {
 			'SELECT * FROM users WHERE nyaitter_address = $1 LIMIT 1',
 			[address]
 		);
-		return rows[0] || null;
+		return this._normalizeUserBlockList(rows[0]);
 	}
 
 	async getOrCreateExternalUser({ providerDomain, externalId, profile = {} }) {
@@ -100,27 +109,30 @@ class PostgresAdapter extends DatabaseAdapter {
 			const address = userData.nyaitter_address || null;
 			try {
 				const { rows } = await this.pool.query(
-											`INSERT INTO users (id, scid, name, handle, nyaitter_address, auth_provider, provider_domain, external_id, external_profile, uuid, settings, bio, header_image, icon_data, created_at)
-						 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW()) RETURNING *`,
+							`INSERT INTO users (id, scid, name, handle, nyaitter_address, auth_provider, provider_domain, external_id, external_profile, uuid, settings, block, bio, header_image, icon_data, created_at)
+							 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13, $14, $15, NOW()) RETURNING *`,
 						[id, userData.scid || null, userData.name || userData.scid || handle, handle, address,
-							 provider, userData.provider_domain || null, userData.external_id || null,
-							 userData.external_profile || null, userData.uuid || null,
-							 userData.settings ? JSON.stringify(userData.settings) : '{}',
-							 userData.bio || userData.me || '', userData.header_image || null,
-							 userData.icon_data || null],
+								 provider, userData.provider_domain || null, userData.external_id || null,
+								 userData.external_profile || null, userData.uuid || null,
+								 userData.settings ? JSON.stringify(userData.settings) : '{}',
+								 JSON.stringify(normalizeBlockList(userData.block, id)),
+								 userData.bio || userData.me || '', userData.header_image || null,
+								 userData.icon_data || null],
 
 				);
-				return rows[0];
-			} catch (error) {
+			return this._normalizeUserBlockList(rows[0]);
+		} catch (error) {
 				if (error.code !== '23505') throw error;
 			}
 		}
 		throw new Error('Could not allocate a unique Nyaitter ID');
 	}
 
-	async searchUsers(query, limit = 20) {
+	async searchUsers(query, limit = 20, offset = 0) {
 		const q = `%${query.toLowerCase()}%`;
 		const digits = String(query).replace(/^#/, '').replace(/\D/g, '');
+		const safeLimit = Math.max(Number(limit) || 0, 0);
+		const safeOffset = Math.max(Number(offset) || 0, 0);
 		const { rows } = await this.pool.query(
 			`SELECT id, name, scid, handle, nyaitter_address, auth_provider, provider_domain, external_id
 			 FROM users
@@ -129,24 +141,30 @@ class PostgresAdapter extends DatabaseAdapter {
 				OR LOWER(COALESCE(handle, '')) LIKE $1
 				OR CAST(id AS TEXT) LIKE $1
 				OR CAST(COALESCE(external_id, -1) AS TEXT) LIKE $1
-			 ORDER BY id DESC LIMIT $2`,
-			[digits ? `%${digits}%` : q, limit]
+			 ORDER BY id ASC LIMIT $2 OFFSET $3`,
+			[digits ? `%${digits}%` : q, safeLimit, safeOffset]
 		);
 		return rows;
 	}
 
 	async getUsersByIds(userIds) {
-		if (!userIds.length) return [];
+		const ids = [...new Set((userIds || []).map(Number).filter(Number.isInteger))];
+		if (ids.length === 0) return [];
+		// 投稿・通知の可視性とシリアライズでは settings / shadow / 権限情報も必要になる。
+		// ここで必要な属性をまとめて返すことで、呼び出し側のユーザーごとの再取得を避ける。
 		const { rows } = await this.pool.query(
-			`SELECT id, name, scid, icon_data, handle, nyaitter_address, auth_provider, provider_domain, external_id FROM users WHERE id = ANY($1)`,
-			[userIds]
+			`SELECT id, name, scid, icon_data, handle, nyaitter_address,
+				auth_provider, provider_domain, external_id, settings, block, bio,
+				header_image, verify, admin, freeze, shadow, uuid, created_at
+			 FROM users WHERE id = ANY($1::int[])`,
+			[ids]
 		);
-		return rows;
+		return rows.map((row) => this._normalizeUserBlockList(row));
 	}
 
 	async getAllUsers() {
 		const { rows } = await this.pool.query('SELECT * FROM users ORDER BY id ASC');
-		return rows;
+		return rows.map((row) => this._normalizeUserBlockList(row));
 	}
 
 		_mapSession(session) {
@@ -180,7 +198,9 @@ class PostgresAdapter extends DatabaseAdapter {
 		}
 
 		async createSession(userId, meta = {}) {
-			const token = crypto.randomBytes(appConfig.auth.sessionTokenBytes).toString('hex');
+			const token = typeof meta.token === 'string' && meta.token
+				? meta.token
+				: crypto.randomBytes(appConfig.auth.sessionTokenBytes).toString('hex');
 			const sessionId = crypto.randomBytes(16).toString('base64url');
 			const expiresAt = new Date(Date.now() + appConfig.auth.sessionExpiryDays * 24 * 60 * 60 * 1000);
 			const { rows } = await this.pool.query(
@@ -372,21 +392,22 @@ class PostgresAdapter extends DatabaseAdapter {
 			return this._mapLoginApproval(rows[0]);
 		}
 
-	async createPost(postData) {
-		const { rows } = await this.pool.query(
-			`INSERT INTO posts (user_id, content, attachments, mask, lock, reply_to, repost_to, created_at)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-			 RETURNING *`,
-			[
-				postData.userId,
-				postData.content,
-				postData.attachments ? JSON.stringify(postData.attachments) : null,
-				!!postData.mask,
-				!!postData.lock,
-				postData.replyTo || null,
-				postData.repostTo || null
-			]
-		);
+		async createPost(postData) {
+			const { rows } = await this.pool.query(
+				`INSERT INTO posts (user_id, content, attachments, mask, lock, announcement, reply_to, repost_to, created_at)
+				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+				 RETURNING *`,
+				[
+					postData.userId,
+					postData.content,
+					postData.attachments ? JSON.stringify(postData.attachments) : null,
+					!!postData.mask,
+					!!postData.lock,
+					!!postData.announcement,
+					postData.replyTo || null,
+					postData.repostTo || null
+				]
+			);
 		return this._normalizePost(rows[0] || null);
 	}
 
@@ -510,29 +531,49 @@ class PostgresAdapter extends DatabaseAdapter {
 		return Number(rows[0].count);
 	}
 
-	async getPostsByUserId(userId, limit = 50, currentUserId = null) {
+	async getPostsByUserId(userId, limit = 50, _currentUserId = null) {
 		const { rows } = await this.pool.query(
 			`SELECT * FROM posts WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2`,
 			[userId, limit]
 		);
-		const posts = rows.map(r => this._normalizePost(r));
-		return Promise.all(posts.map(p => this.getPostDetail(p.id, currentUserId)));
+		// 呼び出し元は共通の serializePostsBatch() で必要な関連情報を一括取得する。
+		// ここで投稿ごとの getPostDetail() を行わず、N+1クエリを避ける。
+		return rows.map((row) => this._normalizePost(row));
 	}
 
-	async getProfilePostIds({ userId, subType = 'all', limit = 30, offset = 0 } = {}) {
-		const clauses = ['user_id = $1'];
-		if (subType === 'posts_only') clauses.push('reply_to IS NULL');
-		if (subType === 'replies_only') clauses.push('reply_to IS NOT NULL');
-		const { rows } = await this.pool.query(
-			`SELECT id FROM posts WHERE ${clauses.join(' AND ')}
-			 ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
-			[userId, limit + 1, offset],
-		);
-		return {
-			ids: rows.slice(0, limit).map((row) => row.id),
-			has_more: rows.length > limit,
-		};
-	}
+		async getProfilePostIds({ userId, subType = 'all', limit = 30, offset = 0, beforeId = null } = {}) {
+			const normalizedLimit = Math.max(1, Math.min(Number(limit) || 30, 100));
+			const normalizedOffset = Math.max(0, Number(offset) || 0);
+			const normalizedBeforeId = Number.isInteger(Number(beforeId)) && Number(beforeId) > 0
+				? Number(beforeId)
+				: null;
+			const values = [Number(userId)];
+			const clauses = ['user_id = $1'];
+			if (subType === 'posts_only') clauses.push('reply_to IS NULL');
+			if (subType === 'replies_only') clauses.push('reply_to IS NOT NULL');
+			if (normalizedBeforeId != null) {
+				values.push(normalizedBeforeId);
+				clauses.push(`id < $${values.length}`);
+			}
+			values.push(normalizedLimit + 1);
+			const limitParam = values.length;
+			let offsetSql = '';
+			if (normalizedBeforeId == null) {
+				values.push(normalizedOffset);
+				offsetSql = ` OFFSET $${values.length}`;
+			}
+			const { rows } = await this.pool.query(
+				`SELECT id FROM posts WHERE ${clauses.join(' AND ')}
+				 ORDER BY created_at DESC, id DESC LIMIT $${limitParam}${offsetSql}`,
+				values,
+			);
+			const ids = rows.slice(0, normalizedLimit).map((row) => row.id);
+			return {
+				ids,
+				has_more: rows.length > normalizedLimit,
+				next_cursor: rows.length > normalizedLimit && ids.length > 0 ? ids[ids.length - 1] : null,
+			};
+		}
 
 	async getMediaCount(userId) {
 		const { rows } = await this.pool.query(
@@ -548,27 +589,27 @@ class PostgresAdapter extends DatabaseAdapter {
 	async getMediaPosts(userId, limit = 15, offset = 0) {
 		const normalizedLimit = Math.max(1, Math.min(Number(limit) || 15, 100));
 		const normalizedOffset = Math.max(0, Number(offset) || 0);
+		// 添付単位で展開してからSQL側でページングする。従来のように全投稿・全添付を
+		// Node.jsへ転送してsliceする必要がないため、長期利用ユーザーのプロフィール表示を抑制できる。
 		const { rows } = await this.pool.query(
-			`SELECT id, attachments FROM posts
-			 WHERE user_id = $1
-			   AND jsonb_typeof(attachments) = 'array'
-			   AND jsonb_array_length(attachments) > 0
-			 ORDER BY created_at DESC, id DESC`,
-			[userId]
+			`SELECT p.id AS post_id,
+					attachment.file->>'id' AS file_id,
+					COALESCE(attachment.file->>'type', 'file') AS file_type
+			 FROM posts p
+			 CROSS JOIN LATERAL jsonb_array_elements(p.attachments) WITH ORDINALITY AS attachment(file, position)
+			 WHERE p.user_id = $1
+			   AND jsonb_typeof(p.attachments) = 'array'
+			   AND jsonb_array_length(p.attachments) > 0
+			 ORDER BY p.created_at DESC, p.id DESC, attachment.position ASC
+			 LIMIT $2 OFFSET $3`,
+			[userId, normalizedLimit, normalizedOffset]
 		);
-		const items = [];
-		for (const row of rows) {
-			const attachments = Array.isArray(row.attachments) ? row.attachments : [];
-			for (const file of attachments) {
-				items.push({
-					post_id: row.id,
-					file_id: file.id,
-					file_type: file.type || 'file',
-					type: file.type || 'file',
-				});
-			}
-		}
-		return items.slice(normalizedOffset, normalizedOffset + normalizedLimit);
+		return rows.map((row) => ({
+			post_id: Number(row.post_id),
+			file_id: row.file_id,
+			file_type: row.file_type || 'file',
+			type: row.file_type || 'file',
+		}));
 	}
 
 	async getReplyPostIds(parentPostId, limit = 50, offset = 0) {
@@ -618,98 +659,219 @@ class PostgresAdapter extends DatabaseAdapter {
 		};
 	}
 
-	async getTimelinePostIds({ tab = 'foryou', followIds = [], limit = 30, offset = 0 } = {}) {
-		const normalizedLimit = Math.max(1, Math.min(Number(limit) || 30, 100));
-		const normalizedOffset = Math.max(0, Number(offset) || 0);
-		let query;
-		let values;
-		if (tab === 'following') {
-			const ids = [...new Set((followIds || []).map(Number).filter(Number.isInteger))];
-			if (ids.length === 0) return { ids: [], has_more: false };
-			query = `SELECT id FROM posts WHERE user_id = ANY($1::int[]) AND reply_to IS NULL
-				ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3`;
-			values = [ids, normalizedLimit + 1, normalizedOffset];
-		} else if (tab === 'announce') {
-			query = `SELECT id FROM posts WHERE user_id = 2525 AND reply_to IS NULL
-				AND content LIKE '%#NXAnnounce%' ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2`;
-			values = [normalizedLimit + 1, normalizedOffset];
-		} else {
-			query = `SELECT id FROM posts WHERE reply_to IS NULL ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2`;
-			values = [normalizedLimit + 1, normalizedOffset];
+		async getTimelinePostIds({ tab = 'foryou', followIds = [], limit = 30, offset = 0, beforeId = null } = {}) {
+			const normalizedLimit = Math.max(1, Math.min(Number(limit) || 30, 100));
+			const normalizedOffset = Math.max(0, Number(offset) || 0);
+			const normalizedBeforeId = Number.isInteger(Number(beforeId)) && Number(beforeId) > 0
+				? Number(beforeId)
+				: null;
+			let query;
+			let values;
+			if (tab === 'following') {
+				const ids = [...new Set((followIds || []).map(Number).filter(Number.isInteger))];
+				if (ids.length === 0) return { ids: [], has_more: false, next_cursor: null };
+				if (normalizedBeforeId != null) {
+					query = `SELECT id FROM posts WHERE user_id = ANY($1::int[]) AND reply_to IS NULL AND id < $2
+						ORDER BY created_at DESC, id DESC LIMIT $3`;
+					values = [ids, normalizedBeforeId, normalizedLimit + 1];
+				} else {
+					query = `SELECT id FROM posts WHERE user_id = ANY($1::int[]) AND reply_to IS NULL
+						ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3`;
+					values = [ids, normalizedLimit + 1, normalizedOffset];
+				}
+			} else if (tab === 'announce') {
+				if (normalizedBeforeId != null) {
+					query = `SELECT id FROM posts WHERE announcement = TRUE AND reply_to IS NULL
+						AND id < $1 ORDER BY created_at DESC, id DESC LIMIT $2`;
+					values = [normalizedBeforeId, normalizedLimit + 1];
+				} else {
+					query = `SELECT id FROM posts WHERE announcement = TRUE AND reply_to IS NULL
+						ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2`;
+					values = [normalizedLimit + 1, normalizedOffset];
+				}
+			} else if (normalizedBeforeId != null) {
+				query = `SELECT id FROM posts WHERE reply_to IS NULL AND id < $1 ORDER BY created_at DESC, id DESC LIMIT $2`;
+				values = [normalizedBeforeId, normalizedLimit + 1];
+			} else {
+				query = `SELECT id FROM posts WHERE reply_to IS NULL ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2`;
+				values = [normalizedLimit + 1, normalizedOffset];
+			}
+			const { rows } = await this.pool.query(query, values);
+			const ids = rows.slice(0, normalizedLimit).map((row) => row.id);
+			return {
+				ids,
+				has_more: rows.length > normalizedLimit,
+				next_cursor: rows.length > normalizedLimit && ids.length > 0 ? ids[ids.length - 1] : null,
+			};
 		}
-		const { rows } = await this.pool.query(query, values);
-		return {
-			ids: rows.slice(0, normalizedLimit).map((row) => row.id),
-			has_more: rows.length > normalizedLimit,
-		};
-	}
 
-	async getRecommendedPostIds({ limit = 30, offset = 0 } = {}) {
-		const normalizedLimit = Math.max(1, Math.min(Number(limit) || 30, 100));
-		const normalizedOffset = Math.max(0, Number(offset) || 0);
-		const candidateLimit = Math.max(500, normalizedOffset + normalizedLimit + 1);
-		const { rows } = await this.pool.query(
-			`WITH candidates AS (
-				SELECT id, created_at FROM posts WHERE reply_to IS NULL ORDER BY created_at DESC, id DESC LIMIT $1
-			), scored AS (
-				SELECT c.id,
-					COALESCE(l.count, 0) + COALESCE(s.count, 0) * 2 + COALESCE(r.count, 0) * 3 AS score,
-					c.created_at
-				FROM candidates c
-				LEFT JOIN LATERAL (SELECT COUNT(*)::int AS count FROM likes WHERE post_id = c.id) l ON true
-				LEFT JOIN LATERAL (SELECT COUNT(*)::int AS count FROM stars WHERE post_id = c.id) s ON true
-				LEFT JOIN LATERAL (SELECT COUNT(*)::int AS count FROM reposts WHERE post_id = c.id) r ON true
-			)
-			SELECT id FROM scored ORDER BY score DESC, created_at DESC, id DESC LIMIT $2 OFFSET $3`,
-			[candidateLimit, normalizedLimit + 1, normalizedOffset],
-		);
-		return {
-			ids: rows.slice(0, normalizedLimit).map((row) => row.id),
-			has_more: rows.length > normalizedLimit,
-		};
-	}
+		async getRecommendedPostIds({ viewerId = null, limit = 30, offset = 0, beforeId = null } = {}) {
+			const normalizedLimit = Math.max(1, Math.min(Number(limit) || 30, 100));
+			const normalizedOffset = Math.max(0, Number(offset) || 0);
+			const normalizedBeforeId = Number.isInteger(Number(beforeId)) && Number(beforeId) > 0
+				? Number(beforeId)
+				: null;
+			const normalizedViewerId = Number.isInteger(Number(viewerId)) ? Number(viewerId) : null;
+			const candidateLimit = Math.min(
+				1000,
+				Math.max(500, (normalizedBeforeId == null ? normalizedOffset : 0) + normalizedLimit + 1),
+			);
+			const values = [];
+			const candidateClauses = ['p.reply_to IS NULL'];
+			if (normalizedBeforeId != null) {
+				values.push(normalizedBeforeId);
+				candidateClauses.push(`p.id < $${values.length}`);
+			}
+			values.push(candidateLimit);
+			const candidateLimitParam = values.length;
+			const personalScoreCtes = [];
+			if (normalizedViewerId != null) {
+				values.push(normalizedViewerId);
+				const likeViewerParam = values.length;
+				values.push(normalizedViewerId);
+				const starViewerParam = values.length;
+				values.push(normalizedViewerId);
+				const directViewerParam = values.length;
+				values.push(normalizedViewerId);
+				const secondDegreeViewerParam = values.length;
+				values.push(normalizedViewerId);
+				const secondDegreeExcludeParam = values.length;
+				personalScoreCtes.push(
+					`viewer_like_affinity AS (
+						SELECT p.user_id, COUNT(*)::int AS count
+						FROM likes l JOIN posts p ON p.id = l.post_id
+						WHERE l.user_id = $${likeViewerParam}
+						GROUP BY p.user_id
+					), viewer_star_affinity AS (
+						SELECT p.user_id, COUNT(*)::int AS count
+						FROM stars s JOIN posts p ON p.id = s.post_id
+						WHERE s.user_id = $${starViewerParam}
+						GROUP BY p.user_id
+					), direct_follows AS (
+						SELECT following_id AS user_id FROM follows WHERE follower_id = $${directViewerParam}
+					), second_degree_follows AS (
+						SELECT DISTINCT f2.following_id AS user_id
+						FROM follows f1 JOIN follows f2 ON f2.follower_id = f1.following_id
+						WHERE f1.follower_id = $${secondDegreeViewerParam}
+							AND f2.following_id <> $${secondDegreeExcludeParam}
+					)`,
+				);
+			}
+			values.push(normalizedLimit + 1);
+			const pageLimitParam = values.length;
+			values.push(normalizedOffset);
+			const pageOffsetParam = values.length;
+			const { rows } = await this.pool.query(
+				`WITH candidates AS (
+					SELECT p.id, p.user_id, p.created_at
+					FROM posts p
+					WHERE ${candidateClauses.join(' AND ')}
+					ORDER BY p.created_at DESC, p.id DESC
+					LIMIT $${candidateLimitParam}
+				), like_counts AS (
+					SELECT l.post_id, COUNT(*)::int AS count
+					FROM likes l JOIN candidates c ON c.id = l.post_id
+					GROUP BY l.post_id
+				), star_counts AS (
+					SELECT s.post_id, COUNT(*)::int AS count
+					FROM stars s JOIN candidates c ON c.id = s.post_id
+					GROUP BY s.post_id
+				), repost_counts AS (
+					SELECT r.post_id, COUNT(*)::int AS count
+					FROM reposts r JOIN candidates c ON c.id = r.post_id
+					GROUP BY r.post_id
+				)${personalScoreCtes.length > 0 ? `, ${personalScoreCtes.join(', ')}` : ''}, scored AS (
+					SELECT c.id, c.created_at,
+						48.0 / (1.0 + GREATEST(0, EXTRACT(EPOCH FROM (NOW() - c.created_at)) / 3600.0) / 6.0)
+						+ LEAST(22.0,
+							COALESCE(l.count, 0) * 4.0 / (COALESCE(l.count, 0) + 4.0)
+							+ COALESCE(s.count, 0) * 8.0 / (COALESCE(s.count, 0) + 2.0)
+							+ COALESCE(r.count, 0) * 10.0 / (COALESCE(r.count, 0) + 2.0))
+						${normalizedViewerId != null ? `+ CASE WHEN df.user_id IS NOT NULL THEN 24.0 WHEN sdf.user_id IS NOT NULL THEN 10.0 ELSE 0.0 END
+						+ LEAST(20.0, COALESCE(vla.count, 0) * 4.0)
+						+ LEAST(32.0, COALESCE(vsa.count, 0) * 8.0)` : ''} AS score
+					FROM candidates c
+					LEFT JOIN like_counts l ON l.post_id = c.id
+					LEFT JOIN star_counts s ON s.post_id = c.id
+					LEFT JOIN repost_counts r ON r.post_id = c.id
+					${normalizedViewerId != null ? `LEFT JOIN viewer_like_affinity vla ON vla.user_id = c.user_id
+					LEFT JOIN viewer_star_affinity vsa ON vsa.user_id = c.user_id
+					LEFT JOIN direct_follows df ON df.user_id = c.user_id
+					LEFT JOIN second_degree_follows sdf ON sdf.user_id = c.user_id` : ''}
+				)
+				SELECT id FROM scored
+				ORDER BY score DESC, created_at DESC, id DESC
+				LIMIT $${pageLimitParam} OFFSET $${pageOffsetParam}`,
+				values,
+			);
+			const ids = rows.slice(0, normalizedLimit).map((row) => row.id);
+			return {
+				ids,
+				has_more: rows.length > normalizedLimit,
+				next_cursor: null,
+				use_offset_pagination: true,
+			};
+		}
 
-	async searchPostIds(query, limit = 30, offset = 0) {
-		const q = String(query || '').trim();
-		if (!q) return { ids: [], has_more: false };
-		const normalizedLimit = Math.max(1, Math.min(Number(limit) || 30, 100));
-		const normalizedOffset = Math.max(0, Number(offset) || 0);
-		const { rows } = await this.pool.query(
-			`SELECT id FROM posts WHERE content ILIKE $1
-			 ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3`,
-			[`%${q}%`, normalizedLimit + 1, normalizedOffset],
-		);
-		return {
-			ids: rows.slice(0, normalizedLimit).map((row) => row.id),
-			has_more: rows.length > normalizedLimit,
-		};
-	}
+		async searchPostIds(query, limit = 30, offset = 0, beforeId = null) {
+			const q = String(query || '').trim();
+			if (!q) return { ids: [], has_more: false, next_cursor: null };
+			const normalizedLimit = Math.max(1, Math.min(Number(limit) || 30, 100));
+			const normalizedOffset = Math.max(0, Number(offset) || 0);
+			const normalizedBeforeId = Number.isInteger(Number(beforeId)) && Number(beforeId) > 0
+				? Number(beforeId)
+				: null;
+			const { rows } = normalizedBeforeId != null
+				? await this.pool.query(
+					`SELECT id FROM posts WHERE content ILIKE $1 AND id < $2
+					 ORDER BY created_at DESC, id DESC LIMIT $3`,
+					[`%${q}%`, normalizedBeforeId, normalizedLimit + 1],
+				)
+				: await this.pool.query(
+					`SELECT id FROM posts WHERE content ILIKE $1
+					 ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3`,
+					[`%${q}%`, normalizedLimit + 1, normalizedOffset],
+				);
+			const ids = rows.slice(0, normalizedLimit).map((row) => row.id);
+			return {
+				ids,
+				has_more: rows.length > normalizedLimit,
+				next_cursor: rows.length > normalizedLimit && ids.length > 0 ? ids[ids.length - 1] : null,
+			};
+		}
 
 	async getPostDetail(id, currentUserId = null) {
-		const post = await this.getPostById(id);
-		if (!post) return null;
+			const post = await this.getPostById(id);
+			if (!post) return null;
 
-		const author = await this.getUserById(post.user_id);
-		const likeCount = await this.getLikeCount(id);
-		const starCount = await this.getStarCount(id);
+			// これらは相互に依存しないため、逐次クエリではなく並列に取得する。
+			const [author, likeCount, starCount, likedByMe, starredByMe] = await Promise.all([
+				this.getUserById(post.user_id),
+				this.getLikeCount(id),
+				this.getStarCount(id),
+				currentUserId ? this.hasUserLikedPost(currentUserId, id) : false,
+				currentUserId ? this.hasUserStarredPost(currentUserId, id) : false,
+			]);
 
-		let likedByMe = false;
-		let starredByMe = false;
-
-		if (currentUserId) {
-			likedByMe = await this.hasUserLikedPost(currentUserId, id);
-			starredByMe = await this.hasUserStarredPost(currentUserId, id);
-		}
-
-		let parentPost = null;
+			let parentPost = null;
 		if (post.reply_to) {
-			const parent = await this.getPostById(post.reply_to);
+			// 親投稿と投稿者を結合して取得し、詳細表示時の追加往復を1回に抑える。
+			const { rows: parentRows } = await this.pool.query(
+				`SELECT parent.id, parent.content,
+						author.id AS author_id, author.name AS author_name
+				 FROM posts parent
+				 LEFT JOIN users author ON author.id = parent.user_id
+				 WHERE parent.id = $1`,
+				[post.reply_to],
+			);
+			const parent = parentRows[0];
 			if (parent) {
-				const parentAuthor = await this.getUserById(parent.user_id);
 				parentPost = {
 					id: parent.id,
 					content: parent.content?.substring(0, 100),
-					author: parentAuthor ? { id: parentAuthor.id, name: parentAuthor.name } : null,
+					author: parent.author_id == null
+						? null
+						: { id: parent.author_id, name: parent.author_name || '' },
 				};
 			}
 		}
@@ -1188,17 +1350,43 @@ class PostgresAdapter extends DatabaseAdapter {
 		return rows;
 	}
 
-	async getFollowIds(userId) {
-		const { rows } = await this.pool.query(
-			`SELECT following_id FROM follows
-			 WHERE follower_id = $1
-			 ORDER BY created_at DESC, following_id ASC`,
-			[userId]
-		);
-		return rows.map((row) => Number(row.following_id));
-	}
+		async getFollowIds(userId) {
+			const { rows } = await this.pool.query(
+				`SELECT following_id FROM follows
+				 WHERE follower_id = $1
+				 ORDER BY created_at DESC, following_id ASC`,
+				[userId]
+			);
+			return rows.map((row) => Number(row.following_id));
+		}
 
-	async getFollowingCount(userId) {
+		async getFollowRelationshipSnapshot(userId, candidateUserIds) {
+			const normalizedUserId = Number(userId);
+			const ids = [...new Set((candidateUserIds || [])
+				.map(Number)
+				.filter((id) => Number.isInteger(id) && id !== normalizedUserId))];
+			if (ids.length === 0) return { followingIds: [], followerIds: [] };
+
+			const { rows } = await this.pool.query(
+				`SELECT following_id AS user_id, 'following' AS direction
+				 FROM follows
+				 WHERE follower_id = $1 AND following_id = ANY($2::int[])
+				 UNION ALL
+				 SELECT follower_id AS user_id, 'follower' AS direction
+				 FROM follows
+				 WHERE following_id = $1 AND follower_id = ANY($2::int[])`,
+				[normalizedUserId, ids],
+			);
+			const followingIds = [];
+			const followerIds = [];
+			for (const row of rows) {
+				if (row.direction === 'following') followingIds.push(Number(row.user_id));
+				if (row.direction === 'follower') followerIds.push(Number(row.user_id));
+			}
+			return { followingIds, followerIds };
+		}
+
+		async getFollowingCount(userId) {
 		const { rows } = await this.pool.query(
 			'SELECT COUNT(*)::int AS count FROM follows WHERE follower_id = $1',
 			[userId]
@@ -1384,17 +1572,18 @@ class PostgresAdapter extends DatabaseAdapter {
 			open: notificationData.open,
 		});
 		const { rows } = await this.pool.query(
-				`INSERT INTO notifications
-				 (user_id, type, from_user_id, post_id, target, read, clicked, created_at)
-				 VALUES ($1, $2, $3, $4, $5::jsonb, false, false, NOW())
-			 RETURNING *`,
-			[
-				notificationData.userId,
-				notificationData.type,
-				notificationData.fromUserId ?? null,
-				target?.kind === 'post' ? target.id : null,
-				JSON.stringify(target),
-			],
+					`INSERT INTO notifications
+					 (user_id, type, from_user_id, post_id, target, message, read, clicked, created_at)
+					 VALUES ($1, $2, $3, $4, $5::jsonb, $6, false, false, NOW())
+				 RETURNING *`,
+				[
+					notificationData.userId,
+					notificationData.type,
+					notificationData.fromUserId ?? null,
+					target?.kind === 'post' ? target.id : null,
+					JSON.stringify(target),
+					typeof notificationData.message === 'string' ? notificationData.message : null,
+				],
 		);
 		return rows[0];
 	}
@@ -1439,6 +1628,13 @@ class PostgresAdapter extends DatabaseAdapter {
 		);
 	}
 
+	async markAllNotificationsAsClicked(userId) {
+		await this.pool.query(
+			'UPDATE notifications SET read = true, clicked = true WHERE user_id = $1 AND (read = false OR clicked = false)',
+			[userId]
+		);
+	}
+
 	async deleteNotification(notificationId) {
 		await this.pool.query(
 			'DELETE FROM notifications WHERE id = $1',
@@ -1447,24 +1643,192 @@ class PostgresAdapter extends DatabaseAdapter {
 		return true;
 	}
 
-	async getUnreadNotificationCount(userId) {
-		const { rows } = await this.pool.query(
-			'SELECT COUNT(*)::int as count FROM notifications WHERE user_id = $1 AND read = false',
-			[userId]
-		);
-		return rows[0].count;
-	}
+		async getUnreadNotificationCount(userId) {
+			const { rows } = await this.pool.query(
+				'SELECT COUNT(*)::int as count FROM notifications WHERE user_id = $1 AND read = false',
+				[userId]
+			);
+			return rows[0].count;
+		}
 
-	async upsertPushSubscription(userId, subscription) {
+		_mapModerationReport(row) {
+			if (!row) return null;
+			return {
+				id: Number(row.id),
+				reporterUserId: Number(row.reporter_user_id),
+				targetKind: row.target_kind,
+				targetId: String(row.target_id),
+				description: row.description || '',
+				targetSnapshot: row.target_snapshot || {},
+				assignmentType: row.assignment_type || 'report',
+				status: row.status,
+				assignedAdminId: row.assigned_admin_id == null ? null : Number(row.assigned_admin_id),
+				assignedAt: row.assigned_at || null,
+				excludedAdminIds: Array.isArray(row.excluded_admin_ids)
+					? row.excluded_admin_ids.map(Number).filter(Number.isInteger)
+					: [],
+				resolution: row.resolution || null,
+				createdAt: row.created_at,
+				resolvedAt: row.resolved_at || null,
+			};
+		}
+
+		async createModerationReport(reportData) {
+			const { rows } = await this.pool.query(
+					`INSERT INTO moderation_reports
+						(reporter_user_id, target_kind, target_id, description, target_snapshot, assignment_type, status, created_at)
+					 VALUES ($1, $2, $3, $4, $5::jsonb, $6, 'pending', COALESCE($7::timestamptz, NOW()))
+					 RETURNING *`,
+				[
+					reportData.reporterUserId,
+					reportData.targetKind,
+					reportData.targetId,
+					String(reportData.description || ''),
+					JSON.stringify(reportData.targetSnapshot || {}),
+					['freeze_appeal', 'verification_application'].includes(reportData.assignmentType)
+						? reportData.assignmentType
+						: 'report',
+					reportData.createdAt || null,
+				],
+			);
+			return this._mapModerationReport(rows[0]);
+		}
+
+			async getOpenModerationAppealByUserId(userId) {
+				const { rows } = await this.pool.query(
+					`SELECT * FROM moderation_reports
+					 WHERE reporter_user_id = $1 AND assignment_type = 'freeze_appeal' AND status <> 'resolved'
+					 ORDER BY created_at DESC LIMIT 1`,
+					[userId],
+				);
+				return this._mapModerationReport(rows[0]);
+			}
+
+			async getOpenModerationVerificationByUserId(userId) {
+				const { rows } = await this.pool.query(
+					`SELECT * FROM moderation_reports
+					 WHERE reporter_user_id = $1 AND assignment_type = 'verification_application' AND status <> 'resolved'
+					 ORDER BY created_at DESC LIMIT 1`,
+					[userId],
+				);
+				return this._mapModerationReport(rows[0]);
+			}
+
+			async getModerationReportById(reportId) {
+				const { rows } = await this.pool.query(
+					'SELECT * FROM moderation_reports WHERE id = $1 LIMIT 1',
+					[reportId],
+				);
+				return this._mapModerationReport(rows[0]);
+			}
+
+		async listModerationReportsForAdmin(adminId, options = {}) {
+			const status = options.status || 'assigned';
+			const limit = Math.max(1, Math.min(Number(options.limit) || 50, 100));
+			const offset = Math.max(0, Number(options.offset) || 0);
+			const { rows } = await this.pool.query(
+				`SELECT * FROM moderation_reports
+				 WHERE assigned_admin_id = $1
+				   AND ($2::text IS NULL OR status = $2)
+				 ORDER BY COALESCE(assigned_at, created_at) DESC, id DESC
+				 LIMIT $3 OFFSET $4`,
+				[adminId, status || null, limit, offset],
+			);
+			return rows.map((row) => this._mapModerationReport(row));
+		}
+
+		async getModerationAdminWorkloads(excludedAdminIds = []) {
+			const excluded = [...new Set((excludedAdminIds || []).map(Number).filter(Number.isInteger))];
+			const { rows } = await this.pool.query(
+				`SELECT u.id AS admin_id, COUNT(r.id)::int AS active_count
+				 FROM users u
+				 LEFT JOIN moderation_reports r
+				   ON r.assigned_admin_id = u.id AND r.status = 'assigned'
+				 WHERE u.admin = TRUE
+				   AND COALESCE(u.freeze, '') = ''
+				   AND NOT (u.id = ANY($1::int[]))
+				 GROUP BY u.id`,
+				[excluded],
+			);
+			return rows.map((row) => ({
+				adminId: Number(row.admin_id),
+				activeCount: Number(row.active_count || 0),
+			}));
+		}
+
+		async assignModerationReport(reportId, assignment = {}) {
+			const excluded = [...new Set((assignment.excludedAdminIds || []).map(Number).filter(Number.isInteger))];
+			const hasExpected = Object.prototype.hasOwnProperty.call(assignment, 'expectedAdminId');
+			const { rows } = await this.pool.query(
+				`UPDATE moderation_reports
+				 SET status = 'assigned', assigned_admin_id = $2,
+					 assigned_at = COALESCE($3::timestamptz, NOW()),
+					 excluded_admin_ids = $4::jsonb
+				 WHERE id = $1 AND status <> 'resolved'
+				   AND ($5::boolean = false OR assigned_admin_id IS NOT DISTINCT FROM $6::int)
+				 RETURNING *`,
+				[
+					reportId,
+					assignment.adminId,
+					assignment.assignedAt || null,
+					JSON.stringify(excluded),
+					hasExpected,
+					hasExpected ? Number(assignment.expectedAdminId) : null,
+				],
+			);
+			return this._mapModerationReport(rows[0]);
+		}
+
+		async getOverdueModerationReports(cutoff) {
+			const { rows } = await this.pool.query(
+				`SELECT * FROM moderation_reports
+				 WHERE status = 'assigned' AND assigned_at IS NOT NULL AND assigned_at <= $1::timestamptz
+				 ORDER BY assigned_at ASC`,
+				[cutoff],
+			);
+			return rows.map((row) => this._mapModerationReport(row));
+		}
+
+		async getUnassignedModerationReports(limit = 100) {
+			const { rows } = await this.pool.query(
+				`SELECT * FROM moderation_reports
+				 WHERE status = 'pending'
+				 ORDER BY created_at ASC, id ASC LIMIT $1`,
+				[Math.max(1, Math.min(Number(limit) || 100, 100))],
+			);
+			return rows.map((row) => this._mapModerationReport(row));
+		}
+
+		async resolveModerationReport(reportId, adminId, resolution) {
+			const { rows } = await this.pool.query(
+				`UPDATE moderation_reports
+				 SET status = 'resolved', resolution = $3::jsonb, resolved_at = NOW()
+				 WHERE id = $1 AND assigned_admin_id = $2 AND status = 'assigned'
+				 RETURNING *`,
+				[reportId, adminId, JSON.stringify(resolution || {})],
+			);
+			return this._mapModerationReport(rows[0]);
+		}
+
+		async deleteModerationReport(reportId) {
+			const result = await this.pool.query(
+				'DELETE FROM moderation_reports WHERE id = $1',
+				[reportId],
+			);
+			return result.rowCount > 0;
+		}
+
+		async upsertPushSubscription(userId, subscription) {
 		const { rows } = await this.pool.query(
 			`INSERT INTO push_subscriptions
-				(user_id, endpoint, expiration_time, p256dh, auth, created_at, updated_at)
-			 VALUES ($1, $2, to_timestamp($3 / 1000.0), $4, $5, NOW(), NOW())
+				(user_id, endpoint, expiration_time, p256dh, auth, session_token, created_at, updated_at)
+			 VALUES ($1, $2, to_timestamp($3 / 1000.0), $4, $5, $6, NOW(), NOW())
 			 ON CONFLICT (user_id, endpoint)
 			 DO UPDATE SET
 				expiration_time = EXCLUDED.expiration_time,
 				p256dh = EXCLUDED.p256dh,
 				auth = EXCLUDED.auth,
+				session_token = COALESCE(EXCLUDED.session_token, push_subscriptions.session_token),
 				updated_at = NOW()
 			 RETURNING *`,
 			[
@@ -1473,6 +1837,7 @@ class PostgresAdapter extends DatabaseAdapter {
 				subscription.expirationTime ?? null,
 				subscription.keys.p256dh,
 				subscription.keys.auth,
+				subscription.sessionToken ?? null,
 			],
 		);
 		return rows[0] || null;
@@ -1480,7 +1845,7 @@ class PostgresAdapter extends DatabaseAdapter {
 
 	async getPushSubscriptions(userId) {
 		const { rows } = await this.pool.query(
-			`SELECT endpoint, expiration_time, p256dh, auth
+			`SELECT endpoint, expiration_time, p256dh, auth, session_token
 			 FROM push_subscriptions
 			 WHERE user_id = $1`,
 			[userId],
@@ -1489,6 +1854,7 @@ class PostgresAdapter extends DatabaseAdapter {
 			endpoint: row.endpoint,
 			expirationTime: row.expiration_time ? new Date(row.expiration_time).getTime() : null,
 			keys: { p256dh: row.p256dh, auth: row.auth },
+			sessionToken: row.session_token || null,
 		}));
 	}
 
@@ -1551,8 +1917,8 @@ class PostgresAdapter extends DatabaseAdapter {
 		const counts = new Map();
 		for (const row of rows) {
 			const matches = (row.content || '').match(/#([^<>/@#\s]+)/g) || [];
-			for (const match of matches) {
-				const tag = match.slice(1).toLowerCase();
+			const uniqueTags = new Set(matches.map((match) => match.slice(1).toLowerCase()));
+			for (const tag of uniqueTags) {
 				counts.set(tag, (counts.get(tag) || 0) + 1);
 			}
 		}
@@ -1590,6 +1956,10 @@ class PostgresAdapter extends DatabaseAdapter {
 			fields.push(`settings = $${idx++}`);
 			values.push(JSON.stringify(profileData.settings || {}));
 		}
+		if (profileData.block !== undefined) {
+			fields.push(`block = $${idx++}::jsonb`);
+			values.push(JSON.stringify(normalizeBlockList(profileData.block, userId)));
+		}
 		if (profileData.verify !== undefined) {
 			fields.push(`verify = $${idx++}`);
 			values.push(Boolean(profileData.verify));
@@ -1613,7 +1983,7 @@ class PostgresAdapter extends DatabaseAdapter {
 			`UPDATE users SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`,
 			values
 		);
-		return rows[0] || null;
+		return this._normalizeUserBlockList(rows[0]);
 	}
 
 	async getUserStatus(userId) {
@@ -1768,6 +2138,7 @@ class PostgresAdapter extends DatabaseAdapter {
 		post.createdAt = post.createdAt ?? post.created_at ?? null;
 		post.mask = !!post.mask;
 		post.lock = !!post.lock;
+		post.announcement = !!post.announcement;
 		if (post.attachments && typeof post.attachments === 'string') {
 			try { post.attachments = JSON.parse(post.attachments); } catch (_) {}
 		}

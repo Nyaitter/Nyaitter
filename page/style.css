@@ -11,7 +11,6 @@
     --l-border-color: #eff3f4;
     --l-bg-color: #f9f9f9;
     --l-main-bg-color: white;
-    --l-ad-bg-color: #f7f9f9;
     --l-pg-bg-color: rgba(255, 255, 255, 0.85); /* ページヘッダーなど */
     --l-emoji-bg-color: none;
     --l-text-color: #0f1419;
@@ -28,7 +27,6 @@
     --d-border-color: #2f363d;
     --d-bg-color: #18191d;
     --d-main-bg-color: #1c1d21;
-    --d-ad-bg-color: #272929;
     --d-pg-bg-color: rgb(33 35 41 / 85%); /* ページヘッダーなど */
     --d-emoji-bg-color: #e8eaed; /* 絵文字の後ろに表示するための白背景　*/
     --d-text-color: #ffffff;
@@ -48,7 +46,6 @@ body.light {
     --border-color: var(--l-border-color);
     --bg-color: var(--l-bg-color);
     --main-bg-color: var(--l-main-bg-color);
-    --ad-bg-color: var(--l-ad-bg-color);
     --pg-bg-color: var(--l-pg-bg-color);
     --emoji-bg-color: var(--l-emoji-bg-color);
     --text-color: var(--l-text-color);
@@ -66,7 +63,6 @@ body.dark {
     --border-color: var(--d-border-color);
     --bg-color: var(--d-bg-color);
     --main-bg-color: var(--d-main-bg-color);
-    --ad-bg-color: var(--d-ad-bg-color);
     --pg-bg-color: var(--d-pg-bg-color);
     --emoji-bg-color: var(--d-emoji-bg-color);
     --text-color: var(--d-text-color);
@@ -157,6 +153,38 @@ textarea {
     gap: 0.5rem;
 }
 
+#left-nav.sidebar-overflow-open {
+    z-index: 500;
+}
+
+.nav-overflow-menu {
+    position: relative;
+    width: 100%;
+}
+
+.nav-overflow-toggle {
+    width: 100%;
+}
+
+.nav-overflow-panel {
+    position: fixed;
+    z-index: 200;
+    box-sizing: border-box;
+    width: min(15rem, calc(100vw - 1rem));
+    max-height: calc(100vh - 1rem);
+    overflow-y: auto;
+    padding: 0.35rem;
+    border: 1px solid var(--border-color);
+    border-radius: 0.85rem;
+    background: var(--main-bg-color);
+    box-shadow: 0 0.45rem 1.25rem rgba(0, 0, 0, 0.14);
+}
+
+.nav-overflow-panel .nav-item {
+    width: 100%;
+    box-sizing: border-box;
+}
+
 .nav-item {
     display: flex;
     align-items: center;
@@ -233,18 +261,32 @@ textarea {
     fill: currentColor;
     stroke: none;
 }
-.nav-item[href='#settings'].active svg circle {
+.nav-item[href^='#settings'].active svg circle {
     stroke: none;
 }
+
+.nav-item-request svg,
+.nav-item-request.active svg {
+    fill: none !important;
+    stroke: currentColor !important;
+}
+
+.nav-item-request svg circle,
+.nav-item-request svg line {
+    fill: none !important;
+    stroke: currentColor !important;
+    stroke-width: 0.45 !important;
+}
+
 @media (prefers-color-scheme: dark) {
-    .nav-item[href='#settings'].active svg circle {
+    .nav-item[href^='#settings'].active svg circle {
         fill: black;
     }
 }
-body.light .nav-item[href='#settings'].active svg circle {
+body.light .nav-item[href^='#settings'].active svg circle {
     fill: white;
 }
-body.dark .nav-item[href='#settings'].active svg circle {
+body.dark .nav-item[href^='#settings'].active svg circle {
     fill: black;
 }
 .nav-item-post {
@@ -494,6 +536,8 @@ img.emoji {
     display: flex;
     justify-content: center;
     align-items: center;
+
+    transition: background-color 0.2s;
 }
 
 .timeline-tab-button:hover {
@@ -601,6 +645,7 @@ img.emoji {
 .post-form-actions #post-submit-button {
     background-color: var(--primary-color);
     color: white;
+    transition: background-color 0.2s;
 }
 
 .post-form-actions #post-submit-button:hover {
@@ -610,7 +655,8 @@ img.emoji {
 .attachment-button,
 .emoji-pic-button,
 .post-mask-button,
-.post-lock-button {
+.post-lock-button,
+.post-announcement-button {
     background: none;
     border: none;
     cursor: pointer;
@@ -624,7 +670,8 @@ img.emoji {
 .attachment-button:hover,
 .emoji-pic-button:hover,
 .post-mask-button:hover,
-.post-lock-button:hover {
+.post-lock-button:hover,
+.post-announcement-button:hover {
     background-color: var(--bg-color);
 }
 
@@ -648,7 +695,8 @@ img.emoji {
 }
 
 .post-mask-button.active svg,
-.post-lock-button.active svg {
+.post-lock-button.active svg,
+.post-announcement-button.active svg {
     stroke: var(--primary-color);
 }
 
@@ -667,6 +715,290 @@ img.emoji {
     display: flex;
     flex-wrap: wrap;
     gap: 0.5rem;
+}
+
+.markdown-content-editor {
+    box-sizing: border-box;
+    width: 100%;
+    min-height: 60px;
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+    word-break: break-word;
+    cursor: text;
+    outline: none;
+}
+
+textarea.markdown-content-editor {
+    font: inherit;
+    line-height: inherit;
+    resize: none;
+}
+
+textarea.markdown-content-editor::placeholder {
+    color: transparent;
+    -webkit-text-fill-color: transparent;
+    opacity: 0;
+}
+
+.markdown-textarea-editor {
+    position: relative;
+    box-sizing: border-box;
+    width: 100%;
+    min-height: 60px;
+    overflow: hidden;
+}
+
+.markdown-textarea-editor .markdown-content-editor {
+    position: relative;
+    z-index: 2;
+    display: block;
+    width: 100%;
+    box-sizing: border-box;
+    color: transparent !important;
+    caret-color: transparent;
+    -webkit-text-fill-color: transparent;
+    border: 0 !important;
+    background: transparent !important;
+    pointer-events: auto;
+}
+
+.markdown-textarea-editor .markdown-content-editor::selection {
+    color: transparent;
+    background: transparent;
+}
+
+.markdown-textarea-editor .markdown-content-editor::placeholder {
+    color: transparent !important;
+    -webkit-text-fill-color: transparent;
+    opacity: 0;
+}
+
+.markdown-editor-paint {
+    position: absolute;
+    z-index: 1;
+    inset: 0;
+    overflow: visible;
+    pointer-events: none;
+    transform-origin: top left;
+}
+
+.markdown-textarea-editor.is-plain-textarea .markdown-editor-paint {
+    display: none;
+}
+
+.markdown-textarea-editor.is-plain-textarea .markdown-content-editor {
+    z-index: auto;
+    color: var(--text-color) !important;
+    caret-color: auto;
+    -webkit-text-fill-color: currentColor;
+}
+
+.markdown-textarea-editor.is-plain-textarea
+    .markdown-content-editor::selection {
+    color: var(--text-color);
+    background: color-mix(in srgb, var(--primary-color) 35%, transparent);
+}
+
+.markdown-textarea-editor.is-plain-textarea
+    .markdown-content-editor::placeholder {
+    color: var(--secondary-text-color) !important;
+    -webkit-text-fill-color: var(--secondary-text-color);
+    opacity: 1;
+}
+
+.markdown-editor-preview,
+.markdown-editor-placeholder {
+    box-sizing: border-box;
+    min-width: 100%;
+    min-height: 100%;
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.markdown-editor-placeholder {
+    position: absolute;
+    inset: 0;
+    color: var(--secondary-text-color);
+}
+
+.markdown-editor-sentinel,
+.markdown-editor-caret-anchor {
+    color: transparent;
+    pointer-events: none;
+}
+
+.markdown-editor-selection,
+.markdown-editor-composition,
+.markdown-editor-caret {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+}
+
+.markdown-editor-selection-rect {
+    position: absolute;
+    border-radius: 2px;
+    background: color-mix(in srgb, var(--primary-color) 35%, transparent);
+}
+
+.markdown-editor-composition-underline {
+    position: absolute;
+    display: block;
+    box-sizing: border-box;
+    border-bottom: 2px solid var(--primary-color);
+}
+
+.markdown-editor-caret {
+    inset: auto;
+    width: 2px;
+    background: var(--text-color);
+    animation: markdown-editor-caret-blink 1s steps(1, end) infinite;
+}
+
+@keyframes markdown-editor-caret-blink {
+    50% {
+        opacity: 0;
+    }
+}
+
+.post-form .markdown-content-editor {
+    border: none;
+    background-color: var(--main-bg-color);
+    color: var(--text-color);
+    padding: 0.5rem 0;
+    font-size: 1.25rem;
+}
+
+.post-form .markdown-editor-preview,
+.post-form .markdown-editor-placeholder {
+    padding: 0.5rem 0;
+    font-size: 1.25rem;
+}
+
+.post-form .markdown-editor-preview {
+    color: var(--text-color);
+}
+
+.dm-form-content .markdown-textarea-editor,
+.markdown-textarea-editor.dm-content-editor {
+    flex-grow: 1;
+    min-height: 38px;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    background-color: var(--bg-color);
+}
+
+.dm-form-content .markdown-content-editor,
+#edit-dm-textarea.markdown-content-editor {
+    flex-grow: 1;
+    min-height: 38px;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    background-color: var(--bg-color);
+    color: var(--text-color);
+    padding: 0.5rem;
+    font-size: 1rem;
+    line-height: 1.2;
+}
+
+.dm-form-content .markdown-editor-preview,
+.markdown-textarea-editor.dm-content-editor .markdown-editor-preview,
+.dm-form-content .markdown-editor-placeholder,
+.markdown-textarea-editor.dm-content-editor .markdown-editor-placeholder {
+    padding: 0.5rem;
+    font-size: 1rem;
+    line-height: 1.2;
+}
+
+.dm-form-content .markdown-editor-preview,
+.markdown-textarea-editor.dm-content-editor .markdown-editor-preview {
+    color: var(--text-color);
+}
+
+.markdown-content-editor p,
+.markdown-content-editor h1,
+.markdown-content-editor h2,
+.markdown-content-editor h3,
+.markdown-content-editor blockquote,
+.markdown-content-editor ul,
+.markdown-content-editor ol,
+.markdown-content-editor pre,
+.markdown-editor-preview p,
+.markdown-editor-preview h1,
+.markdown-editor-preview h2,
+.markdown-editor-preview h3,
+.markdown-editor-preview blockquote,
+.markdown-editor-preview ul,
+.markdown-editor-preview ol,
+.markdown-editor-preview pre {
+    margin: 0;
+}
+
+.markdown-content-editor ul,
+.markdown-content-editor ol,
+.markdown-editor-preview ul,
+.markdown-editor-preview ol {
+    padding-left: 0;
+    list-style: none;
+}
+
+.markdown-content-editor .markdown-syntax,
+.markdown-editor-preview .markdown-syntax {
+    color: color-mix(in srgb, var(--secondary-text-color) 72%, transparent);
+    font-style: normal;
+    font-weight: 400;
+    text-decoration: none;
+}
+
+.markdown-content-editor a,
+.markdown-editor-preview a {
+    color: var(--primary-color);
+    text-decoration: none;
+}
+
+.markdown-content-editor .markdown-spoiler,
+.markdown-editor-preview .markdown-spoiler {
+    position: relative;
+    isolation: isolate;
+    cursor: text;
+}
+
+.markdown-content-editor .markdown-spoiler::before,
+.markdown-editor-preview .markdown-spoiler::before {
+    position: absolute;
+    z-index: 2;
+    inset: 0;
+    border-radius: inherit;
+    background: var(--secondary-text-color);
+    content: '';
+    opacity: 0.12;
+    pointer-events: none;
+}
+
+.markdown-content-editor .markdown-spoiler-content,
+.markdown-editor-preview .markdown-spoiler-content {
+    position: relative;
+    z-index: 1;
+}
+
+.markdown-content-editor .markdown-spoiler:not(.is-revealed),
+.markdown-content-editor .markdown-spoiler:not(.is-revealed) *,
+.markdown-editor-preview .markdown-spoiler:not(.is-revealed),
+.markdown-editor-preview .markdown-spoiler:not(.is-revealed) * {
+    color: var(--text-color) !important;
+    text-shadow: none !important;
+}
+
+.markdown-content-editor .markdown-spoiler:not(.is-revealed) img,
+.markdown-editor-preview .markdown-spoiler:not(.is-revealed) img {
+    opacity: 1;
+}
+
+.markdown-content-editor::selection,
+.markdown-content-editor *::selection {
+    color: transparent;
+    background: transparent;
 }
 
 .file-preview-item {
@@ -744,20 +1076,6 @@ em-emoji-picker {
     }
 }
 
-/* 広告ポスト用のスタイル */
-.ad-post {
-    background-color: var(--ad-bg-color); /* 通常のポストと少し色を変える */
-}
-.ad-post .post-author {
-    color: var(--secondary-text-color);
-    font-weight: normal; /* 太字にしない */
-}
-.ad-post .post-content {
-    cursor: default;
-    white-space: normal;
-    margin-bottom: 0;
-}
-
 .post .user-icon {
     width: 48px;
     height: 48px;
@@ -824,6 +1142,133 @@ em-emoji-picker {
     margin-bottom: auto;
 }
 
+/* 生HTMLを許可しない限定Markdownのブロック要素。投稿・DM本文の余白を統一する。 */
+.post-content > :first-child,
+.dm-message > :first-child,
+.dm-system-message > :first-child {
+    margin-top: 0;
+}
+
+.post-content > :last-child,
+.dm-message > :last-child,
+.dm-system-message > :last-child {
+    margin-bottom: 0;
+}
+
+.post-content p,
+.dm-system-message p {
+    margin: 0 0 0.65rem;
+}
+
+.post-content h1,
+.post-content h2,
+.post-content h3,
+.dm-message h1,
+.dm-message h2,
+.dm-message h3,
+.dm-system-message h1,
+.dm-system-message h2,
+.dm-system-message h3 {
+    margin: 0.8rem 0 0.45rem;
+    line-height: 1.3;
+}
+
+.post-content h1,
+.dm-message h1,
+.dm-system-message h1 {
+    font-size: 1.25em;
+}
+.post-content h2,
+.dm-message h2,
+.dm-system-message h2 {
+    font-size: 1.12em;
+}
+.post-content h3,
+.dm-message h3,
+.dm-system-message h3 {
+    font-size: 1em;
+}
+
+.post-content blockquote,
+.dm-message blockquote,
+.dm-system-message blockquote {
+    margin: 0.65rem 0;
+    padding-left: 0.75rem;
+    border-left: 3px solid var(--border-color);
+    color: var(--secondary-text-color);
+}
+
+.post-content ul,
+.post-content ol,
+.dm-message ul,
+.dm-message ol,
+.dm-system-message ul,
+.dm-system-message ol {
+    margin: 0.65rem 0;
+    padding-left: 1.45rem;
+}
+
+.post-content pre,
+.dm-message pre,
+.dm-system-message pre {
+    overflow-x: auto;
+    margin: 0.65rem 0;
+    padding: 0.6rem 0.75rem;
+    border-radius: 8px;
+    background: var(--bg-color);
+    white-space: pre;
+}
+
+.post-content code,
+.dm-message code,
+.dm-system-message code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.9em;
+}
+
+.post-content :not(pre) > code,
+.dm-message :not(pre) > code,
+.dm-system-message :not(pre) > code {
+    padding: 0.08em 0.3em;
+    border-radius: 4px;
+    background: var(--bg-color);
+}
+
+/* ||ネタバレ|| は表示操作まで内容を覆い隠す。保存データのアクセス制御ではなく表示上の配慮である。 */
+.markdown-spoiler {
+    display: inline;
+    padding: 0.06em 0.22em;
+    border-radius: 4px;
+    background: var(--secondary-text-color);
+    cursor: pointer;
+    user-select: none;
+}
+
+.markdown-spoiler:not(.is-revealed),
+.markdown-spoiler:not(.is-revealed) * {
+    color: transparent !important;
+    text-shadow: none !important;
+}
+
+.markdown-spoiler:not(.is-revealed) img {
+    opacity: 0;
+}
+
+.markdown-spoiler.is-revealed {
+    background: color-mix(
+        in srgb,
+        var(--secondary-text-color) 16%,
+        transparent
+    );
+    cursor: text;
+    user-select: text;
+}
+
+.markdown-spoiler:focus-visible {
+    outline: 2px solid var(--primary-color);
+    outline-offset: 2px;
+}
+
 /* タイムラインの長いポスト本文は一定の高さに制限し、超える分は隠す（詳細表示では適用しない） */
 .post[data-clamp-content] .post-content {
     max-height: 320px;
@@ -848,10 +1293,41 @@ em-emoji-picker {
 }
 
 .post-clamp-toggle.is-visible {
-    display: inline-block;
+    display: inline-flex;
 }
 
-.post-clamp-toggle:hover {
+.dm-message[data-clamp-content] .dm-message-content {
+    max-height: 320px;
+    overflow: hidden;
+}
+
+.dm-message[data-clamp-content]
+    .dm-message-content.dm-message-content-expanded {
+    max-height: none;
+}
+
+.dm-clamp-toggle {
+    display: none;
+    margin: 0.35rem 0 0;
+    padding: 0;
+    border: none;
+    background: none;
+    color: inherit;
+    font: inherit;
+    font-weight: 700;
+    text-decoration: underline;
+    cursor: pointer;
+}
+
+.dm-clamp-toggle.is-visible {
+    display: inline-flex;
+}
+
+.dm-message-container.received .dm-clamp-toggle {
+    color: var(--primary-color);
+}
+
+.dm-clamp-toggle:hover {
     text-decoration: underline;
 }
 
@@ -947,31 +1423,76 @@ em-emoji-picker {
     position: absolute;
     top: 0;
     right: 0;
+    z-index: 5;
+}
+
+.post-menu-btn,
+.dm-message-menu-btn,
+.dm-manage-btn:not(.report-btn) {
+    box-sizing: border-box;
+    display: inline-grid;
+    width: 32px;
+    height: 32px;
+    min-width: 32px;
+    padding: 0;
+    place-items: center;
+    border: 1px solid transparent;
+    border-radius: 50%;
     background: none;
-    border: none;
-    cursor: pointer;
-    font-size: 1.2rem;
     color: var(--secondary-text-color);
-    padding: 0.25rem; /* クリック領域を確保 */
-    z-index: 5; /* 他の要素との重なり順を明確化 */
+    cursor: pointer;
+    font-size: 1.15rem;
+    line-height: 1;
+    transition:
+        background-color 0.16s ease,
+        border-color 0.16s ease,
+        color 0.16s ease;
+}
+
+.post-menu-btn,
+.post-menu-btn:hover {
+    border: none;
+}
+
+.post-menu-btn:hover {
+    color: var(--text-color);
+}
+
+.dm-message-menu-btn:hover {
+    border-color: var(--border-color);
+    color: var(--text-color);
+}
+
+.dm-manage-btn:not(.report-btn):hover {
+    border-color: var(--border-color);
+    background: var(--bg-color);
+    color: var(--text-color);
+}
+
+.post-menu-btn:focus-visible,
+.dm-message-menu-btn:focus-visible,
+.dm-manage-btn:not(.report-btn):focus-visible,
+.post-menu button:focus-visible {
+    outline: 2px solid var(--primary-color);
+    outline-offset: 2px;
 }
 
 .post-menu {
     position: absolute;
     right: 0;
     top: 25px;
-    background: var(--main-bg-color);
-    border: 1px solid var(--border-color);
-    border-radius: 8px;
-    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
     z-index: 101;
-    width: 11rem;
+    width: 12rem;
+    box-sizing: border-box;
     overflow: hidden;
+    padding: 0.35rem;
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+    background: var(--main-bg-color);
+    box-shadow: 0 0.55rem 1.4rem rgba(0, 0, 0, 0.14);
     visibility: hidden;
     opacity: 0;
-    transition:
-        opacity 0.1s ease-out,
-        visibility 0.1s;
+    transition: visibility 0.16s;
     pointer-events: none;
 }
 
@@ -983,15 +1504,22 @@ em-emoji-picker {
 }
 
 .post-menu button {
+    display: flex;
     width: 100%;
-    padding: 0.8rem 1.2rem;
-    text-align: left;
-    background: none;
+    min-height: 2.55rem;
+    align-items: center;
+    padding: 0.6rem 0.75rem;
     border: none;
+    border-radius: 8px;
+    background: transparent;
     color: var(--text-color);
-    font-size: 0.95rem;
+    font-size: 0.92rem;
+    font-weight: 500;
+    text-align: left;
     cursor: pointer;
-    transition: background-color 0.2s;
+    transition:
+        background-color 0.16s ease,
+        color 0.16s ease;
 }
 
 .post-menu button:hover {
@@ -1017,8 +1545,12 @@ em-emoji-picker {
 }
 
 .post-menu .delete-btn {
-    color: #f4212e;
-    font-weight: bold;
+    color: #e5484d;
+    font-weight: 700;
+}
+
+.post-menu .delete-btn:hover {
+    background-color: rgba(229, 72, 77, 0.1);
 }
 
 /* アイコンが縦に伸びるのを防ぎ、クリック範囲をアイコンの高さに限定する */
@@ -1426,6 +1958,96 @@ body.dark .recommend-user button {
     line-height: 1;
 }
 
+/* ブラウザ標準のalert/promptに代わるアプリ内ダイアログ */
+.app-dialog-overlay {
+    z-index: 3000;
+    padding: 1rem;
+    box-sizing: border-box;
+}
+
+.app-dialog-content {
+    box-sizing: border-box;
+    width: min(420px, 100%);
+    max-width: 420px;
+    padding: 1.7rem 1.25rem 1.25rem;
+    border: 1px solid var(--border-color);
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.2);
+}
+
+.app-dialog-message {
+    margin: 0;
+    color: var(--text-color);
+    line-height: 1.55;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.app-dialog-input-group {
+    display: flex;
+    flex-direction: column;
+    gap: 0.45rem;
+    margin-top: 1.1rem;
+    color: var(--text-color);
+    font-weight: 700;
+}
+
+.app-dialog-input-group.hidden {
+    display: none;
+}
+
+#app-dialog-input {
+    box-sizing: border-box;
+    width: 100%;
+    min-height: 3rem;
+    padding: 0.7rem 0.85rem;
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    background: var(--main-bg-color);
+    color: var(--text-color);
+    font: inherit;
+}
+
+#app-dialog-input:focus-visible {
+    outline: 2px solid var(--primary-color);
+    outline-offset: 2px;
+}
+
+.app-dialog-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.65rem;
+    margin-top: 1.35rem;
+}
+
+.app-dialog-actions .login-secondary-button,
+.app-dialog-actions .settings-primary-button {
+    min-height: 2.75rem;
+}
+
+.app-dialog-actions .login-secondary-button.hidden {
+    display: none;
+}
+
+@media (max-width: 480px) {
+    .app-dialog-overlay {
+        padding: 0.5rem;
+    }
+
+    .app-dialog-content {
+        width: 100%;
+        padding: 1.5rem 1rem 1rem;
+    }
+
+    .app-dialog-actions {
+        flex-direction: column-reverse;
+    }
+
+    .app-dialog-actions .login-secondary-button,
+    .app-dialog-actions .settings-primary-button {
+        width: 100%;
+    }
+}
+
 /* 画像プレビュー用モーダル */
 #image-preview-modal {
     align-items: center;
@@ -1482,6 +2104,11 @@ body.dark .recommend-user button {
     margin-top: -4rem;
 }
 
+/* ヘッダー画像がある場合、アイコンだけをバナーへ重ね、操作UIは画像の下へ配置する。 */
+#profile-header.has-profile-banner .profile-actions {
+    margin-top: 4.5rem;
+}
+
 #profile-header .user-icon-large {
     object-fit: cover; /* アイコンが潰れるのを防ぐ */
     width: 128px;
@@ -1498,7 +2125,12 @@ body.dark .recommend-user button {
 }
 
 #profile-header .dm-button {
-    padding: 0.5rem;
+    box-sizing: border-box;
+    width: 38px;
+    height: 38px;
+    min-width: 38px;
+    flex: 0 0 38px;
+    padding: 0;
     border-radius: 50%;
     border: 1px solid var(--text-color);
     /* 枠線の色を黒に変更 */
@@ -1573,6 +2205,7 @@ body.dark .recommend-user button {
     color: var(--secondary-text-color);
     font-weight: 500;
     position: relative;
+    transition: background-color 0.2s;
 }
 
 .tab-button:hover {
@@ -1956,20 +2589,31 @@ body.dark .recommend-user button {
     white-space: normal;
     word-break: break-word;
 }
-.dm-manage-btn {
-    color: var(--text-color);
-    background: var(--main-bg-color);
+.dm-manage-btn:not(.report-btn) {
+    box-sizing: border-box;
+    display: inline-grid;
+    width: 34px;
+    height: 34px;
+    min-width: 34px;
+    padding: 0;
+    place-items: center;
+    flex: 0 0 34px;
     border: 1px solid var(--text-color);
-    cursor: pointer;
-    padding: 0.5rem;
     border-radius: 50%;
-    flex-shrink: 0;
+    background: var(--main-bg-color);
+    color: var(--text-color);
+    cursor: pointer;
+    font-size: 1.1rem;
+    line-height: 1;
     transition:
-        background-color 0.2s,
-        border-color 0.2s;
+        background-color 0.16s ease,
+        border-color 0.16s ease,
+        color 0.16s ease;
 }
-.dm-manage-btn:hover {
+.dm-manage-btn:not(.report-btn):hover {
+    border-color: var(--text-color);
     background-color: var(--bg-color);
+    color: var(--text-color);
 }
 #dm-conversation-container {
     display: flex;
@@ -1998,29 +2642,52 @@ body.dark .recommend-user button {
     position: relative;
 }
 .dm-message-container.sent .dm-message-menu-btn {
+    top: -1.4rem;
     opacity: 1;
 }
 
 .dm-message-menu-btn {
     position: absolute;
-    top: -28px;
-    right: 8px;
-    z-index: 1;
-    background: none;
+    top: 0;
+    right: 6px;
+    z-index: 2;
+    box-sizing: border-box;
+    display: inline-grid;
+    width: 30px;
+    height: 30px;
+    min-width: 30px;
+    padding: 0;
+    place-items: center;
     border: none;
-    font-size: 1.2rem;
-    color: var(--secondary-text-color);
-    padding: 0.1rem;
-    width: 28px;
-    height: 28px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
     border-radius: 50%;
+    background: none;
+    color: var(--secondary-text-color);
     cursor: pointer;
+    font-size: 1.05rem;
+    line-height: 1;
     opacity: 1;
-    transition: background-color 0.2s;
-    box-shadow: none;
+    transition: color 0.16s ease;
+}
+
+.dm-message-menu-btn:hover {
+    border: none;
+    background: none;
+    color: var(--secondary-text-color);
+}
+
+.post-menu-btn svg,
+.dm-manage-btn:not(.report-btn) svg,
+.profile-menu-button.dm-button svg,
+.dm-message-menu-btn svg {
+    display: block;
+    width: 18px;
+    height: 18px;
+    pointer-events: none;
+}
+
+.dm-message-menu-btn:focus-visible {
+    outline: 2px solid var(--primary-color);
+    outline-offset: 2px;
 }
 
 .dm-message-container .post-menu {
@@ -2028,8 +2695,14 @@ body.dark .recommend-user button {
     right: 0;
     left: auto;
     bottom: auto;
-    transform: none;
 }
+
+/* DMメッセージのメニューはビューポートを基準に配置して会話領域の外へ出ないようにする。 */
+.dm-message-container .post-menu.dm-message-menu-popover {
+    position: fixed;
+    z-index: 600;
+}
+
 .dm-message-container.received {
     align-self: flex-start; /* 左寄せ */
     align-items: flex-end; /* アイコンとメッセージバブルの下端を揃える */
@@ -2064,6 +2737,32 @@ body.dark .recommend-user button {
 .dm-message-container.sent .dm-message-meta {
     text-align: right;
 }
+
+/* 受信メッセージでは日時の右にメニューボタンを置く。 */
+.dm-message-container.received .dm-message-meta {
+    display: flex;
+    width: auto;
+    align-items: center;
+}
+
+.dm-message-container.received .dm-message-time {
+    white-space: nowrap;
+}
+
+.dm-message-container.received .dm-message-menu-btn {
+    position: static;
+    width: 22px;
+    height: 22px;
+    min-width: 22px;
+    margin-left: 0.1rem;
+    flex: 0 0 22px;
+}
+
+.dm-message-container.received .dm-message-menu-btn svg {
+    width: 16px;
+    height: 16px;
+}
+
 .dm-message {
     padding: 0.5rem 0.7rem;
     border-radius: 18px;
@@ -2167,15 +2866,13 @@ body.dark .recommend-user button {
 .dm-message-form button:hover {
     background-color: var(--primary-hover-color);
 }
-#dm-attachment-btn:hover {
-    background-color: #e8f5fd;
-}
 
 .dm-message-form button svg {
     width: 20px;
     height: 20px;
     fill: none; /* デフォルトで塗りつぶしなし */
     stroke: currentColor;
+    transition: background-color 0.2s;
 }
 .dm-message-form #send-dm-btn svg {
     fill: none;
@@ -2350,7 +3047,7 @@ body.dark .recommend-user button {
 }
 .post-content p,
 .dm-message p {
-    margin-top: 0.8em; /* pタグの上にだけマージンを設定 */
+    margin-top: 0;
 }
 /* 連続するpタグはマージンを詰める */
 .post-content p + p,
@@ -2762,6 +3459,14 @@ body.dark .recommend-user button {
         display: none;
     }
 
+    #left-nav .nav-overflow-panel .nav-item {
+        justify-content: flex-start;
+    }
+
+    #left-nav .nav-overflow-panel .nav-item .nav-item-text {
+        display: inline;
+    }
+
     /* ポストボタンのアイコン表示切り替え */
     .nav-item-post {
         width: 52px; /* アイコンに合わせたサイズ */
@@ -2814,6 +3519,9 @@ body.dark .recommend-user button {
         flex-direction: row;
         justify-content: space-around;
         width: 100%;
+    }
+    .nav-overflow-menu {
+        display: none;
     }
     .nav-item[href='#likes'],
     .nav-item[href='#stars'] {
@@ -2883,6 +3591,8 @@ body.dark .recommend-user button {
 }
 
 .settings-group-button {
+    box-sizing: border-box;
+    display: block;
     width: 100%;
     padding: 0.75rem 0.8rem;
     border: 0;
@@ -2892,6 +3602,7 @@ body.dark .recommend-user button {
     font: inherit;
     font-weight: 700;
     text-align: left;
+    text-decoration: none;
     cursor: pointer;
     transition:
         background-color 0.2s,
@@ -3655,4 +4366,625 @@ body.dark .settings-bot-new-key-box {
 
 #external-confirm-modal .login-secondary-button.login-auth-action {
     width: 100%;
+}
+
+/* 報告モーダルと管理対応画面 */
+.report-modal-content {
+    box-sizing: border-box;
+    max-width: 520px;
+    padding: 1.6rem;
+    border: 1px solid var(--border-color);
+}
+
+.report-modal-heading h3 {
+    margin: 0 0 0.4rem;
+}
+
+#report-form {
+    display: flex;
+    flex-direction: column;
+    gap: 0.65rem;
+    margin-top: 1rem;
+}
+
+#report-form label {
+    color: var(--text-color);
+    font-weight: 700;
+}
+
+#report-description,
+.moderation-textarea {
+    box-sizing: border-box;
+    width: 100%;
+    resize: vertical;
+    min-height: 7rem;
+    padding: 0.75rem;
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    background: var(--main-bg-color);
+    color: var(--text-color);
+    font: inherit;
+}
+
+#report-description:focus-visible,
+.moderation-textarea:focus-visible,
+.moderation-target-select:focus-visible {
+    outline: 2px solid var(--primary-color);
+    outline-offset: 2px;
+}
+
+.report-modal-note,
+.moderation-help-text {
+    margin: 0;
+    color: var(--secondary-text-color);
+    font-size: 0.85rem;
+    line-height: 1.5;
+}
+
+.report-modal-actions,
+.moderation-form-actions {
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
+    gap: 0.7rem;
+    margin-top: 0.35rem;
+}
+
+.report-modal-actions > button {
+    box-sizing: border-box;
+    min-width: 6.5rem;
+    min-height: 3.15rem;
+    padding: 0.75rem 1rem;
+}
+
+.report-btn {
+    color: #d92d20 !important;
+    font-weight: 700;
+}
+
+.admin-reports-container {
+    padding: 1rem;
+}
+
+.admin-reports-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+}
+
+.moderation-report-card,
+.moderation-review-section {
+    box-sizing: border-box;
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+    background: var(--main-bg-color);
+}
+
+.moderation-report-card {
+    display: block;
+    width: 100%;
+    padding: 1rem;
+    color: var(--text-color);
+    text-align: left;
+    cursor: pointer;
+}
+
+.moderation-report-card:hover {
+    background: var(--bg-color);
+}
+
+.moderation-report-meta {
+    display: flex;
+    justify-content: space-between;
+    gap: 1rem;
+    margin-top: 0.35rem;
+    color: var(--secondary-text-color);
+    font-size: 0.85rem;
+}
+
+.moderation-report-card p {
+    margin: 0.5rem 0 0;
+    color: var(--secondary-text-color);
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.moderation-review-layout {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+    padding: 1rem;
+}
+
+.moderation-review-section {
+    padding: 1rem;
+}
+
+.moderation-review-section h3 {
+    margin: 0 0 0.65rem;
+    font-size: 1rem;
+}
+
+.moderation-content-evidence {
+    max-height: 20rem;
+    overflow: auto;
+    padding: 0.85rem;
+    border-radius: 8px;
+    background: var(--bg-color);
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.moderation-message-evidence {
+    padding: 0.7rem 0;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.moderation-message-evidence:last-child {
+    border-bottom: none;
+}
+
+.moderation-action-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.7rem;
+}
+
+.moderation-action-grid label,
+.moderation-action-field {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+    color: var(--text-color);
+}
+
+.moderation-action-grid label {
+    flex-direction: row;
+    align-items: center;
+    font-weight: 700;
+}
+
+.moderation-target-select {
+    box-sizing: border-box;
+    width: 100%;
+    padding: 0.65rem;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    background: var(--main-bg-color);
+    color: var(--text-color);
+    font: inherit;
+}
+
+.moderation-submit-button {
+    border: none;
+    border-radius: 9999px;
+    padding: 0.65rem 1.1rem;
+    background: var(--primary-color);
+    color: white;
+    font: inherit;
+    font-weight: 700;
+    cursor: pointer;
+}
+
+.moderation-submit-button:hover {
+    background: var(--primary-hover-color);
+}
+
+@media (max-width: 600px) {
+    .report-modal-content {
+        width: calc(100% - 2rem);
+        padding: 1.25rem;
+    }
+
+    .moderation-action-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .moderation-report-meta {
+        flex-direction: column;
+        gap: 0.2rem;
+    }
+}
+
+/* 通知の補足情報 */
+.notification-item-content {
+    min-width: 0;
+}
+
+.notification-timestamp,
+.notification-target-post {
+    overflow: hidden;
+    color: var(--secondary-text-color);
+    font-size: 0.82rem;
+    line-height: 1.35;
+    text-align: left;
+}
+
+.notification-timestamp {
+    margin-bottom: 0.18rem;
+}
+
+.notification-message {
+    min-width: 0;
+    text-align: left;
+}
+
+.notification-target-post {
+    margin-top: 0.28rem;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+}
+
+/* 凍結画面と異議申し立て */
+.freeze-overlay {
+    z-index: 2000;
+    padding: 1.25rem;
+    background: color-mix(in srgb, var(--background-color) 92%, #111 8%);
+}
+
+.freeze-panel {
+    width: min(100%, 34rem);
+    padding: 2rem;
+    border: 1px solid color-mix(in srgb, #d9534f 35%, var(--border-color));
+    border-radius: 1.15rem;
+    background: var(--surface-color, #fff);
+    box-shadow: 0 1.25rem 3.5rem rgba(0, 0, 0, 0.16);
+    text-align: left;
+}
+
+.freeze-panel-mark {
+    display: grid;
+    width: 2.4rem;
+    height: 2.4rem;
+    margin-bottom: 1rem;
+    border-radius: 50%;
+    place-items: center;
+    background: #d9534f;
+    color: #fff;
+    font-size: 1.45rem;
+    font-weight: 800;
+}
+
+.freeze-panel-eyebrow {
+    margin: 0 0 0.42rem;
+    color: var(--secondary-text-color);
+    font-size: 0.72rem;
+    font-weight: 800;
+    letter-spacing: 0.09em;
+}
+
+.freeze-panel h2 {
+    margin: 0;
+    color: var(--text-color);
+    font-size: 1.42rem;
+}
+
+.freeze-panel-lead,
+.freeze-panel-help {
+    color: var(--secondary-text-color);
+    line-height: 1.65;
+}
+
+.freeze-panel-help {
+    margin: 0.9rem 0 0;
+    font-size: 0.84rem;
+}
+
+.freeze-reason-card {
+    margin: 1.4rem 0;
+    padding: 1rem;
+    border-radius: 0.8rem;
+    background: color-mix(in srgb, var(--background-color) 78%, #d9534f 8%);
+}
+
+.freeze-reason-card > span {
+    color: var(--secondary-text-color);
+    font-size: 0.78rem;
+    font-weight: 700;
+}
+
+.freeze-reason-card p {
+    margin: 0.4rem 0 0;
+    white-space: pre-wrap;
+    line-height: 1.55;
+}
+
+.freeze-appeal-button {
+    border: 0;
+    border-radius: 999px;
+    background: var(--primary-color);
+    color: #fff;
+    font: inherit;
+    font-weight: 700;
+    cursor: pointer;
+    padding: 0.72rem 1.2rem;
+}
+
+.freeze-appeal-button:hover:not(:disabled) {
+    filter: brightness(0.94);
+}
+
+.freeze-appeal-button:disabled {
+    cursor: not-allowed;
+    opacity: 0.62;
+}
+
+.freeze-appeal-status {
+    margin: -0.35rem 0 1rem;
+    color: var(--secondary-text-color);
+    font-size: 0.88rem;
+}
+
+.freeze-appeal-modal-content {
+    width: min(100% - 2rem, 34rem);
+}
+
+.freeze-appeal-modal-content > p:not(.freeze-panel-eyebrow) {
+    color: var(--secondary-text-color);
+    line-height: 1.6;
+}
+
+.freeze-appeal-modal-content label {
+    display: block;
+    margin: 1.25rem 0 0.5rem;
+    font-weight: 700;
+}
+
+.freeze-appeal-modal-content textarea {
+    box-sizing: border-box;
+    width: 100%;
+    resize: vertical;
+}
+
+.freeze-appeal-modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.65rem;
+    margin-top: 1.1rem;
+}
+
+@media (max-width: 480px) {
+    .freeze-panel {
+        padding: 1.45rem;
+    }
+    .freeze-appeal-modal-actions {
+        flex-direction: column-reverse;
+    }
+    .freeze-appeal-modal-actions button {
+        width: 100%;
+    }
+}
+
+/* 認証申請 */
+.settings-verification-application {
+    margin: 1.2rem 0;
+    padding: 1rem;
+    border: 1px solid var(--border-color);
+    border-radius: 0.75rem;
+}
+
+.settings-verification-application h4 {
+    margin: 0 0 0.45rem;
+}
+
+.verification-application-modal-content {
+    box-sizing: border-box;
+    width: min(100% - 2rem, 30rem);
+    max-width: 480px;
+    padding: 1.7rem 1.25rem 1.25rem;
+}
+
+.verification-application-modal-content > .settings-help-text {
+    margin: 0 0 1rem;
+    color: var(--secondary-text-color);
+    line-height: 1.55;
+}
+
+.verification-application-note {
+    margin: 0.9rem 0;
+    padding: 0.8rem 0.9rem;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    background: var(--widget-bg-color);
+}
+
+.verification-application-note strong {
+    display: block;
+    margin-bottom: 0.3rem;
+    color: var(--text-color);
+    font-size: 0.92rem;
+}
+
+.verification-application-note p {
+    margin: 0;
+    color: var(--secondary-text-color);
+    font-size: 0.9rem;
+    line-height: 1.55;
+}
+
+.verification-application-actions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.65rem;
+    margin-top: 1.25rem;
+}
+
+.verification-application-actions .login-secondary-button,
+.verification-application-actions .login-auth-action {
+    width: 100%;
+}
+
+@media (max-width: 480px) {
+    .verification-application-modal-content {
+        width: calc(100% - 1rem);
+        padding: 1.5rem 1rem 1rem;
+    }
+
+    .verification-application-actions {
+        grid-template-columns: 1fr;
+    }
+}
+
+/* 未知の場所からのログイン許可待機 */
+/* 背景は .modal-overlay の標準半透明オーバーレイをそのまま使う。 */
+#login-approval-wait-modal {
+    z-index: 1100;
+}
+
+.login-approval-wait-content {
+    box-sizing: border-box;
+    width: min(100% - 2rem, 480px);
+}
+
+.login-approval-wait-content .settings-help-text {
+    margin: 0 0 1rem;
+    line-height: 1.55;
+}
+
+.login-approval-wait-progress {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin: 0.85rem 0;
+    color: var(--secondary-text-color);
+    font-size: 0.9rem;
+}
+
+.login-approval-wait-progress .spinner {
+    width: 1rem;
+    height: 1rem;
+    border-width: 0.16rem;
+}
+
+.login-approval-wait-status {
+    margin: 0.85rem 0;
+    color: var(--text-color);
+    font-size: 0.9rem;
+}
+
+.login-approval-wait-actions {
+    display: flex;
+    justify-content: flex-end;
+}
+
+@media (max-width: 480px) {
+    .login-approval-wait-actions .login-secondary-button {
+        width: 100%;
+    }
+}
+
+.settings-storage-heading {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 1rem;
+}
+
+.settings-storage-heading h4 {
+    margin: 0;
+}
+
+.settings-storage-progress {
+    width: 100%;
+    height: 0.6rem;
+    overflow: hidden;
+    border-radius: 999px;
+    background: var(--border-color);
+    margin: 0.75rem 0 1rem;
+}
+
+.settings-storage-progress-value {
+    width: 0;
+    height: 100%;
+    border-radius: inherit;
+    background: var(--primary-color);
+    transition: width 160ms ease;
+}
+
+.settings-storage-file .settings-session-title {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* モバイルのタイムライン用プル・トゥ・リフレッシュ */
+.pull-to-refresh-indicator {
+    display: none;
+}
+
+@media (max-width: 680px) {
+    .pull-to-refresh-indicator {
+        --pull-distance: 0px;
+        --pull-opacity: 0;
+        position: fixed;
+        top: max(0.5rem, env(safe-area-inset-top));
+        left: 50%;
+        display: flex;
+        align-items: center;
+        gap: 0.45rem;
+        min-height: 2.5rem;
+        padding: 0.45rem 0.8rem;
+        border: 1px solid var(--border-color);
+        border-radius: 9999px;
+        background: var(--pg-bg-color);
+        color: var(--secondary-text-color);
+        box-shadow: 0 0.25rem 0.85rem rgba(0, 0, 0, 0.14);
+        pointer-events: none;
+        z-index: 110;
+        opacity: var(--pull-opacity);
+        transform: translate(-50%, calc(-5.25rem + var(--pull-distance)));
+        transition:
+            transform 180ms ease-out,
+            opacity 150ms ease-out,
+            color 150ms ease-out;
+        will-change: transform, opacity;
+    }
+
+    .pull-to-refresh-indicator.is-pulling {
+        transition: none;
+    }
+
+    .pull-to-refresh-indicator.is-ready {
+        color: var(--primary-color);
+        font-weight: 700;
+    }
+
+    .pull-to-refresh-indicator.is-refreshing {
+        --pull-opacity: 1;
+        transform: translate(-50%, 0.5rem);
+        color: var(--primary-color);
+        font-weight: 700;
+    }
+
+    .pull-to-refresh-icon {
+        width: 1.25rem;
+        height: 1.25rem;
+        fill: none;
+        stroke: currentColor;
+        stroke-width: 2.25;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        transition: transform 150ms ease-out;
+    }
+
+    .pull-to-refresh-indicator.is-ready .pull-to-refresh-icon {
+        transform: rotate(180deg);
+    }
+
+    .pull-to-refresh-indicator.is-refreshing .pull-to-refresh-icon {
+        animation: pull-to-refresh-spin 800ms linear infinite;
+    }
+}
+
+@keyframes pull-to-refresh-spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+/* カスタムPTRが有効な画面だけ、ブラウザ標準の更新ジェスチャーを抑止する。
+ * 有効化クラスはモバイル画面でだけ付与されるため、ここでは媒体クエリを重ねない。 */
+html.pull-to-refresh-enabled,
+body.pull-to-refresh-enabled {
+    overscroll-behavior-y: contain;
 }

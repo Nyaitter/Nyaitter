@@ -1,5 +1,7 @@
 const DatabaseAdapter = require('../DatabaseAdapter');
 
+const { normalizeBlockList } = require('../../../utils/blockList');
+
 const RETRYABLE_STATUS_CODES = new Set([408, 425, 429, 500, 502, 503, 504]);
 
 function boundedInteger(value, fallback, minimum, maximum) {
@@ -47,6 +49,14 @@ function mapLoginApproval(approval) {
 	};
 }
 
+function normalizeUser(user) {
+	if (!user) return null;
+	return {
+		...user,
+		block: normalizeBlockList(user.block, user.id),
+	};
+}
+
 function normalizePost(post) {
 	if (!post) return post;
 	post.userId = post.userId ?? post.user_id;
@@ -55,6 +65,7 @@ function normalizePost(post) {
 	post.createdAt = post.createdAt ?? post.created_at ?? null;
 	post.mask = !!post.mask;
 	post.lock = !!post.lock;
+	post.announcement = !!post.announcement;
 	if (post.attachments && typeof post.attachments === 'string') {
 		try {
 			post.attachments = JSON.parse(post.attachments);
@@ -86,6 +97,31 @@ function serializeGroupDm(row, userId = null) {
 	return res;
 }
 
+function mapModerationReport(row) {
+	if (!row) return null;
+	const parseObject = (value, fallback) => {
+		if (value && typeof value === 'object') return value;
+		try { return JSON.parse(value || ''); } catch (_) { return fallback; }
+	};
+	const excluded = parseObject(row.excludedAdminIds ?? row.excluded_admin_ids, []);
+	return {
+		id: Number(row.id),
+		reporterUserId: Number(row.reporterUserId ?? row.reporter_user_id),
+		targetKind: row.targetKind ?? row.target_kind,
+		targetId: String(row.targetId ?? row.target_id),
+		description: row.description || '',
+		targetSnapshot: parseObject(row.targetSnapshot ?? row.target_snapshot, {}),
+		assignmentType: row.assignmentType ?? row.assignment_type ?? 'report',
+		status: row.status,
+		assignedAdminId: row.assignedAdminId ?? row.assigned_admin_id ?? null,
+		assignedAt: row.assignedAt ?? row.assigned_at ?? null,
+		excludedAdminIds: Array.isArray(excluded) ? excluded.map(Number).filter(Number.isInteger) : [],
+		resolution: parseObject(row.resolution, null),
+		createdAt: row.createdAt ?? row.created_at ?? null,
+		resolvedAt: row.resolvedAt ?? row.resolved_at ?? null,
+	};
+}
+
 class D1Adapter extends DatabaseAdapter {
 	constructor(options = {}) {
 		super();
@@ -96,6 +132,7 @@ class D1Adapter extends DatabaseAdapter {
 		this.retryAttempts = boundedInteger(options.retryAttempts ?? process.env.D1_RETRY_ATTEMPTS, 1, 0, 4);
 		this.retryBaseDelayMs = boundedInteger(options.retryBaseDelayMs ?? process.env.D1_RETRY_BASE_DELAY_MS, 120, 0, 5000);
 		this.readCacheSeconds = boundedInteger(options.readCacheSeconds ?? process.env.D1_READ_CACHE_SECONDS, 0, 0, 60);
+		this.maxReadCacheEntries = boundedInteger(options.maxReadCacheEntries ?? process.env.D1_READ_CACHE_MAX_ENTRIES, 500, 1, 5000);
 		this.batchMaxItems = boundedInteger(options.batchMaxItems ?? process.env.D1_BATCH_MAX_ITEMS, 100, 1, 500);
 		this.readCache = new Map();
 		this.inFlightReads = new Map();
@@ -133,6 +170,17 @@ class D1Adapter extends DatabaseAdapter {
 
 	_clearReadCache() {
 		this.readCache.clear();
+	}
+
+	_pruneReadCache(now = Date.now()) {
+		for (const [key, entry] of this.readCache) {
+			if (!entry || entry.expiresAt <= now) this.readCache.delete(key);
+		}
+		while (this.readCache.size >= this.maxReadCacheEntries) {
+			const oldestKey = this.readCache.keys().next().value;
+			if (oldestKey === undefined) break;
+			this.readCache.delete(oldestKey);
+		}
 	}
 
 	_readCached(cacheKey) {
@@ -203,15 +251,16 @@ class D1Adapter extends DatabaseAdapter {
 		if (existing) return existing;
 
 		const request = this._executeRequest(path, { method, body, retry })
-			.then((value) => {
-				if (cacheSeconds > 0) {
-					this.readCache.set(normalizedCacheKey, {
-						value,
-						expiresAt: Date.now() + cacheSeconds * 1000,
-					});
-				}
-				return value;
-			})
+				.then((value) => {
+					if (cacheSeconds > 0) {
+						this._pruneReadCache();
+						this.readCache.set(normalizedCacheKey, {
+							value,
+							expiresAt: Date.now() + cacheSeconds * 1000,
+						});
+					}
+					return value;
+				})
 			.finally(() => this.inFlightReads.delete(normalizedCacheKey));
 		this.inFlightReads.set(normalizedCacheKey, request);
 		return request;
@@ -380,41 +429,44 @@ class D1Adapter extends DatabaseAdapter {
 	}
 
 	async getUserByScid(scid) {
-		return this._read(`/users/scid/${encodeURIComponent(String(scid))}`);
+		return normalizeUser(await this._read(`/users/scid/${encodeURIComponent(String(scid))}`));
 	}
 
 	async getUserById(id) {
 		const userId = requireId(id, 'id');
-		return this._read(`/users/${userId}`);
+		return normalizeUser(await this._read(`/users/${userId}`));
 	}
 
 	async getUserByNyaitterAddress(address) {
-		return this._read(`/users/address/${encodeURIComponent(String(address))}`);
+		return normalizeUser(await this._read(`/users/address/${encodeURIComponent(String(address))}`));
 	}
 
 	async getOrCreateExternalUser(params) {
-		return this._write('/users/external', params);
+		return normalizeUser(await this._write('/users/external', params));
 	}
 
 	async createUser(userData) {
-		return this._write('/users', userData);
+		return normalizeUser(await this._write('/users', userData));
 	}
 
-	async searchUsers(query, limit = 20) {
+	async searchUsers(query, limit = 20, offset = 0) {
 		return this._read(this._query('/users/search', {
-			q: String(query || ''), limit: this._limit(limit),
+			q: String(query || ''),
+			limit: this._limit(limit),
+			offset: Math.max(Number(offset) || 0, 0),
 		}));
 	}
 
 	async getUsersByIds(userIds) {
 		const ids = this._normalizeIds(userIds);
 		if (ids.length === 0) return [];
-		return this._read('/users/batch', { body: { ids } });
+		const users = await this._read('/users/batch', { body: { ids } });
+		return Array.isArray(users) ? users.map(normalizeUser).filter(Boolean) : [];
 	}
 
 	async getAllUsers() {
 		const users = await this._read('/users', { cacheSeconds: 0 });
-		return Array.isArray(users) ? users : [];
+		return Array.isArray(users) ? users.map(normalizeUser).filter(Boolean) : [];
 	}
 
 	async getUserStatus(userId) {
@@ -426,7 +478,10 @@ class D1Adapter extends DatabaseAdapter {
 	}
 
 	async updateUserProfile(userId, profileData) {
-		return this._write(`/users/${requireId(userId, 'userId')}/profile`, profileData);
+		return normalizeUser(await this._write(
+			`/users/${requireId(userId, 'userId')}/profile`,
+			profileData,
+		));
 	}
 
 	async toggleFollow(followerId, followingId) {
@@ -469,6 +524,25 @@ class D1Adapter extends DatabaseAdapter {
 	async getFollowIds(userId) {
 		const ids = await this._read(`/users/${requireId(userId, 'userId')}/following/ids`, { cacheSeconds: 0 });
 		return Array.isArray(ids) ? ids.map(Number) : [];
+	}
+
+	async getFollowRelationshipSnapshot(userId, candidateUserIds) {
+		const normalizedUserId = requireId(userId, 'userId');
+		const candidateIds = this._normalizeIds(candidateUserIds, { fieldName: 'candidateUserId' })
+			.filter((id) => id !== normalizedUserId);
+		if (candidateIds.length === 0) return { followingIds: [], followerIds: [] };
+		const result = await this._read('/users/follow-relationships', {
+			body: { userId: normalizedUserId, candidateIds },
+			cacheSeconds: 0,
+		});
+		return {
+			followingIds: Array.isArray(result?.following_ids ?? result?.followingIds)
+				? (result.following_ids ?? result.followingIds).map(Number).filter(Number.isInteger)
+				: [],
+			followerIds: Array.isArray(result?.follower_ids ?? result?.followerIds)
+				? (result.follower_ids ?? result.followerIds).map(Number).filter(Number.isInteger)
+				: [],
+		};
 	}
 
 	async createPost(postData) {
@@ -535,31 +609,41 @@ class D1Adapter extends DatabaseAdapter {
 		return { posts, hasMore: posts.length === limit };
 	}
 
-	async getTimelinePostIds({ tab = 'foryou', followIds = [], limit = 30, offset = 0 } = {}) {
+	async getTimelinePostIds({ tab = 'foryou', followIds = [], limit = 30, offset = 0, beforeId = null } = {}) {
 		const body = {
 			tab: String(tab),
 			followIds: this._normalizeIds(followIds),
 			limit: this._limit(limit, 30),
 			offset: this._offset(offset),
+			beforeId: beforeId == null ? null : requireId(beforeId, 'beforeId', 1),
 		};
 		return this._read('/posts/timeline/ids', { body, cacheSeconds: 0 });
 	}
 
-	async getRecommendedPostIds({ limit = 30, offset = 0 } = {}) {
+	async getRecommendedPostIds({ viewerId = null, limit = 30, offset = 0, beforeId = null } = {}) {
 		return this._read(this._query('/posts/recommended/ids', {
-			limit: this._limit(limit, 30), offset: this._offset(offset),
+			viewerId: viewerId == null ? null : requireId(viewerId, 'viewerId'),
+			limit: this._limit(limit, 30),
+			offset: this._offset(offset),
+			beforeId: beforeId == null ? null : requireId(beforeId, 'beforeId', 1),
 		}), { cacheSeconds: 0 });
 	}
 
-	async getProfilePostIds({ userId, subType = 'all', limit = 30, offset = 0 } = {}) {
+	async getProfilePostIds({ userId, subType = 'all', limit = 30, offset = 0, beforeId = null } = {}) {
 		return this._read(this._query(`/users/${requireId(userId, 'userId')}/post-ids`, {
-			subType: String(subType || 'all'), limit: this._limit(limit, 30), offset: this._offset(offset),
+			subType: String(subType || 'all'),
+			limit: this._limit(limit, 30),
+			offset: this._offset(offset),
+			beforeId: beforeId == null ? null : requireId(beforeId, 'beforeId', 1),
 		}), { cacheSeconds: 0 });
 	}
 
-	async searchPostIds(query, limit = 30, offset = 0) {
+	async searchPostIds(query, limit = 30, offset = 0, beforeId = null) {
 		return this._read(this._query('/posts/search/ids', {
-			q: String(query || ''), limit: this._limit(limit, 30), offset: this._offset(offset),
+			q: String(query || ''),
+			limit: this._limit(limit, 30),
+			offset: this._offset(offset),
+			beforeId: beforeId == null ? null : requireId(beforeId, 'beforeId', 1),
 		}), { cacheSeconds: 0 });
 	}
 
@@ -844,9 +928,94 @@ class D1Adapter extends DatabaseAdapter {
 		return this._write(`/users/${requireId(userId, 'userId')}/notifications/read-all`);
 	}
 
+	async markAllNotificationsAsClicked(userId) {
+		return this._write(`/users/${requireId(userId, 'userId')}/notifications/click-all`);
+	}
+
 	async getUnreadNotificationCount(userId) {
 		const res = await this._read(`/users/${requireId(userId, 'userId')}/notifications/unread-count`, { cacheSeconds: 0 });
 		return Number(res?.count ?? res ?? 0);
+	}
+
+	async createModerationReport(reportData) {
+		return mapModerationReport(await this._write('/moderation-reports', reportData));
+	}
+
+	async getOpenModerationAppealByUserId(userId) {
+		return mapModerationReport(await this._read(
+			`/users/${requireId(userId, 'userId')}/moderation-appeal/open`,
+			{ cacheSeconds: 0 },
+		));
+	}
+
+	async getOpenModerationVerificationByUserId(userId) {
+		return mapModerationReport(await this._read(
+			`/users/${requireId(userId, 'userId')}/moderation-verification/open`,
+			{ cacheSeconds: 0 },
+		));
+	}
+
+	async getModerationReportById(reportId) {
+		return mapModerationReport(await this._read(
+			`/moderation-reports/${requireId(reportId, 'reportId', 1)}`,
+			{ cacheSeconds: 0 },
+		));
+	}
+
+	async listModerationReportsForAdmin(adminId, options = {}) {
+		const reports = await this._read(this._query(
+			`/moderation-reports/admin/${requireId(adminId, 'adminId')}`,
+			{
+				status: options.status || 'assigned',
+				limit: this._limit(options.limit, 50, 100),
+				offset: this._offset(options.offset),
+			},
+		), { cacheSeconds: 0 });
+		return Array.isArray(reports) ? reports.map(mapModerationReport).filter(Boolean) : [];
+	}
+
+	async getModerationAdminWorkloads(excludedAdminIds = []) {
+		const excluded = this._normalizeIds(excludedAdminIds, { fieldName: 'excludedAdminId' });
+		const result = await this._write('/moderation-reports/admin-workloads', { excludedAdminIds: excluded });
+		return Array.isArray(result)
+			? result.map((row) => ({
+				adminId: Number(row.adminId ?? row.admin_id),
+				activeCount: Number(row.activeCount ?? row.active_count ?? 0),
+			})).filter((row) => Number.isInteger(row.adminId))
+			: [];
+	}
+
+	async assignModerationReport(reportId, assignment = {}) {
+		return mapModerationReport(await this._write(
+			`/moderation-reports/${requireId(reportId, 'reportId', 1)}/assign`,
+			assignment,
+		));
+	}
+
+	async getOverdueModerationReports(cutoff) {
+		const reports = await this._write('/moderation-reports/overdue', { cutoff });
+		return Array.isArray(reports) ? reports.map(mapModerationReport).filter(Boolean) : [];
+	}
+
+	async getUnassignedModerationReports(limit = 100) {
+		const reports = await this._write('/moderation-reports/unassigned', {
+			limit: this._limit(limit, 100, 100),
+		});
+		return Array.isArray(reports) ? reports.map(mapModerationReport).filter(Boolean) : [];
+	}
+
+	async resolveModerationReport(reportId, adminId, resolution) {
+		return mapModerationReport(await this._write(
+			`/moderation-reports/${requireId(reportId, 'reportId', 1)}/resolve`,
+			{ adminId: requireId(adminId, 'adminId'), resolution },
+		));
+	}
+
+	async deleteModerationReport(reportId) {
+		const result = await this._write(
+			`/moderation-reports/${requireId(reportId, 'reportId', 1)}/delete`,
+		);
+		return typeof result === 'boolean' ? result : Boolean(result?.success);
 	}
 
 	async upsertPushSubscription(userId, subscription) {

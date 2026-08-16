@@ -1,119 +1,57 @@
-# Cloudflare と組み合わせるときの考え方
+# Cloudflare と組み合わせる構成
 
-Nyaitter サーバーを、Cloudflare の機能とどう組み合わせるかのガイドです。
+Nyaitter では、Node.jsサーバーがAPIと認証を担当します。Cloudflareを使う場合も、ブラウザはNode.jsサーバーへ接続し、D1やR2の鍵をブラウザへ渡しません。
 
-## 基本方針
+## 構成のイメージ
 
-Nyaitter は「Node.js の窓口サーバー + データベース／ストレージのアダプター」という形です。
-
-Cloudflare の強みを活かしつつ、開発のしやすさや既存の PostgreSQL を活かすなら、いきなり全部移すより、段階的なハイブリッドが現実的です。
-
-おすすめの分け方：
-
-- 安定して必要なデータ（ユーザー、投稿、DM、いいねなど）→ **PostgreSQL**
-- エッジで扱いたいもの（キャッシュ、一時データなど）→ **D1 / KV など**
-- ファイル → **R2**
-- ブラウザからの直接アップロードや署名発行 → **Worker**
-
-## おすすめの形
-
-```
-Cloudflare（Workers, CDN など）
-         │
-         ▼
-Node.js サーバー（このプロジェクト）
-  ├── PostgreSQL（メインのデータベース）
-  ├── R2（ファイル）
-  └── D1（必要なら補助）
+```text
+ブラウザ
+  ↓ HTTPS / WebSocket
+Nyaitter Node.js サーバー
+  ├─ PostgreSQL または D1 Proxy Worker
+  └─ R2（添付ファイル）
 ```
 
-| 役割 | おすすめ | 理由 |
-|------|----------|------|
-| 本データ | PostgreSQL | リレーショナル、トランザクション、複雑なクエリに強い |
-| ファイル | R2 | 安く、耐久性が高く、S3 互換 |
-| 補助・キャッシュ | D1 / KV | エッジで速く読みたいとき |
-| ブラウザ直接アップロード | Worker + 署名 | サーバーの帯域を節約 |
+## 段階的に導入する
 
-## 段階的な進め方
+| 段階 | 設定 | 内容 |
+|---|---|---|
+| 1 | `memory` + `local` | 手元で機能を試します。データは再起動で消えます。 |
+| 2 | `postgres` + `r2` | DBとファイル保存を分ける、分かりやすい公開構成です。 |
+| 3 | `d1` + `r2` | D1 Proxy Workerを通してCloudflare D1を使います。 |
 
-### 第1段階：Postgres + ローカルストレージ
+## R2を使う
 
-- 開発速度を優先
-- 機能づくりに集中
+添付ファイルをR2へ保存する場合は、Node.jsサーバーへR2の接続情報を設定します。
 
-### 第2段階：R2 を入れる（効果が出やすい）
-
-1. `R2StorageAdapter` に切り替える
-2. 既存ファイルを必要なら移す
-3. 余裕があれば、Worker でブラウザ直接アップロードを検討
-
-効果：ディスク容量の心配が減り、配信も整理しやすい
-
-### 第3段階：D1 を補助で使う
-
-- 未読数のキャッシュ
-- トレンド計算の一部
-- セッションの一部 など、必要なところから
-
-### 第4段階：Worker での処理を広げる（上級）
-
-- 画像処理
-- A/B テスト
-- 高度なレート制限 など
-
-## 接続のパターン
-
-### R2 をサーバーから直接使う（シンプル）
-
-- メリット：構成が単純で分かりやすい
-- デメリット：大きなファイルの帯域をサーバーが使う
-
-### R2 を Worker 経由で使う
-
-- 署名は Worker、実体のアップロードはブラウザが R2 へ
-- スケールしやすく、認証を Worker に寄せられる
-
-### D1 は基本的に Worker 経由
-
-`D1Adapter` は最初から「Worker プロキシ経由」を前提にしています。
-
-## 設定のイメージ
-
-```json
-{
-  "database": {
-    "adapter": "postgres"
-  },
-  "storage": {
-    "adapter": "r2",
-    "r2": {
-      "accountId": "...",
-      "bucket": "nyaitter-uploads",
-      "publicDomain": "https://media.example.com"
-    }
-  }
-}
+```bash
+STORAGE_ADAPTER=r2
+STORAGE_USER_QUOTA_MB=1024
 ```
 
-D1 を使う場合は、環境変数で `DB_ADAPTER=d1` と Worker の URL・トークンを指定します。
+ファイルはユーザーごとに管理されます。画像はEXIFを削除してから保存され、初期設定では1ユーザー当たり1 GBまでです。
 
-## よくある質問
+## D1を使う
 
-**全部 Cloudflare に移した方がいいですか？**
+D1はNode.jsサーバーから直接ではなく、D1 Proxy Workerを通して使います。
 
-いまのところ「全部 Worker 化」はおすすめしていません。Node での開発のしやすさと、PostgreSQL の力を活かした方が、多くの場合うまくいきます。
+```text
+Node.js サーバー → Bearerトークン → D1 Proxy Worker → Cloudflare D1
+```
 
-**R2 と D1 を同時に使って問題ありますか？**
+Workerの `AUTH_TOKEN` とNode.js側の `D1_WORKER_TOKEN` は同じ値にします。ブラウザからWorkerへDBトークンやSQLを送る構成にはしません。
 
-問題ありません。むしろ現在のおすすめに近い形です。
+## 運用時の注意
 
-**Worker を入れると複雑になりませんか？**
+- DBとストレージを切り替える前にバックアップを取ります。
+- Worker、D1マイグレーション、Node.jsの更新は順番に確認します。
+- R2/D1の鍵は `.env` またはデプロイ先のシークレット管理に置き、Gitへ追加しません。
+- 投稿・DM・通知は利用者ごとに見える内容が変わるため、キャッシュ設定は慎重に行います。
 
-最初は「署名発行だけ Worker に任せる」程度から始めると負担が少ないです。
+## 関連文書
 
-## 関連
-
-- [PostgreSQL のセットアップ](./database-postgres.md)
 - [D1 と Worker](./database-d1-worker.md)
-- [R2 ストレージ](./storage-r2.md)
-- [ローカルストレージ](./storage-local.md)
+- [D1 Proxy Worker](../../workers/d1-proxy/README.md)
+- [Cloudflare R2](./storage-r2.md)
+- [PostgreSQL](./database-postgres.md)
+- [本番デプロイのチェックリスト](./production-checklist.md)

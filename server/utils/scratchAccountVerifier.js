@@ -1,6 +1,19 @@
 const { verifyScratchComment } = require('./scratchVerifier');
+const config = require('../config');
 
 const IphubAPIKey = process.env.IPHUB_KEY;
+const scratchVerificationPolicy = config.auth.scratchVerification;
+const SCRATCH_REQUEST_TIMEOUT_MS = 8000;
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = SCRATCH_REQUEST_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
 // Any operational exception must be explicit in environment configuration;
 // production code must not embed permanent authentication bypass accounts.
 const TrustedUsers = new Set(
@@ -14,13 +27,16 @@ const TrustedUsers = new Set(
  * IPHubでIPの評価を行う
  */
 async function checkIpWithIphub(ip) {
+  if (!scratchVerificationPolicy.ipRestrictionEnabled) {
+    return { ok: true, skipped: true };
+  }
   if (!IphubAPIKey) {
     console.warn('[scratchAccountVerifier] IPHUB_KEY が設定されていないため、IPチェックをスキップします');
     return { ok: true, skipped: true };
   }
 
   try {
-    const res = await fetch(`https://v2.api.iphub.info/ip/${ip}`, {
+    const res = await fetchWithTimeout(`https://v2.api.iphub.info/ip/${encodeURIComponent(ip)}`, {
       headers: { "X-Key": IphubAPIKey }
     });
 
@@ -48,7 +64,7 @@ async function checkIpWithIphub(ip) {
  */
 async function checkScratchProfile(username) {
   try {
-    const res = await fetch(`https://scratch.mit.edu/users/${encodeURIComponent(username)}/`);
+    const res = await fetchWithTimeout(`https://scratch.mit.edu/users/${encodeURIComponent(username)}/`);
     if (!res.ok) {
       return { ok: false, error: `Scratch profile fetch failed: ${res.status}` };
     }
@@ -62,14 +78,17 @@ async function checkScratchProfile(username) {
     if (!cleanHtml.includes('Scratcher')) {
       return { ok: false, reason: "Nyaitterの利用条件を満たしていません。" };
     }
-    if (cleanHtml.includes('New Scratcher')) {
+    if (scratchVerificationPolicy.rejectNewScratcher && cleanHtml.includes('New Scratcher')) {
       return { ok: false, reason: "NewScratcherのScratchIDでは利用できません。" };
     }
     if (username.length < 4) {
       return { ok: false, reason: "ユーザー名が短すぎます。" };
     }
 
-    if (/<a[^>]*href="(?!.users)[^"]class[^"]"[^>]>/i.test(cleanHtml)) {
+    if (
+      scratchVerificationPolicy.rejectStudentAccounts &&
+      /<a[^>]*href="(?!.users)[^"]class[^"]"[^>]>/i.test(cleanHtml)
+    ) {
       return { ok: false, reason: "生徒アカウントでは利用できません。" };
     }
 
@@ -82,7 +101,7 @@ async function checkScratchProfile(username) {
 /**
  * フォロワー数を厳密にカウントする
  */
-async function countQualifiedFollowers(username) {
+async function countQualifiedFollowers(username, minimum = scratchVerificationPolicy.minQualifiedFollowers) {
   if (TrustedUsers.has(String(username).toLowerCase())) {
     return 999;
   }
@@ -95,9 +114,9 @@ async function countQualifiedFollowers(username) {
   let validFollowerCount = 0;
   let hasMore = true;
 
-  while (hasMore && validFollowerCount < 25) {
+  while (hasMore && validFollowerCount < minimum) {
     try {
-      const res = await fetch(
+      const res = await fetchWithTimeout(
         `https://api.scratch.mit.edu/users/${encodeURIComponent(username)}/followers?limit=${limit}&offset=${offset}`
       );
       if (!res.ok) break;
@@ -149,12 +168,15 @@ async function verifyScratchAccount(username, code, ip) {
     return { ok: false, reason: profileCheck.reason || profileCheck.error };
   }
 
-  const followerCount = await countQualifiedFollowers(username);
-  if (followerCount < 25) {
-    return {
-      ok: false,
-      reason: `信頼できるフォロワー数の条件を満たしていません(${followerCount}/25)。`
-    };
+  const minimumFollowers = scratchVerificationPolicy.minQualifiedFollowers;
+  if (minimumFollowers > 0) {
+    const followerCount = await countQualifiedFollowers(username, minimumFollowers);
+    if (followerCount < minimumFollowers) {
+      return {
+        ok: false,
+        reason: `信頼できるフォロワー数の条件を満たしていません(${followerCount}/${minimumFollowers})。`
+      };
+    }
   }
 
   const isVerified = await verifyScratchComment(username, code);

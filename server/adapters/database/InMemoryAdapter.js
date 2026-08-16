@@ -6,6 +6,7 @@ const {
 	formatNyaitterId,
 } = require('../../utils/nyaitterAddress');
 const { normalizeTarget } = require('../../utils/notification');
+const { normalizeBlockList } = require('../../utils/blockList');
 
 class InMemoryAdapter extends DatabaseAdapter {
 	constructor() {
@@ -25,8 +26,11 @@ class InMemoryAdapter extends DatabaseAdapter {
 		this.likeCountByPost = new Map();
 		this.starCountByPost = new Map();
 		this.repostCountByPost = new Map();
-		this.likes = new Map(); // `${userId}:${postId}` -> true
-		this.stars = new Map();
+					this.likes = new Map(); // `${userId}:${postId}` -> true
+			this.stars = new Map();
+			this.likedPostIdsByUser = new Map(); // userId -> Set(postId)
+			this.starredPostIdsByUser = new Map(); // userId -> Set(postId)
+
 		this.dmChannels = new Map(); // channelId -> { id, participants, messages, ... }
 		this.groupDms = new Map(); // dmId -> { id, title, member, host_id, time, post, unread }
 		this.groupDmIdsByMember = new Map(); // userId -> Set(dmId)
@@ -35,8 +39,12 @@ class InMemoryAdapter extends DatabaseAdapter {
 		this.follows = new Map(); // `${followerId}:${followingId}` -> true
 		this.followingIdsByUser = new Map(); // followerId -> Set(followingId)
 		this.followerIdsByUser = new Map(); // followingId -> Set(followerId)
-		this.notifications = new Map(); // userId -> [notification]
-		this.pushSubscriptions = new Map(); // userId -> Map(endpoint -> subscription)
+			this.notifications = new Map(); // userId -> [notification]
+			this.notificationsById = new Map(); // notificationId -> notification
+			this.unreadNotificationCounts = new Map(); // userId -> unread count
+			this.moderationReports = new Map(); // reportId -> report record
+			this.nextModerationReportId = 1;
+			this.pushSubscriptions = new Map(); // userId -> Map(endpoint -> subscription)
 		this.reposts = new Map(); // `${userId}:${postId}` -> true
 		this.pinnedPosts = new Map(); // `${userId}:${postId}` -> true
 		this.nextPostId = 1;
@@ -128,7 +136,22 @@ class InMemoryAdapter extends DatabaseAdapter {
 		}
 	}
 
-	_updateFollowIndexes(followerId, followingId, following) {
+			_updateUserReactionIndex(index, userId, postId, active) {
+			const normalizedUserId = Number(userId);
+			const normalizedPostId = Number(postId);
+			if (active) {
+				if (!index.has(normalizedUserId)) index.set(normalizedUserId, new Set());
+				index.get(normalizedUserId).add(normalizedPostId);
+				return;
+			}
+			const postIds = index.get(normalizedUserId);
+			if (!postIds) return;
+			postIds.delete(normalizedPostId);
+			if (postIds.size === 0) index.delete(normalizedUserId);
+		}
+
+		_updateFollowIndexes(followerId, followingId, following) {
+
 		const follower = Number(followerId);
 		const followingUser = Number(followingId);
 		if (following) {
@@ -156,19 +179,29 @@ class InMemoryAdapter extends DatabaseAdapter {
 
 	async disconnect() {}
 
+	_normalizeUserBlockList(user) {
+		if (!user) return null;
+		user.block = normalizeBlockList(user.block, user.id);
+		return user;
+	}
+
 	async getUserByScid(scid) {
 		const id = this.scidToId.get(scid);
-		return id !== undefined ? this.users.get(id) : null;
+		return id !== undefined
+			? this._normalizeUserBlockList(this.users.get(id))
+			: null;
 	}
 
 	async getUserById(id) {
-		return this.users.get(id) || null;
+		return this._normalizeUserBlockList(this.users.get(id));
 	}
 
 	async getUserByNyaitterAddress(address) {
 		if (!this.nyaitterAddressToId) return null;
 		const id = this.nyaitterAddressToId.get(address);
-		return id ? this.users.get(id) : null;
+		return id != null
+			? this._normalizeUserBlockList(this.users.get(id))
+			: null;
 	}
 
 	async getOrCreateExternalUser({
@@ -209,7 +242,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 
 	
 	_withUserDefaults(user) {
-		return {
+		const normalized = {
 			me: '',
 			icon_data: null,
 			header_image: null,
@@ -223,6 +256,8 @@ class InMemoryAdapter extends DatabaseAdapter {
 			lock: false,
 			...(user || {}),
 		};
+		normalized.block = normalizeBlockList(normalized.block, normalized.id);
+		return normalized;
 	}
 
 	async createUser(userData) {
@@ -284,12 +319,14 @@ class InMemoryAdapter extends DatabaseAdapter {
 	}
 
 	
-	async searchUsers(query, limit = 20) {
+	async searchUsers(query, limit = 20, offset = 0) {
 		if (!query || query.trim().length === 0) {
 			return [];
 		}
 
 		const q = query.toLowerCase();
+		const safeLimit = Math.max(Number(limit) || 0, 0);
+		const safeOffset = Math.max(Number(offset) || 0, 0);
 		const results = [];
 
 		for (const user of this.users.values()) {
@@ -307,20 +344,20 @@ class InMemoryAdapter extends DatabaseAdapter {
 				name.includes(q) ||
 				profile.includes(q)
 			) {
-				results.push(user);
-
-				if (results.length >= limit) break;
+				results.push(this._normalizeUserBlockList(user));
 			}
 		}
 
-		return results;
+		return results
+			.sort((left, right) => Number(left.id) - Number(right.id))
+			.slice(safeOffset, safeOffset + safeLimit);
 	}
 
 	
 	async getUsersByIds(userIds) {
 		const results = [];
 		for (const id of userIds) {
-			const user = this.users.get(id);
+			const user = this._normalizeUserBlockList(this.users.get(id));
 			if (user) {
 				results.push(user);
 			}
@@ -330,11 +367,15 @@ class InMemoryAdapter extends DatabaseAdapter {
 
 	
 	async getAllUsers() {
-		return Array.from(this.users.values());
+		return Array.from(this.users.values()).map((user) =>
+			this._normalizeUserBlockList(user),
+		);
 	}
 
 	async createSession(userId, meta = {}) {
-		const token = crypto.randomBytes(config.auth.sessionTokenBytes).toString('hex');
+		const token = typeof meta.token === 'string' && meta.token
+			? meta.token
+			: crypto.randomBytes(config.auth.sessionTokenBytes).toString('hex');
 		const msPerDay = 1000 * 60 * 60 * 24;
 		const expiresAt = new Date(Date.now() + msPerDay * config.auth.sessionExpiryDays);
 		const session = {
@@ -545,6 +586,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 			attachments: postData.attachments || null,
 			mask: !!postData.mask,
 			lock: !!postData.lock,
+			announcement: !!postData.announcement,
 			replyTo: postData.replyTo || null,
 			repostTo: postData.repostTo || null,
 			createdAt: new Date(),
@@ -591,26 +633,24 @@ class InMemoryAdapter extends DatabaseAdapter {
 	}
 
 	
-	async getPostDetail(id, currentUserId = null) {
-		const post = this.posts.get(id);
+		async getPostDetail(id, currentUserId = null) {
+		const postId = Number(id);
+		const post = this.posts.get(postId);
 		if (!post) return null;
 
-		const author = this.getUserById(post.userId);
-		const likeCount = this.getLikeCountForPost(id);
-		const starCount = this.getStarCountForPost(id);
-
-		const likedByMe = currentUserId
-			? this.hasUserLikedPost(currentUserId, id)
-			: false;
-		const starredByMe = currentUserId
-			? this.hasUserStarredPost(currentUserId, id)
-			: false;
-
+		// このアダプターでは関連データがすべてMap索引にあるため、非同期メソッドを
+		// 経由せず直接参照して、不要なPromise生成を避ける。
+		const author = this.users.get(Number(post.userId)) || null;
+		const likeCount = this.likeCountByPost.get(postId) || 0;
+		const starCount = this.starCountByPost.get(postId) || 0;
+		const viewerId = currentUserId == null ? null : Number(currentUserId);
+		const likedByMe = viewerId != null && this.likes.has(`${viewerId}:${postId}`);
+		const starredByMe = viewerId != null && this.stars.has(`${viewerId}:${postId}`);
 		let parentPost = null;
 		if (post.replyTo) {
-			const parent = this.posts.get(post.replyTo);
+			const parent = this.posts.get(Number(post.replyTo));
 			if (parent) {
-				const parentAuthor = this.getUserById(parent.userId);
+				const parentAuthor = this.users.get(Number(parent.userId)) || null;
 				parentPost = {
 					id: parent.id,
 					content: parent.content?.substring(
@@ -655,24 +695,28 @@ class InMemoryAdapter extends DatabaseAdapter {
 	}
 
 	
-	async getPostsByUserId(userId, limit = config.limits.timelineDefaultLimit, currentUserId = null) {
-		const ids = this.postIdsByUser.get(Number(userId)) || [];
-		const sliced = ids.slice(0, Math.max(0, Number(limit) || 0));
-		return Promise.all(sliced.map((id) => this.getPostDetail(id, currentUserId)));
-	}
+		async getPostsByUserId(userId, limit = config.limits.timelineDefaultLimit, _currentUserId = null) {
+			const ids = this.postIdsByUser.get(Number(userId)) || [];
+			return ids
+				.slice(0, Math.max(0, Number(limit) || 0))
+				.map((id) => this.posts.get(id))
+				.filter(Boolean);
+		}
 
 	async toggleLike(userId, postId) {
 		const key = `${userId}:${postId}`;
 		const currentlyLiked = this.likes.has(key);
 
 		const currentCount = this.likeCountByPost.get(postId) || 0;
-		if (currentlyLiked) {
-			this.likes.delete(key);
-			this.likeCountByPost.set(postId, Math.max(0, currentCount - 1));
-		} else {
-			this.likes.set(key, true);
-			this.likeCountByPost.set(postId, currentCount + 1);
-		}
+			if (currentlyLiked) {
+				this.likes.delete(key);
+				this._updateUserReactionIndex(this.likedPostIdsByUser, userId, postId, false);
+				this.likeCountByPost.set(postId, Math.max(0, currentCount - 1));
+			} else {
+				this.likes.set(key, true);
+				this._updateUserReactionIndex(this.likedPostIdsByUser, userId, postId, true);
+				this.likeCountByPost.set(postId, currentCount + 1);
+			}
 
 		const count = this.likeCountByPost.get(postId) || 0;
 
@@ -699,13 +743,15 @@ class InMemoryAdapter extends DatabaseAdapter {
 		const currentlyStarred = this.stars.has(key);
 
 		const currentCount = this.starCountByPost.get(postId) || 0;
-		if (currentlyStarred) {
-			this.stars.delete(key);
-			this.starCountByPost.set(postId, Math.max(0, currentCount - 1));
-		} else {
-			this.stars.set(key, true);
-			this.starCountByPost.set(postId, currentCount + 1);
-		}
+			if (currentlyStarred) {
+				this.stars.delete(key);
+				this._updateUserReactionIndex(this.starredPostIdsByUser, userId, postId, false);
+				this.starCountByPost.set(postId, Math.max(0, currentCount - 1));
+			} else {
+				this.stars.set(key, true);
+				this._updateUserReactionIndex(this.starredPostIdsByUser, userId, postId, true);
+				this.starCountByPost.set(postId, currentCount + 1);
+			}
 
 		const count = this.starCountByPost.get(postId) || 0;
 
@@ -866,9 +912,11 @@ class InMemoryAdapter extends DatabaseAdapter {
 		return result;
 	}
 
-	async getGroupDm(dmId) {
-		return this.groupDms.get(Number(dmId)) || null;
-	}
+		async getGroupDm(dmId) {
+			return this.groupDms.get(dmId)
+				|| this.groupDms.get(Number(dmId))
+				|| null;
+		}
 
 	async createGroupDm(dmData) {
 		const id = this.nextDmId++;
@@ -1054,16 +1102,20 @@ class InMemoryAdapter extends DatabaseAdapter {
 			}
 		}
 
-		for (const key of Array.from(this.likes.keys())) {
-			if (key.endsWith(`:${postId}`)) {
-				this.likes.delete(key);
+			for (const key of Array.from(this.likes.keys())) {
+				if (key.endsWith(`:${postId}`)) {
+					const [reactionUserId] = key.split(':').map(Number);
+					this.likes.delete(key);
+					this._updateUserReactionIndex(this.likedPostIdsByUser, reactionUserId, postId, false);
+				}
 			}
-		}
-		for (const key of Array.from(this.stars.keys())) {
-			if (key.endsWith(`:${postId}`)) {
-				this.stars.delete(key);
+			for (const key of Array.from(this.stars.keys())) {
+				if (key.endsWith(`:${postId}`)) {
+					const [reactionUserId] = key.split(':').map(Number);
+					this.stars.delete(key);
+					this._updateUserReactionIndex(this.starredPostIdsByUser, reactionUserId, postId, false);
+				}
 			}
-		}
 		for (const key of Array.from(this.reposts.keys())) {
 			if (key.endsWith(`:${postId}`)) {
 				this.reposts.delete(key);
@@ -1092,12 +1144,20 @@ class InMemoryAdapter extends DatabaseAdapter {
 			}
 		}
 
-		for (const key of Array.from(this.likes.keys())) {
-			if (key.endsWith(`:${postId}`)) this.likes.delete(key);
-		}
-		for (const key of Array.from(this.stars.keys())) {
-			if (key.endsWith(`:${postId}`)) this.stars.delete(key);
-		}
+			for (const key of Array.from(this.likes.keys())) {
+				if (key.endsWith(`:${postId}`)) {
+					const [reactionUserId] = key.split(':').map(Number);
+					this.likes.delete(key);
+					this._updateUserReactionIndex(this.likedPostIdsByUser, reactionUserId, postId, false);
+				}
+			}
+			for (const key of Array.from(this.stars.keys())) {
+				if (key.endsWith(`:${postId}`)) {
+					const [reactionUserId] = key.split(':').map(Number);
+					this.stars.delete(key);
+					this._updateUserReactionIndex(this.starredPostIdsByUser, reactionUserId, postId, false);
+				}
+			}
 		for (const key of Array.from(this.reposts.keys())) {
 			if (key.endsWith(`:${postId}`)) this.reposts.delete(key);
 		}
@@ -1221,97 +1281,231 @@ class InMemoryAdapter extends DatabaseAdapter {
 		return this.getRepostCountForPost(postId);
 	}
 
-	async createNotification(notificationData) {
-		const id = this.nextNotificationId++;
-		const notification = {
-			id,
-			userId: notificationData.userId,
-			type: notificationData.type,
-			fromUserId: notificationData.fromUserId ?? null,
-			target: normalizeTarget(notificationData.target, {
-				postId: notificationData.postId,
-				open: notificationData.open,
-			}),
+		async createNotification(notificationData) {
+			const id = this.nextNotificationId++;
+			const userId = Number(notificationData.userId);
+			const notification = {
+				id,
+				userId,
+				type: notificationData.type,
+				fromUserId: notificationData.fromUserId ?? null,
+				target: normalizeTarget(notificationData.target, {
+					postId: notificationData.postId,
+					open: notificationData.open,
+				}),
 				read: false,
 				clicked: false,
+				message: typeof notificationData.message === 'string' ? notificationData.message : null,
 				createdAt: new Date(),
-		};
+			};
 
-		if (!this.notifications.has(notificationData.userId)) {
-			this.notifications.set(notificationData.userId, []);
+			if (!this.notifications.has(userId)) this.notifications.set(userId, []);
+			this.notifications.get(userId).push(notification);
+			this.notificationsById.set(id, notification);
+			this.unreadNotificationCounts.set(
+				userId,
+				(this.unreadNotificationCounts.get(userId) || 0) + 1,
+			);
+			return notification;
 		}
-		this.notifications.get(notificationData.userId).push(notification);
 
-		return notification;
-	}
-
-	async getNotifications(userId, limit = 50, offset = 0) {
-		const notifications = this.notifications.get(userId) || [];
-		const sorted = notifications
-			.slice()
-			.sort((a, b) => b.createdAt - a.createdAt);
-		return sorted.slice(offset, offset + limit);
-	}
-
-	async getNotificationById(notificationId) {
-		for (const notifications of this.notifications.values()) {
-			const notif = notifications.find((n) => n.id === notificationId);
-			if (notif) return notif;
+		async getNotifications(userId, limit = 50, offset = 0) {
+			const notifications = this.notifications.get(Number(userId)) || [];
+			// 追加順が古い→新しいなので、配列の複製・全件ソートを避けて後方から切り出す。
+			const start = Math.max(0, notifications.length - Math.max(0, Number(offset) || 0) - Math.max(0, Number(limit) || 0));
+			const end = Math.max(0, notifications.length - Math.max(0, Number(offset) || 0));
+			return notifications.slice(start, end).reverse();
 		}
-		return null;
-	}
 
-	async markNotificationAsRead(notificationId) {
-		for (const notifications of this.notifications.values()) {
-			const notif = notifications.find((n) => n.id === notificationId);
-			if (notif) {
-				notif.read = true;
-				return;
-			}
+		async getNotificationById(notificationId) {
+			return this.notificationsById.get(Number(notificationId)) || null;
 		}
-	}
+
+		async markNotificationAsRead(notificationId) {
+			const notification = this.notificationsById.get(Number(notificationId));
+			if (!notification || notification.read) return;
+			notification.read = true;
+			const userId = Number(notification.userId);
+			this.unreadNotificationCounts.set(
+				userId,
+				Math.max(0, (this.unreadNotificationCounts.get(userId) || 0) - 1),
+			);
+		}
 
 		async markNotificationAsClicked(notificationId) {
-			for (const notifications of this.notifications.values()) {
-				const notif = notifications.find((n) => n.id === notificationId);
-				if (notif) {
-					notif.clicked = true;
-					return;
-				}
-			}
+			const notification = this.notificationsById.get(Number(notificationId));
+			if (notification) notification.clicked = true;
 		}
 
 		async deleteNotification(notificationId) {
-		for (const [userId, notifications] of this.notifications.entries()) {
-			const index = notifications.findIndex(
-				(n) => n.id === notificationId,
-			);
-			if (index !== -1) {
-				notifications.splice(index, 1);
-				if (notifications.length === 0) {
-					this.notifications.delete(userId);
-				}
-				return true;
+			const notification = this.notificationsById.get(Number(notificationId));
+			if (!notification) return false;
+			const userId = Number(notification.userId);
+			const notifications = this.notifications.get(userId) || [];
+			const index = notifications.indexOf(notification);
+			if (index >= 0) notifications.splice(index, 1);
+			if (notifications.length === 0) this.notifications.delete(userId);
+			this.notificationsById.delete(Number(notificationId));
+			if (!notification.read) {
+				this.unreadNotificationCounts.set(
+					userId,
+					Math.max(0, (this.unreadNotificationCounts.get(userId) || 0) - 1),
+				);
 			}
+			return true;
 		}
-		return false;
-	}
 
-	async markAllNotificationsAsRead(userId) {
-		const notifications = this.notifications.get(userId);
-		if (notifications) {
-			for (const notif of notifications) {
-				notif.read = true;
+		async markAllNotificationsAsRead(userId) {
+			const normalizedUserId = Number(userId);
+			const notifications = this.notifications.get(normalizedUserId) || [];
+			for (const notification of notifications) notification.read = true;
+			this.unreadNotificationCounts.set(normalizedUserId, 0);
+		}
+
+		async markAllNotificationsAsClicked(userId) {
+			const normalizedUserId = Number(userId);
+			const notifications = this.notifications.get(normalizedUserId) || [];
+			for (const notification of notifications) {
+				notification.read = true;
+				notification.clicked = true;
 			}
+			this.unreadNotificationCounts.set(normalizedUserId, 0);
 		}
-	}
 
-	async getUnreadNotificationCount(userId) {
-		const notifications = this.notifications.get(userId) || [];
-		return notifications.filter((n) => !n.read).length;
-	}
+		async getUnreadNotificationCount(userId) {
+			return this.unreadNotificationCounts.get(Number(userId)) || 0;
+		}
 
-	async upsertPushSubscription(userId, subscription) {
+		_copyModerationReport(report) {
+			if (!report) return null;
+			return {
+				...report,
+				targetSnapshot: JSON.parse(JSON.stringify(report.targetSnapshot || {})),
+				excludedAdminIds: [...(report.excludedAdminIds || [])],
+				resolution: report.resolution == null
+					? null
+					: JSON.parse(JSON.stringify(report.resolution)),
+			};
+		}
+
+		async createModerationReport(reportData) {
+			const now = reportData.createdAt ? new Date(reportData.createdAt) : new Date();
+			const report = {
+				id: this.nextModerationReportId++,
+				reporterUserId: Number(reportData.reporterUserId),
+				targetKind: String(reportData.targetKind),
+				targetId: String(reportData.targetId),
+				description: String(reportData.description || ''),
+				targetSnapshot: JSON.parse(JSON.stringify(reportData.targetSnapshot || {})),
+				assignmentType: ['freeze_appeal', 'verification_application'].includes(reportData.assignmentType)
+					? reportData.assignmentType
+					: 'report',
+				status: 'pending',
+				assignedAdminId: null,
+				assignedAt: null,
+				excludedAdminIds: [],
+				resolution: null,
+				createdAt: now,
+				resolvedAt: null,
+			};
+			this.moderationReports.set(report.id, report);
+			return this._copyModerationReport(report);
+		}
+
+		async getOpenModerationAppealByUserId(userId) {
+			const appeal = [...this.moderationReports.values()]
+				.filter((report) => Number(report.reporterUserId) === Number(userId))
+				.filter((report) => report.assignmentType === 'freeze_appeal' && report.status !== 'resolved')
+				.sort((left, right) => new Date(right.createdAt) - new Date(left.createdAt))[0];
+			return this._copyModerationReport(appeal);
+		}
+
+		async getOpenModerationVerificationByUserId(userId) {
+			const request = [...this.moderationReports.values()]
+				.filter((report) => Number(report.reporterUserId) === Number(userId))
+				.filter((report) => report.assignmentType === 'verification_application' && report.status !== 'resolved')
+				.sort((left, right) => new Date(right.createdAt) - new Date(left.createdAt))[0];
+			return this._copyModerationReport(request);
+		}
+
+		async getModerationReportById(reportId) {
+			return this._copyModerationReport(this.moderationReports.get(Number(reportId)));
+		}
+
+		async listModerationReportsForAdmin(adminId, options = {}) {
+			const status = options.status || 'assigned';
+			const limit = Math.max(1, Math.min(Number(options.limit) || 50, 100));
+			const offset = Math.max(0, Number(options.offset) || 0);
+			return [...this.moderationReports.values()]
+				.filter((report) => Number(report.assignedAdminId) === Number(adminId))
+				.filter((report) => !status || report.status === status)
+				.sort((left, right) => new Date(right.assignedAt || right.createdAt) - new Date(left.assignedAt || left.createdAt))
+				.slice(offset, offset + limit)
+				.map((report) => this._copyModerationReport(report));
+		}
+
+		async getModerationAdminWorkloads(excludedAdminIds = []) {
+			const excluded = new Set((excludedAdminIds || []).map(Number));
+			return [...this.users.values()]
+				.filter((user) => Boolean(user.admin) && !user.freeze && !excluded.has(Number(user.id)))
+				.map((user) => ({
+					adminId: Number(user.id),
+					activeCount: [...this.moderationReports.values()].filter((report) => (
+						report.status === 'assigned' && Number(report.assignedAdminId) === Number(user.id)
+					)).length,
+				}));
+		}
+
+		async assignModerationReport(reportId, assignment = {}) {
+			const report = this.moderationReports.get(Number(reportId));
+			if (!report || report.status === 'resolved') return null;
+			if (
+				assignment.expectedAdminId !== undefined &&
+				Number(report.assignedAdminId) !== Number(assignment.expectedAdminId)
+			) return null;
+			report.status = 'assigned';
+			report.assignedAdminId = Number(assignment.adminId);
+			report.assignedAt = assignment.assignedAt
+				? new Date(assignment.assignedAt)
+				: new Date();
+			report.excludedAdminIds = [...new Set((assignment.excludedAdminIds || report.excludedAdminIds || [])
+				.map(Number)
+				.filter(Number.isInteger))];
+			return this._copyModerationReport(report);
+		}
+
+		async getOverdueModerationReports(cutoff) {
+			const deadline = new Date(cutoff);
+			return [...this.moderationReports.values()]
+				.filter((report) => report.status === 'assigned' && report.assignedAt && new Date(report.assignedAt) <= deadline)
+				.map((report) => this._copyModerationReport(report));
+		}
+
+		async getUnassignedModerationReports(limit = 100) {
+			return [...this.moderationReports.values()]
+				.filter((report) => report.status === 'pending')
+				.sort((left, right) => new Date(left.createdAt) - new Date(right.createdAt))
+				.slice(0, Math.max(1, Math.min(Number(limit) || 100, 100)))
+				.map((report) => this._copyModerationReport(report));
+		}
+
+		async resolveModerationReport(reportId, adminId, resolution) {
+			const report = this.moderationReports.get(Number(reportId));
+			if (
+				!report || report.status !== 'assigned' ||
+				Number(report.assignedAdminId) !== Number(adminId)
+			) return null;
+			report.status = 'resolved';
+			report.resolution = JSON.parse(JSON.stringify(resolution || {}));
+			report.resolvedAt = new Date();
+			return this._copyModerationReport(report);
+		}
+
+		async deleteModerationReport(reportId) {
+			return this.moderationReports.delete(Number(reportId));
+		}
+
+		async upsertPushSubscription(userId, subscription) {
 		const normalizedUserId = Number(userId);
 		if (!this.users.has(normalizedUserId)) return null;
 		if (!this.pushSubscriptions.has(normalizedUserId)) {
@@ -1327,6 +1521,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 			expiration_time: subscription.expirationTime ?? null,
 			p256dh: subscription.keys.p256dh,
 			auth: subscription.keys.auth,
+			session_token: subscription.sessionToken || existing?.session_token || null,
 			created_at: existing?.created_at || now,
 			updated_at: now,
 		};
@@ -1336,7 +1531,13 @@ class InMemoryAdapter extends DatabaseAdapter {
 
 	async getPushSubscriptions(userId) {
 		const subscriptions = this.pushSubscriptions.get(Number(userId));
-		return subscriptions ? [...subscriptions.values()].map((subscription) => ({ ...subscription })) : [];
+		if (!subscriptions) return [];
+		return [...subscriptions.values()].map((subscription) => ({
+			endpoint: subscription.endpoint,
+			expirationTime: subscription.expiration_time,
+			keys: { p256dh: subscription.p256dh, auth: subscription.auth },
+			sessionToken: subscription.session_token || null,
+		}));
 	}
 
 	async deletePushSubscription(userId, endpoint) {
@@ -1391,41 +1592,44 @@ class InMemoryAdapter extends DatabaseAdapter {
 			'freeze',
 			'shadow',
 			'lock',
+			'admin',
 		];
 		for (const key of allowed) {
 			if (profileData[key] !== undefined) {
-				user[key] = profileData[key];
+				user[key] =
+					key === 'block'
+						? normalizeBlockList(profileData[key], userId)
+						: profileData[key];
 			}
 		}
 
-		return user;
+		return this._normalizeUserBlockList(user);
 	}
 
-	async getLikeIds(userId) {
-		const result = [];
-		for (const key of this.likes.keys()) {
-			const [uId, postId] = key.split(':').map(Number);
-			if (uId === userId) result.push(postId);
+		async getLikeIds(userId) {
+			return [...(this.likedPostIdsByUser.get(Number(userId)) || [])];
 		}
-		return result;
-	}
 
-	async getStarIds(userId) {
-		const result = [];
-		for (const key of this.stars.keys()) {
-			const [uId, postId] = key.split(':').map(Number);
-			if (uId === userId) result.push(postId);
+		async getStarIds(userId) {
+			return [...(this.starredPostIdsByUser.get(Number(userId)) || [])];
 		}
-		return result;
-	}
 
-	async getFollowIds(userId) {
-		const result = [];
-		for (const key of this.follows.keys()) {
-			const [followerId, followingId] = key.split(':').map(Number);
-			if (followerId === userId) result.push(followingId);
+		async getFollowIds(userId) {
+			return [...(this.followingIdsByUser.get(Number(userId)) || [])];
 		}
-		return result;
+
+	async getFollowRelationshipSnapshot(userId, candidateUserIds) {
+		const normalizedUserId = Number(userId);
+		const candidates = [...new Set((candidateUserIds || [])
+			.map(Number)
+			.filter((id) => Number.isInteger(id) && id !== normalizedUserId))];
+		const followingIds = [];
+		const followerIds = [];
+		for (const candidateId of candidates) {
+			if (this.follows.has(`${normalizedUserId}:${candidateId}`)) followingIds.push(candidateId);
+			if (this.follows.has(`${candidateId}:${normalizedUserId}`)) followerIds.push(candidateId);
+		}
+		return { followingIds, followerIds };
 	}
 
 	async getPinnedPostId(userId) {
@@ -1436,31 +1640,17 @@ class InMemoryAdapter extends DatabaseAdapter {
 		return null;
 	}
 
-	async getFollowingCount(userId) {
-		let count = 0;
-		for (const key of this.follows.keys()) {
-			const [followerId] = key.split(':').map(Number);
-			if (followerId === userId) count++;
+		async getFollowingCount(userId) {
+			return (this.followingIdsByUser.get(Number(userId)) || new Set()).size;
 		}
-		return count;
-	}
 
-	async getFollowerCount(userId) {
-		let count = 0;
-		for (const key of this.follows.keys()) {
-			const [, followingId] = key.split(':').map(Number);
-			if (followingId === userId) count++;
+		async getFollowerCount(userId) {
+			return (this.followerIdsByUser.get(Number(userId)) || new Set()).size;
 		}
-		return count;
-	}
 
-	async getPostCount(userId) {
-		let count = 0;
-		for (const post of this.posts.values()) {
-			if (post.userId === userId) count++;
+		async getPostCount(userId) {
+			return (this.postIdsByUser.get(Number(userId)) || []).length;
 		}
-		return count;
-	}
 
 	async getRanking(type, limit = 50) {
 		const fieldByType = {
@@ -1579,81 +1769,160 @@ class InMemoryAdapter extends DatabaseAdapter {
 			}
 
 		
-			async getProfilePostIds({ userId, subType = 'all', limit = 30, offset = 0 } = {}) {
+			async getProfilePostIds({ userId, subType = 'all', limit = 30, offset = 0, beforeId = null } = {}) {
 			const normalizedLimit = Math.max(1, Number(limit) || 30);
-			const normalizedOffset = Math.max(0, Number(offset) || 0);
+			const normalizedBeforeId = Number.isInteger(Number(beforeId)) && Number(beforeId) > 0
+				? Number(beforeId)
+				: null;
+			const normalizedOffset = normalizedBeforeId == null ? Math.max(0, Number(offset) || 0) : 0;
 			const sourceIds = this.postIdsByUser.get(Number(userId)) || [];
-			if (subType === 'all') {
-				const window = sourceIds.slice(normalizedOffset, normalizedOffset + normalizedLimit + 1);
-				return { ids: window.slice(0, normalizedLimit), has_more: window.length > normalizedLimit };
-			}
-			const matched = [];
-			for (const id of sourceIds) {
+			const matched = sourceIds.filter((id) => {
 				const post = this.posts.get(id);
-				if (!post) continue;
-				const matches = subType === 'posts_only' ? post.replyTo == null : post.replyTo != null;
-				if (!matches) continue;
-				if (matched.length < normalizedOffset + normalizedLimit + 1) matched.push(id);
-				else break;
-			}
-			const window = matched.slice(normalizedOffset);
-			return { ids: window.slice(0, normalizedLimit), has_more: window.length > normalizedLimit };
+				if (!post || (normalizedBeforeId != null && Number(id) >= normalizedBeforeId)) return false;
+				return subType === 'all' || (subType === 'posts_only' ? post.replyTo == null : post.replyTo != null);
+			});
+			const window = matched.slice(normalizedOffset, normalizedOffset + normalizedLimit + 1);
+			const ids = window.slice(0, normalizedLimit);
+			return {
+				ids,
+				has_more: window.length > normalizedLimit,
+				next_cursor: window.length > normalizedLimit && ids.length > 0 ? ids[ids.length - 1] : null,
+			};
 		}
 
-		async getTimelinePostIds({ tab = 'foryou', followIds = [], limit = 30, offset = 0 } = {}) {
+		async getTimelinePostIds({ tab = 'foryou', followIds = [], limit = 30, offset = 0, beforeId = null } = {}) {
 			const normalizedLimit = Math.max(1, Number(limit) || 30);
-			const normalizedOffset = Math.max(0, Number(offset) || 0);
-			if (tab !== 'following' && tab !== 'announce') {
-				const matched = [];
-				for (const id of this.postIdsNewest) {
-					const post = this.posts.get(id);
-					if (!post || post.replyTo != null) continue;
-					if (matched.length < normalizedOffset + normalizedLimit + 1) matched.push(id);
-					else break;
-				}
-				const window = matched.slice(normalizedOffset);
-				return { ids: window.slice(0, normalizedLimit), has_more: window.length > normalizedLimit };
-			}
+			const normalizedBeforeId = Number.isInteger(Number(beforeId)) && Number(beforeId) > 0
+				? Number(beforeId)
+				: null;
+			const normalizedOffset = normalizedBeforeId == null ? Math.max(0, Number(offset) || 0) : 0;
 			const followSet = tab === 'following' ? new Set((followIds || []).map(Number)) : null;
 			const matched = [];
 			for (const id of this.postIdsNewest) {
 				const post = this.posts.get(id);
-				if (!post) continue;
+				if (!post || post.replyTo != null || (normalizedBeforeId != null && Number(id) >= normalizedBeforeId)) continue;
 				const matches = tab === 'following'
-					? followSet.has(Number(post.userId)) && post.replyTo === null
-					: Number(post.userId) === 2525 && post.replyTo === null && (post.content || '').includes('#NXAnnounce');
+					? followSet.has(Number(post.userId))
+					: tab === 'announce'
+						? post.announcement === true
+						: true;
 				if (!matches) continue;
-				if (matched.length < normalizedOffset + normalizedLimit + 1) matched.push(id);
-				else break;
+				matched.push(id);
+				if (matched.length >= normalizedOffset + normalizedLimit + 1) break;
 			}
-			const window = matched.slice(normalizedOffset);
-			return { ids: window.slice(0, normalizedLimit), has_more: window.length > normalizedLimit };
-	}
-
-	
-	async getRecommendedPostIds({ limit = 30, offset = 0 } = {}) {
-		const posts = await this.getTrendingPosts(offset + limit);
-		const ids = posts.slice(offset, offset + limit).map((p) => p.id);
-		const has_more = posts.length > offset + limit;
-		return { ids, has_more };
-	}
-
-	
-	async searchPostIds(query, limit = 30, offset = 0) {
-		if (!query || query.trim().length === 0) return { ids: [], has_more: false };
-		const q = query.toLowerCase().trim();
-		const normalizedLimit = Math.max(1, Number(limit) || 30);
-		const normalizedOffset = Math.max(0, Number(offset) || 0);
-		const matched = [];
-		for (const id of this.postIdsNewest) {
-			const post = this.posts.get(id);
-			if (!post || !(post.content || '').toLowerCase().includes(q)) continue;
-			if (matched.length < normalizedOffset + normalizedLimit + 1) matched.push(id);
-			else break;
+			const window = matched.slice(normalizedOffset, normalizedOffset + normalizedLimit + 1);
+			const ids = window.slice(0, normalizedLimit);
+			return {
+				ids,
+				has_more: window.length > normalizedLimit,
+				next_cursor: window.length > normalizedLimit && ids.length > 0 ? ids[ids.length - 1] : null,
+			};
 		}
-		const window = matched.slice(normalizedOffset);
-		return { ids: window.slice(0, normalizedLimit), has_more: window.length > normalizedLimit };
-	}
+
+		async getRecommendedPostIds({ viewerId = null, limit = 30, offset = 0, beforeId = null } = {}) {
+			const normalizedLimit = Math.max(1, Number(limit) || 30);
+			const normalizedBeforeId = Number.isInteger(Number(beforeId)) && Number(beforeId) > 0
+				? Number(beforeId)
+				: null;
+			const normalizedOffset = normalizedBeforeId == null ? Math.max(0, Number(offset) || 0) : 0;
+			const candidateLimit = Math.min(
+				1000,
+				Math.max(500, normalizedOffset + normalizedLimit + 1),
+			);
+			const normalizedViewerId = Number.isInteger(Number(viewerId)) ? Number(viewerId) : null;
+			const directFollowIds = normalizedViewerId == null
+				? new Set()
+				: new Set(this.followingIdsByUser.get(normalizedViewerId) || []);
+			const secondDegreeFollowIds = new Set();
+			for (const followedUserId of directFollowIds) {
+				for (const candidateUserId of this.followingIdsByUser.get(followedUserId) || []) {
+					if (candidateUserId !== normalizedViewerId && !directFollowIds.has(candidateUserId)) {
+						secondDegreeFollowIds.add(candidateUserId);
+					}
+				}
+			}
+			const affinityByAuthor = new Map();
+			const addAffinity = (postIds, field) => {
+				for (const postId of postIds) {
+					const reactedPost = this.posts.get(postId);
+					if (!reactedPost) continue;
+					const authorId = Number(reactedPost.userId);
+					const affinity = affinityByAuthor.get(authorId) || { likes: 0, stars: 0 };
+					affinity[field] += 1;
+					affinityByAuthor.set(authorId, affinity);
+				}
+			};
+			if (normalizedViewerId != null) {
+				addAffinity(this.likedPostIdsByUser.get(normalizedViewerId) || [], 'likes');
+				addAffinity(this.starredPostIdsByUser.get(normalizedViewerId) || [], 'stars');
+			}
+
+			const candidates = [];
+			for (const id of this.postIdsNewest) {
+				const post = this.posts.get(id);
+				if (!post || post.replyTo != null || (normalizedBeforeId != null && Number(id) >= normalizedBeforeId)) continue;
+				candidates.push(post);
+				if (candidates.length >= candidateLimit) break;
+			}
+			const now = Date.now();
+			const scored = candidates.map((post) => {
+				const authorId = Number(post.userId);
+				const ageHours = Math.max(0, (now - new Date(post.createdAt || post.created_at).getTime()) / 3600000);
+				const recencyScore = 48 / (1 + ageHours / 6);
+				const affinity = affinityByAuthor.get(authorId) || { likes: 0, stars: 0 };
+				const affinityScore = Math.min(20, affinity.likes * 4) + Math.min(32, affinity.stars * 8);
+				const graphScore = directFollowIds.has(authorId)
+					? 24
+					: secondDegreeFollowIds.has(authorId)
+						? 10
+						: 0;
+				const engagementScore = Math.min(
+					22,
+					Math.log1p(this.likeCountByPost.get(Number(post.id)) || 0) * 2
+						+ Math.log1p(this.starCountByPost.get(Number(post.id)) || 0) * 4
+						+ Math.log1p(this.repostCountByPost.get(Number(post.id)) || 0) * 5,
+				);
+				return { post, score: recencyScore + graphScore + affinityScore + engagementScore };
+			});
+			scored.sort((left, right) => (
+				right.score - left.score
+				|| new Date(right.post.createdAt || right.post.created_at).getTime() - new Date(left.post.createdAt || left.post.created_at).getTime()
+				|| Number(right.post.id) - Number(left.post.id)
+			));
+			const window = scored.slice(normalizedOffset, normalizedOffset + normalizedLimit + 1);
+			const ids = window.slice(0, normalizedLimit).map(({ post }) => post.id);
+			return {
+				ids,
+				has_more: window.length > normalizedLimit,
+				next_cursor: null,
+				use_offset_pagination: true,
+			};
+		}
+
+		async searchPostIds(query, limit = 30, offset = 0, beforeId = null) {
+			if (!query || query.trim().length === 0) return { ids: [], has_more: false, next_cursor: null };
+			const q = query.toLowerCase().trim();
+			const normalizedLimit = Math.max(1, Number(limit) || 30);
+			const normalizedBeforeId = Number.isInteger(Number(beforeId)) && Number(beforeId) > 0
+				? Number(beforeId)
+				: null;
+			const normalizedOffset = normalizedBeforeId == null ? Math.max(0, Number(offset) || 0) : 0;
+			const matched = [];
+			for (const id of this.postIdsNewest) {
+				const post = this.posts.get(id);
+				if (!post || (normalizedBeforeId != null && Number(id) >= normalizedBeforeId)) continue;
+				if (!(post.content || '').toLowerCase().includes(q)) continue;
+				matched.push(id);
+				if (matched.length >= normalizedOffset + normalizedLimit + 1) break;
+			}
+			const window = matched.slice(normalizedOffset, normalizedOffset + normalizedLimit + 1);
+			const ids = window.slice(0, normalizedLimit);
+			return {
+				ids,
+				has_more: window.length > normalizedLimit,
+				next_cursor: window.length > normalizedLimit && ids.length > 0 ? ids[ids.length - 1] : null,
+			};
+		}
 
 	
 	async getTrendingHashtags(limit = 10) {
@@ -1661,8 +1930,8 @@ class InMemoryAdapter extends DatabaseAdapter {
 		for (const post of this.posts.values()) {
 			const content = post.content || '';
 			const matches = content.match(/#([^<>/@#\s]+)/g) || [];
-			for (const match of matches) {
-				const tag = match.slice(1).toLowerCase();
+			const uniqueTags = new Set(matches.map((match) => match.slice(1).toLowerCase()));
+			for (const tag of uniqueTags) {
 				counts.set(tag, (counts.get(tag) || 0) + 1);
 			}
 		}

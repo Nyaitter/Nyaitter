@@ -3,13 +3,50 @@ document.addEventListener('DOMContentLoaded', async () => {
 	if (!container) return;
 
 	const isSafeEmojiId = (value) => /^[A-Za-z0-9_-]{1,80}$/.test(String(value || ''));
-	const showMessage = (message, className) => {
-		container.replaceChildren();
-		const paragraph = document.createElement('p');
-		paragraph.className = className;
-		paragraph.textContent = message;
-		container.appendChild(paragraph);
-	};
+			const showMessage = (message, className) => {
+			container.replaceChildren();
+			const paragraph = document.createElement('p');
+			paragraph.className = className;
+			paragraph.textContent = message;
+			container.appendChild(paragraph);
+		};
+		const dialogModal = document.getElementById('emoji-dialog-modal');
+		const dialogMessage = document.getElementById('emoji-dialog-message');
+		const dialogClose = document.getElementById('emoji-dialog-close');
+		const dialogAction = document.getElementById('emoji-dialog-action');
+
+		const showEmojiAlert = (message) => {
+			if (!dialogModal || !dialogMessage || !dialogClose || !dialogAction)
+				return;
+			const previousFocus = document.activeElement;
+			dialogMessage.textContent = String(message || '');
+			dialogModal.classList.remove('hidden');
+
+			const close = () => {
+				dialogModal.classList.add('hidden');
+				dialogClose.onclick = null;
+				dialogAction.onclick = null;
+				dialogModal.onclick = null;
+				document.removeEventListener('keydown', onKeyDown);
+				if (previousFocus instanceof HTMLElement) previousFocus.focus();
+			};
+			const onKeyDown = (event) => {
+				if (event.key === 'Escape') {
+					event.preventDefault();
+					close();
+				}
+			};
+
+			dialogClose.onclick = close;
+			dialogAction.onclick = close;
+			dialogModal.onclick = (event) => {
+				if (event.target === dialogModal) close();
+			};
+			document.addEventListener('keydown', onKeyDown);
+			requestAnimationFrame(() => dialogAction.focus());
+		};
+
+
 
 	try {
 		const response = await fetch('/emoji/list.json', { credentials: 'same-origin' });
@@ -73,7 +110,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 				}, 1500);
 			} catch (error) {
 				console.error('クリップボードへのコピーに失敗しました:', error);
-				alert('コピーに失敗しました。');
+					showEmojiAlert('コピーに失敗しました。');
 			}
 		});
 	} catch (error) {

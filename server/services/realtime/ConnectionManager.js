@@ -1,3 +1,22 @@
+const {
+  getVisibleDmUnreadCount,
+} = require('../DmVisibilityService');
+
+function getBlockedUserIds(user) {
+  return new Set(
+    (Array.isArray(user?.block) ? user.block : [])
+      .map(Number)
+      .filter(Number.isInteger),
+  );
+}
+
+function blocksUser(user, targetUserId) {
+  for (const blockedUserId of Array.isArray(user?.block) ? user.block : []) {
+    if (Number(blockedUserId) === targetUserId) return true;
+  }
+  return false;
+}
+
 class ConnectionManager {
   constructor() {
     this.connectionsByUser = new Map();
@@ -26,22 +45,14 @@ class ConnectionManager {
     }
   }
 
-  sendToUser(userId, event) {
+  _sendSerializedToUser(userId, serialized) {
     const normalizedUserId = Number(userId);
     const sockets = this.connectionsByUser.get(normalizedUserId);
     if (!sockets || sockets.size === 0) return false;
 
-    let serialized;
-    try {
-      serialized = JSON.stringify(event);
-    } catch (error) {
-      console.warn('[realtime] Event serialization failed:', error.message);
-      return false;
-    }
-
     let delivered = false;
-    for (const socket of [...sockets]) {
-      // ws.OPEN is 1. 数値で確認し、ライブラリ実装への依存を最小化する。
+    // Setを直接走査することで、イベントごとのソケット配列複製を避ける。
+    for (const socket of sockets) {
       if (!socket || socket.readyState !== 1) {
         this.unregister(normalizedUserId, socket);
         continue;
@@ -64,6 +75,17 @@ class ConnectionManager {
     return delivered;
   }
 
+  sendToUser(userId, event) {
+    let serialized;
+    try {
+      serialized = JSON.stringify(event);
+    } catch (error) {
+      console.warn('[realtime] Event serialization failed:', error.message);
+      return false;
+    }
+    return this._sendSerializedToUser(userId, serialized);
+  }
+
   async publishNotificationUnreadCount(userId, dbAdapter) {
     const unreadCount = await dbAdapter.getUnreadNotificationCount(userId);
     this.sendToUser(userId, {
@@ -75,13 +97,11 @@ class ConnectionManager {
 
   async publishNewNotification(userId, notification, dbAdapter) {
     const unreadCount = await dbAdapter.getUnreadNotificationCount(userId);
+    // notification_newに未読数を含める。クライアントは同イベントだけで
+    // 通知一覧とバッジを更新できるため、同一値の二重配信を避ける。
     this.sendToUser(userId, {
       type: 'notification_new',
       notification,
-      unread_count: unreadCount,
-    });
-    this.sendToUser(userId, {
-      type: 'notification_unread_count',
       unread_count: unreadCount,
     });
     return unreadCount;
@@ -97,13 +117,105 @@ class ConnectionManager {
   }
 
   async publishDmUnreadCount(userId, dbAdapter, dmId = null) {
-    const unreadCount = await dbAdapter.getGroupDmUnreadTotal(userId);
+    const unreadCount = await getVisibleDmUnreadCount(dbAdapter, userId);
     this.sendToUser(userId, {
       type: 'dm_unread_count',
       unread_count: unreadCount,
       ...(dmId ? { dm_id: String(dmId) } : {}),
     });
     return unreadCount;
+  }
+
+  async publishPostToFollowers(authorUserId, dbAdapter, postId) {
+    const authorId = Number(authorUserId);
+    if (!Number.isInteger(authorId) || authorId < 0 || !dbAdapter) {
+      return 0;
+    }
+
+    const connectedUserIds = [...this.connectionsByUser.keys()].filter(
+      (userId) => Number(userId) !== authorId,
+    );
+    if (connectedUserIds.length === 0) return 0;
+
+    let recipientIds = [];
+    try {
+      if (typeof dbAdapter.getFollowRelationshipSnapshot === 'function') {
+        const snapshot = await dbAdapter.getFollowRelationshipSnapshot(
+          authorId,
+          connectedUserIds,
+        );
+        recipientIds = Array.isArray(snapshot?.followerIds)
+          ? snapshot.followerIds.map(Number).filter(Number.isInteger)
+          : [];
+      } else if (typeof dbAdapter.getFollowIds === 'function') {
+        // 旧アダプター互換のフォールバック。
+        const following = await Promise.all(
+          connectedUserIds.map(async (recipientId) => ({
+            recipientId,
+            followingIds: await dbAdapter.getFollowIds(recipientId),
+          })),
+        );
+        recipientIds = following
+          .filter(({ followingIds }) =>
+            (followingIds || []).some((id) => Number(id) === authorId),
+          )
+          .map(({ recipientId }) => recipientId);
+      }
+    } catch (error) {
+      console.warn('[realtime] Failed to determine post recipients:', error.message);
+      return 0;
+    }
+
+    recipientIds = [...new Set(recipientIds)].filter((recipientId) =>
+      this.connectionsByUser.has(recipientId),
+    );
+    if (recipientIds.length === 0) return 0;
+
+    // フォロー関係と同じく、ブロック判定に必要なユーザー情報も一括取得する。
+    let usersById = new Map();
+    try {
+      const userIds = [authorId, ...recipientIds];
+      const users = typeof dbAdapter.getUsersByIds === 'function'
+        ? await dbAdapter.getUsersByIds(userIds)
+        : await Promise.all(userIds.map((userId) => dbAdapter.getUserById(userId)));
+      usersById = new Map(
+        (users || [])
+          .filter(Boolean)
+          .map((user) => [Number(user.id), user]),
+      );
+    } catch (error) {
+      console.warn('[realtime] Failed to load post recipient visibility:', error.message);
+      return 0;
+    }
+
+    const authorBlocks = getBlockedUserIds(usersById.get(authorId));
+    let serializedEvent;
+    try {
+      // 同一イベントを全受信者へ送るため、JSON化は配信ごとに一度だけ行う。
+      serializedEvent = JSON.stringify({
+        type: 'timeline_post',
+        timeline: 'following',
+        author_id: authorId,
+        post_id: Number(postId),
+      });
+    } catch (error) {
+      console.warn('[realtime] Timeline event serialization failed:', error.message);
+      return 0;
+    }
+
+    let deliveredCount = 0;
+    for (const recipientId of recipientIds) {
+      const recipient = usersById.get(recipientId);
+      if (!recipient) continue;
+      if (authorBlocks.has(recipientId) || blocksUser(recipient, authorId)) {
+        continue;
+      }
+      if (this._sendSerializedToUser(recipientId, serializedEvent)) {
+        deliveredCount += 1;
+      }
+    }
+
+    return deliveredCount;
   }
 
   closeAll(code = 1001, reason = 'Server shutting down') {

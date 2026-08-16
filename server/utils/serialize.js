@@ -4,7 +4,13 @@ const {
 	getUserNyaitterId,
 } = require('./nyaitterAddress');
 const { normalizeNotificationRecord } = require('./notification');
-const { canViewPost, isPrivatePost } = require('./postVisibility');
+const {
+	canViewPost,
+	canViewPostWithContext,
+	createPostVisibilityContext,
+	isPrivatePost,
+} = require('./postVisibility');
+const { getVisibleDmUnreadCount } = require('../services/DmVisibilityService');
 
 function serializeUserBrief(user, publicUrl = null) {
 	if (!user) return null;
@@ -30,21 +36,53 @@ function getAddressForPublicUrl(user, publicUrl) {
 	return `${formatNyaitterId(user.id)}@${new URL(publicUrl).host}`;
 }
 
+async function serializeNotifications(db, notifications, publicUrl = null) {
+	const normalizedNotifications = (notifications || [])
+		.map(normalizeNotificationRecord)
+		.filter(Boolean);
+	if (normalizedNotifications.length === 0) return [];
+
+	const fromUserIds = [...new Set(normalizedNotifications
+		.map((notification) => Number(notification.fromUserId))
+		.filter(Number.isInteger))];
+	const targetPostIds = [...new Set(normalizedNotifications
+		.map((notification) => (
+			notification.target?.kind === 'post' ? Number(notification.target.id) : null
+		))
+		.filter((postId) => Number.isInteger(postId) && postId > 0))];
+	const [fromUsers, targetPosts] = await Promise.all([
+		fetchNotificationUsersByIds(db, fromUserIds),
+		targetPostIds.length > 0 ? db.getPostsByIds(targetPostIds) : [],
+	]);
+	const fromUsersById = new Map(fromUsers.map((user) => [Number(user.id), user]));
+	const targetPostsById = new Map((targetPosts || []).map((post) => [Number(post.id), post]));
+
+	return normalizedNotifications.map((notification) => ({
+		id: notification.id,
+		type: notification.type,
+		from: serializeUserBrief(
+			notification.fromUserId != null
+				? fromUsersById.get(Number(notification.fromUserId)) || null
+				: null,
+			publicUrl,
+		),
+		target: notification.target,
+		target_post: notification.target?.kind === 'post'
+			? (() => {
+				const post = targetPostsById.get(Number(notification.target.id));
+				return post ? { id: Number(post.id), content: String(post.content || '') } : null;
+			})()
+			: null,
+		read: notification.read,
+		clicked: notification.clicked,
+		message: notification.message || null,
+		created_at: notification.createdAt,
+	}));
+}
+
 async function serializeNotification(db, notification, publicUrl = null) {
-	const normalized = normalizeNotificationRecord(notification);
-	if (!normalized) return null;
-	const fromUser = normalized.fromUserId != null && db.getUserById
-		? await db.getUserById(normalized.fromUserId)
-		: null;
-	return {
-		id: normalized.id,
-		type: normalized.type,
-		from: serializeUserBrief(fromUser, publicUrl),
-		target: normalized.target,
-		read: normalized.read,
-		clicked: normalized.clicked,
-		created_at: normalized.createdAt,
-	};
+	const [serialized] = await serializeNotifications(db, [notification], publicUrl);
+	return serialized || null;
 }
 
 async function serializeUser(db, user, viewerId = null, publicUrl = null) {
@@ -58,10 +96,10 @@ async function serializeUser(db, user, viewerId = null, publicUrl = null) {
 		db.getPinnedPostId ? db.getPinnedPostId(id) : null,
 		isSelf && db.getNotifications ? db.getNotifications(id, 200) : [],
 		isSelf && db.getUnreadNotificationCount ? db.getUnreadNotificationCount(id) : 0,
-		isSelf && db.getGroupDmUnreadTotal ? db.getGroupDmUnreadTotal(id) : 0,
+		isSelf ? getVisibleDmUnreadCount(db, id) : 0,
 	]);
 	const structuredNotifications = isSelf
-		? (await Promise.all(notifications.map((notification) => serializeNotification(db, notification, publicUrl)))).filter(Boolean)
+		? await serializeNotifications(db, notifications, publicUrl)
 		: [];
 
 	return {
@@ -153,6 +191,21 @@ async function fetchPostsByIds(db, postIds) {
 	return (await Promise.all(ids.map((id) => db.getPostById(id)))).filter(Boolean);
 }
 
+async function fetchNotificationUsersByIds(db, userIds) {
+	const ids = [...new Set((userIds || []).map(Number).filter(Number.isInteger))];
+	if (ids.length === 0) return [];
+	if (typeof db.getUsersByIds === 'function') {
+		try {
+			const users = await db.getUsersByIds(ids);
+			if (Array.isArray(users)) return users.filter(Boolean);
+		} catch (_) {
+			// 一括取得が利用できない旧アダプターだけ、既存の単件取得へ後退する。
+		}
+	}
+	if (typeof db.getUserById !== 'function') return [];
+	return (await Promise.all(ids.map((id) => db.getUserById(id)))).filter(Boolean);
+}
+
 async function fetchUsersByIds(db, userIds) {
 	const ids = [...new Set((userIds || []).map(Number).filter(Number.isInteger))];
 	if (ids.length === 0) return [];
@@ -230,34 +283,50 @@ async function serializePostsBatch(db, rootPosts, currentUserId = null, publicUr
 	]);
 	const usersById = new Map(users.map((user) => [Number(user.id), user]));
 	const metricsByPostId = new Map(metrics.map((metric) => [Number(metric.post_id), metric]));
-	const visibility = await Promise.all(allPosts.map((post) => canViewPost(
+	const visibilityContext = await createPostVisibilityContext(
 		db,
-		post,
+		allPosts,
 		currentUserId,
-		usersById.get(Number(post.userId)) || null,
-	)));
-	const visibleByPostId = new Map(allPosts.map((post, index) => [Number(post.id), visibility[index]]));
+		usersById,
+	);
+	const visibleByPostId = new Map(allPosts.map((post) => [
+		Number(post.id),
+		canViewPostWithContext(post, visibilityContext),
+	]));
+	const briefUsersById = new Map();
+	const visitingPostIds = new Set();
 
-	function compose(post, depth = 0, visited = new Set()) {
-		if (!post || !visibleByPostId.get(Number(post.id)) || visited.has(Number(post.id))) return null;
-		const nextVisited = new Set(visited);
-		nextVisited.add(Number(post.id));
-		const metric = metricsByPostId.get(Number(post.id)) || {};
+	function getBriefUser(author) {
+		const authorId = Number(author?.id);
+		if (!briefUsersById.has(authorId)) {
+			briefUsersById.set(authorId, serializeUserBrief(author, publicUrl));
+		}
+		return briefUsersById.get(authorId);
+	}
+
+	function compose(post, depth = 0) {
+		const postId = Number(post?.id);
+		if (!post || !visibleByPostId.get(postId) || visitingPostIds.has(postId)) return null;
+
+		// 同じ再帰経路だけを追跡することで、各ノードでSetを複製する必要をなくす。
+		visitingPostIds.add(postId);
+		const metric = metricsByPostId.get(postId) || {};
 		const author = usersById.get(Number(post.userId)) || null;
 		const replyToPost = depth < 2 && post.replyTo != null
-			? compose(postsById.get(Number(post.replyTo)), depth + 1, nextVisited)
+			? compose(postsById.get(Number(post.replyTo)), depth + 1)
 			: null;
 		const repostedPost = depth < 2 && post.repostTo != null
-			? compose(postsById.get(Number(post.repostTo)), depth + 1, nextVisited)
+			? compose(postsById.get(Number(post.repostTo)), depth + 1)
 			: null;
-		const brief = serializeUserBrief(author, publicUrl);
+		const brief = getBriefUser(author);
 
-		return {
+		const serialized = {
 			id: post.id,
 			userid: post.userId,
 			content: post.content,
 			mask: !!post.mask,
 			lock: !!post.lock,
+			announcement: !!post.announcement,
 			private: isPrivatePost(post, author),
 			attachments: post.attachments || [],
 			reply_id: post.replyTo || null,
@@ -274,6 +343,8 @@ async function serializePostsBatch(db, rootPosts, currentUserId = null, publicUr
 			liked_by_me: !!metric.liked_by_me,
 			starred_by_me: !!metric.starred_by_me,
 		};
+		visitingPostIds.delete(postId);
+		return serialized;
 	}
 
 	return initialPosts.map((post) => compose(post)).filter(Boolean);
@@ -299,6 +370,7 @@ async function serializeReply(db, post, currentUserId = null, publicUrl = null) 
 			content: post.content,
 			mask: !!post.mask,
 			lock: !!post.lock,
+			announcement: !!post.announcement,
 			private: isPrivatePost(post, author),
 			attachments: post.attachments || [],
 		reply_id: post.replyTo || null,
@@ -332,6 +404,7 @@ module.exports = {
 	serializeUserBrief,
 	serializePublicProfile,
 	serializeNotification,
+	serializeNotifications,
 	serializePost,
 	serializeReply,
 	serializePostsBatch,

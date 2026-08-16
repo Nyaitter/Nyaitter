@@ -2,7 +2,13 @@ const express = require('express');
 const { requireAuth, optionalAuth } = require('../middleware/auth');
 const { createRateLimiter } = require('../middleware/rateLimit');
 const { NOTIFICATION_TYPES, normalizeTarget } = require('../utils/notification');
-const { serializeNotification } = require('../utils/serialize');
+const {
+	serializeNotification,
+	serializeNotifications,
+} = require('../utils/serialize');
+const {
+	createNotificationIfAllowed,
+} = require('../services/NotificationDeliveryService');
 
 const router = express.Router();
 
@@ -121,6 +127,9 @@ router.post('/', requireAuth, notificationLimiter, async (req, res) => {
 	if (!NOTIFICATION_TYPES.has(type)) {
 		return res.status(400).json({ error: 'A supported notification type is required' });
 	}
+	if (type === 'quote') {
+		return res.status(400).json({ error: 'Quote notifications are discontinued' });
+	}
 	if (type === 'admin_notice' && !req.user.admin) {
 		return res.status(403).json({ error: 'Admin access required for admin_notice' });
 	}
@@ -139,15 +148,18 @@ router.post('/', requireAuth, notificationLimiter, async (req, res) => {
 	}
 
 	try {
-		const notification = await db.createNotification({
-			userId: recipientId,
-			type,
-			fromUserId: senderId,
-			target: normalizedTarget,
-		});
-		const serializedNotification = await serializeNotification(db, notification);
-		await publishNewNotification(req, recipientId, serializedNotification);
-		res.json({ success: true, notification: serializedNotification });
+			const notification = await createNotificationIfAllowed(db, {
+				userId: recipientId,
+				type,
+				fromUserId: senderId,
+				target: normalizedTarget,
+			});
+			if (!notification) {
+				return res.json({ success: true, notification: null });
+			}
+			const serializedNotification = await serializeNotification(db, notification);
+			await publishNewNotification(req, recipientId, serializedNotification);
+			res.json({ success: true, notification: serializedNotification });
 	} catch (err) {
 		console.error('[notifications] create error:', err);
 		res.status(500).json({ error: '通知の作成に失敗しました' });
@@ -168,10 +180,10 @@ router.get('/', requireAuth, async (req, res) => {
 			notifications = notifications.filter(n => new Date(n.created_at || n.createdAt) > since);
 		}
 
-		const [serializedNotifications, unreadCount] = await Promise.all([
-			Promise.all(notifications.map((notification) => serializeNotification(db, notification))),
-			db.getUnreadNotificationCount(userId),
-		]);
+			const [serializedNotifications, unreadCount] = await Promise.all([
+				serializeNotifications(db, notifications),
+				db.getUnreadNotificationCount(userId),
+			]);
 
 		res.json({
 			notifications: serializedNotifications.filter(Boolean),
@@ -281,13 +293,28 @@ router.put('/read-all', requireAuth, async (req, res) => {
 	const userId = req.user.id;
 
 	try {
-				await db.markAllNotificationsAsRead(userId);
-				const unreadCount = await db.getUnreadNotificationCount(userId);
-				await publishNotificationUnreadCount(req, userId);
-				res.json({ success: true, notification_unread_count: unreadCount });
+		await db.markAllNotificationsAsRead(userId);
+		const unreadCount = await db.getUnreadNotificationCount(userId);
+		await publishNotificationUnreadCount(req, userId);
+		res.json({ success: true, notification_unread_count: unreadCount });
 	} catch (err) {
 		console.error('[notifications] mark all read error:', err);
-		res.status(500).json({ error: '一括既読処理に失敗しました' });
+		res.status(500).json({ error: '未読数のリセットに失敗しました' });
+	}
+});
+
+router.put('/click-all', requireAuth, async (req, res) => {
+	const db = getDbAdapter(req);
+	const userId = req.user.id;
+
+	try {
+		await db.markAllNotificationsAsClicked(userId);
+		const unreadCount = await db.getUnreadNotificationCount(userId);
+		await publishNotificationUnreadCount(req, userId);
+		res.json({ success: true, notification_unread_count: unreadCount });
+	} catch (err) {
+		console.error('[notifications] mark all clicked error:', err);
+		res.status(500).json({ error: '一括クリック済み処理に失敗しました' });
 	}
 });
 

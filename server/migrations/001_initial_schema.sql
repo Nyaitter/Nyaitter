@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS posts (
     content TEXT NOT NULL,
     attachments JSONB,
     mask BOOLEAN DEFAULT false,
+    announcement BOOLEAN NOT NULL DEFAULT false,
     reply_to INTEGER REFERENCES posts(id),
     repost_to INTEGER REFERENCES posts(id),
     created_at TIMESTAMPTZ DEFAULT NOW()
@@ -37,6 +38,8 @@ CREATE TABLE IF NOT EXISTS posts (
 
 CREATE INDEX IF NOT EXISTS idx_posts_user_id ON posts(user_id);
 CREATE INDEX IF NOT EXISTS idx_posts_created_at ON posts(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_posts_announcements ON posts(created_at DESC, id DESC)
+    WHERE announcement = true AND reply_to IS NULL;
 
 -- Likes
 CREATE TABLE IF NOT EXISTS likes (

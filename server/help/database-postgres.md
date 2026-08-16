@@ -1,132 +1,98 @@
 # PostgreSQL のセットアップ
 
-Nyaitter サーバーで PostgreSQL を使うときの手順です。Worker を併用する構成にも触れます。
+Nyaitter を永続的に運用する場合の標準的な選択肢は PostgreSQL です。Node.js サーバーは `PostgresAdapter` を通して接続し、投稿、通知、グループDM、ログイン保護、Push購読などのデータを保存します。
 
-## どんな構成がいいか
+## 推奨構成
 
-| 構成 | おすすめ度 | 向いている場合 |
-|------|------------|----------------|
-| Node.js + PostgreSQL だけ | とてもおすすめ | 自前サーバーや VPS で完結させたい |
-| Node.js + PostgreSQL + Worker（D1/R2） | おすすめ | 将来 Cloudflare も使いたい |
-| Node.js + D1（Worker 経由）だけ | やや低い | Cloudflare だけに寄せたいとき |
+| 構成 | 向いている場合 |
+|---|---|
+| Node.js + PostgreSQL | VPSやマネージドPostgreSQLで完結させたい場合 |
+| Node.js + PostgreSQL + R2 | DBをPostgreSQL、添付ファイルをR2に分ける一般的な実運用 |
+| Node.js + PostgreSQL + R2 + D1 Worker | Cloudflare機能を必要な領域に限定して段階導入する場合 |
 
-このガイドでは「PostgreSQL だけ」を中心に説明します。
+## 1. PostgreSQL と依存関係を用意する
 
-## PostgreSQL だけ使う場合
-
-### 1. パッケージを入れる
+`pg` はプロジェクトの依存関係に含まれます。依存関係全体はリポジトリのルートで導入します。
 
 ```bash
-npm install pg
+npm install
 ```
 
-### 2. データベースを作る
+PostgreSQL側で専用のDBと、必要最小限の権限を持つ接続ユーザーを作成します。
 
 ```sql
 CREATE DATABASE nyaitter;
 ```
 
-### 3. スキーマを入れる
+## 2. マイグレーションを適用する
 
-`server/migrations/` にある SQL を順番に実行します。最初は `001_initial_schema.sql` です。
+PostgreSQL用SQLは `server/migrations/` にあります。新規DBでは番号順にすべて適用します。
 
 ```bash
-psql -U ユーザー名 -d nyaitter -f server/migrations/001_initial_schema.sql
+cd /path/to/Nyaitter
+for migration in server/migrations/*.sql; do
+  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$migration"
+done
 ```
 
-本番では、マイグレーション用のツール（node-pg-migrate など）の利用を推奨します。
+既存DBへ反映する場合は、すでに適用済みのファイルを記録し、未適用分だけを番号順に実行してください。現在は `023_dm_message_reports.sql` まであります。投稿候補の読み取りを速くする `018_recommendation_candidate_index.sql` なども含まれるため、番号を飛ばさずに適用してください。
 
-### 4. 設定する
+> 本番DBに対しては、事前バックアップ、ステージング適用、復旧手順の確認なしにSQLを実行しないでください。
 
-**環境変数（簡単）**
+詳しくは [`../migrations/README.md`](../migrations/README.md) を参照してください。
+
+## 3. サーバーを設定する
+
+`server/.env` またはデプロイ先のシークレットに設定します。
 
 ```env
+NODE_ENV=production
 DB_ADAPTER=postgres
-DATABASE_URL="postgres://nyaitter:password@localhost:5432/nyaitter?sslmode=disable"
+DATABASE_URL=postgres://nyaitter:password@db.example.com:5432/nyaitter?sslmode=require
 ```
 
-**config.json でも可**
+`server/config.json` でも `database.postgres.connectionString`、`poolSize`、`ssl` を指定できますが、接続文字列やパスワードを追跡対象の設定ファイルへ保存しないでください。実運用では環境変数またはホスティングサービスのシークレットを推奨します。
 
-```json
-{
-  "database": {
-    "adapter": "postgres",
-    "postgres": {
-      "connectionString": "postgres://nyaitter:password@localhost:5432/nyaitter",
-      "poolSize": 15,
-      "ssl": false
-    }
-  }
-}
+## SSL と接続プール
+
+マネージドPostgreSQLではSSLが必要なことが多いため、接続先の指示に従って `sslmode=require` などを設定します。自己署名証明書や独自CAを使う場合は、接続ライブラリとホスティング事業者の手順を確認してください。
+
+接続プールはDBの最大接続数、アプリプロセス数、同時リクエスト数を合算して決めます。単純に大きくするのではなく、DB監視で接続待ち・遅いクエリ・CPU使用率を確認してください。
+
+## 4. 起動と確認
+
+```bash
+npm start
 ```
 
-本番では `DATABASE_URL` を使うのが一般的です。
+起動後に、少なくとも次を確認します。
 
-### 5. SSL（本番向け）
-
-Render、Neon、AWS RDS などでは SSL が必要なことが多いです。
-
-```env
-DATABASE_URL="postgres://user:pass@host:5432/db?sslmode=require"
+```bash
+curl --fail http://127.0.0.1:3000/server/health
+curl --fail http://127.0.0.1:3000/server/ready
 ```
 
-または config で `"ssl": true` を指定します。
+ステージングではログイン、投稿、検索、添付アップロード、ユーザー別ストレージ上限、通知、DM、Push購読を確認します。非公開投稿、検索除外、ブロック関係についても、取得経路にかかわらず同じ可視性ルールになることを確認してください。
 
-### 6. 接続確認
+## バックアップと復旧
 
-サーバーを起動して、次のようなログが出れば成功です。
+- `pg_dump` またはマネージドサービスのバックアップを定期実行します。
+- DBスキーマの変更前に復旧可能なスナップショットを作成します。
+- R2など外部ストレージを使う場合、DBバックアップとオブジェクトの保持方針を別途決めます。
+- 実際に別環境へ復元する訓練を行い、復旧時間と手順を記録します。
 
-```
-[adapters] Using PostgresAdapter
-[PostgresAdapter] Connected to PostgreSQL
-```
+## トラブルシューティング
 
-## Worker を併用する場合
+| 症状 | 確認項目 |
+|---|---|
+| `relation does not exist` | 未適用のマイグレーション、接続先DB、スキーマ検索パス |
+| SSL接続エラー | `DATABASE_URL`、CA設定、ホスティング事業者のSSL要件 |
+| 接続上限・待ち時間 | プール数、アプリプロセス数、DBの最大接続数、遅いクエリ |
+| アダプター初期化エラー | `DB_ADAPTER=postgres`、接続文字列、ネットワーク到達性、起動ログ |
 
-PostgreSQL をメインのデータベースにし、Cloudflare（D1・R2 など）を足す構成です。
+## 関連ドキュメント
 
-```
-ブラウザ
-  ↓
-Node.js サーバー
-  ├── PostgreSQL（ユーザー・投稿・DM などの本データ）
-  └── Cloudflare Worker
-        ├── D1（補助データ）
-        ├── R2（ファイル）
-        └── その他
-```
-
-向いている場合：
-
-- 将来 R2 を本格利用したい
-- エッジでの処理やグローバルな制限を試したい
-- Cloudflare に少しずつ移したい
-
-ポイント：
-
-1. データベースはこれまでどおり PostgresAdapter
-2. ファイルは R2StorageAdapter
-3. 必要なら D1Adapter を追加で使う
-
-Worker の詳細は [D1 と Worker のガイド](./database-d1-worker.md) を見てください。
-
-## 本番運用のヒント
-
-- 接続プールのサイズは、CPU コア数の 2〜4 倍程度を目安に
-- サーバーは終了信号を受けたとき、プールをきちんと閉じる
-- 遅いクエリのログや、接続数の監視を入れると安心
-- バックアップは `pg_dump` の定期実行か、マネージドサービスの機能を使う
-
-## 困ったとき
-
-| 症状 | 確認すること |
-|------|----------------|
-| relation does not exist | スキーマ（テーブル）が入っていない。SQL を実行する |
-| SSL 関連のエラー | 接続文字列に `sslmode=require` を付ける、または `ssl: true` |
-| 接続が足りなくなる | `poolSize` を増やすか、接続の取りっぱなしがないか調べる |
-
-## 関連
-
-- [アダプターの概要](../adapters/README.md)
-- [R2 ストレージ](./storage-r2.md)
-- [D1 と Worker](./database-d1-worker.md)
+- [PostgreSQL マイグレーション](../migrations/README.md)
+- [Cloudflare R2 ストレージ](./storage-r2.md)
+- [Cloudflare D1 と Worker](./database-d1-worker.md)
+- [本番デプロイのチェックリスト](./production-checklist.md)

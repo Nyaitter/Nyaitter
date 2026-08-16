@@ -45,6 +45,13 @@ function isSafeHost(host) {
  * that have no request context.
  */
 function getPublicUrl(req = null) {
+  const configured = normalizePublicUrl(process.env.PUBLIC_URL || config.federation?.publicUrl);
+  // 本番は設定済みの正規URLを使い、利用者が送るHostヘッダーで認証コールバックや
+  // 共有URLのオリジンが変化しないようにする。
+  if ((process.env.NODE_ENV || 'development') === 'production' && configured) {
+    return configured;
+  }
+
   if (req && typeof req.get === 'function') {
     const forwardedHost = config.server?.trustProxy === true
       ? String(req.headers['x-forwarded-host'] || '').split(',')[0].trim()
@@ -57,7 +64,6 @@ function getPublicUrl(req = null) {
     }
   }
 
-  const configured = normalizePublicUrl(process.env.PUBLIC_URL || config.federation?.publicUrl);
   if (configured) return configured;
 
   const port = config.server?.port || 3000;

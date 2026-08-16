@@ -11,6 +11,13 @@ const NOTIFICATION_TYPES = new Set([
   'dm_host_transfer',
   'admin_notice',
   'login_approval',
+  'moderation_assignment',
+  'moderation_action_taken',
+  'moderation_no_action',
+  'appeal_approved',
+  'appeal_rejected',
+  'verification_approved',
+  'verification_rejected',
 ]);
 
 const TARGET_KINDS = new Set(['post', 'dm', 'user', 'route']);
@@ -55,6 +62,9 @@ function getNotificationActorLabel(notification) {
 }
 
 function getNotificationText(notification) {
+  if (typeof notification?.message === 'string' && notification.message.trim()) {
+    return notification.message.trim();
+  }
   const actor = getNotificationActorLabel(notification);
   switch (notification?.type) {
     case 'reply': return `${actor} さんがあなたのポストに返信しました。`;
@@ -69,6 +79,13 @@ function getNotificationText(notification) {
     case 'dm_host_transfer': return `${actor} さんからDMの管理者権限を受け取りました。`;
     case 'admin_notice': return `${actor} さんからお知らせがあります。`;
     case 'login_approval': return '不明な場所からのログイン承認が必要です。';
+    case 'moderation_assignment': return '新しい報告があなたに割り当てられました。';
+    case 'moderation_action_taken': return 'あなたが報告したコンテンツは、審査により不適切であると判定されました。コミュニティの健全化へのご協力に感謝します。';
+    case 'moderation_no_action': return 'あなたが報告したコンテンツは、審査により適切だと判定されたため対応されません。';
+    case 'appeal_approved': return '異議申し立てが承認され、アカウントの凍結が解除されました。';
+    case 'appeal_rejected': return '異議申し立ては審査の結果、承認されませんでした。';
+    case 'verification_approved': return '認証申請が承認されました。プロフィールに認証バッジが表示されます。';
+    case 'verification_rejected': return '認証申請は審査の結果、承認されませんでした。';
     default: return '新しい通知があります。';
   }
 }
@@ -87,6 +104,7 @@ function normalizeNotificationRecord(notification) {
     }),
     read: Boolean(notification.read),
     clicked: Boolean(notification.clicked),
+    message: typeof notification.message === 'string' ? notification.message : null,
     createdAt: notification.createdAt ?? notification.created_at ?? null,
   };
 }

@@ -63,7 +63,7 @@ class DatabaseAdapter {
 	}
 
 	
-	async searchUsers(query, limit = 20) {
+	async searchUsers(query, limit = 20, offset = 0) {
 		throw new Error('searchUsers() must be implemented');
 	}
 
@@ -418,10 +418,27 @@ class DatabaseAdapter {
 		throw new Error('markAllNotificationsAsRead() must be implemented');
 	}
 
+	async markAllNotificationsAsClicked(userId) {
+		throw new Error('markAllNotificationsAsClicked() must be implemented');
+	}
+
 	
 	async getUnreadNotificationCount(userId) {
 		throw new Error('getUnreadNotificationCount() must be implemented');
 	}
+
+	// モデレーション報告。reporterUserId は管理者向けの公開データへ含めないこと。
+	async createModerationReport(reportData) { throw new Error('createModerationReport() must be implemented'); }
+	async getOpenModerationAppealByUserId(userId) { throw new Error('getOpenModerationAppealByUserId() must be implemented'); }
+	async getOpenModerationVerificationByUserId(userId) { throw new Error('getOpenModerationVerificationByUserId() must be implemented'); }
+	async getModerationReportById(reportId) { throw new Error('getModerationReportById() must be implemented'); }
+	async listModerationReportsForAdmin(adminId, options = {}) { throw new Error('listModerationReportsForAdmin() must be implemented'); }
+	async getModerationAdminWorkloads(excludedAdminIds = []) { throw new Error('getModerationAdminWorkloads() must be implemented'); }
+	async assignModerationReport(reportId, assignment) { throw new Error('assignModerationReport() must be implemented'); }
+	async getOverdueModerationReports(cutoff) { throw new Error('getOverdueModerationReports() must be implemented'); }
+	async getUnassignedModerationReports(limit = 100) { throw new Error('getUnassignedModerationReports() must be implemented'); }
+	async resolveModerationReport(reportId, adminId, resolution) { throw new Error('resolveModerationReport() must be implemented'); }
+	async deleteModerationReport(reportId) { throw new Error('deleteModerationReport() must be implemented'); }
 
 	
 	async upsertPushSubscription(userId, subscription) {
@@ -468,6 +485,10 @@ class DatabaseAdapter {
 
 	async getFollowIds(userId) {
 		throw new Error('getFollowIds() must be implemented');
+	}
+
+	async getFollowRelationshipSnapshot(userId, candidateUserIds) {
+		throw new Error('getFollowRelationshipSnapshot() must be implemented');
 	}
 
 	async getRepostCount(postId) {

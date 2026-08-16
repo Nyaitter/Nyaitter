@@ -23,7 +23,8 @@ function notFound(message = 'Not Found') {
 
 function internalError(error) {
 	console.error('[d1-proxy] Internal Error:', error);
-	return json({ error: error.message || 'Internal Server Error' }, 500);
+	// D1/SQLiteの詳細や内部実装を呼び出し元へ露出しない。
+	return json({ error: 'Internal Server Error' }, 500);
 }
 
 function formatNyaitterId(id) {
@@ -72,6 +73,23 @@ function parseJsonSafe(value, fallback = null) {
 	}
 }
 
+function normalizeBlockUserId(value) {
+	if (value === null || value === undefined || (typeof value === 'string' && value.trim() === '')) {
+		return null;
+	}
+	const id = Number(value);
+	return Number.isInteger(id) && id >= 0 ? id : null;
+}
+
+function normalizeBlockList(value, ownerUserId = null) {
+	const ownerId = normalizeBlockUserId(ownerUserId);
+	if (!Array.isArray(value)) return [];
+	return [...new Set(value
+		.map(normalizeBlockUserId)
+		.filter((id) => id !== null && id !== ownerId))]
+		.sort((left, right) => left - right);
+}
+
 function normalizeUserRow(row) {
 	if (!row) return null;
 	return {
@@ -94,6 +112,7 @@ function normalizeUserRow(row) {
 		admin: Boolean(row.admin),
 		freeze: row.freeze || null,
 		shadow: Boolean(row.shadow),
+		block: normalizeBlockList(parseJsonSafe(row.block, []), row.id),
 		created_at: row.created_at,
 	};
 }
@@ -108,6 +127,7 @@ function normalizePostRow(row) {
 		attachments: parseJsonSafe(row.attachments, []),
 		mask: Boolean(row.mask),
 		lock: Boolean(row.lock),
+		announcement: Boolean(row.announcement),
 		replyTo: row.reply_to || null,
 		reply_to: row.reply_to || null,
 		repostTo: row.repost_to || null,
@@ -136,6 +156,28 @@ function normalizeGroupDmRow(row, viewerId = null) {
 		res.unread_count = Number(unread[viewerId] ?? unread[String(viewerId)] ?? 0);
 	}
 	return res;
+}
+
+function normalizeModerationReportRow(row) {
+	if (!row) return null;
+	return {
+		id: Number(row.id),
+		reporterUserId: Number(row.reporter_user_id),
+		targetKind: row.target_kind,
+		targetId: String(row.target_id),
+		description: row.description || '',
+		targetSnapshot: parseJsonSafe(row.target_snapshot, {}),
+		assignmentType: row.assignment_type || 'report',
+		status: row.status,
+		assignedAdminId: row.assigned_admin_id == null ? null : Number(row.assigned_admin_id),
+		assignedAt: row.assigned_at || null,
+		excludedAdminIds: Array.isArray(parseJsonSafe(row.excluded_admin_ids, []))
+			? parseJsonSafe(row.excluded_admin_ids, []).map(Number).filter(Number.isInteger)
+			: [],
+		resolution: row.resolution ? parseJsonSafe(row.resolution, null) : null,
+		createdAt: row.created_at,
+		resolvedAt: row.resolved_at || null,
+	};
 }
 
 export default {
@@ -421,13 +463,15 @@ export default {
 				const now = new Date().toISOString();
 
 				await db.prepare(
-					`INSERT INTO users (id, scid, name, handle, nyaitter_address, auth_provider, provider_domain, external_id, external_profile, bio, header_image, icon_data, created_at)
-					 VALUES (?, ?, ?, ?, ?, 'nyaitter', ?, ?, ?, ?, ?, ?, ?)`
-				).bind(
-					id, null, profile.name || handle, handle, address, providerDomain, externalId,
-					JSON.stringify(profile.external_profile || profile), profile.bio || profile.me || '',
-					profile.header_image || null, profile.icon_data || null, now
-				).run();
+						`INSERT INTO users (id, scid, name, handle, nyaitter_address, auth_provider, provider_domain, external_id, external_profile, block, bio, header_image, icon_data, created_at)
+						 VALUES (?, ?, ?, ?, ?, 'nyaitter', ?, ?, ?, ?, ?, ?, ?, ?)`
+					).bind(
+						id, null, profile.name || handle, handle, address, providerDomain, externalId,
+						JSON.stringify(profile.external_profile || profile),
+						JSON.stringify(normalizeBlockList(profile.block, id)),
+						profile.bio || profile.me || '', profile.header_image || null,
+						profile.icon_data || null, now
+					).run();
 
 				const created = await db.prepare('SELECT * FROM users WHERE id = ?').bind(id).first();
 				return json(normalizeUserRow(created));
@@ -450,14 +494,16 @@ export default {
 
 					try {
 						await db.prepare(
-							`INSERT INTO users (id, scid, name, handle, nyaitter_address, auth_provider, provider_domain, external_id, external_profile, uuid, settings, bio, header_image, icon_data, created_at)
-							 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+							`INSERT INTO users (id, scid, name, handle, nyaitter_address, auth_provider, provider_domain, external_id, external_profile, uuid, settings, block, bio, header_image, icon_data, created_at)
+							 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 						).bind(
 							id, userData.scid || null, userData.name || userData.scid || handle, handle, address,
 							provider, userData.provider_domain || null, userData.external_id || null,
 							userData.external_profile ? JSON.stringify(userData.external_profile) : null,
 							userData.uuid || null, userData.settings ? JSON.stringify(userData.settings) : '{}',
-							userData.bio || userData.me || '', userData.header_image || null, userData.icon_data || null, now
+							JSON.stringify(normalizeBlockList(userData.block, id)),
+							userData.bio || userData.me || '', userData.header_image || null,
+							userData.icon_data || null, now
 						).run();
 
 						const created = await db.prepare('SELECT * FROM users WHERE id = ?').bind(id).first();
@@ -533,6 +579,7 @@ export default {
 				if (body.header_image !== undefined) { sets.push('header_image = ?'); values.push(body.header_image); }
 				if (body.icon_data !== undefined) { sets.push('icon_data = ?'); values.push(body.icon_data); }
 				if (body.settings !== undefined) { sets.push('settings = ?'); values.push(JSON.stringify(body.settings || {})); }
+				if (body.block !== undefined) { sets.push('block = ?'); values.push(JSON.stringify(normalizeBlockList(body.block, userId))); }
 				if (body.verify !== undefined) { sets.push('verify = ?'); values.push(body.verify ? 1 : 0); }
 				if (body.freeze !== undefined) { sets.push('freeze = ?'); values.push(body.freeze || null); }
 				if (body.admin !== undefined) { sets.push('admin = ?'); values.push(body.admin ? 1 : 0); }
@@ -546,13 +593,169 @@ export default {
 				return json(normalizeUserRow(row));
 			}
 
-			if (method === 'GET' && pathname.match(/^\/users\/(\d+)$/)) {
-				const userId = Number(pathname.split('/')[2]);
-				const row = await db.prepare('SELECT * FROM users WHERE id = ?').bind(userId).first();
-				return json(normalizeUserRow(row));
-			}
+				if (method === 'GET' && pathname.match(/^\/users\/(\d+)$/)) {
+					const userId = Number(pathname.split('/')[2]);
+					const row = await db.prepare('SELECT * FROM users WHERE id = ?').bind(userId).first();
+					return json(normalizeUserRow(row));
+				}
 
-			if (method === 'POST' && pathname.match(/^\/users\/(\d+)\/follow$/)) {
+				if (method === 'POST' && pathname === '/moderation-reports') {
+					const body = await request.json();
+					const reporterUserId = Number(body.reporterUserId);
+					const targetKind = String(body.targetKind || '');
+						const targetId = ['dm', 'dm_message'].includes(targetKind)
+							? String(body.targetId || '').trim()
+							: Number(body.targetId);
+					const description = String(body.description || '');
+					const assignmentType = ['freeze_appeal', 'verification_application'].includes(body.assignmentType)
+						? body.assignmentType
+						: 'report';
+						const validTargetId = ['dm', 'dm_message'].includes(targetKind)
+							? targetId.length > 0 && targetId.length <= 256
+							: Number.isInteger(targetId);
+						if (!Number.isInteger(reporterUserId) || !validTargetId || !['user', 'post', 'dm', 'dm_message'].includes(targetKind)) {
+						return badRequest('Invalid moderation report');
+					}
+					const now = body.createdAt || new Date().toISOString();
+					const result = await db.prepare(
+						`INSERT INTO moderation_reports
+							(reporter_user_id, target_kind, target_id, description, target_snapshot, assignment_type, status, excluded_admin_ids, created_at)
+						 VALUES (?, ?, ?, ?, ?, ?, 'pending', '[]', ?)`
+					).bind(
+						reporterUserId,
+						targetKind,
+						targetId,
+						description,
+						JSON.stringify(body.targetSnapshot || {}),
+						assignmentType,
+						now,
+					).run();
+					const row = await db.prepare('SELECT * FROM moderation_reports WHERE id = ?').bind(result.meta.last_row_id).first();
+					return json(normalizeModerationReportRow(row), 201);
+				}
+
+				if (method === 'GET' && pathname.match(/^\/users\/(\d+)\/moderation-appeal\/open$/)) {
+					const userId = Number(pathname.split('/')[2]);
+					const row = await db.prepare(
+						`SELECT * FROM moderation_reports
+						 WHERE reporter_user_id = ? AND assignment_type = 'freeze_appeal' AND status <> 'resolved'
+						 ORDER BY created_at DESC LIMIT 1`
+					).bind(userId).first();
+					return json(normalizeModerationReportRow(row));
+				}
+
+				if (method === 'GET' && pathname.match(/^\/users\/(\d+)\/moderation-verification\/open$/)) {
+					const userId = Number(pathname.split('/')[2]);
+					const row = await db.prepare(
+						`SELECT * FROM moderation_reports
+						 WHERE reporter_user_id = ? AND assignment_type = 'verification_application' AND status <> 'resolved'
+						 ORDER BY created_at DESC LIMIT 1`
+					).bind(userId).first();
+					return json(normalizeModerationReportRow(row));
+				}
+
+				if (method === 'POST' && pathname === '/moderation-reports/admin-workloads') {
+					const body = await request.json();
+					const excluded = [...new Set((Array.isArray(body.excludedAdminIds) ? body.excludedAdminIds : [])
+						.map(Number)
+						.filter(Number.isInteger))];
+					const placeholders = excluded.map(() => '?').join(', ');
+					const exclusionClause = excluded.length > 0 ? `AND u.id NOT IN (${placeholders})` : '';
+					const { results } = await db.prepare(
+						`SELECT u.id AS admin_id, COUNT(r.id) AS active_count
+						 FROM users u
+						 LEFT JOIN moderation_reports r ON r.assigned_admin_id = u.id AND r.status = 'assigned'
+						 WHERE u.admin = 1 AND COALESCE(u.freeze, '') = '' ${exclusionClause}
+						 GROUP BY u.id`
+					).bind(...excluded).all();
+					return json((results || []).map((row) => ({
+						adminId: Number(row.admin_id),
+						activeCount: Number(row.active_count || 0),
+					})));
+				}
+
+				if (method === 'POST' && pathname === '/moderation-reports/overdue') {
+					const body = await request.json();
+					const cutoff = String(body.cutoff || '');
+					const { results } = await db.prepare(
+						`SELECT * FROM moderation_reports
+						 WHERE status = 'assigned' AND assigned_at IS NOT NULL AND assigned_at <= ?
+						 ORDER BY assigned_at ASC`
+					).bind(cutoff).all();
+					return json((results || []).map(normalizeModerationReportRow));
+				}
+
+				if (method === 'POST' && pathname === '/moderation-reports/unassigned') {
+					const body = await request.json();
+					const limit = Math.max(1, Math.min(Number(body.limit) || 100, 100));
+					const { results } = await db.prepare(
+						`SELECT * FROM moderation_reports
+						 WHERE status = 'pending' ORDER BY created_at ASC, id ASC LIMIT ?`
+					).bind(limit).all();
+					return json((results || []).map(normalizeModerationReportRow));
+				}
+
+				if (method === 'GET' && pathname.match(/^\/moderation-reports\/admin\/(\d+)$/)) {
+					const adminId = Number(pathname.split('/')[3]);
+					const status = url.searchParams.get('status') || 'assigned';
+					const limit = Math.max(1, Math.min(Number(url.searchParams.get('limit') || 50), 100));
+					const offset = Math.max(0, Number(url.searchParams.get('offset') || 0));
+					const { results } = await db.prepare(
+						`SELECT * FROM moderation_reports
+						 WHERE assigned_admin_id = ? AND (? = '' OR status = ?)
+						 ORDER BY COALESCE(assigned_at, created_at) DESC, id DESC LIMIT ? OFFSET ?`
+					).bind(adminId, status, status, limit, offset).all();
+					return json((results || []).map(normalizeModerationReportRow));
+				}
+
+				if (method === 'GET' && pathname.match(/^\/moderation-reports\/(\d+)$/)) {
+					const reportId = Number(pathname.split('/')[2]);
+					const row = await db.prepare('SELECT * FROM moderation_reports WHERE id = ?').bind(reportId).first();
+					return json(normalizeModerationReportRow(row));
+				}
+
+				if (method === 'POST' && pathname.match(/^\/moderation-reports\/(\d+)\/assign$/)) {
+					const reportId = Number(pathname.split('/')[2]);
+					const body = await request.json();
+					const existing = await db.prepare('SELECT * FROM moderation_reports WHERE id = ?').bind(reportId).first();
+					if (!existing || existing.status === 'resolved') return json(null);
+					if (Object.prototype.hasOwnProperty.call(body, 'expectedAdminId') && Number(existing.assigned_admin_id) !== Number(body.expectedAdminId)) {
+						return json(null);
+					}
+					const excluded = [...new Set((Array.isArray(body.excludedAdminIds) ? body.excludedAdminIds : parseJsonSafe(existing.excluded_admin_ids, []))
+						.map(Number)
+						.filter(Number.isInteger))];
+					const assignedAt = body.assignedAt || new Date().toISOString();
+					await db.prepare(
+						`UPDATE moderation_reports
+						 SET status = 'assigned', assigned_admin_id = ?, assigned_at = ?, excluded_admin_ids = ?
+						 WHERE id = ?`
+					).bind(Number(body.adminId), assignedAt, JSON.stringify(excluded), reportId).run();
+					const row = await db.prepare('SELECT * FROM moderation_reports WHERE id = ?').bind(reportId).first();
+					return json(normalizeModerationReportRow(row));
+				}
+
+				if (method === 'POST' && pathname.match(/^\/moderation-reports\/(\d+)\/resolve$/)) {
+					const reportId = Number(pathname.split('/')[2]);
+					const body = await request.json();
+					const now = new Date().toISOString();
+					const result = await db.prepare(
+						`UPDATE moderation_reports
+						 SET status = 'resolved', resolution = ?, resolved_at = ?
+						 WHERE id = ? AND assigned_admin_id = ? AND status = 'assigned'`
+					).bind(JSON.stringify(body.resolution || {}), now, reportId, Number(body.adminId)).run();
+					if (result.meta.changes === 0) return json(null);
+					const row = await db.prepare('SELECT * FROM moderation_reports WHERE id = ?').bind(reportId).first();
+					return json(normalizeModerationReportRow(row));
+				}
+
+				if (method === 'POST' && pathname.match(/^\/moderation-reports\/(\d+)\/delete$/)) {
+					const reportId = Number(pathname.split('/')[2]);
+					const result = await db.prepare('DELETE FROM moderation_reports WHERE id = ?').bind(reportId).run();
+					return json({ success: result.meta.changes > 0 });
+				}
+
+				if (method === 'POST' && pathname.match(/^\/users\/(\d+)\/follow$/)) {
 				const followingId = Number(pathname.split('/')[2]);
 				const body = await request.json();
 				const followerId = Number(body.followerId);
@@ -572,6 +775,34 @@ export default {
 				const followerId = Number(url.searchParams.get('followerId'));
 				const existing = await db.prepare('SELECT 1 FROM follows WHERE follower_id = ? AND following_id = ?').bind(followerId, followingId).first();
 				return json({ following: Boolean(existing) });
+			}
+
+			if (method === 'POST' && pathname === '/users/follow-relationships') {
+				const body = await request.json();
+				const userId = Number(body?.userId);
+				const candidateIds = [...new Set((Array.isArray(body?.candidateIds) ? body.candidateIds : [])
+					.map(Number)
+					.filter((id) => Number.isSafeInteger(id) && id >= 0 && id !== userId))].slice(0, 500);
+				if (!Number.isSafeInteger(userId) || userId < 0 || candidateIds.length === 0) {
+					return json({ following_ids: [], follower_ids: [] });
+				}
+				const placeholders = candidateIds.map(() => '?').join(', ');
+				const { results } = await db.prepare(
+					`SELECT following_id AS user_id, 'following' AS direction
+					 FROM follows
+					 WHERE follower_id = ? AND following_id IN (${placeholders})
+					 UNION ALL
+					 SELECT follower_id AS user_id, 'follower' AS direction
+					 FROM follows
+					 WHERE following_id = ? AND follower_id IN (${placeholders})`
+				).bind(userId, ...candidateIds, userId, ...candidateIds).all();
+				const following_ids = [];
+				const follower_ids = [];
+				for (const row of results || []) {
+					if (row.direction === 'following') following_ids.push(Number(row.user_id));
+					if (row.direction === 'follower') follower_ids.push(Number(row.user_id));
+				}
+				return json({ following_ids, follower_ids });
 			}
 
 			if (method === 'GET' && pathname.match(/^\/users\/(\d+)\/following$/)) {
@@ -620,15 +851,16 @@ export default {
 				const content = postData.content || '';
 				const attachments = postData.attachments ? JSON.stringify(postData.attachments) : null;
 				const mask = postData.mask ? 1 : 0;
-				const lock = postData.lock ? 1 : 0;
-				const replyTo = postData.replyTo ? Number(postData.replyTo) : null;
+					const lock = postData.lock ? 1 : 0;
+					const announcement = postData.announcement ? 1 : 0;
+					const replyTo = postData.replyTo ? Number(postData.replyTo) : null;
 				const repostTo = postData.repostTo ? Number(postData.repostTo) : null;
 				const now = new Date().toISOString();
 
 				const res = await db.prepare(
-					`INSERT INTO posts (user_id, content, attachments, mask, lock, reply_to, repost_to, created_at)
-					 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-				).bind(userId, content, attachments, mask, lock, replyTo, repostTo, now).run();
+						`INSERT INTO posts (user_id, content, attachments, mask, lock, announcement, reply_to, repost_to, created_at)
+						 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+					).bind(userId, content, attachments, mask, lock, announcement, replyTo, repostTo, now).run();
 
 				const created = await db.prepare('SELECT * FROM posts WHERE id = ?').bind(res.meta.last_row_id).first();
 				return json(normalizePostRow(created));
@@ -743,89 +975,199 @@ export default {
 				const tab = body.tab || 'foryou';
 				const followIds = Array.isArray(body.followIds) ? body.followIds.map(Number).filter(Number.isSafeInteger) : [];
 				const limit = Math.min(Number(body.limit || 30), 100);
-				const offset = Number(body.offset || 0);
+				const beforeId = Number.isSafeInteger(Number(body.beforeId)) && Number(body.beforeId) > 0
+					? Number(body.beforeId)
+					: null;
+				const offset = beforeId == null ? Number(body.offset || 0) : 0;
 
 				let results = [];
 				if (tab === 'following') {
 					if (followIds.length === 0) return json({ ids: [], has_more: false });
 					const placeholders = followIds.map(() => '?').join(', ');
-					const queryRes = await db.prepare(
-						`SELECT id FROM posts WHERE user_id IN (${placeholders}) AND reply_to IS NULL ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`
-					).bind(...followIds, limit + 1, offset).all();
+					const queryRes = beforeId != null
+						? await db.prepare(
+							`SELECT id FROM posts WHERE user_id IN (${placeholders}) AND reply_to IS NULL AND id < ? ORDER BY created_at DESC, id DESC LIMIT ?`
+						).bind(...followIds, beforeId, limit + 1).all()
+						: await db.prepare(
+							`SELECT id FROM posts WHERE user_id IN (${placeholders}) AND reply_to IS NULL ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`
+						).bind(...followIds, limit + 1, offset).all();
 					results = queryRes.results || [];
 				} else if (tab === 'announce') {
-					const queryRes = await db.prepare(
-						`SELECT id FROM posts WHERE user_id = 2525 AND reply_to IS NULL AND content LIKE '%#NXAnnounce%' ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`
-					).bind(limit + 1, offset).all();
+					const queryRes = beforeId != null
+						? await db.prepare(
+							`SELECT id FROM posts WHERE announcement = 1 AND reply_to IS NULL AND id < ? ORDER BY created_at DESC, id DESC LIMIT ?`
+						).bind(beforeId, limit + 1).all()
+						: await db.prepare(
+							`SELECT id FROM posts WHERE announcement = 1 AND reply_to IS NULL ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`
+						).bind(limit + 1, offset).all();
 					results = queryRes.results || [];
 				} else {
-					const queryRes = await db.prepare(
-						`SELECT id FROM posts WHERE reply_to IS NULL ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`
-					).bind(limit + 1, offset).all();
+					const queryRes = beforeId != null
+						? await db.prepare(
+							`SELECT id FROM posts WHERE reply_to IS NULL AND id < ? ORDER BY created_at DESC, id DESC LIMIT ?`
+						).bind(beforeId, limit + 1).all()
+						: await db.prepare(
+							`SELECT id FROM posts WHERE reply_to IS NULL ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`
+						).bind(limit + 1, offset).all();
 					results = queryRes.results || [];
 				}
 
+				const ids = results.slice(0, limit).map((r) => r.id);
 				return json({
-					ids: results.slice(0, limit).map((r) => r.id),
+					ids,
 					has_more: results.length > limit,
+					next_cursor: results.length > limit && ids.length > 0 ? ids[ids.length - 1] : null,
 				});
 			}
 
-			if (method === 'GET' && pathname === '/posts/recommended/ids') {
-				const limit = Math.min(Number(url.searchParams.get('limit') || 30), 100);
-				const offset = Number(url.searchParams.get('offset') || 0);
-
-				const { results } = await db.prepare(
-					`SELECT p.id,
-					   (COALESCE((SELECT COUNT(*) FROM likes WHERE post_id = p.id), 0) +
-					    COALESCE((SELECT COUNT(*) FROM stars WHERE post_id = p.id), 0) * 2 +
-					    COALESCE((SELECT COUNT(*) FROM reposts WHERE post_id = p.id), 0) * 3) AS score
-					 FROM posts p
-					 WHERE p.reply_to IS NULL
-					 ORDER BY score DESC, p.created_at DESC, p.id DESC
-					 LIMIT ? OFFSET ?`
-				).bind(limit + 1, offset).all();
-
-				const rows = results || [];
-				return json({
-					ids: rows.slice(0, limit).map((r) => r.id),
-					has_more: rows.length > limit,
-				});
-			}
+				if (method === 'GET' && pathname === '/posts/recommended/ids') {
+					const limit = Math.min(Math.max(Number(url.searchParams.get('limit') || 30), 1), 100);
+					const beforeId = Number.isSafeInteger(Number(url.searchParams.get('beforeId'))) && Number(url.searchParams.get('beforeId')) > 0
+						? Number(url.searchParams.get('beforeId'))
+						: null;
+					const offset = beforeId == null ? Math.max(Number(url.searchParams.get('offset') || 0), 0) : 0;
+					const viewerIdParam = url.searchParams.get('viewerId');
+					const viewerId = viewerIdParam !== null && Number.isSafeInteger(Number(viewerIdParam))
+						? Number(viewerIdParam)
+						: null;
+					const candidateLimit = Math.min(1000, Math.max(500, offset + limit + 1));
+					const candidateWhere = beforeId != null ? 'p.reply_to IS NULL AND p.id < ?' : 'p.reply_to IS NULL';
+					const candidateBindings = beforeId != null ? [beforeId, candidateLimit] : [candidateLimit];
+					const commonCtes = `WITH candidates AS (
+						SELECT p.id, p.user_id, p.created_at
+						FROM posts p
+						WHERE ${candidateWhere}
+						ORDER BY p.created_at DESC, p.id DESC
+						LIMIT ?
+					), like_counts AS (
+						SELECT l.post_id, COUNT(*) AS count
+						FROM likes l JOIN candidates c ON c.id = l.post_id
+						GROUP BY l.post_id
+					), star_counts AS (
+						SELECT s.post_id, COUNT(*) AS count
+						FROM stars s JOIN candidates c ON c.id = s.post_id
+						GROUP BY s.post_id
+					), repost_counts AS (
+						SELECT r.post_id, COUNT(*) AS count
+						FROM reposts r JOIN candidates c ON c.id = r.post_id
+						GROUP BY r.post_id
+					)`;
+					const engagementScore = `MIN(22.0,
+						COALESCE(l.count, 0) * 4.0 / (COALESCE(l.count, 0) + 4.0)
+						+ COALESCE(s.count, 0) * 8.0 / (COALESCE(s.count, 0) + 2.0)
+						+ COALESCE(r.count, 0) * 10.0 / (COALESCE(r.count, 0) + 2.0))`;
+					const recencyScore = `48.0 / (1.0 + MAX(0.0, (julianday('now') - julianday(c.created_at)) * 24.0) / 6.0)`;
+					const query = viewerId == null
+						? `${commonCtes}, scored AS (
+							SELECT c.id, c.created_at, ${recencyScore} + ${engagementScore} AS score
+							FROM candidates c
+							LEFT JOIN like_counts l ON l.post_id = c.id
+							LEFT JOIN star_counts s ON s.post_id = c.id
+							LEFT JOIN repost_counts r ON r.post_id = c.id
+						)
+						SELECT id FROM scored ORDER BY score DESC, created_at DESC, id DESC LIMIT ? OFFSET ?`
+						: `${commonCtes}, viewer_like_affinity AS (
+							SELECT p.user_id, COUNT(*) AS count
+							FROM likes l JOIN posts p ON p.id = l.post_id
+							WHERE l.user_id = ?
+							GROUP BY p.user_id
+						), viewer_star_affinity AS (
+							SELECT p.user_id, COUNT(*) AS count
+							FROM stars s JOIN posts p ON p.id = s.post_id
+							WHERE s.user_id = ?
+							GROUP BY p.user_id
+						), direct_follows AS (
+							SELECT following_id AS user_id FROM follows WHERE follower_id = ?
+						), second_degree_follows AS (
+							SELECT DISTINCT f2.following_id AS user_id
+							FROM follows f1 JOIN follows f2 ON f2.follower_id = f1.following_id
+							WHERE f1.follower_id = ? AND f2.following_id <> ?
+						), scored AS (
+							SELECT c.id, c.created_at,
+								${recencyScore} + ${engagementScore}
+								+ CASE WHEN df.user_id IS NOT NULL THEN 24.0 WHEN sdf.user_id IS NOT NULL THEN 10.0 ELSE 0.0 END
+								+ MIN(20.0, COALESCE(vla.count, 0) * 4.0)
+								+ MIN(32.0, COALESCE(vsa.count, 0) * 8.0) AS score
+							FROM candidates c
+							LEFT JOIN like_counts l ON l.post_id = c.id
+							LEFT JOIN star_counts s ON s.post_id = c.id
+							LEFT JOIN repost_counts r ON r.post_id = c.id
+							LEFT JOIN viewer_like_affinity vla ON vla.user_id = c.user_id
+							LEFT JOIN viewer_star_affinity vsa ON vsa.user_id = c.user_id
+							LEFT JOIN direct_follows df ON df.user_id = c.user_id
+							LEFT JOIN second_degree_follows sdf ON sdf.user_id = c.user_id
+						)
+						SELECT id FROM scored ORDER BY score DESC, created_at DESC, id DESC LIMIT ? OFFSET ?`;
+					const bindings = viewerId == null
+						? [...candidateBindings, limit + 1, offset]
+						: [...candidateBindings, viewerId, viewerId, viewerId, viewerId, viewerId, limit + 1, offset];
+					const { results } = await db.prepare(query).bind(...bindings).all();
+					const rows = results || [];
+					const ids = rows.slice(0, limit).map((r) => r.id);
+					return json({
+						ids,
+						has_more: rows.length > limit,
+						next_cursor: null,
+						use_offset_pagination: true,
+					});
+				}
 
 			if (method === 'GET' && pathname.match(/^\/users\/(\d+)\/post-ids$/)) {
 				const userId = Number(pathname.split('/')[2]);
 				const subType = url.searchParams.get('subType') || 'all';
 				const limit = Math.min(Number(url.searchParams.get('limit') || 30), 100);
-				const offset = Number(url.searchParams.get('offset') || 0);
+				const beforeId = Number.isSafeInteger(Number(url.searchParams.get('beforeId'))) && Number(url.searchParams.get('beforeId')) > 0
+					? Number(url.searchParams.get('beforeId'))
+					: null;
+				const offset = beforeId == null ? Number(url.searchParams.get('offset') || 0) : 0;
 
 				let sql = 'SELECT id FROM posts WHERE user_id = ?';
+				const bindings = [userId];
 				if (subType === 'posts_only') sql += ' AND reply_to IS NULL';
 				if (subType === 'replies_only') sql += ' AND reply_to IS NOT NULL';
-				sql += ' ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?';
+				if (beforeId != null) {
+					sql += ' AND id < ?';
+					bindings.push(beforeId);
+				}
+				sql += beforeId != null
+					? ' ORDER BY created_at DESC, id DESC LIMIT ?'
+					: ' ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?';
+				bindings.push(limit + 1);
+				if (beforeId == null) bindings.push(offset);
 
-				const { results } = await db.prepare(sql).bind(userId, limit + 1, offset).all();
+				const { results } = await db.prepare(sql).bind(...bindings).all();
 				const rows = results || [];
+				const ids = rows.slice(0, limit).map((r) => r.id);
 				return json({
-					ids: rows.slice(0, limit).map((r) => r.id),
+					ids,
 					has_more: rows.length > limit,
+					next_cursor: rows.length > limit && ids.length > 0 ? ids[ids.length - 1] : null,
 				});
 			}
 
 			if (method === 'GET' && pathname === '/posts/search/ids') {
 				const q = url.searchParams.get('q') || '';
 				const limit = Math.min(Number(url.searchParams.get('limit') || 30), 100);
-				const offset = Number(url.searchParams.get('offset') || 0);
-				if (!q.trim()) return json({ ids: [], has_more: false });
+				const beforeId = Number.isSafeInteger(Number(url.searchParams.get('beforeId'))) && Number(url.searchParams.get('beforeId')) > 0
+					? Number(url.searchParams.get('beforeId'))
+					: null;
+				const offset = beforeId == null ? Number(url.searchParams.get('offset') || 0) : 0;
+				if (!q.trim()) return json({ ids: [], has_more: false, next_cursor: null });
 
-				const { results } = await db.prepare(
-					'SELECT id FROM posts WHERE LOWER(content) LIKE ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?'
-				).bind(`%${q.toLowerCase()}%`, limit + 1, offset).all();
+				const { results } = beforeId != null
+					? await db.prepare(
+						'SELECT id FROM posts WHERE LOWER(content) LIKE ? AND id < ? ORDER BY created_at DESC, id DESC LIMIT ?'
+					).bind(`%${q.toLowerCase()}%`, beforeId, limit + 1).all()
+					: await db.prepare(
+						'SELECT id FROM posts WHERE LOWER(content) LIKE ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?'
+					).bind(`%${q.toLowerCase()}%`, limit + 1, offset).all();
 
 				const rows = results || [];
+				const ids = rows.slice(0, limit).map((r) => r.id);
 				return json({
-					ids: rows.slice(0, limit).map((r) => r.id),
+					ids,
 					has_more: rows.length > limit,
+					next_cursor: rows.length > limit && ids.length > 0 ? ids[ids.length - 1] : null,
 				});
 			}
 
@@ -880,43 +1222,49 @@ export default {
 			if (method === 'GET' && pathname.match(/^\/posts\/(\d+)\/detail$/)) {
 				const postId = Number(pathname.split('/')[2]);
 				const currentUserId = url.searchParams.get('currentUserId') ? Number(url.searchParams.get('currentUserId')) : null;
+				const viewerId = currentUserId ? currentUserId : null;
 
-				const post = await db.prepare('SELECT * FROM posts WHERE id = ?').bind(postId).first();
-				if (!post) return json(null);
+				// 詳細画面で必要な関連情報を単一クエリへ集約し、WorkerとD1間の逐次往復をなくす。
+				const detail = await db.prepare(
+					`SELECT p.*,
+						author.id AS author_id,
+						author.name AS author_name,
+						author.scid AS author_scid,
+						COALESCE((SELECT COUNT(*) FROM likes WHERE post_id = p.id), 0) AS like_count,
+						COALESCE((SELECT COUNT(*) FROM stars WHERE post_id = p.id), 0) AS star_count,
+						EXISTS(SELECT 1 FROM likes WHERE user_id = ? AND post_id = p.id) AS liked_by_me,
+						EXISTS(SELECT 1 FROM stars WHERE user_id = ? AND post_id = p.id) AS starred_by_me,
+						parent.id AS parent_id,
+						parent.content AS parent_content,
+						parent_author.id AS parent_author_id,
+						parent_author.name AS parent_author_name
+					 FROM posts p
+					 LEFT JOIN users author ON author.id = p.user_id
+					 LEFT JOIN posts parent ON parent.id = p.reply_to
+					 LEFT JOIN users parent_author ON parent_author.id = parent.user_id
+					 WHERE p.id = ?`
+				).bind(viewerId, viewerId, postId).first();
+				if (!detail) return json(null);
 
-				const author = await db.prepare('SELECT id, name, scid FROM users WHERE id = ?').bind(post.user_id).first();
-				const likeCountRow = await db.prepare('SELECT COUNT(*) as count FROM likes WHERE post_id = ?').bind(postId).first();
-				const starCountRow = await db.prepare('SELECT COUNT(*) as count FROM stars WHERE post_id = ?').bind(postId).first();
-
-				let likedByMe = false;
-				let starredByMe = false;
-				if (currentUserId) {
-					const l = await db.prepare('SELECT 1 FROM likes WHERE user_id = ? AND post_id = ?').bind(currentUserId, postId).first();
-					const s = await db.prepare('SELECT 1 FROM stars WHERE user_id = ? AND post_id = ?').bind(currentUserId, postId).first();
-					likedByMe = Boolean(l);
-					starredByMe = Boolean(s);
-				}
-
-				let parentPost = null;
-				if (post.reply_to) {
-					const parent = await db.prepare('SELECT id, user_id, content FROM posts WHERE id = ?').bind(post.reply_to).first();
-					if (parent) {
-						const parentAuthor = await db.prepare('SELECT id, name FROM users WHERE id = ?').bind(parent.user_id).first();
-						parentPost = {
-							id: parent.id,
-							content: parent.content ? parent.content.substring(0, 100) : '',
-							author: parentAuthor ? { id: parentAuthor.id, name: parentAuthor.name } : null,
-						};
-					}
-				}
+				const parentPost = detail.parent_id == null
+					? null
+					: {
+						id: detail.parent_id,
+						content: detail.parent_content ? String(detail.parent_content).substring(0, 100) : '',
+						author: detail.parent_author_id == null
+							? null
+							: { id: detail.parent_author_id, name: detail.parent_author_name || '' },
+					};
 
 				return json({
-					...normalizePostRow(post),
-					author: author ? { id: author.id, name: author.name, scid: author.scid } : null,
-					like_count: Number(likeCountRow?.count || 0),
-					star_count: Number(starCountRow?.count || 0),
-					liked_by_me: likedByMe,
-					starred_by_me: starredByMe,
+					...normalizePostRow(detail),
+					author: detail.author_id == null
+						? null
+						: { id: detail.author_id, name: detail.author_name || '', scid: detail.author_scid || null },
+					like_count: Number(detail.like_count || 0),
+					star_count: Number(detail.star_count || 0),
+					liked_by_me: Boolean(detail.liked_by_me),
+					starred_by_me: Boolean(detail.starred_by_me),
 					parent_post: parentPost,
 				});
 			}
@@ -941,8 +1289,8 @@ export default {
 				const counts = new Map();
 				for (const row of results || []) {
 					const matches = (row.content || '').match(/#([^<>/@#\s]+)/g) || [];
-					for (const match of matches) {
-						const tag = match.slice(1).toLowerCase();
+					const uniqueTags = new Set(matches.map((match) => match.slice(1).toLowerCase()));
+					for (const tag of uniqueTags) {
 						counts.set(tag, (counts.get(tag) || 0) + 1);
 					}
 				}
@@ -961,36 +1309,41 @@ export default {
 
 			if (method === 'GET' && pathname.match(/^\/users\/(\d+)\/media\/count$/)) {
 				const userId = Number(pathname.split('/')[2]);
-				const { results } = await db.prepare('SELECT attachments FROM posts WHERE user_id = ?').bind(userId).all();
-				let count = 0;
-				for (const r of results || []) {
-					const att = parseJsonSafe(r.attachments, []);
-					if (Array.isArray(att) && att.length > 0) count += 1;
-				}
-				return json({ count });
+				const row = await db.prepare(
+					`SELECT COUNT(*) AS count FROM posts
+					 WHERE user_id = ?
+					   AND json_valid(attachments)
+					   AND json_type(attachments) = 'array'
+					   AND json_array_length(attachments) > 0`
+				).bind(userId).first();
+				return json({ count: Number(row?.count || 0) });
 			}
 
 			if (method === 'GET' && pathname.match(/^\/users\/(\d+)\/media$/)) {
 				const userId = Number(pathname.split('/')[2]);
-				const limit = Math.min(Number(url.searchParams.get('limit') || 15), 100);
-				const offset = Number(url.searchParams.get('offset') || 0);
+				const limit = Math.min(Math.max(Number(url.searchParams.get('limit') || 15), 1), 100);
+				const offset = Math.max(Number(url.searchParams.get('offset') || 0), 0);
 
-				const { results } = await db.prepare('SELECT id, attachments FROM posts WHERE user_id = ? ORDER BY created_at DESC').bind(userId).all();
-				const items = [];
-				for (const r of results || []) {
-					const att = parseJsonSafe(r.attachments, []);
-					if (Array.isArray(att)) {
-						for (const file of att) {
-							items.push({
-								post_id: r.id,
-								file_id: file.id,
-								file_type: file.type || 'file',
-								type: file.type || 'file',
-							});
-						}
-					}
-				}
-				return json(items.slice(offset, offset + limit));
+				// JSON配列をD1側で添付単位に展開してページングする。全投稿・全添付を
+				// Workerへ読み込んでからsliceするより、転送量とメモリ使用量を抑えられる。
+				const { results } = await db.prepare(
+					`SELECT p.id AS post_id,
+						json_extract(attachment.value, '$.id') AS file_id,
+						COALESCE(json_extract(attachment.value, '$.type'), 'file') AS file_type
+					 FROM posts p
+					 CROSS JOIN json_each(p.attachments) AS attachment
+					 WHERE p.user_id = ?
+					   AND json_valid(p.attachments)
+					   AND json_type(p.attachments) = 'array'
+					 ORDER BY p.created_at DESC, p.id DESC, CAST(attachment.key AS INTEGER) ASC
+					 LIMIT ? OFFSET ?`
+				).bind(userId, limit, offset).all();
+				return json((results || []).map((row) => ({
+					post_id: Number(row.post_id),
+					file_id: row.file_id,
+					file_type: row.file_type || 'file',
+					type: row.file_type || 'file',
+				})));
 			}
 
 			if (method === 'GET' && pathname.match(/^\/posts\/(\d+)\/replies\/count$/)) {
@@ -1421,13 +1774,14 @@ export default {
 				const type = String(body.type);
 				const fromUserId = body.fromUserId != null ? Number(body.fromUserId) : null;
 				const postId = body.postId != null ? Number(body.postId) : (body.target?.kind === 'post' ? Number(body.target.id) : null);
-				const target = body.target ? JSON.stringify(body.target) : null;
-				const now = new Date().toISOString();
+					const target = body.target ? JSON.stringify(body.target) : null;
+					const message = typeof body.message === 'string' ? body.message : null;
+					const now = new Date().toISOString();
 
-				const res = await db.prepare(
-					`INSERT INTO notifications (user_id, type, from_user_id, post_id, target, read, clicked, created_at)
-					 VALUES (?, ?, ?, ?, ?, 0, 0, ?)`
-				).bind(userId, type, fromUserId, postId, target, now).run();
+					const res = await db.prepare(
+						`INSERT INTO notifications (user_id, type, from_user_id, post_id, target, message, read, clicked, created_at)
+						 VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?)`
+					).bind(userId, type, fromUserId, postId, target, message, now).run();
 
 				const row = await db.prepare('SELECT * FROM notifications WHERE id = ?').bind(res.meta.last_row_id).first();
 				return json(row ? { ...row, target: parseJsonSafe(row.target, null), read: Boolean(row.read), clicked: Boolean(row.clicked) } : null);
@@ -1474,11 +1828,17 @@ export default {
 				return json({ success: res.meta.changes > 0 });
 			}
 
-			if (method === 'POST' && pathname.match(/^\/users\/(\d+)\/notifications\/read-all$/)) {
-				const userId = Number(pathname.split('/')[2]);
-				await db.prepare('UPDATE notifications SET read = 1 WHERE user_id = ? AND read = 0').bind(userId).run();
-				return json({ success: true });
-			}
+					if (method === 'POST' && pathname.match(/^\/users\/(\d+)\/notifications\/read-all$/)) {
+						const userId = Number(pathname.split('/')[2]);
+						await db.prepare('UPDATE notifications SET read = 1 WHERE user_id = ? AND read = 0').bind(userId).run();
+						return json({ success: true });
+					}
+
+					if (method === 'POST' && pathname.match(/^\/users\/(\d+)\/notifications\/click-all$/)) {
+						const userId = Number(pathname.split('/')[2]);
+						await db.prepare('UPDATE notifications SET read = 1, clicked = 1 WHERE user_id = ? AND (read = 0 OR clicked = 0)').bind(userId).run();
+						return json({ success: true });
+					}
 
 			if (method === 'GET' && pathname.match(/^\/users\/(\d+)\/notifications\/unread-count$/)) {
 				const userId = Number(pathname.split('/')[2]);
@@ -1493,28 +1853,31 @@ export default {
 				const expirationTime = body.expirationTime != null ? Number(body.expirationTime) : null;
 				const p256dh = String(body.keys?.p256dh || '');
 				const auth = String(body.keys?.auth || '');
+				const sessionToken = body.sessionToken != null ? String(body.sessionToken) : null;
 				const now = new Date().toISOString();
 
 				await db.prepare(
-					`INSERT INTO push_subscriptions (user_id, endpoint, expiration_time, p256dh, auth, created_at, updated_at)
-					 VALUES (?, ?, ?, ?, ?, ?, ?)
+					`INSERT INTO push_subscriptions (user_id, endpoint, expiration_time, p256dh, auth, session_token, created_at, updated_at)
+					 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 					 ON CONFLICT(user_id, endpoint) DO UPDATE SET
 					   expiration_time = excluded.expiration_time,
 					   p256dh = excluded.p256dh,
 					   auth = excluded.auth,
+					   session_token = COALESCE(excluded.session_token, push_subscriptions.session_token),
 					   updated_at = excluded.updated_at`
-				).bind(userId, endpoint, expirationTime, p256dh, auth, now, now).run();
+				).bind(userId, endpoint, expirationTime, p256dh, auth, sessionToken, now, now).run();
 
-				return json({ userId, endpoint, expirationTime, keys: { p256dh, auth } });
+				return json({ userId, endpoint, expirationTime, keys: { p256dh, auth }, sessionToken });
 			}
 
 			if (method === 'GET' && pathname.match(/^\/users\/(\d+)\/push-subscriptions$/)) {
 				const userId = Number(pathname.split('/')[2]);
-				const { results } = await db.prepare('SELECT endpoint, expiration_time, p256dh, auth FROM push_subscriptions WHERE user_id = ?').bind(userId).all();
+				const { results } = await db.prepare('SELECT endpoint, expiration_time, p256dh, auth, session_token FROM push_subscriptions WHERE user_id = ?').bind(userId).all();
 				return json((results || []).map((r) => ({
 					endpoint: r.endpoint,
 					expirationTime: r.expiration_time ? Number(r.expiration_time) : null,
 					keys: { p256dh: r.p256dh, auth: r.auth },
+					sessionToken: r.session_token || null,
 				})));
 			}
 

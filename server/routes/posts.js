@@ -10,12 +10,22 @@ const {
 	serializeNotification,
 } = require('../utils/serialize');
 const {
-	CONTENT_TYPE_EXTENSIONS,
 	isOwnedAttachmentKey,
 	normalizeContentType,
 } = require('../adapters/storage/safeStoragePath');
 const { getPublicUrl } = require('../utils/nyaitterAddress');
-const { canViewPost, filterViewablePosts } = require('../utils/postVisibility');
+const {
+	canViewPost,
+	createPostVisibilityContext,
+	filterViewablePosts,
+	filterDiscoverablePosts,
+} = require('../utils/postVisibility');
+const {
+	getDiscoverablePostPage,
+} = require('../services/PostDiscoveryQueryService');
+const {
+	createNotificationIfAllowed,
+} = require('../services/NotificationDeliveryService');
 
 const router = express.Router();
 
@@ -45,6 +55,18 @@ async function publishNewNotification(req, userId, notification) {
 		void pushService.sendNotificationToUser(userId, structuredNotification).catch((error) => {
 			console.warn('[posts] notification push delivery failed:', error.message);
 		});
+	}
+}
+
+async function publishNewTimelinePost(req, authorUserId, postId) {
+	const realtime = req.app.locals.realtime;
+	if (!realtime?.publishPostToFollowers) return;
+
+	try {
+		await realtime.publishPostToFollowers(authorUserId, getDbAdapter(req), postId);
+	} catch (error) {
+		// 投稿自体はすでに永続化済みのため、リアルタイム配信失敗で投稿APIを失敗させない。
+		console.warn('[posts] timeline realtime delivery failed:', error.message);
 	}
 }
 
@@ -89,6 +111,47 @@ async function getViewablePostIds(db, postIds, viewerId = null) {
 	const viewable = await filterViewablePosts(db, posts, viewerId);
 	const visibleIds = new Set(viewable.map((post) => Number(post.id)));
 	return uniqueIds.filter((id) => visibleIds.has(id));
+}
+
+async function getDiscoverableModePage(
+	db,
+	{ mode, tab = 'foryou', query = '', viewerId = null, limit, offset, beforeId = null },
+) {
+	const followIds =
+		mode === 'timeline' && tab === 'following' && viewerId != null && db.getFollowIds
+			? await db.getFollowIds(viewerId)
+			: [];
+
+	return getDiscoverablePostPage({
+		db,
+		viewerId,
+		limit,
+		offset,
+		beforeId,
+		fetchCandidatePage: ({ limit: candidateLimit, offset: candidateOffset, beforeId: candidateBeforeId }) => {
+			if (mode === 'timeline') {
+				return db.getTimelinePostIds({
+					tab,
+					followIds,
+					limit: candidateLimit,
+					offset: candidateOffset,
+					beforeId: candidateBeforeId,
+				});
+			}
+				if (mode === 'recommended') {
+					return db.getRecommendedPostIds({
+						viewerId,
+						limit: candidateLimit,
+						offset: candidateOffset,
+						beforeId: candidateBeforeId,
+					});
+				}
+			if (mode === 'search') {
+					return db.searchPostIds(query, candidateLimit, candidateOffset, candidateBeforeId);
+			}
+			throw new Error(`Unsupported discoverable mode: ${mode}`);
+		},
+	});
 }
 
 async function getThreadReplyPostIds(db, postId, limit, offset) {
@@ -144,10 +207,8 @@ function validateAttachmentReferences(attachments, userId) {
 			throw new Error('Invalid attachment');
 		}
 		if (attachment.data !== undefined) {
-			const contentType = normalizeContentType(attachment.contentType);
-			if (!CONTENT_TYPE_EXTENSIONS.has(contentType)) {
-				throw new Error('Unsupported attachment content type');
-			}
+			// MIMEタイプはクライアント申告値を保存するだけで、形式による拒否は行わない。
+			normalizeContentType(attachment.contentType);
 			decodeBase64File(attachment.data);
 			continue;
 		}
@@ -184,9 +245,6 @@ router.post('/uploads', requireAuth, async (req, res) => {
 	}
 
 	const normalizedContentType = normalizeContentType(contentType);
-	if (!CONTENT_TYPE_EXTENSIONS.has(normalizedContentType)) {
-		return res.status(415).json({ error: 'Unsupported file content type' });
-	}
 
 	let buffer;
 	try {
@@ -212,13 +270,49 @@ router.post('/uploads', requireAuth, async (req, res) => {
 		});
 
 		res.json(result);
-	} catch (err) {
-		console.error('[posts] upload error:', err);
-		res.status(500).json({ error: 'ファイルのアップロードに失敗しました' });
-	}
-});
+		} catch (err) {
+			console.error('[posts] upload error:', err);
+			if (err?.code === 'STORAGE_QUOTA_EXCEEDED') {
+				return res.status(413).json({
+					error: 'ストレージの保存上限を超えるため、アップロードできません。',
+					limit_bytes: err.limitBytes,
+					used_bytes: err.usedBytes,
+				});
+			}
+			if (Number.isInteger(err?.statusCode)) {
+				return res.status(err.statusCode).json({ error: err.message });
+			}
+			res.status(500).json({ error: 'ファイルのアップロードに失敗しました' });
+		}
+	});
 
-router.delete('/uploads', requireAuth, async (req, res) => {
+	router.get('/uploads/storage', requireAuth, async (req, res) => {
+		const storage = getStorageAdapter(req);
+		if (!storage || typeof storage.getUsage !== 'function' || typeof storage.listFiles !== 'function') {
+			return res.status(501).json({ error: 'Storage inventory is not available' });
+		}
+
+		const folder = `attachments/${req.user.id}`;
+		const limitBytes = Math.max(1, Number(config.storage?.userQuotaMB || 1024)) * 1024 * 1024;
+		try {
+			const [usedBytes, files] = await Promise.all([
+				storage.getUsage(folder),
+				storage.listFiles(folder, { limit: 500 }),
+			]);
+			res.json({
+				limit_mb: Number(config.storage?.userQuotaMB || 1024),
+				limit_bytes: limitBytes,
+				used_bytes: Math.max(0, Number(usedBytes) || 0),
+				used_percent: Math.min(100, ((Math.max(0, Number(usedBytes) || 0) / limitBytes) * 100)),
+				files: Array.isArray(files) ? files : [],
+			});
+		} catch (err) {
+			console.error('[posts] storage inventory error:', err);
+			res.status(500).json({ error: 'ストレージ情報の取得に失敗しました' });
+		}
+	});
+
+	router.delete('/uploads', requireAuth, async (req, res) => {
 	const storage = getStorageAdapter(req);
 	const { fileIds } = req.body || {};
 
@@ -258,8 +352,16 @@ router.post('/', requireAuth, async (req, res) => {
 	const storage = getStorageAdapter(req);
 	const postService = new PostService({ dbAdapter: db, storageAdapter: storage });
 
-	const { content, attachments = [], mask, lock, reply_to, repost_to } = req.body;
+	const { content, attachments = [], mask, lock, announcement, reply_to, repost_to } = req.body;
 	const userId = req.user.id;
+	const isAnnouncement = announcement === true;
+
+	if (isAnnouncement && req.user.admin !== true) {
+		return res.status(403).json({ error: 'Only administrators can create announcements' });
+	}
+	if (isAnnouncement && (reply_to || repost_to)) {
+		return res.status(400).json({ error: 'Announcements cannot be replies or reposts' });
+	}
 
 	const hasContent =
 		typeof content === 'string' && content.trim().length > 0;
@@ -304,36 +406,30 @@ router.post('/', requireAuth, async (req, res) => {
 			content: trimmed,
 			attachments: processedAttachments,
 			mask: !!mask,
-			lock: !!lock,
-			replyTo: reply_to || null,
+				lock: !!lock,
+				announcement: isAnnouncement,
+				replyTo: reply_to || null,
 			repostTo: repost_to || null,
 		});
 
-		if (reply_to && post.replyTo) {
-			const parent = await db.getPostById(post.replyTo);
-			if (parent && parent.userId !== userId) {
-					const notification = await db.createNotification({
-						userId: parent.userId,
-						type: 'reply',
-						fromUserId: userId,
+		const replyTargetId = Number(reply_to);
+		if (Number.isInteger(replyTargetId) && replyTargetId > 0) {
+			const parent = await db.getPostById(replyTargetId);
+			if (parent && Number(parent.userId) !== Number(userId)) {
+				const notification = await createNotificationIfAllowed(db, {
+					userId: parent.userId,
+					type: 'reply',
+					fromUserId: userId,
 					target: { kind: 'post', id: post.id },
-					});
+				});
+				if (notification) {
 					await publishNewNotification(req, parent.userId, notification);
+				}
 			}
 		}
 
-		if (repost_to && post.repostTo) {
-			const original = await db.getPostById(post.repostTo);
-			if (original && original.userId !== userId) {
-					const notification = await db.createNotification({
-						userId: original.userId,
-						type: 'quote',
-						fromUserId: userId,
-					target: { kind: 'post', id: post.id },
-					});
-					await publishNewNotification(req, original.userId, notification);
-			}
-		}
+
+		await publishNewTimelinePost(req, userId, post.id);
 
 		res.status(201).json({
 			success: true,
@@ -341,6 +437,9 @@ router.post('/', requireAuth, async (req, res) => {
 		});
 	} catch (err) {
 		console.error('[posts] create error:', err);
+		if (Number.isInteger(err?.statusCode)) {
+			return res.status(err.statusCode).json({ error: err.message });
+		}
 		res.status(500).json({ error: '投稿の作成に失敗しました' });
 	}
 });
@@ -349,13 +448,25 @@ router.get('/', optionalAuth, async (req, res) => {
 	const db = getDbAdapter(req);
 
 	try {
-				const posts = await db.getRecentPosts(config.limits.timelineDefaultLimit);
-		const currentUserId = req.user ? req.user.id : null;
-		const viewablePosts = await filterViewablePosts(db, posts, currentUserId);
+					const posts = await db.getRecentPosts(config.limits.timelineDefaultLimit);
+			const currentUserId = req.user ? req.user.id : null;
+			const visibilityContext = await createPostVisibilityContext(db, posts, currentUserId);
+				const viewablePosts = await filterViewablePosts(
+					db,
+					posts,
+					currentUserId,
+					visibilityContext,
+				);
+			const discoverablePosts = await filterDiscoverablePosts(
+				db,
+				viewablePosts,
+				currentUserId,
+				visibilityContext,
+			);
 
-		const enriched = await serializePostsBatch(
-			db,
-			viewablePosts,
+			const enriched = await serializePostsBatch(
+				db,
+				discoverablePosts,
 
 				currentUserId,
 				getPublicUrl(req),
@@ -373,12 +484,24 @@ router.get('/trending', optionalAuth, async (req, res) => {
 	const limit = Math.min(parseInt(req.query.limit, 10) || 20, 50);
 
 	try {
-				const posts = await db.getTrendingPosts(limit);
-		const currentUserId = req.user ? req.user.id : null;
-		const viewablePosts = await filterViewablePosts(db, posts, currentUserId);
-		const hydrated = await serializePostsBatch(
-			db,
-			viewablePosts,
+					const posts = await db.getTrendingPosts(limit);
+			const currentUserId = req.user ? req.user.id : null;
+			const visibilityContext = await createPostVisibilityContext(db, posts, currentUserId);
+				const viewablePosts = await filterViewablePosts(
+					db,
+					posts,
+					currentUserId,
+					visibilityContext,
+				);
+			const discoverablePosts = await filterDiscoverablePosts(
+				db,
+				viewablePosts,
+				currentUserId,
+				visibilityContext,
+			);
+			const hydrated = await serializePostsBatch(
+				db,
+				discoverablePosts,
 
 				currentUserId,
 				getPublicUrl(req),
@@ -395,18 +518,25 @@ router.get('/search', optionalAuth, async (req, res) => {
 	const db = getDbAdapter(req);
 	const q = req.query.q || '';
 	const limit = Math.min(parseInt(req.query.limit, 10) || 30, 100);
-	const offset = parseInt(req.query.offset, 10) || 0;
+	const beforeId = safeParsePostId(req.query.before_id);
+	const offset = beforeId == null ? (parseInt(req.query.offset, 10) || 0) : 0;
 
 	if (!q.trim()) {
 		return res.json({ posts: [], has_next: false });
 	}
 
-	try {
-		const { ids, has_more } = await db.searchPostIds(q, limit, offset);
-		const currentUserId = req.user ? req.user.id : null;
-		const viewableIds = await getViewablePostIds(db, ids, currentUserId);
-		const posts = await serializePostsByIds(db, viewableIds, currentUserId, getPublicUrl(req));
-		res.json({ posts, has_next: has_more });
+		try {
+			const currentUserId = req.user ? req.user.id : null;
+				const { ids, has_more, next_cursor } = await getDiscoverableModePage(db, {
+					mode: 'search',
+					query: q,
+					viewerId: currentUserId,
+					limit,
+					offset,
+					beforeId,
+				});
+				const posts = await serializePostsByIds(db, ids, currentUserId, getPublicUrl(req));
+				res.json({ posts, has_next: has_more, next_cursor });
 	} catch (err) {
 		console.error('[posts] search error:', err);
 		res.status(500).json({ error: '検索に失敗しました' });
@@ -416,14 +546,20 @@ router.get('/search', optionalAuth, async (req, res) => {
 router.get('/recommended', optionalAuth, async (req, res) => {
 	const db = getDbAdapter(req);
 	const limit = Math.min(parseInt(req.query.limit, 10) || 30, 100);
-	const offset = parseInt(req.query.offset, 10) || 0;
+	const beforeId = safeParsePostId(req.query.before_id);
+	const offset = beforeId == null ? (parseInt(req.query.offset, 10) || 0) : 0;
 
-	try {
-		const { ids, has_more } = await db.getRecommendedPostIds({ limit, offset });
-		const currentUserId = req.user ? req.user.id : null;
-		const viewableIds = await getViewablePostIds(db, ids, currentUserId);
-		const posts = await serializePostsByIds(db, viewableIds, currentUserId, getPublicUrl(req));
-		res.json({ posts, has_next: has_more });
+		try {
+			const currentUserId = req.user ? req.user.id : null;
+			const { ids, has_more, next_cursor } = await getDiscoverableModePage(db, {
+				mode: 'recommended',
+				viewerId: currentUserId,
+				limit,
+				offset,
+				beforeId,
+			});
+			const posts = await serializePostsByIds(db, ids, currentUserId, getPublicUrl(req));
+			res.json({ posts, has_next: has_more, next_cursor });
 	} catch (err) {
 		console.error('[posts] recommended error:', err);
 		res.status(500).json({ error: 'おすすめ投稿の取得に失敗しました' });
@@ -435,33 +571,41 @@ router.get('/page', optionalAuth, async (req, res) => {
 	const mode = String(req.query.mode || 'timeline');
 	const tab = String(req.query.tab || 'foryou');
 	const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 30, 1), 100);
-	const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+	const beforeId = safeParsePostId(req.query.before_id);
+	const offset = beforeId == null ? Math.max(parseInt(req.query.offset, 10) || 0, 0) : 0;
 	const currentUserId = req.user ? req.user.id : null;
 
-	try {
-		let result = { ids: [], has_more: false };
-		if (mode === 'timeline') {
-			const followIds = tab === 'following' && currentUserId && db.getFollowIds
-				? await db.getFollowIds(currentUserId)
-				: [];
-			result = await db.getTimelinePostIds({ tab, followIds, limit, offset });
-		} else if (mode === 'recommended') {
-			result = await db.getRecommendedPostIds({ limit, offset });
-		} else if (mode === 'search') {
-			result = await db.searchPostIds(String(req.query.q || ''), limit, offset);
-		} else if (mode === 'profile') {
+		try {
+			let result = { ids: [], has_more: false };
+			const isDiscoverableMode = [
+				'timeline',
+				'recommended',
+				'search',
+			].includes(mode);
+			if (isDiscoverableMode) {
+				result = await getDiscoverableModePage(db, {
+					mode,
+					tab,
+					query: String(req.query.q || ''),
+					viewerId: currentUserId,
+					limit,
+					offset,
+					beforeId,
+				});
+			} else if (mode === 'profile') {
 			const userId = safeParsePostId(req.query.user_id);
 			if (!userId) return res.status(400).json({ error: 'user_id is required' });
 			const subType = ['all', 'posts_only', 'replies_only'].includes(req.query.sub_type)
 				? req.query.sub_type
 				: 'all';
 			if (db.getProfilePostIds) {
-				result = await db.getProfilePostIds({ userId, subType, limit, offset });
+				result = await db.getProfilePostIds({ userId, subType, limit, offset, beforeId });
 			} else {
 				const posts = await db.getPostsByUserId(userId, offset + limit + 1, currentUserId);
 				const filtered = posts.filter((post) => (
-					subType === 'posts_only' ? post.replyTo == null
-						: subType === 'replies_only' ? post.replyTo != null : true
+					(beforeId == null || Number(post.id) < beforeId) &&
+					(subType === 'posts_only' ? post.replyTo == null
+						: subType === 'replies_only' ? post.replyTo != null : true)
 				));
 				result = {
 					ids: filtered.slice(offset, offset + limit).map((post) => post.id),
@@ -469,7 +613,7 @@ router.get('/page', optionalAuth, async (req, res) => {
 				};
 			}
 			const pinId = safeParsePostId(req.query.pin_id);
-			if (offset === 0 && pinId && !result.ids.includes(pinId)) result.ids.push(pinId);
+			if (beforeId == null && offset === 0 && pinId && !result.ids.includes(pinId)) result.ids.push(pinId);
 		} else if (mode === 'ids') {
 			const ids = String(req.query.ids || '')
 				.split(',')
@@ -477,14 +621,21 @@ router.get('/page', optionalAuth, async (req, res) => {
 				.filter(Boolean)
 				.slice(offset, offset + limit);
 			result = { ids, has_more: false };
-		} else {
-			return res.status(400).json({ error: 'Unsupported post page mode' });
-		}
+			} else {
+				return res.status(400).json({ error: 'Unsupported post page mode' });
+			}
 
-		const viewableIds = await getViewablePostIds(db, result.ids || [], currentUserId);
-		const posts = await serializePostsByIds(
-			db,
-			viewableIds,
+			const nextCursor = result.next_cursor ?? (
+				result.has_more && result.ids?.length > 0
+					? result.ids[result.ids.length - 1]
+					: null
+			);
+			const viewableIds = isDiscoverableMode
+				? result.ids || []
+				: await getViewablePostIds(db, result.ids || [], currentUserId);
+			const posts = await serializePostsByIds(
+				db,
+				viewableIds,
 			currentUserId,
 			getPublicUrl(req),
 		);
@@ -500,9 +651,10 @@ router.get('/page', optionalAuth, async (req, res) => {
 		];
 		
 		res.json({
-			posts,
-			has_more: !!result.has_more,
-			context: {
+				posts,
+				has_more: !!result.has_more,
+				next_cursor: nextCursor,
+				context: {
 				users: (contextUsers || []).map((user) => ({
 					id: user.id,
 					name: user.name || '',
@@ -530,24 +682,15 @@ router.get('/ids', optionalAuth, async (req, res) => {
 	const offset = parseInt(req.query.offset, 10) || 0;
 	const currentUserId = req.user ? req.user.id : null;
 
-	try {
-		let result;
-					if (tab === 'following') {
-				const followIds = currentUserId
-					? await db.getFollowIds(currentUserId)
-					: [];
-				result = await db.getTimelinePostIds({
-					tab: 'following',
-					followIds,
-					limit,
-					offset,
-				});
-			} else {
-				result = await db.getTimelinePostIds({ tab, limit, offset });
-			}
-
-			const ids = await getViewablePostIds(db, result.ids || [], currentUserId);
-			res.json({ ids, has_more: result.has_more });
+		try {
+			const result = await getDiscoverableModePage(db, {
+				mode: 'timeline',
+				tab,
+				viewerId: currentUserId,
+				limit,
+				offset,
+			});
+			res.json({ ids: result.ids, has_more: result.has_more });
 
 	} catch (err) {
 		console.error('[posts] ids error:', err);
@@ -705,7 +848,7 @@ router.post('/:id/like', requireAuth, async (req, res) => {
 
 		if (result.liked) {
 			if (post.userId !== userId) {
-					const notification = await db.createNotification({
+					const notification = await createNotificationIfAllowed(db, {
 						userId: post.userId,
 						type: 'like',
 						fromUserId: userId,
@@ -750,7 +893,7 @@ router.post('/:id/star', requireAuth, async (req, res) => {
 
 		if (result.starred) {
 			if (post.userId !== userId) {
-					const notification = await db.createNotification({
+					const notification = await createNotificationIfAllowed(db, {
 						userId: post.userId,
 						type: 'star',
 						fromUserId: userId,

@@ -1,160 +1,99 @@
-# Nyaitter サーバーについて
+# Nyaitter サーバー
 
-Nyaitter のバックエンドです。ブラウザは直接データベースに触れず、このサーバー経由でだけやり取りします。
+このフォルダには、Nyaitter のAPI、認証、投稿、通知、DM、ファイル保存、リアルタイム配信を行うNode.jsサーバーがあります。ブラウザはデータベースやストレージへ直接つながず、必ずこのサーバーを通して操作します。
 
 ## 起動方法
 
-プロジェクトのルートで次を実行します。
+リポジトリのルートで次を実行します。
 
 ```bash
 npm install
+cp server/.env.example server/.env
 npm run dev:server
 ```
 
-ブラウザで http://localhost:3000/ を開きます。
+初期設定では <http://localhost:3000/> で動きます。
 
-## URL の振り分け
+| URL | 用途 |
+|---|---|
+| `/server/health` | サーバーが応答しているか確認する |
+| `/server/ready` | 起動準備が完了したか確認する |
+| `/server/api/status` | サーバーと認証の状態を確認する |
+| `/server/apidocs` | 各APIに関する情報を取得する(β) |
+
+> 初期設定のメモリDBは、再起動するとデータが消えます。公開運用ではPostgreSQLまたはD1を使ってください。
+
+## 主なURL
 
 | パス | 内容 |
-|------|------|
-| `/server/health` | サーバーが動いているか確認する |
-| `/server/api/posts` | 投稿の取得・作成・いいねなど |
-| `/server/api/dm` | ダイレクトメッセージ |
-| `/server/api/users` | ユーザー検索・プロフィール |
-| `/server/auth/*` | ログイン関連 |
-| `/server/apidocs` | 各APIに関する情報を取得する(β) |
-| それ以外 | `page/` フォルダの静的ファイル（フロント画面） |
+|---|---|
+| `/server/api/posts` | 投稿、検索、リアクション、添付ファイル |
+| `/server/api/users` | プロフィール、フォロー、設定 |
+| `/server/api/dm` | グループDM、未読数、暗号化用公開鍵 |
+| `/server/api/notifications` | 通知の取得、既読、削除 |
+| `/server/api/push` | Push通知の設定 |
+| `/server/auth/*` | Scratch認証、セッション、外部ログイン |
+| `/uploads/*` | ローカル保存時のアップロードファイル |
 
-例：
+## 設定の置き場所
 
-- `http://localhost:3000/` → `page/index.html`
-- `http://localhost:3000/js/main.js` → `page/js/main.js`
-- `http://localhost:3000/server/health` → ヘルスチェックの JSON
+通常の設定は `server/config.json`、パスワードやトークンなどの秘密情報は `server/.env` に置きます。`server/.env` はGitへ追加しないでください。
 
-## 環境変数
+| 分類 | よく使う設定 |
+|---|---|
+| 起動 | `PORT`、`NODE_ENV`、`LOG_LEVEL` |
+| DB | `DB_ADAPTER`、`DATABASE_URL`、`D1_WORKER_URL`、`D1_WORKER_TOKEN` |
+| ストレージ | `STORAGE_ADAPTER`、`STORAGE_USER_QUOTA_MB`、`R2_*` |
+| 認証 | `MULTI_ACCOUNT_COOKIE_SECRET`、`LOGIN_SECURITY_HMAC_SECRET`、`TURNSTILE_*` |
+| Push通知 | `VAPID_SUBJECT`、`VAPID_PUBLIC_KEY`、`VAPID_PRIVATE_KEY` |
 
-`server/.env.example` をコピーして `server/.env` を作り、必要な値を入れてください。
+環境変数の一覧と説明は [`.env.example`](./.env.example) を確認してください。
 
-開発時の初期設定：
+## ファイルのアップロード
 
-- `DB_ADAPTER=memory`（メモリ上のデータベース）
-- `STORAGE_ADAPTER=local`（ローカルフォルダにファイル保存）
+すべてのファイル形式を保存できます。アップロードしたファイルは `attachments/{ユーザーID}` の形でユーザー別に管理されます。
 
-## 設定ファイル
+- 入力ファイルの上限は初期設定で **5 MB** です。
+- 1ユーザーの保存上限は初期設定で **1 GB** です。
+- 上限は `storage.userQuotaMB` または `STORAGE_USER_QUOTA_MB` でMB単位に変更できます。
+- 画像は保存前にEXIF・位置情報などを削除します。大きい画像は縦横比を保ったまま縮小し、WebPへ圧縮します。
+- ユーザーは **設定 → ストレージ** で使用率、保存ファイル、削除操作を確認できます。
 
-細かい設定は `server/config.json` にまとまっています。
+## 開発用の注意
 
-主な項目：
+`DEV_BYPASS_AUTH=true` はScratch認証を省略する開発専用設定です。公開サーバーでは絶対に使わないでください。`NODE_ENV=production` で有効にすると、サーバーは起動を拒否します。
 
-- `server` … ポート番号など
-- `cors` … 許可するオリジン
-- `limits` … 投稿文字数やアップロードサイズの上限
-- `auth` … セッションの有効期間など
-- `database` / `storage` … 使うデータベース・ストレージの種類
-- `rateLimit` … アクセス制限
-- `security` … セキュリティヘッダ
+`TRUST_PROXY=true` は、信頼できるリバースプロキシの背後で動かす場合だけ設定します。直接公開するサーバーで安易に有効化しないでください。
 
-重要な値の一部は環境変数の方が優先されます（`PORT` など）。
+APIを更新した際には`npm run swagger`を用いてAPI Docsの更新を行ってください。
 
-## 全体の仕組み
+## DM暗号化の一時停止
 
-このサーバーは「フロント用の窓口（BFF）」です。
+複数デバイスでのDM利用を優先するため、現在はDMのE2E暗号化を既定で無効にしています。新規DMと編集後のDMは平文で保存され、暗号化済みのDMペイロードはサーバーで受け付けません。以前に保存された暗号化DMは削除せず、当時の秘密鍵が残る端末では引き続き閲覧できます。
 
-- ブラウザは `/server/...` だけを呼び出す
-- データベースやファイル保存の実装はアダプターで切り替え可能
-  - 開発用：メモリ（InMemory）
-  - 本番向け：PostgreSQL、Cloudflare D1、R2 など
+> `DM_E2E_ENABLED=true` の指定だけでは再有効化されません。再有効化する際は、鍵管理・送信処理を含むクライアント実装も併せて戻してください。
 
-詳細は `server/adapters/README.md` と `server/help/` を見てください。
+## 保存先の選び方
 
-## 主な API
+| 種類 | 開発向け | 公開運用向け |
+|---|---|---|
+| データベース | `memory` | `postgres` または `d1` |
+| ファイル保存 | `local` | `r2` |
 
-### 投稿
+詳しい説明は [アダプターの文書](./adapters/README.md) と [セットアップ・運用ガイド](./help/README.md) にあります。
 
-- `GET /server/api/posts` … タイムライン
-- `POST /server/api/posts` … 投稿する（ログイン必要）
-- `GET /server/api/posts/:id` … 投稿の詳細
-- `POST /server/api/posts/:id/like` … いいねの切り替え
-- `POST /server/api/posts/:id/star` … スターの切り替え
-- `GET /server/api/posts/:id/replies` … 返信一覧
+## 運用前の確認
 
-### ダイレクトメッセージ
+公開前は [本番デプロイのチェックリスト](./help/production-checklist.md) を確認してください。秘密鍵、DB接続文字列、D1/R2トークンをクライアント側や `config.json`、Gitへ書き込んではいけません。
 
-- `GET /server/api/dm` … 会話一覧（ログイン必要）
-- `GET /server/api/dm/unread` … 未読数（ログイン必要）
-- `POST /server/api/dm/:targetUserId` … 会話を開始／取得（ログイン必要）
-- `GET /server/api/dm/:channelId/messages` … メッセージ一覧（ログイン必要）
-- `POST /server/api/dm/:channelId/messages` … 送信（ログイン必要）
-- `PUT /server/api/dm/:channelId/read` … 既読にする（ログイン必要）
+## ローカル操作CLI
 
-### ユーザー
+起動中のサーバーは、同じOS利用者だけが使えるローカルソケットでCLI操作できます。
 
-- `GET /server/api/users/search?q=...` … 検索
-- `GET /server/api/users/:userId` … プロフィール
-- `GET /server/api/users?ids=1,2,3` … 複数ユーザー取得
-
-### 認証
-
-- `POST /server/auth/scratch/generate` … 確認コード発行
-- `POST /server/auth/scratch/verify` … Scratch アカウント確認
-- `GET /server/auth/me` … 今ログインしているユーザー（ログイン必要）
-- `GET /server/auth/external/confirm-context` … 外部ログイン確認画面用の情報
-- `POST /server/auth/external/confirm` … 外部ログインを許可して proof を発行（ログイン必要）
-- `POST /server/auth/external/verify` … 他サーバーからの proof 検証
-- `POST /server/auth/external/init` … 外部サーバーへのログイン開始
-- `POST /server/auth/external/complete` … 外部ログイン完了処理
-
-
-## 新しい API を足すとき
-
-1. `server/routes/` にファイルを作る（例：`posts.js`）
-2. `server/index.js` で登録する
-
-```js
-app.use('/server/api/posts', require('./routes/posts'));
+```bash
+npm run cli -- server status
+npm run cli -- server restart
+npm run cli -- admin grant '#3480'
 ```
 
-3. データベースは `req.app.locals.dbAdapter` 経由で使う
-4. API Docsの更新を`npm run swagger`で行う
-
-## セキュリティの注意
-
-- セッション用のトークンは短めの有効期限にし、定期的に入れ替える
-- 権限が必要な処理は必ずこのサーバーを通す
-- 秘密のキーをブラウザに渡さない
-
-## 外部 Nyaitter アドレスでのログイン
-
-デフォルトでは `federation.allow_external_login` は有効です（`trusted_servers` が空のときはオープンモード）。このサーバーが確認側になる場合は `/auth/external` で許可画面を表示します。
-
-
-ログイン画面では、Scratch のユーザー名のほかに `#1234@example.com` 形式の Nyaitter アドレスも使えます。
-
-この形式が入力されると、サーバーは `POST /server/auth/external/init` を呼び出し、登録済みの外部サーバーの確認ページへ進みます。Scratch ユーザー名の場合は、これまでどおりコメント認証になります。
-
-外部ログインを使うには `server/config.json` の `federation` で次のようにします。
-
-- `allow_external_login` を有効にする
-- `trusted_servers` にサーバーを1件以上書くと、その一覧だけを受け付ける（ホワイトリスト）
-- `trusted_servers` を空にすると、任意の Nyaitter サーバーを受け付ける（オープン）
-
-どちらの場合も、証明（proof）は HTTPS でサーバー同士が確認します。
-
-```json
-{
-  "federation": {
-    "allow_external_login": true,
-    "trusted_servers": [
-      {
-        "domain": "remote.nyaitter.example",
-        "auth_endpoint": "https://remote.nyaitter.example/login/confirm",
-        "verify_endpoint": "https://remote.nyaitter.example/api/verify-login"
-      }
-    ]
-  }
-}
-```
-
-開始時に短い寿命の `state` と、コールバック先の URL を外部サーバーに渡します。外部サーバーは成功時に、同じ `state` と `proof` を付けて戻します。ログイン画面は `/server/auth/external/complete` を呼び、検証が成功したときだけセッションを作ります。
-
-`state` は約10分で無効になり、一度使うと消費されます。
+メモリDBの内容は再起動で消えるため、開発環境で付与した管理者権限も必要に応じて再設定してください。

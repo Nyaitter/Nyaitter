@@ -1,3 +1,5 @@
+const isProduction = (process.env.NODE_ENV || 'development') === 'production';
+
 let rawConfig;
 try {
   rawConfig = require('./config.json');
@@ -8,6 +10,25 @@ try {
 
 function get(path, defaultValue) {
   return path.split('.').reduce((o, k) => (o && o[k] !== undefined ? o[k] : defaultValue), rawConfig);
+}
+
+function envBoolean(name, fallback) {
+  const value = process.env[name];
+  if (value === undefined || value === '') return Boolean(fallback);
+  if (['true', '1', 'yes', 'on'].includes(String(value).toLowerCase())) return true;
+  if (['false', '0', 'no', 'off'].includes(String(value).toLowerCase())) return false;
+  console.warn(`[config] ${name} must be a boolean; using configured default.`);
+  return Boolean(fallback);
+}
+
+function envNonNegativeInteger(name, fallback) {
+  const value = process.env[name];
+  const candidate = value === undefined || value === '' ? fallback : value;
+  const parsed = Number(candidate);
+  if (Number.isInteger(parsed) && parsed >= 0) return parsed;
+  console.warn(`[config] ${name} must be a non-negative integer; using configured default.`);
+  const normalizedFallback = Number(fallback);
+  return Number.isInteger(normalizedFallback) && normalizedFallback >= 0 ? normalizedFallback : 0;
 }
 
 const config = {
@@ -41,8 +62,15 @@ const config = {
     dmMessagesMaxLimit: get('limits.dmMessagesMaxLimit', 100),
     parentPostPreviewLength: get('limits.parentPostPreviewLength', 100),
     followingDefaultLimit: get('limits.followingDefaultLimit', 100),
-    maxFileUploadSizeMB: get('limits.maxFileUploadSizeMB', 10),
+    maxFileUploadSizeMB: get('limits.maxFileUploadSizeMB', 5),
   },
+
+  dm: {
+    // 一時的に既定で無効。DM_E2E_ENABLED=true で明示的に再有効化できる。
+    e2eEnabled: envBoolean('DM_E2E_ENABLED', get('dm.e2eEnabled', false)),
+  },
+
+  imageUpload: get('imageUpload', {}),
 
 	  auth: {
 	    sessionExpiryDays: get('auth.sessionExpiryDays', 30),
@@ -51,6 +79,24 @@ const config = {
 	    sessionTokenBytes: get('auth.sessionTokenBytes', 32),
 	    botTokenIdBytes: get('auth.botTokenIdBytes', 16),
 	    verificationCodeBytes: get('auth.verificationCodeBytes', 4),
+	    scratchVerification: {
+	      ipRestrictionEnabled: envBoolean(
+	        'SCRATCH_IP_RESTRICTION_ENABLED',
+	        get('auth.scratchVerification.ipRestrictionEnabled', true),
+	      ),
+	      rejectNewScratcher: envBoolean(
+	        'SCRATCH_REJECT_NEW_SCRATCHER',
+	        get('auth.scratchVerification.rejectNewScratcher', true),
+	      ),
+	      rejectStudentAccounts: envBoolean(
+	        'SCRATCH_REJECT_STUDENT_ACCOUNTS',
+	        get('auth.scratchVerification.rejectStudentAccounts', true),
+	      ),
+	      minQualifiedFollowers: envNonNegativeInteger(
+	        'SCRATCH_MIN_QUALIFIED_FOLLOWERS',
+	        get('auth.scratchVerification.minQualifiedFollowers', 25),
+	      ),
+	    },
 	  },
 
 	  // VAPID private keys must only be supplied through environment variables
@@ -77,13 +123,17 @@ const config = {
       retryAttempts: Math.min(4, Math.max(0, Math.floor(Number(process.env.D1_RETRY_ATTEMPTS || get('database.d1.retryAttempts', 1)) || 0))),
       retryBaseDelayMs: Math.min(5000, Math.max(0, Math.floor(Number(process.env.D1_RETRY_BASE_DELAY_MS || get('database.d1.retryBaseDelayMs', 120)) || 0))),
       readCacheSeconds: Math.min(60, Math.max(0, Math.floor(Number(process.env.D1_READ_CACHE_SECONDS || get('database.d1.readCacheSeconds', 0)) || 0))),
+      maxReadCacheEntries: Math.min(5000, Math.max(1, Math.floor(Number(process.env.D1_READ_CACHE_MAX_ENTRIES || get('database.d1.maxReadCacheEntries', 500)) || 500))),
       batchMaxItems: Math.min(500, Math.max(1, Math.floor(Number(process.env.D1_BATCH_MAX_ITEMS || get('database.d1.batchMaxItems', 100)) || 100))),
     },
   },
 
-	storage: {
-		adapter: process.env.STORAGE_ADAPTER || get('storage.adapter', 'local'),
-		local: get('storage.local', { uploadDir: './uploads' }),
+		storage: {
+			adapter: process.env.STORAGE_ADAPTER || get('storage.adapter', 'local'),
+			userQuotaMB: Math.min(102400, Math.max(1, Math.floor(Number(
+				process.env.STORAGE_USER_QUOTA_MB || get('storage.userQuotaMB', 1024),
+			) || 1024))),
+			local: get('storage.local', { uploadDir: './uploads' }),
 		r2: {
 			...get('storage.r2', {}),
 			cacheControl: process.env.R2_CACHE_CONTROL || get('storage.r2.cacheControl', 'public, max-age=31536000, immutable'),
@@ -105,14 +155,21 @@ const config = {
     windowMs: get('rateLimit.windowMs', 60000),
     max: get('rateLimit.max', 1000),
     auth: {
-      windowMs: get('rateLimit.auth.windowMs', 60000),
-      max: get('rateLimit.auth.max', 100),
+      windowMs: envNonNegativeInteger(
+        'RATE_LIMIT_AUTH_WINDOW_MS',
+        get('rateLimit.auth.windowMs', 60000),
+      ),
+      max: envNonNegativeInteger(
+        'RATE_LIMIT_AUTH_MAX',
+        get('rateLimit.auth.max', 120),
+      ),
     },
   },
 
   security: {
     hsts: {
-      enabled: get('security.hsts.enabled', false),
+      // HTTPS終端を前提とする本番ではHSTSを既定で有効化する。
+      enabled: get('security.hsts.enabled', isProduction),
       maxAge: get('security.hsts.maxAge', 31536000),
       includeSubDomains: get('security.hsts.includeSubDomains', true),
     },
@@ -143,7 +200,7 @@ const config = {
 
 function validateConfig() {
   const errors = [];
-  const isProd = (process.env.NODE_ENV || 'development') === 'production';
+  const isProd = isProduction;
 
   if (isProd) {
     if (!process.env.TURNSTILE_SECRET_KEY && !config.raw?.turnstile?.secret) {
@@ -156,6 +213,14 @@ function validateConfig() {
 
     if (config.database.adapter === 'memory') {
       console.warn('[config] WARNING: Using in-memory database in production is not recommended');
+    }
+
+    if (!process.env.PUBLIC_URL && !config.federation.publicUrl) {
+      errors.push('PUBLIC_URL or federation.publicUrl must be configured in production');
+    }
+
+    if (config.federation.allow_external_login && (config.federation.trusted_servers || []).length === 0) {
+      console.warn('[config] External login is configured but no trusted_servers are defined; it will remain disabled');
     }
   }
 
