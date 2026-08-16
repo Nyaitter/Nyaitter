@@ -151,8 +151,11 @@ class AutoModerationService {
       return;
     }
 
+    const privateLevel = getPrivateLevel(post);
+    if(privateLevel === 4) return; // すでに限定公開かつワンクッション済みの投稿は判定しない。
+
     const level = await this._classify(post);
-    if (level <= getPrivateLevel(post)) return;
+    if (level <= privateLevel) return;
 
     const name = levelName(level);
     const fields = {};
