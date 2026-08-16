@@ -55,18 +55,21 @@ async function publishNewNotification(req, userId, notification) {
 
 	const pushService = req.app.locals.pushNotificationService;
 	if (pushService?.enabled) {
-		void pushService.sendNotificationToUser(userId, structuredNotification).catch((error) => {
+		void pushService.sendNotificationToUser(userId, structuredNotification, {
+			publicUrl: getPublicUrl(req),
+		}).catch((error) => {
 			console.warn('[posts] notification push delivery failed:', error.message);
 		});
 	}
 }
 
-async function publishNewTimelinePost(req, authorUserId, postId) {
+async function publishNewTimelinePost(req, post) {
+	if (!post || post.replyTo != null || post.reply_to != null) return;
 	const realtime = req.app.locals.realtime;
 	if (!realtime?.publishPostToFollowers) return;
 
 	try {
-		await realtime.publishPostToFollowers(authorUserId, getDbAdapter(req), postId);
+		await realtime.publishPostToFollowers(post.userId, getDbAdapter(req), post);
 	} catch (error) {
 		// 投稿自体はすでに永続化済みのため、リアルタイム配信失敗で投稿APIを失敗させない。
 		console.warn('[posts] timeline realtime delivery failed:', error.message);
@@ -322,7 +325,7 @@ router.post('/', requireAuth, postWriteLimiter, async (req, res) => {
 		}
 
 
-		await publishNewTimelinePost(req, userId, post.id);
+			await publishNewTimelinePost(req, post);
 
 		res.status(201).json({
 			success: true,
@@ -420,7 +423,7 @@ router.get('/search', optionalAuth, async (req, res) => {
 
 		try {
 			const currentUserId = req.user ? req.user.id : null;
-				const { ids, has_more, next_cursor } = await getDiscoverableModePage(db, {
+				const { posts: discoveredPosts = [], has_more, next_cursor } = await getDiscoverableModePage(db, {
 					mode: 'search',
 					query: q,
 					viewerId: currentUserId,
@@ -428,7 +431,12 @@ router.get('/search', optionalAuth, async (req, res) => {
 					offset,
 					beforeId,
 				});
-				const posts = await serializePostsByIds(db, ids, currentUserId, getPublicUrl(req));
+				const posts = await serializePostsBatch(
+					db,
+					discoveredPosts,
+					currentUserId,
+					getPublicUrl(req),
+				);
 				res.json({ posts, has_next: has_more, next_cursor });
 	} catch (err) {
 		console.error('[posts] search error:', err);
@@ -444,14 +452,19 @@ router.get('/recommended', optionalAuth, async (req, res) => {
 
 		try {
 			const currentUserId = req.user ? req.user.id : null;
-			const { ids, has_more, next_cursor } = await getDiscoverableModePage(db, {
+			const { posts: discoveredPosts = [], has_more, next_cursor } = await getDiscoverableModePage(db, {
 				mode: 'recommended',
 				viewerId: currentUserId,
 				limit,
 				offset,
 				beforeId,
 			});
-			const posts = await serializePostsByIds(db, ids, currentUserId, getPublicUrl(req));
+			const posts = await serializePostsBatch(
+				db,
+				discoveredPosts,
+				currentUserId,
+				getPublicUrl(req),
+			);
 			res.json({ posts, has_next: has_more, next_cursor });
 	} catch (err) {
 		console.error('[posts] recommended error:', err);
@@ -523,15 +536,15 @@ router.get('/page', optionalAuth, async (req, res) => {
 					? result.ids[result.ids.length - 1]
 					: null
 			);
-			const viewableIds = isDiscoverableMode
-				? result.ids || []
+			const discoveredPosts = isDiscoverableMode && Array.isArray(result.posts)
+				? result.posts
+				: null;
+			const viewableIds = discoveredPosts
+				? discoveredPosts.map((post) => Number(post.id))
 				: await getViewablePostIds(db, result.ids || [], currentUserId);
-			const posts = await serializePostsByIds(
-				db,
-				viewableIds,
-			currentUserId,
-			getPublicUrl(req),
-		);
+			const posts = discoveredPosts
+				? await serializePostsBatch(db, discoveredPosts, currentUserId, getPublicUrl(req))
+				: await serializePostsByIds(db, viewableIds, currentUserId, getPublicUrl(req));
 		const postContext = collectPostContext(posts);
 		const authorIds = new Set(postContext.authors.keys());
 		const missingMentionIds = postContext.mentionedIds.filter((id) => !authorIds.has(id));
@@ -783,18 +796,6 @@ router.post('/:id/star', requireAuth, postWriteLimiter, async (req, res) => {
 			return res.status(404).json({ error: 'Post not found' });
 		}
 		const result = await postService.toggleStar(userId, postId);
-
-		if (result.starred) {
-			if (post.userId !== userId) {
-					const notification = await createNotificationIfAllowed(db, {
-						userId: post.userId,
-						type: 'star',
-						fromUserId: userId,
-					target: { kind: 'post', id: postId },
-					});
-					await publishNewNotification(req, post.userId, notification);
-			}
-		}
 
 		const updatedStars = await db.getStarIds(userId);
 

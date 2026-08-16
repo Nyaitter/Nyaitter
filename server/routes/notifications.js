@@ -3,6 +3,7 @@ const { requireAuth, optionalAuth } = require('../middleware/auth');
 const { createRateLimiter } = require('../middleware/rateLimit');
 const config = require('../config');
 const { NOTIFICATION_TYPES, normalizeTarget } = require('../utils/notification');
+const { getPublicUrl } = require('../utils/nyaitterAddress');
 const {
 	serializeNotification,
 	serializeNotifications,
@@ -109,7 +110,9 @@ async function publishNewNotification(req, userId, notification) {
 
 	const pushService = req.app.locals.pushNotificationService;
 	if (pushService?.enabled) {
-		void pushService.sendNotificationToUser(userId, notification).catch((error) => {
+		void pushService.sendNotificationToUser(userId, notification, {
+			publicUrl: getPublicUrl(req),
+		}).catch((error) => {
 			console.warn('[notifications] new-notification push delivery failed:', error.message);
 		});
 	}

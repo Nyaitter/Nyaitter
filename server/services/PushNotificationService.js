@@ -1,5 +1,18 @@
 const webpush = require('web-push');
+const config = require('../config');
+const { getPublicUrl, normalizePublicUrl } = require('../utils/nyaitterAddress');
 const { getNotificationText, getNotificationTargetHash } = require('../utils/notification');
+
+function getPushIconUrl(notification, publicUrl = null) {
+  const fromUserId = Number(notification?.from?.id);
+  if (!Number.isInteger(fromUserId) || fromUserId < 1) return null;
+
+  const origin = normalizePublicUrl(publicUrl) || getPublicUrl();
+  const apiEndpoint = config.server?.apiEndpoint === '/'
+    ? ''
+    : String(config.server?.apiEndpoint || '/server').replace(/\/+$/, '');
+  return `${origin}${apiEndpoint}/api/users/${encodeURIComponent(String(fromUserId))}/icon`;
+}
 
 class PushNotificationService {
   constructor({ dbAdapter, pushConfig = {} }) {
@@ -29,7 +42,7 @@ class PushNotificationService {
     };
   }
 
-  async sendNotificationToUser(userId, notification) {
+  async sendNotificationToUser(userId, notification, { publicUrl = null } = {}) {
     if (!this.enabled) return { attempted: 0, delivered: 0, removed: 0 };
 
     let subscriptions;
@@ -47,7 +60,7 @@ class PushNotificationService {
       url: getNotificationTargetHash(notification?.target, notification?.from?.id),
       user_id: userId,
       notification_id: notification?.id || null,
-      icon: notification?.from?.id != null ? `/server/api/users/${notification.from.id}/icon` : null,
+      icon: getPushIconUrl(notification, publicUrl),
     });
 
     const result = { attempted: subscriptions.length, delivered: 0, removed: 0, skipped: 0 };

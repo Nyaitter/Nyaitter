@@ -126,9 +126,13 @@ class ConnectionManager {
     return unreadCount;
   }
 
-  async publishPostToFollowers(authorUserId, dbAdapter, postId) {
+  async publishPostToFollowers(authorUserId, dbAdapter, post) {
+    if (post && typeof post === 'object' && (post.replyTo != null || post.reply_to != null)) {
+      return 0;
+    }
+    const postId = Number(post && typeof post === 'object' ? post.id : post);
     const authorId = Number(authorUserId);
-    if (!Number.isInteger(authorId) || authorId < 0 || !dbAdapter) {
+    if (!Number.isInteger(authorId) || authorId < 0 || !Number.isInteger(postId) || postId < 1 || !dbAdapter) {
       return 0;
     }
 

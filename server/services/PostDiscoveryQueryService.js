@@ -40,7 +40,7 @@ async function getDiscoverablePostPage({
 	let candidateOffset = 0;
 	let candidateBeforeId = normalizedBeforeId;
 	let visibleOffset = 0;
-	const collectedIds = [];
+	const collectedPosts = [];
 	let hasMore = false;
 	let requiresOffsetPagination = false;
 
@@ -86,10 +86,10 @@ async function getDiscoverablePostPage({
 				visibleOffset += 1;
 				continue;
 			}
-			collectedIds.push(Number(post.id));
-			if (collectedIds.length > normalizedLimit) break;
+			collectedPosts.push(post);
+			if (collectedPosts.length > normalizedLimit) break;
 		}
-		if (collectedIds.length > normalizedLimit) {
+		if (collectedPosts.length > normalizedLimit) {
 			hasMore = true;
 			break;
 		}
@@ -103,9 +103,11 @@ async function getDiscoverablePostPage({
 			break;
 	}
 
-	const ids = collectedIds.slice(0, normalizedLimit);
+	const posts = collectedPosts.slice(0, normalizedLimit);
+	const ids = posts.map((post) => Number(post.id));
 	return {
 		ids,
+		posts,
 		has_more: hasMore,
 		next_cursor: !requiresOffsetPagination && hasMore && ids.length > 0
 			? ids[ids.length - 1]

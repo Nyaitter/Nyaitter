@@ -163,6 +163,7 @@ async function serializePublicProfile(db, user, viewerId = null, publicUrl = nul
 		name: user.name || '',
 		me: user.me || user.bio || '',
 		header_image: user.header_image || null,
+		icon_data: user.icon_data || null,
 		icon_available: Boolean(user.icon_data || user.scid),
 		account_state: user.freeze ? 'frozen' : 'active',
 		admin: !!user.admin,

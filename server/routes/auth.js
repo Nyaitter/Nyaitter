@@ -216,7 +216,9 @@ async function publishLoginApprovalNotification(req, userId, approval) {
   if (realtime) await realtime.publishNewNotification(userId, serialized, db);
   const pushService = req.app.locals.pushNotificationService;
   if (pushService?.enabled) {
-    void pushService.sendNotificationToUser(userId, serialized).catch((error) => {
+    void pushService.sendNotificationToUser(userId, serialized, {
+      publicUrl: getPublicUrl(req),
+    }).catch((error) => {
       console.warn('[auth] login approval push delivery failed:', error.message);
     });
   }

@@ -83,7 +83,7 @@ APIの基準パスは `NYAITTER_API_ENDPOINT` または `server.apiEndpoint` で
 
 `NYAITTER_API_ENDPOINT=/` と設定した場合は、`/posts` と `/api/posts` のように公開されます。`/api` は互換用の別名であり、どちらも同じ処理を実行します。
 
-Clientの `config.js` でHTTPSの外部APIエンドポイントを指定した場合、リアルタイム接続は同じホストの `wss://` URLを使用します。ClientのCSPとServerが静的配信時に返すCSPは、HTTPS APIとWSS接続を許可しています。
+Clientの `config.js` でHTTPSの外部APIエンドポイントを指定した場合、リアルタイム接続は同じホストの `wss://` URLを使用します。ClientのCSPとServerが静的配信時に返すCSPは、HTTPS APIとWSS接続を許可しています。投稿のリアルタイム通知は、投稿者をフォローしている接続中のユーザーだけに送信し、返信投稿は対象にしません。
 
 ## Push通知とセッション
 
@@ -92,6 +92,8 @@ Push通知を有効にするには、`VAPID_SUBJECT`、`VAPID_PUBLIC_KEY`、`VAP
 ClientとAPIを別オリジンに配置する場合、Push購読の作成・削除も通常のCookie付きAPI要求と同じCORS設定を使います。`NYAITTER_CORS_ALLOWED_ORIGINS` にClientのオリジンを指定し、`NYAITTER_CORS_CREDENTIALS=true` を有効にしてください。これらに登録されていないオリジンからの購読操作は拒否されます。
 
 通知は、購読に紐付く**有効なセッションが存在し、かつ通知対象ユーザー本人のセッションであるデバイスにだけ**送信されます。ログアウト、セッションの個別無効化、IP単位のセッション無効化、期限切れなどによりセッションが無効になったデバイスへは送信しません。無効なセッションに紐付く購読は次回の送信対象確認時に削除されます。
+
+Push通知の送信者アイコンは、現在の公開API URLを基準にした絶対URLで配信されます。Client、API、ユーザーファイルを別ドメインに配置する場合は、`PUBLIC_URL` または `federation.publicUrl` を正しいAPI公開URLに設定してください。
 
 | 送信対象の状態 | Push通知の動作 |
 |---|---|

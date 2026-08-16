@@ -95,9 +95,13 @@ function createPipeline(input, options) {
 }
 
 async function encodeCompressedWebp(input, options) {
+  // 回転・縮小までの共通パイプラインは一度だけ作成する。clone()した出力側だけを
+  // 品質ごとに切り替えることで、上限を超えたときの再試行に伴う準備処理を減らす。
+  const pipeline = createPipeline(input, options);
+
   for (let quality = options.webpQuality; quality >= options.minWebpQuality; quality -= 5) {
     // withMetadata() を呼ばないため、EXIF・位置情報・IPTC・XMPは出力されない。
-    const output = await createPipeline(input, options)
+    const output = await pipeline.clone()
       .webp({ quality, effort: 4, smartSubsample: true })
       .toBuffer();
 

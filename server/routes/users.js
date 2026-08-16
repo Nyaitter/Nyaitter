@@ -104,7 +104,9 @@ async function publishNewNotification(req, userId, notification) {
 
 	const pushService = req.app.locals.pushNotificationService;
 	if (pushService?.enabled) {
-		void pushService.sendNotificationToUser(userId, structuredNotification).catch((error) => {
+		void pushService.sendNotificationToUser(userId, structuredNotification, {
+			publicUrl: getPublicUrl(req),
+		}).catch((error) => {
 			console.warn('[users] notification push delivery failed:', error.message);
 		});
 	}
