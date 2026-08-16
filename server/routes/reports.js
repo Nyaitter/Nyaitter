@@ -1,10 +1,11 @@
 const express = require('express');
 const { requireAuth } = require('../middleware/auth');
 const { createRateLimiter } = require('../middleware/rateLimit');
+const config = require('../config');
 
 const router = express.Router();
-const reportCreateLimiter = createRateLimiter({ windowMs: 60 * 1000, max: 10 });
-const reportActionLimiter = createRateLimiter({ windowMs: 60 * 1000, max: 30 });
+const reportCreateLimiter = createRateLimiter(config.rateLimit.reportCreate);
+const reportActionLimiter = createRateLimiter(config.rateLimit.reportAction);
 
 function getModerationReportService(req) {
   return req.app.locals.moderationReportService;

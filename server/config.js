@@ -1,3 +1,5 @@
+const { parseDuration, parseIntegerRange } = require('./utils/settingFormats');
+
 const isProduction = (process.env.NODE_ENV || 'development') === 'production';
 
 let rawConfig;
@@ -31,6 +33,83 @@ function envNonNegativeInteger(name, fallback) {
   return Number.isInteger(normalizedFallback) && normalizedFallback >= 0 ? normalizedFallback : 0;
 }
 
+function readSetting(envNames, configPaths, fallback) {
+  for (const name of envNames) {
+    const value = process.env[name];
+    if (value !== undefined && value !== '') return value;
+  }
+  for (const path of configPaths) {
+    const value = get(path, undefined);
+    if (value !== undefined && value !== null && value !== '') return value;
+  }
+  return fallback;
+}
+
+function rangeSetting(label, envNames, configPaths, fallback, minimum = 0) {
+  const value = readSetting(envNames, configPaths, fallback);
+  const parsed = parseIntegerRange(value, { minimum });
+  if (parsed) return parsed;
+
+  console.warn(
+    `[config] ${label} must use an integer range such as 10, 10.., ..10, or 10..15; using configured default.`,
+  );
+  return parseIntegerRange(fallback, { minimum });
+}
+
+function durationSetting(label, envNames, configPaths, fallback) {
+  const value = readSetting(envNames, configPaths, fallback);
+  const parsed = parseDuration(value);
+  if (parsed !== null) return parsed;
+
+  console.warn(
+    `[config] ${label} must use milliseconds or a duration such as 10min, 15m10s, or 1000ms; using configured default.`,
+  );
+  return parseDuration(fallback);
+}
+
+function maximumRangeSetting(label, envNames, configPaths, legacyConfigPaths, fallback, minimum = 0) {
+  const configured = readSetting(envNames, configPaths, undefined);
+  if (configured !== undefined) {
+    return rangeSetting(label, envNames, configPaths, fallback, minimum);
+  }
+
+  for (const path of legacyConfigPaths) {
+    const legacyValue = get(path, undefined);
+    if (legacyValue !== undefined && legacyValue !== null && legacyValue !== '') {
+      return rangeSetting(label, [], [], `..${legacyValue}`, minimum);
+    }
+  }
+  return rangeSetting(label, [], [], fallback, minimum);
+}
+
+function exactIntegerSetting(label, envNames, configPaths, fallback, minimum = 0) {
+  const value = readSetting(envNames, configPaths, fallback);
+  const parsed = parseIntegerRange(value, { minimum });
+  if (parsed && parsed.min !== null && parsed.min === parsed.max) return parsed.min;
+
+  console.warn(`[config] ${label} must be a non-negative integer; using configured default.`);
+  const fallbackRange = parseIntegerRange(fallback, { minimum });
+  return fallbackRange?.min ?? minimum;
+}
+
+function rateLimitSetting({ label, envPrefix, configPath, defaultWindow, defaultMax, legacyWindowPaths = [], legacyMaxPaths = [], legacyWindowEnv = [], legacyMaxEnv = [] }) {
+  return {
+    windowMs: durationSetting(
+      `${label} window`,
+      [`${envPrefix}_WINDOW`, ...legacyWindowEnv],
+      [`${configPath}.window`, `${configPath}.windowMs`, ...legacyWindowPaths],
+      defaultWindow,
+    ),
+    max: exactIntegerSetting(
+      `${label} max`,
+      [`${envPrefix}_MAX`, ...legacyMaxEnv],
+      [`${configPath}.max`, ...legacyMaxPaths],
+      defaultMax,
+      1,
+    ),
+  };
+}
+
 function normalizeApiEndpoint(value, fallback = '/server') {
   const candidate = String(value === undefined || value === null ? fallback : value).trim();
   if (!candidate) return fallback;
@@ -59,6 +138,53 @@ function optionalPort(name, value) {
   if (Number.isInteger(parsed) && parsed >= 1 && parsed <= 65535) return parsed;
   console.warn(`[config] ${name} must be an integer between 1 and 65535; file serving is disabled.`);
   return null;
+}
+
+const defaultCorsAllowedOrigins = [
+  'http://localhost:3000',
+  'http://127.0.0.1:3000',
+];
+
+function normalizeCorsAllowedOrigins(value) {
+  const candidates = Array.isArray(value)
+    ? value
+    : typeof value === 'string'
+      ? value.split(',')
+      : [];
+  const origins = new Set();
+
+  for (const value of candidates) {
+    const candidate = String(value || '').trim();
+    if (!candidate) continue;
+
+    try {
+      const url = new URL(candidate);
+      const isHttp = url.protocol === 'http:' || url.protocol === 'https:';
+      const hasOnlyOrigin =
+        url.username === '' &&
+        url.password === '' &&
+        (url.pathname === '/' || url.pathname === '') &&
+        url.search === '' &&
+        url.hash === '';
+      if (!isHttp || !hasOnlyOrigin) throw new Error('invalid origin');
+      origins.add(url.origin);
+    } catch (_) {
+      console.warn(
+        `[config] Ignoring invalid CORS origin: ${candidate}. Use an http(s) origin without a path.`,
+      );
+    }
+  }
+
+  return [...origins];
+}
+
+function corsAllowedOriginsSetting() {
+  if (process.env.NYAITTER_CORS_ALLOWED_ORIGINS !== undefined) {
+    return process.env.NYAITTER_CORS_ALLOWED_ORIGINS;
+  }
+  // Backward compatibility for deployments that already use this variable.
+  if (process.env.ALLOWED_ORIGINS !== undefined) return process.env.ALLOWED_ORIGINS;
+  return get('cors.allowedOrigins', defaultCorsAllowedOrigins);
 }
 
 const config = {
@@ -97,25 +223,143 @@ const config = {
   },
 
   cors: {
-    allowedOrigins: (process.env.ALLOWED_ORIGINS
-      ? process.env.ALLOWED_ORIGINS.split(',')
-      : get('cors.allowedOrigins', ['http://localhost:3000', 'http://127.0.0.1:3000'])
-    ).map(o => o.trim()),
+    // NYAITTER_CORS_ALLOWED_ORIGINS takes a comma-separated list of origins.
+    // config.json uses an array at cors.allowedOrigins.
+    allowedOrigins: normalizeCorsAllowedOrigins(corsAllowedOriginsSetting()),
     credentials: get('cors.credentials', false),
     preflightMaxAge: get('cors.preflightMaxAge', 600),
   },
 
   limits: {
-    postContentMax: get('limits.postContentMax', 1000),
-    dmContentMax: get('limits.dmContentMax', 2000),
-    timelineDefaultLimit: get('limits.timelineDefaultLimit', 30),
-    userSearchDefaultLimit: get('limits.userSearchDefaultLimit', 20),
-    userSearchMaxLimit: get('limits.userSearchMaxLimit', 100),
-    dmMessagesDefaultLimit: get('limits.dmMessagesDefaultLimit', 50),
-    dmMessagesMaxLimit: get('limits.dmMessagesMaxLimit', 100),
-    parentPostPreviewLength: get('limits.parentPostPreviewLength', 100),
-    followingDefaultLimit: get('limits.followingDefaultLimit', 100),
-    maxFileUploadSizeMB: get('limits.maxFileUploadSizeMB', 5),
+    postContentLength: maximumRangeSetting(
+      'post content length',
+      ['NYAITTER_LIMIT_POST_CONTENT_LENGTH'],
+      ['limits.postContentLength'],
+      ['limits.postContentMax'],
+      '..1000',
+    ),
+    dmContentLength: maximumRangeSetting(
+      'DM content length',
+      ['NYAITTER_LIMIT_DM_CONTENT_LENGTH'],
+      ['limits.dmContentLength'],
+      ['limits.dmContentMax'],
+      '..2000',
+    ),
+    dmE2eEphemeralKeyLength: rangeSetting(
+      'DM E2E ephemeral key length',
+      ['NYAITTER_LIMIT_DM_E2E_EPHEMERAL_KEY_LENGTH'],
+      ['limits.dmE2eEphemeralKeyLength'],
+      '1..1024',
+      1,
+    ),
+    dmE2eCiphertextLength: rangeSetting(
+      'DM E2E ciphertext length',
+      ['NYAITTER_LIMIT_DM_E2E_CIPHERTEXT_LENGTH'],
+      ['limits.dmE2eCiphertextLength'],
+      '1..16384',
+      1,
+    ),
+    dmE2ePayloadLength: rangeSetting(
+      'DM E2E payload length',
+      ['NYAITTER_LIMIT_DM_E2E_PAYLOAD_LENGTH'],
+      ['limits.dmE2ePayloadLength'],
+      '..65536',
+    ),
+    userNameLength: rangeSetting(
+      'user name length',
+      ['NYAITTER_LIMIT_USER_NAME_LENGTH'],
+      ['limits.userNameLength'],
+      '1..50',
+    ),
+    profileBioLength: rangeSetting(
+      'profile bio length',
+      ['NYAITTER_LIMIT_PROFILE_BIO_LENGTH'],
+      ['limits.profileBioLength'],
+      '..500',
+    ),
+    scratchUsernameLength: rangeSetting(
+      'Scratch username length',
+      ['NYAITTER_LIMIT_SCRATCH_USERNAME_LENGTH'],
+      ['limits.scratchUsernameLength'],
+      '3..20',
+    ),
+    timelinePageSize: exactIntegerSetting(
+      'timeline page size',
+      ['NYAITTER_LIMIT_TIMELINE_PAGE_SIZE'],
+      ['limits.timelinePageSize', 'limits.timelineDefaultLimit'],
+      30,
+      1,
+    ),
+    userSearchPageSize: rangeSetting(
+      'user search page size',
+      ['NYAITTER_LIMIT_USER_SEARCH_PAGE_SIZE'],
+      ['limits.userSearchPageSize'],
+      `1..${get('limits.userSearchMaxLimit', 100)}`,
+      1,
+    ),
+    userSearchDefaultLimit: exactIntegerSetting(
+      'user search default page size',
+      ['NYAITTER_LIMIT_USER_SEARCH_DEFAULT_PAGE_SIZE'],
+      ['limits.userSearchDefaultLimit'],
+      20,
+      1,
+    ),
+    dmMessagesPageSize: rangeSetting(
+      'DM messages page size',
+      ['NYAITTER_LIMIT_DM_MESSAGES_PAGE_SIZE'],
+      ['limits.dmMessagesPageSize'],
+      `1..${get('limits.dmMessagesMaxLimit', 100)}`,
+      1,
+    ),
+    dmMessagesDefaultLimit: exactIntegerSetting(
+      'DM messages default page size',
+      ['NYAITTER_LIMIT_DM_MESSAGES_DEFAULT_PAGE_SIZE'],
+      ['limits.dmMessagesDefaultLimit'],
+      50,
+      1,
+    ),
+    followingPageSize: exactIntegerSetting(
+      'following page size',
+      ['NYAITTER_LIMIT_FOLLOWING_PAGE_SIZE'],
+      ['limits.followingPageSize', 'limits.followingDefaultLimit'],
+      100,
+      1,
+    ),
+    parentPostPreviewLength: exactIntegerSetting(
+      'parent post preview length',
+      ['NYAITTER_LIMIT_PARENT_POST_PREVIEW_LENGTH'],
+      ['limits.parentPostPreviewLength'],
+      100,
+      0,
+    ),
+    maxFileUploadSizeMB: exactIntegerSetting(
+      'maximum file upload size',
+      ['NYAITTER_LIMIT_MAX_FILE_UPLOAD_SIZE_MB'],
+      ['limits.maxFileUploadSizeMB'],
+      5,
+      1,
+    ),
+    fileDeleteBatchSize: exactIntegerSetting(
+      'file delete batch size',
+      ['NYAITTER_LIMIT_FILE_DELETE_BATCH_SIZE'],
+      ['limits.fileDeleteBatchSize'],
+      1000,
+      1,
+    ),
+    postBatchSize: exactIntegerSetting(
+      'post batch size',
+      ['NYAITTER_LIMIT_POST_BATCH_SIZE'],
+      ['limits.postBatchSize'],
+      100,
+      1,
+    ),
+    storageListPageSize: exactIntegerSetting(
+      'storage list page size',
+      ['NYAITTER_LIMIT_STORAGE_LIST_PAGE_SIZE'],
+      ['limits.storageListPageSize'],
+      500,
+      1,
+    ),
   },
 
   dm: {
@@ -204,19 +448,81 @@ const config = {
   },
 
   rateLimit: {
-    enabled: get('rateLimit.enabled', true),
-    windowMs: get('rateLimit.windowMs', 60000),
-    max: get('rateLimit.max', 1000),
-    auth: {
-      windowMs: envNonNegativeInteger(
-        'RATE_LIMIT_AUTH_WINDOW_MS',
-        get('rateLimit.auth.windowMs', 60000),
-      ),
-      max: envNonNegativeInteger(
-        'RATE_LIMIT_AUTH_MAX',
-        get('rateLimit.auth.max', 120),
-      ),
-    },
+    enabled: envBoolean('NYAITTER_RATE_LIMIT_ENABLED', get('rateLimit.enabled', true)),
+    general: rateLimitSetting({
+      label: 'general rate limit',
+      envPrefix: 'NYAITTER_RATE_LIMIT_GENERAL',
+      configPath: 'rateLimit.general',
+      defaultWindow: '1min',
+      defaultMax: 1000,
+      legacyWindowPaths: ['rateLimit.windowMs'],
+      legacyMaxPaths: ['rateLimit.max'],
+    }),
+    auth: rateLimitSetting({
+      label: 'auth rate limit',
+      envPrefix: 'NYAITTER_RATE_LIMIT_AUTH',
+      configPath: 'rateLimit.auth',
+      defaultWindow: '1min',
+      defaultMax: 120,
+      legacyWindowEnv: ['RATE_LIMIT_AUTH_WINDOW_MS'],
+      legacyMaxEnv: ['RATE_LIMIT_AUTH_MAX'],
+    }),
+    postWrite: rateLimitSetting({
+      label: 'post write rate limit',
+      envPrefix: 'NYAITTER_RATE_LIMIT_POST_WRITE',
+      configPath: 'rateLimit.postWrite',
+      defaultWindow: '1min',
+      defaultMax: 30,
+    }),
+    profileUpdate: rateLimitSetting({
+      label: 'profile update rate limit',
+      envPrefix: 'NYAITTER_RATE_LIMIT_PROFILE_UPDATE',
+      configPath: 'rateLimit.profileUpdate',
+      defaultWindow: '1min',
+      defaultMax: 20,
+    }),
+    dmSend: rateLimitSetting({
+      label: 'DM send rate limit',
+      envPrefix: 'NYAITTER_RATE_LIMIT_DM_SEND',
+      configPath: 'rateLimit.dmSend',
+      defaultWindow: '1min',
+      defaultMax: 60,
+    }),
+    upload: rateLimitSetting({
+      label: 'upload rate limit',
+      envPrefix: 'NYAITTER_RATE_LIMIT_UPLOAD',
+      configPath: 'rateLimit.upload',
+      defaultWindow: '1min',
+      defaultMax: 30,
+    }),
+    notification: rateLimitSetting({
+      label: 'notification rate limit',
+      envPrefix: 'NYAITTER_RATE_LIMIT_NOTIFICATION',
+      configPath: 'rateLimit.notification',
+      defaultWindow: '1min',
+      defaultMax: 60,
+    }),
+    reportCreate: rateLimitSetting({
+      label: 'report create rate limit',
+      envPrefix: 'NYAITTER_RATE_LIMIT_REPORT_CREATE',
+      configPath: 'rateLimit.reportCreate',
+      defaultWindow: '1min',
+      defaultMax: 10,
+    }),
+    reportAction: rateLimitSetting({
+      label: 'report action rate limit',
+      envPrefix: 'NYAITTER_RATE_LIMIT_REPORT_ACTION',
+      configPath: 'rateLimit.reportAction',
+      defaultWindow: '1min',
+      defaultMax: 30,
+    }),
+    verificationApplication: rateLimitSetting({
+      label: 'verification application rate limit',
+      envPrefix: 'NYAITTER_RATE_LIMIT_VERIFICATION_APPLICATION',
+      configPath: 'rateLimit.verificationApplication',
+      defaultWindow: '1min',
+      defaultMax: 5,
+    }),
   },
 
   security: {

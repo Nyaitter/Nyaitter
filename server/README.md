@@ -83,6 +83,20 @@ APIの基準パスは `NYAITTER_API_ENDPOINT` または `server.apiEndpoint` で
 
 `NYAITTER_API_ENDPOINT=/` と設定した場合は、`/posts` と `/api/posts` のように公開されます。`/api` は互換用の別名であり、どちらも同じ処理を実行します。
 
+## Push通知とセッション
+
+Push通知を有効にするには、`VAPID_SUBJECT`、`VAPID_PUBLIC_KEY`、`VAPID_PRIVATE_KEY` を設定します。ブラウザが `POST /push/subscriptions` を実行すると、Push購読はその時点で認証に使用したセッションと紐付けて保存されます。
+
+通知は、購読に紐付く**有効なセッションが存在し、かつ通知対象ユーザー本人のセッションであるデバイスにだけ**送信されます。ログアウト、セッションの個別無効化、IP単位のセッション無効化、期限切れなどによりセッションが無効になったデバイスへは送信しません。無効なセッションに紐付く購読は次回の送信対象確認時に削除されます。
+
+| 送信対象の状態 | Push通知の動作 |
+|---|---|
+| 有効な本人セッションに紐付く | 送信する |
+| セッションが無効・期限切れ・別ユーザー・未紐付け | 送信せず、購読を削除する |
+| セッション照合中に一時的なDB障害が発生した | 誤送信を防ぐため送信せず、購読は保持する |
+
+> 既存の古いPush購読など、セッションに紐付かない購読には通知を送信しません。対象デバイスでログイン後に再度Push通知を許可すると、新しい有効セッションへ購読が紐付きます。
+
 ## 設定
 
 通常の設定は `server/config.json`、パスワードやトークンなどの秘密情報は `server/.env` に置きます。`server/.env` はGitへ追加しないでください。
@@ -93,9 +107,82 @@ APIの基準パスは `NYAITTER_API_ENDPOINT` または `server.apiEndpoint` で
 | APIパス | `NYAITTER_API_ENDPOINT`、`server.apiEndpoint` |
 | ユーザーファイル | `NYAITTER_USER_FILES_ENDPOINT`、`NYAITTER_USER_FILES_PORT`、`userFiles.endpoint`、`userFiles.port` |
 | Client同期 | `NYAITTER_CLIENT_REPOSITORY`、`client.repository` |
+| CORS | `NYAITTER_CORS_ALLOWED_ORIGINS`、`cors.allowedOrigins` |
 | DB | `DB_ADAPTER`、`DATABASE_URL`、`D1_WORKER_URL`、`D1_WORKER_TOKEN` |
 | ストレージ | `STORAGE_ADAPTER`、`STORAGE_USER_QUOTA_MB`、`R2_*` |
 | Push通知 | `VAPID_SUBJECT`、`VAPID_PUBLIC_KEY`、`VAPID_PRIVATE_KEY` |
+
+CORSで別ドメインに配置したClientからAPIを利用する場合は、許可する**オリジン**を設定します。`server/config.json` では `cors.allowedOrigins` に配列で指定し、環境変数では `NYAITTER_CORS_ALLOWED_ORIGINS` にカンマ区切りで指定します。オリジンには `https://client.example.com` のようにスキーム・ホスト・必要なポートだけを含め、パス、クエリ、フラグメントは含めません。
+
+```json
+{
+  "cors": {
+    "allowedOrigins": [
+      "https://client.example.com",
+      "https://admin.example.com"
+    ]
+  }
+}
+```
+
+```dotenv
+NYAITTER_CORS_ALLOWED_ORIGINS=https://client.example.com,https://admin.example.com
+```
+
+環境変数が設定されている場合は `cors.allowedOrigins` より優先されます。既存の `ALLOWED_ORIGINS` も互換性のため引き続き利用できますが、新規の設定では `NYAITTER_CORS_ALLOWED_ORIGINS` を使用してください。
+
+### 制限値とレート制限
+
+文字数・件数・ページサイズの範囲は、`10`（ちょうど10）、`10..`（10以上）、`..10`（10以下）、`10..15`（10以上15以下）の形式で指定します。レート制限の時間は、`10min`、`10s15m`、`15m10s`、`1000ms` のように指定します。時間の単位は `min`、`s`、`ms` で、同じ単位は一度だけ指定できます。
+
+| 分類 | `config.json` | 環境変数 | 既定値 | 適用先 |
+|---|---|---|---|---|
+| ポスト本文 | `limits.postContentLength` | `NYAITTER_LIMIT_POST_CONTENT_LENGTH` | `..1000` | 投稿の作成・編集 |
+| DM本文 | `limits.dmContentLength` | `NYAITTER_LIMIT_DM_CONTENT_LENGTH` | `..2000` | DM送信・編集 |
+| 表示名 | `limits.userNameLength` | `NYAITTER_LIMIT_USER_NAME_LENGTH` | `1..50` | プロフィール更新 |
+| 自己紹介 | `limits.profileBioLength` | `NYAITTER_LIMIT_PROFILE_BIO_LENGTH` | `..500` | プロフィール更新 |
+| Scratchユーザー名 | `limits.scratchUsernameLength` | `NYAITTER_LIMIT_SCRATCH_USERNAME_LENGTH` | `3..20` | Scratch認証 |
+| ファイル容量 | `limits.maxFileUploadSizeMB` | `NYAITTER_LIMIT_MAX_FILE_UPLOAD_SIZE_MB` | `5` | アップロード |
+| 一括件数 | `limits.fileDeleteBatchSize`、`limits.postBatchSize` | `NYAITTER_LIMIT_FILE_DELETE_BATCH_SIZE`、`NYAITTER_LIMIT_POST_BATCH_SIZE` | `1000`、`100` | ファイル削除、ポスト一括取得 |
+| ページサイズ | `limits.userSearchPageSize`、`limits.dmMessagesPageSize` | `NYAITTER_LIMIT_USER_SEARCH_PAGE_SIZE`、`NYAITTER_LIMIT_DM_MESSAGES_PAGE_SIZE` | `1..100` | 検索、DM一覧 |
+
+レート制限は各設定の `window` と `max` で指定します。環境変数では `NYAITTER_RATE_LIMIT_<対象>_WINDOW` と `NYAITTER_RATE_LIMIT_<対象>_MAX` を使います。
+
+| 対象 | `config.json` の設定キー | 環境変数の接頭辞 | 既定値 |
+|---|---|---|---|
+| 一般API | `rateLimit.general` | `NYAITTER_RATE_LIMIT_GENERAL` | `1000 / 1min` |
+| 認証 | `rateLimit.auth` | `NYAITTER_RATE_LIMIT_AUTH` | `120 / 1min` |
+| 投稿操作 | `rateLimit.postWrite` | `NYAITTER_RATE_LIMIT_POST_WRITE` | `30 / 1min` |
+| プロフィール更新 | `rateLimit.profileUpdate` | `NYAITTER_RATE_LIMIT_PROFILE_UPDATE` | `20 / 1min` |
+| DM送信 | `rateLimit.dmSend` | `NYAITTER_RATE_LIMIT_DM_SEND` | `60 / 1min` |
+| ファイル操作 | `rateLimit.upload` | `NYAITTER_RATE_LIMIT_UPLOAD` | `30 / 1min` |
+| 通知送信 | `rateLimit.notification` | `NYAITTER_RATE_LIMIT_NOTIFICATION` | `60 / 1min` |
+| 通報作成・対応 | `rateLimit.reportCreate`、`rateLimit.reportAction` | `NYAITTER_RATE_LIMIT_REPORT_CREATE`、`NYAITTER_RATE_LIMIT_REPORT_ACTION` | `10 / 1min`、`30 / 1min` |
+| 認証申請 | `rateLimit.verificationApplication` | `NYAITTER_RATE_LIMIT_VERIFICATION_APPLICATION` | `5 / 1min` |
+
+`config.json` の例です。
+
+```json
+{
+  "limits": {
+    "postContentLength": "..1000",
+    "userNameLength": "1..50",
+    "profileBioLength": "..500"
+  },
+  "rateLimit": {
+    "postWrite": { "window": "15m10s", "max": 30 }
+  }
+}
+```
+
+環境変数では次のように指定できます。
+
+```dotenv
+NYAITTER_LIMIT_POST_CONTENT_LENGTH=..1000
+NYAITTER_LIMIT_PROFILE_BIO_LENGTH=..500
+NYAITTER_RATE_LIMIT_POST_WRITE_WINDOW=15m10s
+NYAITTER_RATE_LIMIT_POST_WRITE_MAX=30
+```
 
 設定例は [`.env.example`](./.env.example) を確認してください。
 

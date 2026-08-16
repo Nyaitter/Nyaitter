@@ -1,6 +1,7 @@
 const express = require('express');
 const { optionalAuth, requireAuth } = require('../middleware/auth');
 const config = require('../config');
+const { isWithinRange, describeIntegerRange } = require('../utils/settingFormats');
 const {
 	serializeUser,
 	serializeUserBrief,
@@ -17,6 +18,8 @@ const {
 } = require('../services/NotificationDeliveryService');
 
 const router = express.Router();
+const { createRateLimiter } = require('../middleware/rateLimit');
+const profileUpdateLimiter = createRateLimiter(config.rateLimit.profileUpdate);
 
 function getDbAdapter(req) {
 	return req.app.locals.dbAdapter;
@@ -24,6 +27,15 @@ function getDbAdapter(req) {
 
 function getStorageAdapter(req) {
 	return req.app.locals.storageAdapter;
+}
+
+function validateProfileText(value, label, range) {
+	if (value === undefined) return null;
+	if (typeof value !== 'string') return `${label} must be a string`;
+	if (!isWithinRange(value.length, range)) {
+		return `${label} must be ${describeIntegerRange(range)} characters`;
+	}
+	return null;
 }
 
 function getScratchIconService(req) {
@@ -207,10 +219,15 @@ router.get('/:userId/icon', optionalAuth, handleUserIcon);
 router.get('/search', optionalAuth, async (req, res) => {
 	const db = getDbAdapter(req);
 	const query = req.query.q || '';
-	const limit = Math.min(
-		Math.max(parseInt(req.query.limit, 10) || config.limits.userSearchDefaultLimit, 1),
-		config.limits.userSearchMaxLimit,
-	);
+	const requestedLimit = parseInt(req.query.limit, 10);
+	const pageSize = config.limits.userSearchPageSize;
+	const minimum = pageSize.min === null ? 1 : pageSize.min;
+	const maximum = pageSize.max;
+	let limit = Number.isInteger(requestedLimit) && requestedLimit > 0
+		? requestedLimit
+		: config.limits.userSearchDefaultLimit;
+	limit = Math.max(limit, minimum);
+	if (maximum !== null) limit = Math.min(limit, maximum);
 	const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
 
 	if (query.trim().length === 0) {
@@ -604,11 +621,16 @@ router.get('/:userId/pin', optionalAuth, async (req, res) => {
 	}
 });
 
-router.put('/me', requireAuth, async (req, res) => {
+router.put('/me', requireAuth, profileUpdateLimiter, async (req, res) => {
 	const db = getDbAdapter(req);
 	const userId = req.user.id;
 	const { name, me, bio, header_image, icon_data, settings, block } =
 		req.body;
+	const validationError =
+		validateProfileText(name, 'name', config.limits.userNameLength) ||
+		validateProfileText(me, 'me', config.limits.profileBioLength) ||
+		validateProfileText(bio, 'bio', config.limits.profileBioLength);
+	if (validationError) return res.status(400).json({ error: validationError });
 
 	try {
 		const updated = await db.updateUserProfile(userId, {

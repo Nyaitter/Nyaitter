@@ -3,10 +3,17 @@ const crypto = require('crypto');
 const { requireAuth } = require('../middleware/auth');
 const { hasBlockRelationship } = require('../utils/blockRelationship');
 const config = require('../config');
+const { isWithinRange, describeIntegerRange } = require('../utils/settingFormats');
 const router = express.Router();
+const { createRateLimiter } = require('../middleware/rateLimit');
+const dmSendLimiter = createRateLimiter(config.rateLimit.dmSend);
 
 function getDbAdapter(req) {
 	return req.app.locals.dbAdapter;
+}
+
+function lengthError(label, range) {
+	return `${label} must be ${describeIntegerRange(range)} characters`;
 }
 
 async function publishDmMessage(req, userIds, dmId, message, sender = null) {
@@ -99,9 +106,12 @@ function normalizeClientMessage(message, userId) {
 		if (e2e.v !== 1) {
 			throw new Error('Unsupported E2E format');
 		}
-		if (typeof e2e.eph !== 'string' || e2e.eph.length === 0 || e2e.eph.length > 1024) {
-			throw new Error('e2e.eph is required');
-		}
+			if (
+				typeof e2e.eph !== 'string' ||
+				!isWithinRange(e2e.eph.length, config.limits.dmE2eEphemeralKeyLength)
+			) {
+				throw new Error(lengthError('e2e.eph', config.limits.dmE2eEphemeralKeyLength));
+			}
 		if (!e2e.ct || typeof e2e.ct !== 'object') {
 			throw new Error('e2e.ct is required');
 		}
@@ -124,14 +134,14 @@ function normalizeClientMessage(message, userId) {
 			) {
 				throw new Error('Invalid E2E ciphertext');
 			}
-			if (entry.data.length > 16384) {
-				throw new Error('DM content must be 2000 characters or less');
-			}
+				if (!isWithinRange(entry.data.length, config.limits.dmE2eCiphertextLength)) {
+					throw new Error(lengthError('E2E ciphertext', config.limits.dmE2eCiphertextLength));
+				}
 			totalDataLength += entry.data.length;
 		}
-		if (totalDataLength > 65536) {
-			throw new Error('E2E payload too large');
-		}
+			if (!isWithinRange(totalDataLength, config.limits.dmE2ePayloadLength)) {
+				throw new Error(lengthError('E2E payload', config.limits.dmE2ePayloadLength));
+			}
 		return {
 			id: crypto.randomUUID(),
 			created_at: new Date().toISOString(),
@@ -143,8 +153,8 @@ function normalizeClientMessage(message, userId) {
 		};
 	}
 
-	if (content.length > 2000) {
-		throw new Error('DM content must be 2000 characters or less');
+	if (content && !isWithinRange(content.length, config.limits.dmContentLength)) {
+		throw new Error(lengthError('DM content', config.limits.dmContentLength));
 	}
 	if (!content && (!Array.isArray(message.attachments) || message.attachments.length === 0)) {
 		throw new Error('Message content or attachments are required');
@@ -186,8 +196,9 @@ function validateMessageHistoryUpdate(existingMessages, requestedMessages, userI
 		if (message.userid !== userId || message.type !== 'user') {
 			throw new Error('You can only edit your own messages');
 		}
-		if (!message.e2e && String(message.content || '').trim().length > 2000) {
-			throw new Error('DM content must be 2000 characters or less');
+		const content = String(message.content || '').trim();
+		if (content && !message.e2e && !isWithinRange(content.length, config.limits.dmContentLength)) {
+			throw new Error(lengthError('DM content', config.limits.dmContentLength));
 		}
 	}
 
@@ -567,7 +578,7 @@ router.delete('/:dmId', requireAuth, async (req, res) => {
 	}
 });
 
-router.post('/:dmId/messages', requireAuth, async (req, res) => {
+router.post('/:dmId/messages', requireAuth, dmSendLimiter, async (req, res) => {
 	const db = getDbAdapter(req);
 	const userId = req.user.id;
 	const dmId = req.params.dmId;

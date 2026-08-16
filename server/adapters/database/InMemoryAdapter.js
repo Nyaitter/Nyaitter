@@ -682,7 +682,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 	}
 
 	
-	async getRecentPosts(limit = config.limits.timelineDefaultLimit) {
+	async getRecentPosts(limit = config.limits.timelinePageSize) {
 		const normalizedLimit = Math.max(0, Number(limit) || 0);
 		const posts = [];
 		for (const id of this.postIdsNewest) {
@@ -695,7 +695,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 	}
 
 	
-		async getPostsByUserId(userId, limit = config.limits.timelineDefaultLimit, _currentUserId = null) {
+		async getPostsByUserId(userId, limit = config.limits.timelinePageSize, _currentUserId = null) {
 			const ids = this.postIdsByUser.get(Number(userId)) || [];
 			return ids
 				.slice(0, Math.max(0, Number(limit) || 0))
@@ -1070,7 +1070,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 		return this.follows.has(`${followerId}:${followingId}`);
 	}
 
-	async getFollowing(userId, limit = config.limits.followingDefaultLimit) {
+	async getFollowing(userId, limit = config.limits.followingPageSize) {
 		const ids = this.followingIdsByUser.get(Number(userId)) || new Set();
 		return [...ids]
 			.slice(0, Math.max(0, Number(limit) || 0))
@@ -1078,7 +1078,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 			.filter(Boolean);
 	}
 
-	async getFollowers(userId, limit = config.limits.followingDefaultLimit) {
+	async getFollowers(userId, limit = config.limits.followingPageSize) {
 		const ids = this.followerIdsByUser.get(Number(userId)) || new Set();
 		return [...ids]
 			.slice(0, Math.max(0, Number(limit) || 0))

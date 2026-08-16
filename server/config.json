@@ -22,16 +22,25 @@
 		"preflightMaxAge": 600
 	},
 	"limits": {
-		"postContentMax": 1000,
-		"dmContentMax": 2000,
-		"timelineDefaultLimit": 30,
+		"postContentLength": "..1000",
+		"dmContentLength": "..2000",
+		"dmE2eEphemeralKeyLength": "1..1024",
+		"dmE2eCiphertextLength": "1..16384",
+		"dmE2ePayloadLength": "..65536",
+		"userNameLength": "1..50",
+		"profileBioLength": "..500",
+		"scratchUsernameLength": "3..20",
+		"timelinePageSize": 30,
+		"userSearchPageSize": "1..100",
 		"userSearchDefaultLimit": 20,
-		"userSearchMaxLimit": 100,
+		"dmMessagesPageSize": "1..100",
 		"dmMessagesDefaultLimit": 50,
-		"dmMessagesMaxLimit": 100,
+		"followingPageSize": 100,
 		"parentPostPreviewLength": 100,
-		"followingDefaultLimit": 100,
-	"maxFileUploadSizeMB": 5
+		"maxFileUploadSizeMB": 5,
+		"fileDeleteBatchSize": 1000,
+		"postBatchSize": 100,
+		"storageListPageSize": 500
 		},
 		"dm": {
 			"e2eEnabled": false
@@ -94,13 +103,17 @@
 	},
 	"rateLimit": {
 		"enabled": true,
-		"windowMs": 60000,
-		"max": 1000,
-			"auth": {
-				"windowMs": 60000,
-				"max": 120
-			}
-	},
+		"general": { "window": "1min", "max": 1000 },
+		"auth": { "window": "1min", "max": 120 },
+		"postWrite": { "window": "1min", "max": 30 },
+		"profileUpdate": { "window": "1min", "max": 20 },
+		"dmSend": { "window": "1min", "max": 60 },
+		"upload": { "window": "1min", "max": 30 },
+		"notification": { "window": "1min", "max": 60 },
+		"reportCreate": { "window": "1min", "max": 10 },
+		"reportAction": { "window": "1min", "max": 30 },
+		"verificationApplication": { "window": "1min", "max": 5 }
+		},
 	"security": {
 		"hsts": {
 			"enabled": true,

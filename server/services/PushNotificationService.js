@@ -52,14 +52,19 @@ class PushNotificationService {
 
     const result = { attempted: subscriptions.length, delivered: 0, removed: 0, skipped: 0 };
     await Promise.all(subscriptions.map(async (subscription) => {
-      const sessionValid = await this._isSessionValid(subscription.sessionToken);
-      if (!sessionValid) {
+      const sessionStatus = await this._getSessionStatus(
+        userId,
+        subscription.sessionToken,
+      );
+      if (sessionStatus !== 'valid') {
         result.skipped += 1;
-        try {
-          await this.dbAdapter.deletePushSubscription(userId, subscription.endpoint);
-          result.removed += 1;
-        } catch (deleteError) {
-          console.warn('[push] Failed to remove stale subscription:', deleteError.message);
+        if (sessionStatus === 'invalid') {
+          try {
+            await this.dbAdapter.deletePushSubscription(userId, subscription.endpoint);
+            result.removed += 1;
+          } catch (deleteError) {
+            console.warn('[push] Failed to remove stale subscription:', deleteError.message);
+          }
         }
         return;
       }
@@ -89,15 +94,22 @@ class PushNotificationService {
     return result;
   }
 
-  async _isSessionValid(sessionToken) {
-    if (!sessionToken) return true;
-    if (typeof this.dbAdapter.getSessionByToken !== 'function') return true;
+  async _getSessionStatus(userId, sessionToken) {
+    // 旧形式など、セッションに紐付かない購読には送信しない。
+    if (!sessionToken) return 'invalid';
+    if (typeof this.dbAdapter.getSessionByToken !== 'function') {
+      console.warn('[push] Session validation is not supported by the active database adapter.');
+      return 'unknown';
+    }
+
     try {
       const session = await this.dbAdapter.getSessionByToken(sessionToken);
-      return Boolean(session);
+      if (!session || Number(session.userId) !== Number(userId)) return 'invalid';
+      return 'valid';
     } catch (error) {
+      // DBの一時障害時に誤送信しない。購読自体は回復後に利用できるよう削除しない。
       console.warn('[push] Session validation failed:', error.message);
-      return true;
+      return 'unknown';
     }
   }
 }

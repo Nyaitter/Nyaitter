@@ -1,6 +1,7 @@
 const express = require('express');
 const { requireAuth, optionalAuth } = require('../middleware/auth');
 const { createRateLimiter } = require('../middleware/rateLimit');
+const config = require('../config');
 const { NOTIFICATION_TYPES, normalizeTarget } = require('../utils/notification');
 const {
 	serializeNotification,
@@ -12,7 +13,7 @@ const {
 
 const router = express.Router();
 
-const notificationLimiter = createRateLimiter({ windowMs: 60000, max: 60 });
+const notificationLimiter = createRateLimiter(config.rateLimit.notification);
 
 // サーバー側イベントで自動生成される通知タイプ。クライアントからは作成できない。
 const SERVER_GENERATED_TYPES = new Set(['like', 'star', 'follow', 'quote', 'reply', 'login_approval']);

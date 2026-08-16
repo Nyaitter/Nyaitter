@@ -7,6 +7,8 @@ const {
 } = require('../adapters/storage/safeStoragePath');
 
 const router = express.Router();
+const { createRateLimiter } = require('../middleware/rateLimit');
+const uploadLimiter = createRateLimiter(config.rateLimit.upload);
 
 function getStorageAdapter(req) {
 	return req.app.locals.storageAdapter;
@@ -22,7 +24,7 @@ function decodeBase64File(value) {
 	return Buffer.from(value, 'base64');
 }
 
-router.post('/', requireAuth, async (req, res) => {
+router.post('/', requireAuth, uploadLimiter, async (req, res) => {
 	const storage = getStorageAdapter(req);
 	if (!storage || typeof storage.upload !== 'function') {
 		return res.status(501).json({ error: 'Storage adapter not available' });
@@ -86,7 +88,7 @@ router.get('/storage', requireAuth, async (req, res) => {
 	try {
 		const [usedBytes, files] = await Promise.all([
 			storage.getUsage(folder),
-			storage.listFiles(folder, { limit: 500 }),
+			storage.listFiles(folder, { limit: config.limits.storageListPageSize }),
 		]);
 		res.json({
 			limit_mb: Number(config.storage?.userQuotaMB || 1024),
@@ -101,7 +103,7 @@ router.get('/storage', requireAuth, async (req, res) => {
 	}
 });
 
-router.delete('/', requireAuth, async (req, res) => {
+router.delete('/', requireAuth, uploadLimiter, async (req, res) => {
 	const storage = getStorageAdapter(req);
 	const { fileIds } = req.body || {};
 	if (!Array.isArray(fileIds) || fileIds.length === 0) {
@@ -118,9 +120,11 @@ router.delete('/', requireAuth, async (req, res) => {
 			}
 		}
 		const uniqueFileIds = [...new Set(fileIds)];
-		if (uniqueFileIds.length > 1000) {
-			return res.status(400).json({ error: 'A maximum of 1000 files can be deleted per request' });
-		}
+			if (uniqueFileIds.length > config.limits.fileDeleteBatchSize) {
+				return res.status(400).json({
+					error: `A maximum of ${config.limits.fileDeleteBatchSize} files can be deleted per request`,
+				});
+			}
 		if (typeof storage.deleteMany === 'function') {
 			await storage.deleteMany(uniqueFileIds);
 		} else {

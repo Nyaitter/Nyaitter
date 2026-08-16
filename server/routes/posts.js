@@ -2,6 +2,7 @@ const express = require('express');
 const PostService = require('../services/PostService');
 const { requireAuth, optionalAuth } = require('../middleware/auth');
 const config = require('../config');
+const { isWithinRange, describeIntegerRange } = require('../utils/settingFormats');
 const {
 	serializePost,
 	serializeReply,
@@ -28,6 +29,8 @@ const {
 } = require('../services/NotificationDeliveryService');
 
 const router = express.Router();
+const { createRateLimiter } = require('../middleware/rateLimit');
+const postWriteLimiter = createRateLimiter(config.rateLimit.postWrite);
 
 function getDbAdapter(req) {
 	return req.app.locals.dbAdapter;
@@ -72,6 +75,10 @@ async function publishNewTimelinePost(req, authorUserId, postId) {
 
 function getStorageAdapter(req) {
 	return req.app.locals.storageAdapter;
+}
+
+function contentLengthError(range) {
+	return `content must be ${describeIntegerRange(range)} characters`;
 }
 
 function getAttachmentStorageKeys(attachments) {
@@ -233,7 +240,7 @@ function isValidAttachmentUrl(value) {
 	}
 }
 
-router.post('/', requireAuth, async (req, res) => {
+router.post('/', requireAuth, postWriteLimiter, async (req, res) => {
 	const db = getDbAdapter(req);
 	const storage = getStorageAdapter(req);
 	const postService = new PostService({ dbAdapter: db, storageAdapter: storage });
@@ -258,8 +265,8 @@ router.post('/', requireAuth, async (req, res) => {
 		return res.status(400).json({ error: 'content, attachments, or repost_to is required' });
 	}
 	const trimmed = hasContent ? content.trim() : '';
-	if (trimmed.length > config.limits.postContentMax) {
-		return res.status(400).json({ error: `content must be ${config.limits.postContentMax} characters or less` });
+	if (hasContent && !isWithinRange(trimmed.length, config.limits.postContentLength)) {
+		return res.status(400).json({ error: contentLengthError(config.limits.postContentLength) });
 	}
 
 	let processedAttachments;
@@ -334,7 +341,7 @@ router.get('/', optionalAuth, async (req, res) => {
 	const db = getDbAdapter(req);
 
 	try {
-					const posts = await db.getRecentPosts(config.limits.timelineDefaultLimit);
+					const posts = await db.getRecentPosts(config.limits.timelinePageSize);
 			const currentUserId = req.user ? req.user.id : null;
 			const visibilityContext = await createPostVisibilityContext(db, posts, currentUserId);
 				const viewablePosts = await filterViewablePosts(
@@ -601,7 +608,7 @@ router.post('/hydrate', optionalAuth, async (req, res) => {
 	const db = getDbAdapter(req);
 	const postIds = [...new Set((req.body.post_ids || [])
 		.map((id) => parseInt(id, 10))
-		.filter((id) => Number.isInteger(id) && id > 0))].slice(0, 100);
+		.filter((id) => Number.isInteger(id) && id > 0))].slice(0, config.limits.postBatchSize);
 
 	try {
 		const currentUserId = req.user ? req.user.id : null;
@@ -617,7 +624,7 @@ router.post('/metrics', optionalAuth, async (req, res) => {
 	const db = getDbAdapter(req);
 	const postIds = [...new Set((req.body.post_ids || [])
 		.map((id) => parseInt(id, 10))
-		.filter((id) => Number.isInteger(id) && id > 0))].slice(0, 100);
+		.filter((id) => Number.isInteger(id) && id > 0))].slice(0, config.limits.postBatchSize);
 
 	try {
 		const currentUserId = req.user ? req.user.id : null;
@@ -713,7 +720,7 @@ router.get('/:id/replies', optionalAuth, async (req, res) => {
 	}
 });
 
-router.post('/:id/like', requireAuth, async (req, res) => {
+router.post('/:id/like', requireAuth, postWriteLimiter, async (req, res) => {
 	const db = getDbAdapter(req);
 	const storage = getStorageAdapter(req);
 	const postService = new PostService({ dbAdapter: db, storageAdapter: storage });
@@ -758,7 +765,7 @@ router.post('/:id/like', requireAuth, async (req, res) => {
 	}
 });
 
-router.post('/:id/star', requireAuth, async (req, res) => {
+router.post('/:id/star', requireAuth, postWriteLimiter, async (req, res) => {
 	const db = getDbAdapter(req);
 	const storage = getStorageAdapter(req);
 	const postService = new PostService({ dbAdapter: db, storageAdapter: storage });
@@ -803,7 +810,7 @@ router.post('/:id/star', requireAuth, async (req, res) => {
 	}
 });
 
-router.delete('/:id', requireAuth, async (req, res) => {
+router.delete('/:id', requireAuth, postWriteLimiter, async (req, res) => {
 	const db = getDbAdapter(req);
 	const storage = getStorageAdapter(req);
 	const postId = safeParsePostId(req.params.id);
@@ -832,7 +839,7 @@ router.delete('/:id', requireAuth, async (req, res) => {
 	}
 });
 
-router.delete('/admin/:id', requireAuth, async (req, res) => {
+router.delete('/admin/:id', requireAuth, postWriteLimiter, async (req, res) => {
 	const db = getDbAdapter(req);
 	const storage = getStorageAdapter(req);
 	const postId = safeParsePostId(req.params.id);
@@ -887,7 +894,7 @@ router.get('/:id/reposts', optionalAuth, async (req, res) => {
 	}
 });
 
-router.post('/:id/repost', requireAuth, async (req, res) => {
+router.post('/:id/repost', requireAuth, postWriteLimiter, async (req, res) => {
 	const db = getDbAdapter(req);
 	const postId = safeParsePostId(req.params.id);
 	const userId = req.user.id;
@@ -912,7 +919,7 @@ router.post('/:id/repost', requireAuth, async (req, res) => {
 	}
 });
 
-router.post('/:id/pin', requireAuth, async (req, res) => {
+router.post('/:id/pin', requireAuth, postWriteLimiter, async (req, res) => {
 	const db = getDbAdapter(req);
 	const postId = safeParsePostId(req.params.id);
 	const userId = req.user.id;
@@ -931,7 +938,7 @@ router.post('/:id/pin', requireAuth, async (req, res) => {
 	}
 });
 
-router.put('/:id', requireAuth, async (req, res) => {
+router.put('/:id', requireAuth, postWriteLimiter, async (req, res) => {
 	const db = getDbAdapter(req);
 	const storage = getStorageAdapter(req);
 	const postId = safeParsePostId(req.params.id);
@@ -946,8 +953,8 @@ router.put('/:id', requireAuth, async (req, res) => {
 	if (typeof content !== 'string' || content.trim().length === 0) {
 		return res.status(400).json({ error: 'content is required' });
 	}
-	if (content.trim().length > config.limits.postContentMax) {
-		return res.status(400).json({ error: `content must be ${config.limits.postContentMax} characters or less` });
+	if (!isWithinRange(content.trim().length, config.limits.postContentLength)) {
+		return res.status(400).json({ error: contentLengthError(config.limits.postContentLength) });
 	}
 	if (attachments !== undefined) {
 		try {

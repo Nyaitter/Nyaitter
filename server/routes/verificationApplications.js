@@ -1,9 +1,10 @@
 const express = require('express');
 const { requireAuth } = require('../middleware/auth');
 const { createRateLimiter } = require('../middleware/rateLimit');
+const config = require('../config');
 
 const router = express.Router();
-const verificationApplicationLimiter = createRateLimiter({ windowMs: 60 * 1000, max: 5 });
+const verificationApplicationLimiter = createRateLimiter(config.rateLimit.verificationApplication);
 
 function getModerationService(req) {
   return req.app.locals.moderationReportService || null;

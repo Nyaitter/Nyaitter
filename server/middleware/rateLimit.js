@@ -1,8 +1,8 @@
 const config = require('../config');
 
 function createRateLimiter(options = {}) {
-  const windowMs = options.windowMs || config.rateLimit.windowMs || 60000;
-  const max = options.max || config.rateLimit.max || 1000;
+  const windowMs = options.windowMs || config.rateLimit.general?.windowMs || 60000;
+  const max = options.max || config.rateLimit.general?.max || 1000;
   const keyGenerator = options.keyGenerator || ((req) => {
     if (req.user?.id) {
       return `user:${req.user.id}`;

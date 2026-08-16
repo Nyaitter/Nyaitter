@@ -4,6 +4,7 @@
 const fs = require('fs');
 const path = require('path');
 const dotenv = require('dotenv');
+const { parseDuration, parseIntegerRange } = require('./utils/settingFormats');
 
 const SERVER_DIR = __dirname;
 const ENV_PATH = path.join(SERVER_DIR, '.env');
@@ -33,6 +34,18 @@ function setting(envName, config, configPath, fallback = '') {
     return get(config, configPath, fallback);
 }
 
+function firstSetting(envNames, config, configPaths, fallback = '') {
+    for (const envName of envNames) {
+        const envValue = process.env[envName];
+        if (envValue !== undefined && envValue !== '') return envValue;
+    }
+    for (const configPath of configPaths) {
+        const value = get(config, configPath, undefined);
+        if (value !== undefined && value !== null && value !== '') return value;
+    }
+    return fallback;
+}
+
 function isNonEmptyString(value) {
     return typeof value === 'string' && value.trim() !== '';
 }
@@ -46,10 +59,59 @@ function isHttpUrl(value) {
     }
 }
 
+function isCorsOrigin(value) {
+    try {
+        const url = new URL(String(value).trim());
+        return (
+            (url.protocol === 'http:' || url.protocol === 'https:') &&
+            url.username === '' &&
+            url.password === '' &&
+            (url.pathname === '/' || url.pathname === '') &&
+            url.search === '' &&
+            url.hash === ''
+        );
+    } catch (_) {
+        return false;
+    }
+}
+
+function corsOriginValues(value) {
+    if (Array.isArray(value)) return value;
+    if (typeof value === 'string') return value.split(',');
+    return null;
+}
+
 function hasPlaceholder(value) {
     return /(?:^|[/:])(?:user|pass|password|example|changeme)(?:$|[/:@?])/i.test(
         String(value || ''),
     );
+}
+
+function inspectRangeSetting(config, { label, envName, configPath, fallback, minimum = 0, exact = false }) {
+    const value = firstSetting([envName], config, [configPath], fallback);
+    const range = parseIntegerRange(value, { minimum });
+    if (!range || (exact && (range.min === null || range.min !== range.max))) {
+        addIssue(
+            'error',
+            'LIMIT_RANGE_INVALID',
+            `${label} が無効です: ${value}`,
+            `${envName} または ${configPath} に 10、10..、..10、10..15 の形式で設定してください。`,
+        );
+    }
+}
+
+function inspectDurationSetting(config, { label, envName, configPath, fallback, legacyEnvName = null, legacyConfigPath = null }) {
+    const envNames = legacyEnvName ? [envName, legacyEnvName] : [envName];
+    const configPaths = legacyConfigPath ? [configPath, legacyConfigPath] : [configPath];
+    const value = firstSetting(envNames, config, configPaths, fallback);
+    if (parseDuration(value) === null) {
+        addIssue(
+            'error',
+            'RATE_LIMIT_DURATION_INVALID',
+            `${label} が無効です: ${value}`,
+            `${envName} または ${configPath} に 10min、15m10s、1000ms の形式で設定してください。`,
+        );
+    }
 }
 
 function inspect() {
@@ -89,6 +151,83 @@ function inspect() {
             `APIエンドポイントがパスとして無効です: ${apiEndpoint || '(空)'}`,
             'NYAITTER_API_ENDPOINT または server.apiEndpoint に /server、/、/v1 のような先頭が / のパスを設定してください。',
         );
+    }
+
+    const configuredCorsOrigins =
+        process.env.NYAITTER_CORS_ALLOWED_ORIGINS !== undefined
+            ? process.env.NYAITTER_CORS_ALLOWED_ORIGINS
+            : process.env.ALLOWED_ORIGINS !== undefined
+              ? process.env.ALLOWED_ORIGINS
+              : get(config, 'cors.allowedOrigins', []);
+    const corsOrigins = corsOriginValues(configuredCorsOrigins);
+    if (corsOrigins === null) {
+        addIssue(
+            'error',
+            'CORS_ALLOWED_ORIGINS_INVALID_TYPE',
+            'CORS許可オリジンは文字列または配列で指定してください。',
+            'NYAITTER_CORS_ALLOWED_ORIGINS にはカンマ区切りのURLを、config.json の cors.allowedOrigins にはURL配列を設定してください。',
+        );
+    } else {
+        const invalidCorsOrigins = corsOrigins
+            .map((origin) => String(origin || '').trim())
+            .filter((origin) => origin && !isCorsOrigin(origin));
+        if (invalidCorsOrigins.length > 0) {
+            addIssue(
+                'error',
+                'CORS_ALLOWED_ORIGINS_INVALID',
+                `CORS許可オリジンが無効です: ${invalidCorsOrigins.join(', ')}`,
+                'http://localhost:3000 や https://client.example.com のように、パス・クエリ・フラグメントを含まないHTTP(S)オリジンを設定してください。',
+            );
+        }
+    }
+
+    const rangeSettings = [
+        ['ポスト本文の文字数制限', 'NYAITTER_LIMIT_POST_CONTENT_LENGTH', 'limits.postContentLength', '..1000', 0, false],
+        ['DM本文の文字数制限', 'NYAITTER_LIMIT_DM_CONTENT_LENGTH', 'limits.dmContentLength', '..2000', 0, false],
+        ['DM E2E一時鍵の文字数制限', 'NYAITTER_LIMIT_DM_E2E_EPHEMERAL_KEY_LENGTH', 'limits.dmE2eEphemeralKeyLength', '1..1024', 1, false],
+        ['DM E2E暗号文の文字数制限', 'NYAITTER_LIMIT_DM_E2E_CIPHERTEXT_LENGTH', 'limits.dmE2eCiphertextLength', '1..16384', 1, false],
+        ['DM E2Eペイロードの文字数制限', 'NYAITTER_LIMIT_DM_E2E_PAYLOAD_LENGTH', 'limits.dmE2ePayloadLength', '..65536', 0, false],
+        ['表示名の文字数制限', 'NYAITTER_LIMIT_USER_NAME_LENGTH', 'limits.userNameLength', '1..50', 0, false],
+        ['自己紹介の文字数制限', 'NYAITTER_LIMIT_PROFILE_BIO_LENGTH', 'limits.profileBioLength', '..500', 0, false],
+        ['Scratchユーザー名の文字数制限', 'NYAITTER_LIMIT_SCRATCH_USERNAME_LENGTH', 'limits.scratchUsernameLength', '3..20', 1, false],
+        ['タイムライン取得件数', 'NYAITTER_LIMIT_TIMELINE_PAGE_SIZE', 'limits.timelinePageSize', 30, 1, true],
+        ['ユーザー検索ページサイズ', 'NYAITTER_LIMIT_USER_SEARCH_PAGE_SIZE', 'limits.userSearchPageSize', '1..100', 1, false],
+        ['ユーザー検索既定件数', 'NYAITTER_LIMIT_USER_SEARCH_DEFAULT_PAGE_SIZE', 'limits.userSearchDefaultLimit', 20, 1, true],
+        ['DMメッセージページサイズ', 'NYAITTER_LIMIT_DM_MESSAGES_PAGE_SIZE', 'limits.dmMessagesPageSize', '1..100', 1, false],
+        ['DMメッセージ既定件数', 'NYAITTER_LIMIT_DM_MESSAGES_DEFAULT_PAGE_SIZE', 'limits.dmMessagesDefaultLimit', 50, 1, true],
+        ['フォロー一覧取得件数', 'NYAITTER_LIMIT_FOLLOWING_PAGE_SIZE', 'limits.followingPageSize', 100, 1, true],
+        ['親投稿プレビュー文字数', 'NYAITTER_LIMIT_PARENT_POST_PREVIEW_LENGTH', 'limits.parentPostPreviewLength', 100, 0, true],
+        ['最大アップロード容量（MB）', 'NYAITTER_LIMIT_MAX_FILE_UPLOAD_SIZE_MB', 'limits.maxFileUploadSizeMB', 5, 1, true],
+        ['ファイル一括削除件数', 'NYAITTER_LIMIT_FILE_DELETE_BATCH_SIZE', 'limits.fileDeleteBatchSize', 1000, 1, true],
+        ['ポスト一括取得件数', 'NYAITTER_LIMIT_POST_BATCH_SIZE', 'limits.postBatchSize', 100, 1, true],
+        ['保存ファイル一覧取得件数', 'NYAITTER_LIMIT_STORAGE_LIST_PAGE_SIZE', 'limits.storageListPageSize', 500, 1, true],
+    ];
+    for (const [label, envName, configPath, fallback, minimum, exact] of rangeSettings) {
+        inspectRangeSetting(config, { label, envName, configPath, fallback, minimum, exact });
+    }
+
+    const rateLimitSettings = [
+        ['一般APIのレート制限時間', 'NYAITTER_RATE_LIMIT_GENERAL_WINDOW', 'rateLimit.general.window', '1min', null, 'rateLimit.windowMs'],
+        ['認証APIのレート制限時間', 'NYAITTER_RATE_LIMIT_AUTH_WINDOW', 'rateLimit.auth.window', '1min', 'RATE_LIMIT_AUTH_WINDOW_MS', 'rateLimit.auth.windowMs'],
+        ['投稿操作のレート制限時間', 'NYAITTER_RATE_LIMIT_POST_WRITE_WINDOW', 'rateLimit.postWrite.window', '1min'],
+        ['プロフィール更新のレート制限時間', 'NYAITTER_RATE_LIMIT_PROFILE_UPDATE_WINDOW', 'rateLimit.profileUpdate.window', '1min'],
+        ['DM送信のレート制限時間', 'NYAITTER_RATE_LIMIT_DM_SEND_WINDOW', 'rateLimit.dmSend.window', '1min'],
+        ['ファイル操作のレート制限時間', 'NYAITTER_RATE_LIMIT_UPLOAD_WINDOW', 'rateLimit.upload.window', '1min'],
+        ['通知送信のレート制限時間', 'NYAITTER_RATE_LIMIT_NOTIFICATION_WINDOW', 'rateLimit.notification.window', '1min'],
+        ['通報作成のレート制限時間', 'NYAITTER_RATE_LIMIT_REPORT_CREATE_WINDOW', 'rateLimit.reportCreate.window', '1min'],
+        ['通報対応のレート制限時間', 'NYAITTER_RATE_LIMIT_REPORT_ACTION_WINDOW', 'rateLimit.reportAction.window', '1min'],
+        ['認証申請のレート制限時間', 'NYAITTER_RATE_LIMIT_VERIFICATION_APPLICATION_WINDOW', 'rateLimit.verificationApplication.window', '1min'],
+    ];
+    for (const [label, envName, configPath, fallback, legacyEnvName, legacyConfigPath] of rateLimitSettings) {
+        inspectDurationSetting(config, { label, envName, configPath, fallback, legacyEnvName, legacyConfigPath });
+        inspectRangeSetting(config, {
+            label: label.replace('時間', '件数'),
+            envName: envName.replace(/_WINDOW$/, '_MAX'),
+            configPath: configPath.replace(/\.window$/, '.max'),
+            fallback: 1,
+            minimum: 1,
+            exact: true,
+        });
     }
 
     const userFilesEndpoint = String(

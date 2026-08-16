@@ -14,6 +14,7 @@ const { normalizeExternalProfile } = require('../services/auth/ExternalProfileMa
 const { requireAuth, requireAuthAllowFrozen, optionalAuth } = require('../middleware/auth');
 
 const config = require('../config');
+const { isWithinRange } = require('../utils/settingFormats');
 const { serializeUser, serializeNotification } = require('../utils/serialize');
 const {
   formatNyaitterId,
@@ -35,6 +36,14 @@ const externalLoginProofStore = new ExternalLoginProofStore();
 
 function getDbAdapter(req) {
   return req.app.locals.dbAdapter;
+}
+
+function isValidScratchUsername(username) {
+  return (
+    typeof username === 'string' &&
+    /^[a-zA-Z0-9_-]+$/.test(username) &&
+    isWithinRange(username.length, config.limits.scratchUsernameLength)
+  );
 }
 
 function requireInteractiveSession(req, res, next) {
@@ -277,7 +286,7 @@ router.post('/scratch/generate', (req, res) => {
   if (!username || typeof username !== 'string') {
     return res.status(400).json({ error: 'username is required' });
   }
-  if (!/^[a-zA-Z0-9_-]{3,20}$/.test(username)) {
+  if (!isValidScratchUsername(username)) {
     return res.status(400).json({ error: 'Invalid Scratch username format' });
   }
 
@@ -299,7 +308,7 @@ router.post('/scratch/verify', async (req, res) => {
   if (!username || !code) {
     return res.status(400).json({ error: 'username and code are required' });
   }
-  if (!/^[a-zA-Z0-9_-]{3,20}$/.test(username)) {
+  if (!isValidScratchUsername(username)) {
     return res.status(400).json({ error: 'Invalid Scratch username format' });
   }
 
@@ -694,7 +703,7 @@ router.post('/dev-login', async (req, res) => {
   if (!username || typeof username !== 'string') {
     return res.status(400).json({ error: 'username is required' });
   }
-  if (!/^[a-zA-Z0-9_-]{3,20}$/.test(username)) {
+  if (!isValidScratchUsername(username)) {
     return res.status(400).json({ error: 'Invalid username format' });
   }
 
