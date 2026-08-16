@@ -3,3 +3,5 @@ node_modules
 
 # Local server environment settings
 /server/.env
+
+uploads/
