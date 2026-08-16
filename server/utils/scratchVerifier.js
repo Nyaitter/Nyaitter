@@ -4,21 +4,33 @@ const config = require('../config');
 const TARGET_PROJECT_ID = process.env.SCRATCH_PROJECT_ID || '1239738451';
 const PROJECT_OWNER_USERNAME = process.env.SCRATCH_PROJECT_OWNER || 'NyaitterTeam';
 
-// メモリ上に保存する一時的なコード (username -> { code, expiresAt })
+// メモリ上に保存する一時的なコード
+// (username -> { code, expiresAt, issuedIpHash })
 const pendingCodes = new Map();
+
+function matchesSecret(expectedValue, actualValue) {
+  const expected = Buffer.from(String(expectedValue || ''), 'utf8');
+  const actual = Buffer.from(String(actualValue || ''), 'utf8');
+  return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
+}
 
 /**
  * 検証コードを生成する
  * @param {string} username - Scratchユーザー名
+ * @param {string} issuedIpHash - 発行要求のIPハッシュ
  * @returns {{ code: string, expiresAt: number }}
  */
-function generateVerificationCode(username) {
+function generateVerificationCode(username, issuedIpHash) {
   const code = crypto.randomBytes(config.auth?.verificationCodeBytes || 4).toString('hex').toUpperCase();
   const msPerMinute = 1000 * 60;
   const expiryMins = config.auth?.verificationCodeExpiryMinutes || 10;
   const expiresAt = Date.now() + msPerMinute * expiryMins;
 
-  pendingCodes.set(username.toLowerCase(), { code, expiresAt });
+  pendingCodes.set(username.toLowerCase(), {
+    code,
+    expiresAt,
+    issuedIpHash: String(issuedIpHash || ''),
+  });
 
   for (const [key, value] of pendingCodes.entries()) {
     if (value.expiresAt < Date.now()) {
@@ -147,26 +159,38 @@ async function verifyScratchComment(username, code) {
 }
 
 /**
- * 検証コードが有効か確認し、成功したら消費する
+ * 発行済みコードの有効期限と一致を確認する。ここではコードを消費しない。
  */
-async function checkAndConsumeCode(username, code) {
-  const record = pendingCodes.get(username.toLowerCase());
+function checkVerificationCode(username, code, requestIpHash) {
+  const normalizedUsername = String(username || '').trim().toLowerCase();
+  const record = pendingCodes.get(normalizedUsername);
   if (!record) {
     return { success: false, reason: 'コードが見つかりません。再度「コードを取得」してください。' };
   }
   if (record.expiresAt < Date.now()) {
-    pendingCodes.delete(username.toLowerCase());
+    pendingCodes.delete(normalizedUsername);
     return { success: false, reason: 'コードの有効期限が切れています。再度コードを取得してください。' };
   }
+  if (!record.issuedIpHash || !matchesSecret(record.issuedIpHash, requestIpHash)) {
+    return { success: false, reason: 'コードを発行したIPアドレスと同じ接続から認証してください。' };
+  }
 
-	const cleanInputCode = code.trim().toUpperCase();
-	const expected = Buffer.from(record.code.toUpperCase(), 'utf8');
-	const actual = Buffer.from(cleanInputCode, 'utf8');
-	if (expected.length !== actual.length || !crypto.timingSafeEqual(expected, actual)) {
-		return { success: false, reason: '入力されたコードが一致しません。' };
-	}
+  const cleanInputCode = String(code || '').trim().toUpperCase();
+  if (!matchesSecret(record.code.toUpperCase(), cleanInputCode)) {
+    return { success: false, reason: '入力されたコードが一致しません。' };
+  }
 
-  const isVerified = await verifyScratchComment(username, cleanInputCode);
+  return { success: true, code: cleanInputCode };
+}
+
+/**
+ * Scratch上のコメントを確認する。確認失敗時も、コードは有効期限まで保持する。
+ */
+async function verifyPendingCode(username, code, requestIpHash) {
+  const codeResult = checkVerificationCode(username, code, requestIpHash);
+  if (!codeResult.success) return codeResult;
+
+  const isVerified = await verifyScratchComment(username, codeResult.code);
   if (!isVerified) {
     return {
       success: false,
@@ -174,12 +198,35 @@ async function checkAndConsumeCode(username, code) {
     };
   }
 
-  pendingCodes.delete(username.toLowerCase());
   return { success: true };
+}
+
+/**
+ * 認証完了後にだけコードを消費する。別のリクエストで先に消費・更新された場合も防ぐ。
+ */
+function consumeVerificationCode(username, code, requestIpHash) {
+  const codeResult = checkVerificationCode(username, code, requestIpHash);
+  if (!codeResult.success) return codeResult;
+
+  pendingCodes.delete(String(username || '').trim().toLowerCase());
+  return { success: true };
+}
+
+/**
+ * 既存利用者向けの一括検証・消費関数。認証ルートでは後続のアカウント確認後に
+ * consumeVerificationCode() を呼ぶため、失敗時のコード消費を防げる。
+ */
+async function checkAndConsumeCode(username, code, requestIpHash) {
+  const verification = await verifyPendingCode(username, code, requestIpHash);
+  if (!verification.success) return verification;
+  return consumeVerificationCode(username, code, requestIpHash);
 }
 
 module.exports = {
   generateVerificationCode,
+  checkVerificationCode,
+  verifyPendingCode,
+  consumeVerificationCode,
   checkAndConsumeCode,
   verifyScratchComment,
 };

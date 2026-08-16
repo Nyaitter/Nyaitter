@@ -2,7 +2,8 @@ const express = require('express');
 const crypto = require('crypto');
 const {
   generateVerificationCode,
-  checkAndConsumeCode,
+  verifyPendingCode,
+  consumeVerificationCode,
 } = require('../utils/scratchVerifier');
 
 const { verifyScratchAccount } = require('../utils/scratchAccountVerifier');
@@ -292,7 +293,8 @@ router.post('/scratch/generate', (req, res) => {
     return res.status(400).json({ error: 'Invalid Scratch username format' });
   }
 
-  const { code, expiresAt } = generateVerificationCode(username);
+  const { ipHash } = getRequestLoginMetadata(req);
+  const { code, expiresAt } = generateVerificationCode(username, ipHash);
 
   res.json({
     code,
@@ -306,6 +308,7 @@ router.post('/scratch/verify', async (req, res) => {
   // Express derives req.ip from X-Forwarded-For only when trust proxy is enabled.
   // Reading the header directly would allow an untrusted client to forge its IP.
   const ip = req.ip || req.socket?.remoteAddress || '127.0.0.1';
+  const { ipHash } = getRequestLoginMetadata(req);
 
   if (!username || !code) {
     return res.status(400).json({ error: 'username and code are required' });
@@ -322,7 +325,9 @@ router.post('/scratch/verify', async (req, res) => {
   }
 
   if (!bypassAuth) {
-    const codeResult = await checkAndConsumeCode(username, code.toUpperCase());
+    // コメントの反映待ちやアカウント条件の不一致でログインに失敗しても、コードは
+    // 発行時の有効期限まで再試行できるよう、ここでは消費しない。
+    const codeResult = await verifyPendingCode(username, code.toUpperCase(), ipHash);
     if (!codeResult.success) {
       return res.status(400).json({ error: codeResult.reason });
     }
@@ -330,6 +335,13 @@ router.post('/scratch/verify', async (req, res) => {
     const accountCheck = await verifyScratchAccount(username, code, ip);
     if (!accountCheck.ok) {
       return res.status(400).json({ error: accountCheck.reason || 'Scratchアカウントの検証に失敗しました。' });
+    }
+
+    // コメントとアカウント条件の両方を通過した時点でだけ消費する。端末承認待ちも
+    // 検証済みログインとして扱うため、承認経由でコードが残り続けることはない。
+    const consumption = consumeVerificationCode(username, code, ipHash);
+    if (!consumption.success) {
+      return res.status(400).json({ error: consumption.reason });
     }
   } else {
     console.warn('[auth] DEV_BYPASS_AUTH が有効です。すべての検証をスキップしています。');
