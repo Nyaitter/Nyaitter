@@ -8,8 +8,15 @@ const path = require('path');
 const MAX_COMMAND_BYTES = 8 * 1024;
 
 function getOperatorSocketPath() {
-  return process.env.NYAITTER_OPERATOR_SOCKET
-    || path.join(os.tmpdir(), 'nyaitter-operator.sock');
+  if (process.env.NYAITTER_OPERATOR_SOCKET) {
+    return process.env.NYAITTER_OPERATOR_SOCKET;
+  }
+
+  if (process.platform === 'win32') {
+    return '\\\\.\\pipe\\nyaitter-operator';
+  }
+
+  return path.join(os.tmpdir(), 'nyaitter-operator.sock');
 }
 
 function parseUserId(value) {
@@ -63,6 +70,10 @@ function createCommandHandler({ dbAdapter, shutdown, getStatus }) {
 }
 
 async function removeStaleSocket(socketPath) {
+  if (process.platform === 'win32') {
+    return;
+  }
+
   try {
     await fs.promises.unlink(socketPath);
   } catch (error) {
@@ -71,10 +82,6 @@ async function removeStaleSocket(socketPath) {
 }
 
 async function startOperatorControlServer({ dbAdapter, shutdown, getStatus }) {
-  if (process.platform === 'win32') {
-    throw new Error('The local operator CLI currently requires a Unix domain socket');
-  }
-
   const socketPath = getOperatorSocketPath();
   await removeStaleSocket(socketPath);
   const handleCommand = createCommandHandler({ dbAdapter, shutdown, getStatus });
@@ -125,7 +132,10 @@ async function startOperatorControlServer({ dbAdapter, shutdown, getStatus }) {
       resolve();
     });
   });
-  await fs.promises.chmod(socketPath, 0o600);
+
+  if (process.platform !== 'win32') {
+    await fs.promises.chmod(socketPath, 0o600);
+  }
 
   return {
     socketPath,
