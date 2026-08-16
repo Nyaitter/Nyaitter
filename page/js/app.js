@@ -106,12 +106,7 @@ export function initApp() {
             return;
         }
 
-        const {
-            type,
-            message,
-            defaultValue = '',
-            resolve,
-        } = current;
+        const { type, message, defaultValue = '', resolve } = current;
         const isPrompt = type === 'prompt';
         const isConfirm = type === 'confirm';
         const previousFocus = document.activeElement;
@@ -124,7 +119,10 @@ export function initApp() {
               : '通知';
         appDialog.message.textContent = String(message ?? '');
         appDialog.inputGroup.classList.toggle('hidden', !isPrompt);
-        appDialog.cancelButton.classList.toggle('hidden', !(isPrompt || isConfirm));
+        appDialog.cancelButton.classList.toggle(
+            'hidden',
+            !(isPrompt || isConfirm),
+        );
         appDialog.submitButton.textContent = isPrompt
             ? '入力を確定'
             : isConfirm
@@ -154,7 +152,9 @@ export function initApp() {
         const onCancel = () =>
             close(isPrompt ? null : isConfirm ? false : undefined);
         const onSubmit = () =>
-            close(isPrompt ? appDialog.input.value : isConfirm ? true : undefined);
+            close(
+                isPrompt ? appDialog.input.value : isConfirm ? true : undefined,
+            );
         const onBackdropClick = (event) => {
             if (event.target === appDialog.modal) onCancel();
         };
@@ -276,12 +276,12 @@ export function initApp() {
                     },
                 ],
             );
-            const profileCaches = Array.from(profilePostPageCaches.entries()).map(
-                ([pageKey, pageCache]) => [
-                    pageKey,
-                    serializePostPageCache(pageCache),
-                ],
-            );
+            const profileCaches = Array.from(
+                profilePostPageCaches.entries(),
+            ).map(([pageKey, pageCache]) => [
+                pageKey,
+                serializePostPageCache(pageCache),
+            ]);
             const auxiliaryPostCaches = Array.from(
                 auxiliaryPostPageCaches.entries(),
             ).map(([pageKey, pageCache]) => [
@@ -361,7 +361,10 @@ export function initApp() {
                 stored.screenData
                     .slice(-MAX_SCREEN_DATA_CACHES)
                     .forEach(([cacheKey, payload]) => {
-                        if (typeof cacheKey === 'string' && payload !== undefined)
+                        if (
+                            typeof cacheKey === 'string' &&
+                            payload !== undefined
+                        )
                             screenDataCaches.set(cacheKey, payload);
                     });
             }
@@ -543,7 +546,9 @@ export function initApp() {
             const parsed = JSON.parse(
                 sessionStorage.getItem(SCROLL_POSITIONS_STORAGE_KEY) || '{}',
             );
-            return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+            return parsed &&
+                typeof parsed === 'object' &&
+                !Array.isArray(parsed)
                 ? parsed
                 : {};
         } catch (_) {
@@ -577,8 +582,9 @@ export function initApp() {
                 updatedAt: Date.now(),
             };
             const staleKeys = Object.entries(positions)
-                .sort(([, a], [, b]) =>
-                    Number(a?.updatedAt || 0) - Number(b?.updatedAt || 0),
+                .sort(
+                    ([, a], [, b]) =>
+                        Number(a?.updatedAt || 0) - Number(b?.updatedAt || 0),
                 )
                 .slice(0, -MAX_SAVED_SCROLL_POSITIONS)
                 .map(([key]) => key);
@@ -981,12 +987,15 @@ export function initApp() {
         })
         .then((list) => {
             const emojiList = Array.isArray(list) ? list : [];
-            customEmojiIds = [...new Set(
-                emojiList
-                    .map((emoji) => String(emoji?.id || ''))
-                    .filter((id) => /^[A-Za-z0-9_-]{1,80}$/.test(id)),
-            )].sort((left, right) =>
-                right.length - left.length || left.localeCompare(right),
+            customEmojiIds = [
+                ...new Set(
+                    emojiList
+                        .map((emoji) => String(emoji?.id || ''))
+                        .filter((id) => /^[A-Za-z0-9_-]{1,80}$/.test(id)),
+                ),
+            ].sort(
+                (left, right) =>
+                    right.length - left.length || left.localeCompare(right),
             );
             return emojiList;
         })
@@ -1154,7 +1163,11 @@ export function initApp() {
             pullActive = false;
             indicator.style.setProperty('--pull-distance', '0px');
             indicator.style.setProperty('--pull-opacity', '0');
-            indicator.classList.remove('is-pulling', 'is-ready', 'is-refreshing');
+            indicator.classList.remove(
+                'is-pulling',
+                'is-ready',
+                'is-refreshing',
+            );
             indicator.setAttribute('aria-hidden', 'true');
             label.textContent = '引いて更新';
         };
@@ -1180,7 +1193,8 @@ export function initApp() {
             const isWithinNotificationView =
                 context.screenId === 'notifications-screen' &&
                 mainContent?.contains(target);
-            if (!isWithinActiveScreen && !isWithinNotificationView) return false;
+            if (!isWithinActiveScreen && !isWithinNotificationView)
+                return false;
 
             // ホームでは投稿本文・余白を含むタイムライン全体を開始対象にする。
             // 投稿内の操作ボタンや投稿フォームからの開始だけは除外する。
@@ -1248,8 +1262,10 @@ export function initApp() {
             'touchstart',
             (event) => {
                 updatePullToRefreshAvailability();
-                if (refreshInProgress || !isPullToRefreshMobileViewport()) return;
-                const target = event.target instanceof Element ? event.target : null;
+                if (refreshInProgress || !isPullToRefreshMobileViewport())
+                    return;
+                const target =
+                    event.target instanceof Element ? event.target : null;
                 const touch = event.touches[0];
                 if (!target || !touch || !canStartPull(target)) return;
                 startX = touch.clientX;
@@ -1311,11 +1327,15 @@ export function initApp() {
         };
 
         document.addEventListener('touchend', finishPull, { passive: true });
-        document.addEventListener('touchcancel', () => {
-            trackingPull = false;
-            startScrollY = 0;
-            if (!refreshInProgress) resetIndicator();
-        }, { passive: true });
+        document.addEventListener(
+            'touchcancel',
+            () => {
+                trackingPull = false;
+                startScrollY = 0;
+                if (!refreshInProgress) resetIndicator();
+            },
+            { passive: true },
+        );
         window.addEventListener('resize', updatePullToRefreshAvailability, {
             passive: true,
         });
@@ -1515,10 +1535,7 @@ export function initApp() {
             const clampLimit = Number.parseFloat(
                 window.getComputedStyle(contentEl).maxHeight,
             );
-            if (
-                Number.isFinite(clampLimit) &&
-                naturalHeight > clampLimit + 1
-            ) {
+            if (Number.isFinite(clampLimit) && naturalHeight > clampLimit + 1) {
                 toggleBtn.classList.add('is-visible');
             }
             return true;
@@ -1732,9 +1749,11 @@ export function initApp() {
                 ? notification.from
                 : null;
         const targetPost =
-            notification.target_post && typeof notification.target_post === 'object'
+            notification.target_post &&
+            typeof notification.target_post === 'object'
                 ? notification.target_post
-                : notification.targetPost && typeof notification.targetPost === 'object'
+                : notification.targetPost &&
+                    typeof notification.targetPost === 'object'
                   ? notification.targetPost
                   : null;
         return {
@@ -1745,12 +1764,16 @@ export function initApp() {
                     : 'admin_notice',
             from,
             target,
-            targetPost: targetPost && typeof targetPost.content === 'string'
-                ? { id: Number(targetPost.id), content: targetPost.content }
-                : null,
+            targetPost:
+                targetPost && typeof targetPost.content === 'string'
+                    ? { id: Number(targetPost.id), content: targetPost.content }
+                    : null,
             read: Boolean(notification.read),
             clicked: Boolean(notification.clicked),
-            message: typeof notification.message === 'string' ? notification.message : null,
+            message:
+                typeof notification.message === 'string'
+                    ? notification.message
+                    : null,
             created_at: notification.created_at || null,
         };
     }
@@ -1793,7 +1816,10 @@ export function initApp() {
     }
 
     function getNotificationDisplayText(notification) {
-        if (typeof notification.message === 'string' && notification.message.trim())
+        if (
+            typeof notification.message === 'string' &&
+            notification.message.trim()
+        )
             return notification.message.trim();
         if (notification.type === 'login_approval')
             return '不明な場所からのログイン承認が必要です。';
@@ -1822,12 +1848,17 @@ export function initApp() {
 
         const timestamp = document.createElement('div');
         timestamp.className = 'notification-timestamp';
-        timestamp.textContent = formatPostTimestamp({ created_at: notification.created_at });
+        timestamp.textContent = formatPostTimestamp({
+            created_at: notification.created_at,
+        });
         content.appendChild(timestamp);
 
         const message = document.createElement('div');
         message.className = 'notification-message';
-        if (typeof notification.message === 'string' && notification.message.trim()) {
+        if (
+            typeof notification.message === 'string' &&
+            notification.message.trim()
+        ) {
             message.textContent = notification.message.trim();
         } else {
             const actorId = Number(notification.from?.id);
@@ -1911,7 +1942,10 @@ export function initApp() {
         const replaceCustomEmoji = (value) => {
             let processed = value;
             for (const emojiId of customEmojiIds) {
-                const escapedId = emojiId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                const escapedId = emojiId.replace(
+                    /[.*+?^${}()|[\]\\]/g,
+                    '\\$&',
+                );
                 const emojiPattern = new RegExp(`_${escapedId}_`, 'g');
                 processed = processed.replace(
                     emojiPattern,
@@ -2079,7 +2113,10 @@ export function initApp() {
                 container: segment.node,
                 offset: Math.max(
                     0,
-                    Math.min(sourceOffset - segment.start, segment.node.data.length),
+                    Math.min(
+                        sourceOffset - segment.start,
+                        segment.node.data.length,
+                    ),
                 ),
             };
         }
@@ -2101,7 +2138,10 @@ export function initApp() {
             }
         }
         const parent = segment.node.parentNode;
-        const index = Array.prototype.indexOf.call(parent.childNodes, segment.node);
+        const index = Array.prototype.indexOf.call(
+            parent.childNodes,
+            segment.node,
+        );
         return {
             container: parent,
             offset: index + (sourceOffset > segment.start ? 1 : 0),
@@ -2109,10 +2149,15 @@ export function initApp() {
     }
 
     function getMarkdownEditorBoundary(preview, sourceOffset) {
-        const { segments, sourceLength } = getMarkdownEditorSourceSegments(preview);
+        const { segments, sourceLength } =
+            getMarkdownEditorSourceSegments(preview);
         const offset = Math.max(0, Math.min(sourceOffset, sourceLength));
         const activeEmojiSegment = segments.find((item) => {
-            if (item.kind !== 'emoji' || offset < item.start || offset > item.end) {
+            if (
+                item.kind !== 'emoji' ||
+                offset < item.start ||
+                offset > item.end
+            ) {
                 return false;
             }
             return Boolean(
@@ -2169,15 +2214,19 @@ export function initApp() {
         } catch {
             return null;
         }
-        const rect = Array.from(range.getClientRects()).at(-1) || range.getBoundingClientRect();
+        const rect =
+            Array.from(range.getClientRects()).at(-1) ||
+            range.getBoundingClientRect();
         if (rect.height > 0) return rect;
 
         const previewRect = preview.getBoundingClientRect();
         const style = window.getComputedStyle(preview);
         const fontSize = Number.parseFloat(style.fontSize) || 16;
-        const lineHeight = Number.parseFloat(style.lineHeight) || fontSize * 1.2;
+        const lineHeight =
+            Number.parseFloat(style.lineHeight) || fontSize * 1.2;
         return {
-            left: previewRect.left + (Number.parseFloat(style.paddingLeft) || 0),
+            left:
+                previewRect.left + (Number.parseFloat(style.paddingLeft) || 0),
             top: previewRect.top + (Number.parseFloat(style.paddingTop) || 0),
             height: lineHeight,
         };
@@ -2224,7 +2273,10 @@ export function initApp() {
                 ? preferredStart
                 : -1;
         if (start < 0) {
-            const aroundCaret = Math.max(0, editor.selectionStart - data.length);
+            const aroundCaret = Math.max(
+                0,
+                editor.selectionStart - data.length,
+            );
             start = source.lastIndexOf(data, aroundCaret);
         }
         if (start < 0) return null;
@@ -2296,7 +2348,9 @@ export function initApp() {
         const { start: selectionStart, end: selectionEnd } = selection;
         const { segments } = getMarkdownEditorSourceSegments(preview);
         preview.querySelectorAll('.markdown-editor-emoji').forEach((token) => {
-            const image = token.querySelector('img.nyaitter-emoji[data-emoji-id]');
+            const image = token.querySelector(
+                'img.nyaitter-emoji[data-emoji-id]',
+            );
             const label = token.querySelector('.markdown-editor-emoji-id');
             const segment = segments.find((item) => item.node === image);
             if (!image || !label || !segment) return;
@@ -2315,7 +2369,9 @@ export function initApp() {
         const preview = getMarkdownEditorPreview(editor);
         const paint = getMarkdownEditorPaint(editor);
         if (!preview || !paint) return;
-        const selectionLayer = paint.querySelector('.markdown-editor-selection');
+        const selectionLayer = paint.querySelector(
+            '.markdown-editor-selection',
+        );
         const caret = paint.querySelector('.markdown-editor-caret');
         if (!selectionLayer || !caret) return;
 
@@ -2339,15 +2395,17 @@ export function initApp() {
         const { start, end } = selection;
         const paintRect = paint.getBoundingClientRect();
         if (start !== end) {
-            getMarkdownEditorSelectionRects(preview, start, end).forEach((rect) => {
-                const highlight = document.createElement('span');
-                highlight.className = 'markdown-editor-selection-rect';
-                highlight.style.left = `${rect.left - paintRect.left}px`;
-                highlight.style.top = `${rect.top - paintRect.top}px`;
-                highlight.style.width = `${Math.max(rect.width, 1)}px`;
-                highlight.style.height = `${rect.height}px`;
-                selectionLayer.append(highlight);
-            });
+            getMarkdownEditorSelectionRects(preview, start, end).forEach(
+                (rect) => {
+                    const highlight = document.createElement('span');
+                    highlight.className = 'markdown-editor-selection-rect';
+                    highlight.style.left = `${rect.left - paintRect.left}px`;
+                    highlight.style.top = `${rect.top - paintRect.top}px`;
+                    highlight.style.width = `${Math.max(rect.width, 1)}px`;
+                    highlight.style.height = `${rect.height}px`;
+                    selectionLayer.append(highlight);
+                },
+            );
             return;
         }
 
@@ -2444,7 +2502,9 @@ export function initApp() {
             delete editor._markdownEditorComposition;
             updateMarkdownEditorPreview(editor);
         });
-        editor.addEventListener('input', () => updateMarkdownEditorPreview(editor));
+        editor.addEventListener('input', () =>
+            updateMarkdownEditorPreview(editor),
+        );
         editor.addEventListener('select', sync);
         editor.addEventListener('keyup', sync);
         editor.addEventListener('focus', sync);
@@ -2492,7 +2552,8 @@ export function initApp() {
     document.addEventListener(
         'click',
         (event) => {
-            const target = event.target instanceof Element ? event.target : null;
+            const target =
+                event.target instanceof Element ? event.target : null;
             const spoiler = target?.closest('.markdown-spoiler');
             if (
                 !spoiler ||
@@ -2510,7 +2571,8 @@ export function initApp() {
         'keydown',
         (event) => {
             if (event.key !== 'Enter' && event.key !== ' ') return;
-            const target = event.target instanceof Element ? event.target : null;
+            const target =
+                event.target instanceof Element ? event.target : null;
             const spoiler = target?.closest('.markdown-spoiler');
             if (spoiler?.closest('.markdown-content-editor')) return;
             if (!spoiler) return;
@@ -2605,7 +2667,9 @@ export function initApp() {
 
         const picker = container.querySelector('#emoji-picker');
         const pickerButton = container.querySelector('.emoji-pic-button');
-        const editor = container.querySelector('[data-markdown-content-editor]');
+        const editor = container.querySelector(
+            '[data-markdown-content-editor]',
+        );
         if (!picker || !pickerButton || !editor) return;
 
         const emojiMart = window.EmojiMart;
@@ -2672,9 +2736,7 @@ export function initApp() {
                 picker.style.top = `${buttonRect.bottom + 8}px`;
             }
         });
-        editor.addEventListener('focus', () =>
-            picker.classList.add('hidden'),
-        );
+        editor.addEventListener('focus', () => picker.classList.add('hidden'));
     }
 
     async function router() {
@@ -2730,8 +2792,13 @@ export function initApp() {
                 await showProfileScreen(userId, subpage);
             } else if (hash.startsWith('#search/'))
                 await showSearchResults(decodeURIComponent(hash.substring(8)));
-            else if (hash.startsWith('#admin/reports/') && getCurrentUser()?.admin)
-                await showAdminReportDetailScreen(hash.substring('#admin/reports/'.length));
+            else if (
+                hash.startsWith('#admin/reports/') &&
+                getCurrentUser()?.admin
+            )
+                await showAdminReportDetailScreen(
+                    hash.substring('#admin/reports/'.length),
+                );
             else if (hash === '#admin/reports' && getCurrentUser()?.admin)
                 await showAdminReportsScreen();
             else if (hash === '#admin/logs' && getCurrentUser()?.admin)
@@ -2819,8 +2886,12 @@ export function initApp() {
             DOM.rightSidebar.links.innerHTML = linkItems
                 .map((item) => {
                     const name = escapeHTML(String(item?.name || 'リンク'));
-                    const url = escapeHTML(String(item?.url || item?.link || '#'));
-                    const external = /^https:\/\//i.test(String(item?.url || item?.link || ''));
+                    const url = escapeHTML(
+                        String(item?.url || item?.link || '#'),
+                    );
+                    const external = /^https:\/\//i.test(
+                        String(item?.url || item?.link || ''),
+                    );
                     return `<a href="${url}" class="link"${external ? ' target="_blank" rel="noopener noreferrer"' : ''}>${name}</a>`;
                 })
                 .join('');
@@ -2857,7 +2928,6 @@ export function initApp() {
                         window.handleFollowToggle(userId, button);
                 }
             });
-
     }
 
     function setupSidebarOverflowMenu() {
@@ -2885,18 +2955,26 @@ export function initApp() {
             : [];
         if (!sidebar || !menu || menuLinks.length === 0) return;
 
-        window.addEventListener('resize', () => {
-            window.clearTimeout(sidebarOverflowResizeTimer);
-            sidebarOverflowResizeTimer = window.setTimeout(setupSidebarOverflowMenu, 120);
-        }, { signal });
-
-        const availableMenuHeight = () => Math.max(
-            0,
-            sidebar.clientHeight
-                - (logo?.offsetHeight || 0)
-                - (menuBottom?.offsetHeight || 0)
-                - 24,
+        window.addEventListener(
+            'resize',
+            () => {
+                window.clearTimeout(sidebarOverflowResizeTimer);
+                sidebarOverflowResizeTimer = window.setTimeout(
+                    setupSidebarOverflowMenu,
+                    120,
+                );
+            },
+            { signal },
         );
+
+        const availableMenuHeight = () =>
+            Math.max(
+                0,
+                sidebar.clientHeight -
+                    (logo?.offsetHeight || 0) -
+                    (menuBottom?.offsetHeight || 0) -
+                    24,
+            );
         if (menu.scrollHeight <= availableMenuHeight()) return;
 
         const overflow = document.createElement('div');
@@ -2935,7 +3013,10 @@ export function initApp() {
             const edgeMargin = 8;
             const gap = 6;
             const toggleRect = toggle.getBoundingClientRect();
-            const panelWidth = Math.min(240, Math.max(0, window.innerWidth - edgeMargin * 2));
+            const panelWidth = Math.min(
+                240,
+                Math.max(0, window.innerWidth - edgeMargin * 2),
+            );
             panel.style.width = `${panelWidth}px`;
             panel.style.maxHeight = `${Math.max(0, window.innerHeight - edgeMargin * 2)}px`;
 
@@ -2945,10 +3026,16 @@ export function initApp() {
             if (top + panelHeight > window.innerHeight - edgeMargin) {
                 top = toggleRect.top - panelHeight - gap;
             }
-            top = Math.max(edgeMargin, Math.min(top, window.innerHeight - panelHeight - edgeMargin));
+            top = Math.max(
+                edgeMargin,
+                Math.min(top, window.innerHeight - panelHeight - edgeMargin),
+            );
             const left = Math.max(
                 edgeMargin,
-                Math.min(toggleRect.left, window.innerWidth - panelWidthAfterLayout - edgeMargin),
+                Math.min(
+                    toggleRect.left,
+                    window.innerWidth - panelWidthAfterLayout - edgeMargin,
+                ),
             );
             panel.style.top = `${top}px`;
             panel.style.left = `${left}px`;
@@ -2961,16 +3048,28 @@ export function initApp() {
             if (isOpen) positionOverflowPanel();
         };
 
-        toggle?.addEventListener('click', (event) => {
-            event.stopPropagation();
-            toggleOverflow();
-        }, { signal });
-        document.addEventListener('click', (event) => {
-            if (!overflow.contains(event.target)) closeOverflow();
-        }, { signal });
-        document.addEventListener('keydown', (event) => {
-            if (event.key === 'Escape') closeOverflow();
-        }, { signal });
+        toggle?.addEventListener(
+            'click',
+            (event) => {
+                event.stopPropagation();
+                toggleOverflow();
+            },
+            { signal },
+        );
+        document.addEventListener(
+            'click',
+            (event) => {
+                if (!overflow.contains(event.target)) closeOverflow();
+            },
+            { signal },
+        );
+        document.addEventListener(
+            'keydown',
+            (event) => {
+                if (event.key === 'Escape') closeOverflow();
+            },
+            { signal },
+        );
     }
 
     async function updateNavAndSidebars() {
@@ -3031,7 +3130,8 @@ export function initApp() {
                 if (item.hash === '#') {
                     isActive = hash === '#' || hash === '';
                 } else if (item.hash === '#settings/profile') {
-                    isActive = hash === '#settings' || hash.startsWith('#settings/');
+                    isActive =
+                        hash === '#settings' || hash.startsWith('#settings/');
                 } else {
                     isActive = hash.startsWith(item.hash);
                 }
@@ -3179,9 +3279,10 @@ export function initApp() {
             button.textContent = '異議申し立てを行う';
             return;
         }
-        status.textContent = appeal.status === 'assigned'
-            ? '異議申し立ては担当管理者に割り当てられ、確認中です。'
-            : '異議申し立てを受け付け、担当管理者への割当を待っています。';
+        status.textContent =
+            appeal.status === 'assigned'
+                ? '異議申し立ては担当管理者に割り当てられ、確認中です。'
+                : '異議申し立てを受け付け、担当管理者への割当を待っています。';
         status.classList.remove('hidden');
         button.disabled = true;
         button.textContent = '異議申し立てを確認中';
@@ -3201,7 +3302,9 @@ export function initApp() {
         const openButton = document.getElementById('open-freeze-appeal-btn');
         const modal = document.getElementById('freeze-appeal-modal');
         const form = document.getElementById('freeze-appeal-form');
-        const description = document.getElementById('freeze-appeal-description');
+        const description = document.getElementById(
+            'freeze-appeal-description',
+        );
         const errorElement = document.getElementById('freeze-appeal-error');
         if (!openButton || !modal || !form || !description) return;
 
@@ -3212,9 +3315,11 @@ export function initApp() {
             modal.classList.remove('hidden');
             description.focus();
         };
-        modal.querySelectorAll('[data-action="close-freeze-appeal"]').forEach((button) => {
-            button.onclick = closeFreezeAppealModal;
-        });
+        modal
+            .querySelectorAll('[data-action="close-freeze-appeal"]')
+            .forEach((button) => {
+                button.onclick = closeFreezeAppealModal;
+            });
         modal.onclick = (event) => {
             if (event.target === modal) closeFreezeAppealModal();
         };
@@ -3230,7 +3335,10 @@ export function initApp() {
             submit.disabled = false;
             if (error) {
                 if (errorElement) {
-                    errorElement.textContent = error.message || String(error) || '異議申し立てを送信できませんでした。';
+                    errorElement.textContent =
+                        error.message ||
+                        String(error) ||
+                        '異議申し立てを送信できませんでした。';
                     errorElement.classList.remove('hidden');
                 }
                 return;
@@ -3247,8 +3355,10 @@ export function initApp() {
             url.searchParams.get('push_notification_id'),
         );
         if (
-            !Number.isInteger(userId) || userId < 0 ||
-            !Number.isInteger(notificationId) || notificationId <= 0
+            !Number.isInteger(userId) ||
+            userId < 0 ||
+            !Number.isInteger(notificationId) ||
+            notificationId <= 0
         )
             return null;
 
@@ -3259,7 +3369,10 @@ export function initApp() {
         };
     }
 
-    function replaceCurrentLocation({ hash = window.location.hash, clearPush = false } = {}) {
+    function replaceCurrentLocation({
+        hash = window.location.hash,
+        clearPush = false,
+    } = {}) {
         const url = new URL(window.location.href);
         if (clearPush) {
             url.searchParams.delete('push_user_id');
@@ -3291,7 +3404,10 @@ export function initApp() {
                 },
             );
             if (switchError) {
-                console.error('プッシュ通知のアカウント切替に失敗:', switchError);
+                console.error(
+                    'プッシュ通知のアカウント切替に失敗:',
+                    switchError,
+                );
                 replaceCurrentLocation({ hash: '#' });
                 await router();
                 showAppAlert(
@@ -3324,7 +3440,9 @@ export function initApp() {
             console.error('プッシュ通知の既読化に失敗:', readError);
             replaceCurrentLocation({ hash: '#notifications' });
             await router();
-            showAppAlert('通知を既読にできなかったため、対象コンテンツは開きませんでした。');
+            showAppAlert(
+                '通知を既読にできなかったため、対象コンテンツは開きませんでした。',
+            );
             return true;
         }
         if (getCurrentUser()) {
@@ -3341,7 +3459,9 @@ export function initApp() {
             console.error('プッシュ通知のクリック済み化に失敗:', clickedError);
             replaceCurrentLocation({ hash: '#notifications' });
             await router();
-            showAppAlert('通知をクリック済みにできなかったため、対象コンテンツは開きませんでした。');
+            showAppAlert(
+                '通知をクリック済みにできなかったため、対象コンテンツは開きませんでした。',
+            );
             return true;
         }
 
@@ -3461,7 +3581,11 @@ export function initApp() {
             const userId = Number(item.dataset.id);
             item.onclick = async (event) => {
                 if (event.target.closest('.switcher-delete-btn')) {
-                    if (!await showAppConfirm('この端末からアカウントを解除しますか？'))
+                    if (
+                        !(await showAppConfirm(
+                            'この端末からアカウントを解除しますか？',
+                        ))
+                    )
                         return;
                     const { data: result, error: removeError } =
                         await apiRequest(
@@ -3796,9 +3920,13 @@ export function initApp() {
 	                        <button type="button" class="post-lock-button float-right" title="プライベート" aria-pressed="false">
 	                            ${ICONS.lock}
 	                        </button>
-	                        ${getCurrentUser()?.admin ? `<button type="button" class="post-announcement-button float-right" title="アナウンス" aria-pressed="false">
+	                        ${
+                                getCurrentUser()?.admin
+                                    ? `<button type="button" class="post-announcement-button float-right" title="アナウンス" aria-pressed="false">
 	                            ${ICONS.megaphone}
-	                        </button>` : ''}
+	                        </button>`
+                                    : ''
+                            }
 	                        <span class="float-clear"></span>
 	                    </div>
 	                </div>
@@ -3820,26 +3948,35 @@ export function initApp() {
         container
             .querySelector('.post-mask-button')
             .addEventListener('click', () => handlePostMask(container));
-		container
-			.querySelector('.post-lock-button')
-			.addEventListener('click', () => handlePostLock(container));
-		const announcementButton = container.querySelector('.post-announcement-button');
-		if (announcementButton) {
-			announcementButton.addEventListener('click', () => handlePostAnnouncement(container));
-		}
-		container
-			.querySelector('#post-submit-button')
+        container
+            .querySelector('.post-lock-button')
+            .addEventListener('click', () => handlePostLock(container));
+        const announcementButton = container.querySelector(
+            '.post-announcement-button',
+        );
+        if (announcementButton) {
+            announcementButton.addEventListener('click', () =>
+                handlePostAnnouncement(container),
+            );
+        }
+        container
+            .querySelector('#post-submit-button')
             .addEventListener('click', () => handlePostSubmit(container));
         const editor = container.querySelector('#post-content');
         editor.addEventListener('keydown', handleCtrlEnter);
         editor.addEventListener('paste', (event) => {
             const imageFiles = Array.from(event.clipboardData?.items || [])
-                .filter((item) => item.kind === 'file' && item.type.startsWith('image/'))
+                .filter(
+                    (item) =>
+                        item.kind === 'file' && item.type.startsWith('image/'),
+                )
                 .map((item, index) => {
                     const file = item.getAsFile();
                     if (!file) return null;
                     if (file.name) return file;
-                    const extension = item.type.split('/')[1]?.replace(/[^a-z0-9]/gi, '') || 'png';
+                    const extension =
+                        item.type.split('/')[1]?.replace(/[^a-z0-9]/gi, '') ||
+                        'png';
                     return new File(
                         [file],
                         `pasted-image-${Date.now()}-${index}.${extension}`,
@@ -3962,7 +4099,11 @@ export function initApp() {
         });
     }
 
-    async function handleFileSelection(event, container, { append = false } = {}) {
+    async function handleFileSelection(
+        event,
+        container,
+        { append = false } = {},
+    ) {
         const previewContainer = container.querySelector(
             '.file-preview-container',
         );
@@ -3984,14 +4125,18 @@ export function initApp() {
         }
 
         setSelectedFiles(
-            append ? [...getSelectedFiles(), ...compressedFiles] : compressedFiles,
+            append
+                ? [...getSelectedFiles(), ...compressedFiles]
+                : compressedFiles,
         );
 
         // 圧縮後のファイル一覧をhidden inputにも反映し、通常のファイル添付と同じ状態に保つ。
         const fileInput = container.querySelector('#file-input');
         if (fileInput && typeof DataTransfer !== 'undefined') {
             const selectedFileList = new DataTransfer();
-            getSelectedFiles().forEach((file) => selectedFileList.items.add(file));
+            getSelectedFiles().forEach((file) =>
+                selectedFileList.items.add(file),
+            );
             fileInput.files = selectedFileList.files;
         }
 
@@ -4044,45 +4189,48 @@ export function initApp() {
         button.classList.toggle('active');
     }
 
-	function handlePostLock(container) {
-		const button = container.querySelector('.post-lock-button');
-		button.classList.toggle('active');
-		button.setAttribute(
-			'aria-pressed',
-			String(button.classList.contains('active')),
-		);
-	}
+    function handlePostLock(container) {
+        const button = container.querySelector('.post-lock-button');
+        button.classList.toggle('active');
+        button.setAttribute(
+            'aria-pressed',
+            String(button.classList.contains('active')),
+        );
+    }
 
-	function handlePostAnnouncement(container) {
-		const button = container.querySelector('.post-announcement-button');
-		if (!button) return;
-		button.classList.toggle('active');
-		button.setAttribute(
-			'aria-pressed',
-			String(button.classList.contains('active')),
-		);
-	}
+    function handlePostAnnouncement(container) {
+        const button = container.querySelector('.post-announcement-button');
+        if (!button) return;
+        button.classList.toggle('active');
+        button.setAttribute(
+            'aria-pressed',
+            String(button.classList.contains('active')),
+        );
+    }
 
-	async function handlePostSubmit(container) {
+    async function handlePostSubmit(container) {
         if (!getCurrentUser()) return showAppAlert('ログインが必要です。');
         const contentEl = container.querySelector('#post-content');
         const content = getMarkdownEditorValue(contentEl).trim();
         if (!content && getSelectedFiles().length === 0 && !getQuotingPost())
-            return showAppAlert('内容を入力するか、ファイルを添付してください。');
+            return showAppAlert(
+                '内容を入力するか、ファイルを添付してください。',
+            );
 
         const maskActive = container
             .querySelector('.post-mask-button')
             .classList.contains('active');
-		const lockActive = container
-			.querySelector('.post-lock-button')
-			.classList.contains('active');
-		const announcementActive = container
-			.querySelector('.post-announcement-button')
-			?.classList.contains('active') || false;
+        const lockActive = container
+            .querySelector('.post-lock-button')
+            .classList.contains('active');
+        const announcementActive =
+            container
+                .querySelector('.post-announcement-button')
+                ?.classList.contains('active') || false;
 
-		const button = container.querySelector('#post-submit-button');
+        const button = container.querySelector('#post-submit-button');
         button.disabled = true;
-        button.textContent = '投稿中...';
+        button.textContent = '送信中...';
         showLoading(true);
 
         let attachmentsData = [];
@@ -4113,10 +4261,10 @@ export function initApp() {
                     p_repost_to: getQuotingPost()?.id || null,
                     p_attachments:
                         attachmentsData.length > 0 ? attachmentsData : null,
-	                    p_mask: maskActive,
-	                    p_lock: lockActive,
-	                    p_announcement: announcementActive,
-	                })
+                    p_mask: maskActive,
+                    p_lock: lockActive,
+                    p_announcement: announcementActive,
+                })
                 .single(); // .single()を追加して、返り値が1行であることを期待
 
             if (rpcError) {
@@ -4310,7 +4458,6 @@ export function initApp() {
             isPinned = false,
             clampHeight = false,
         } = options;
-
 
         const displayAuthor = author || post.author;
         if (!displayAuthor) return null;
@@ -4804,7 +4951,8 @@ export function initApp() {
                     );
                     if (!wasExpanded)
                         contentEl.classList.add('post-content-expanded');
-                    const naturalHeight = contentEl.getBoundingClientRect().height;
+                    const naturalHeight =
+                        contentEl.getBoundingClientRect().height;
                     if (!wasExpanded)
                         contentEl.classList.remove('post-content-expanded');
                     const clampLimit = Number.parseFloat(
@@ -4829,7 +4977,6 @@ export function initApp() {
         return postEl;
     }
 
-
     async function showMainScreen() {
         DOM.pageHeader.innerHTML = `<h2 id="page-title">ホーム</h2>`;
         showScreen('main-screen');
@@ -4844,7 +4991,7 @@ export function initApp() {
 	                <button class="timeline-tab-button" data-tab="following">フォロー中</button>
 		                <button class="timeline-tab-button" data-tab="announce">お知らせ</button>
 		            `;
-	            // ユーザー設定からデフォルトタブを取得。なければ 'all' を使用
+            // ユーザー設定からデフォルトタブを取得。なければ 'all' を使用
             setCurrentTimelineTab(
                 getCurrentUser().settings?.default_timeline_tab || 'all',
             );
@@ -4853,7 +5000,7 @@ export function initApp() {
 	                <button class="timeline-tab-button" data-tab="all">すべて</button>
 		                <button class="timeline-tab-button" data-tab="announce">お知らせ</button>
 		            `;
-	            // 未ログインユーザーのデフォルトは「すべて」固定
+            // 未ログインユーザーのデフォルトは「すべて」固定
             setCurrentTimelineTab('all');
         }
 
@@ -5092,7 +5239,8 @@ export function initApp() {
         document
             .getElementById('mark-all-read-btn')
             .addEventListener('click', async () => {
-                if (!await showAppConfirm('すべての通知を既読にしますか？')) return;
+                if (!(await showAppConfirm('すべての通知を既読にしますか？')))
+                    return;
 
                 showLoading(true);
                 try {
@@ -5444,7 +5592,6 @@ export function initApp() {
                         }
                         repliesContainer.appendChild(replyNode);
                     }
-
                 }
 
                 pagination.page++;
@@ -5475,9 +5622,8 @@ export function initApp() {
                 { rootMargin: '200px' },
             );
 
-            const savedDetailPosition = getSavedScrollPositions()[
-                getScrollRouteKey()
-            ];
+            const savedDetailPosition =
+                getSavedScrollPositions()[getScrollRouteKey()];
             const savedDetailY = Number(savedDetailPosition?.y);
             const restoreTargetY =
                 Number.isFinite(savedDetailY) && savedDetailY > 0
@@ -5628,7 +5774,8 @@ export function initApp() {
                 );
                 dmPayload = result.data || {};
                 error = result.error;
-                if (!error) setScreenDataCache(dmConversationCacheKey, dmPayload);
+                if (!error)
+                    setScreenDataCache(dmConversationCacheKey, dmPayload);
             } else {
                 // キャッシュ復元時も既読化し、成功時はバッジを待たずにローカル状態へ反映する。
                 const key = String(dmId);
@@ -5644,7 +5791,8 @@ export function initApp() {
                     getDmUnreadCounts().set(key, 0);
                     getCurrentUser().unreadDmTotal = Math.max(
                         0,
-                        Number(getCurrentUser().unreadDmTotal || 0) - cachedUnreadBefore,
+                        Number(getCurrentUser().unreadDmTotal || 0) -
+                            cachedUnreadBefore,
                     );
                     deleteScreenDataCache(getDmCacheKey('list'));
                 }
@@ -5848,8 +5996,7 @@ export function initApp() {
 
     function resetProfileTabNavigation(userId, subpage) {
         const normalizedUserId = Number(userId);
-        if (!Number.isInteger(normalizedUserId) || normalizedUserId < 0)
-            return;
+        if (!Number.isInteger(normalizedUserId) || normalizedUserId < 0) return;
 
         const normalizedTab = String(subpage || 'posts');
         const hash =
@@ -5937,9 +6084,8 @@ export function initApp() {
 	                        <h2>${getEmoji(escapeHTML(user.name))}</h2>
 							<div class="user-id" title="Nyaitter ID">${getNyaitterId(user)}</div>
 	                    </div>`;
-                const actionsContainer = profileHeader.querySelector(
-                    '#profile-actions',
-                );
+                const actionsContainer =
+                    profileHeader.querySelector('#profile-actions');
                 if (
                     actionsContainer &&
                     getCurrentUser()?.admin &&
@@ -6090,7 +6236,10 @@ export function initApp() {
                     menuButton.className = 'profile-menu-button dm-button'; // dm-buttonのスタイルを流用
                     menuButton.innerHTML = ICONS.more;
                     menuButton.title = 'プロフィールメニュー';
-                    menuButton.setAttribute('aria-label', 'プロフィールメニュー');
+                    menuButton.setAttribute(
+                        'aria-label',
+                        'プロフィールメニュー',
+                    );
                     menuButton.onclick = (e) => {
                         e.stopPropagation();
                         openProfileMenu(user);
@@ -6280,7 +6429,9 @@ export function initApp() {
         }
     }
 
-    async function showSettingsScreen(initialGroup = getSettingsGroupFromHash()) {
+    async function showSettingsScreen(
+        initialGroup = getSettingsGroupFromHash(),
+    ) {
         if (!getCurrentUser()) return router();
         DOM.pageHeader.innerHTML = `<h2 id="page-title">設定</h2>`;
         showScreen('settings-screen');
@@ -6674,14 +6825,29 @@ export function initApp() {
                 void loadUserBotTokens();
             }
         };
-        const verificationApplicationModal = document.getElementById('verification-application-modal');
-        const verificationApplicationButton = document.getElementById('open-verification-application-btn');
-        const verificationApplicationStatus = document.getElementById('verification-application-status');
-        const verificationApplicationError = document.getElementById('verification-application-error');
-        const verificationApplicationSubmit = document.getElementById('submit-verification-application-btn');
-        const closeVerificationApplicationModal = () => verificationApplicationModal?.classList.add('hidden');
+        const verificationApplicationModal = document.getElementById(
+            'verification-application-modal',
+        );
+        const verificationApplicationButton = document.getElementById(
+            'open-verification-application-btn',
+        );
+        const verificationApplicationStatus = document.getElementById(
+            'verification-application-status',
+        );
+        const verificationApplicationError = document.getElementById(
+            'verification-application-error',
+        );
+        const verificationApplicationSubmit = document.getElementById(
+            'submit-verification-application-btn',
+        );
+        const closeVerificationApplicationModal = () =>
+            verificationApplicationModal?.classList.add('hidden');
         const updateVerificationApplicationStatus = (application) => {
-            if (!verificationApplicationButton || !verificationApplicationStatus) return;
+            if (
+                !verificationApplicationButton ||
+                !verificationApplicationStatus
+            )
+                return;
             if (getCurrentUser().verify) {
                 verificationApplicationButton.disabled = true;
                 verificationApplicationButton.textContent = '認証済み';
@@ -6697,15 +6863,20 @@ export function initApp() {
             }
             verificationApplicationButton.disabled = true;
             verificationApplicationButton.textContent = '認証申請を確認中';
-            verificationApplicationStatus.textContent = application.status === 'assigned'
-                ? '認証申請は担当管理者に割り当てられ、確認中です。'
-                : '認証申請を受け付け、担当管理者への割当を待っています。';
+            verificationApplicationStatus.textContent =
+                application.status === 'assigned'
+                    ? '認証申請は担当管理者に割り当てられ、確認中です。'
+                    : '認証申請を受け付け、担当管理者への割当を待っています。';
             verificationApplicationStatus.classList.remove('hidden');
         };
         const refreshVerificationApplicationStatus = async () => {
-            if (getCurrentUser().verify) return updateVerificationApplicationStatus(null);
-            const { data, error } = await apiRequest('/server/api/verification-applications/me');
-            if (!error) updateVerificationApplicationStatus(data?.application || null);
+            if (getCurrentUser().verify)
+                return updateVerificationApplicationStatus(null);
+            const { data, error } = await apiRequest(
+                '/server/api/verification-applications/me',
+            );
+            if (!error)
+                updateVerificationApplicationStatus(data?.application || null);
         };
         verificationApplicationButton?.addEventListener('click', () => {
             if (!verificationApplicationButton.disabled) {
@@ -6713,23 +6884,33 @@ export function initApp() {
                 verificationApplicationModal?.classList.remove('hidden');
             }
         });
-        verificationApplicationModal?.querySelectorAll('[data-action="close-verification-application"]').forEach((button) => {
-            button.addEventListener('click', closeVerificationApplicationModal);
-        });
+        verificationApplicationModal
+            ?.querySelectorAll('[data-action="close-verification-application"]')
+            .forEach((button) => {
+                button.addEventListener(
+                    'click',
+                    closeVerificationApplicationModal,
+                );
+            });
         verificationApplicationModal?.addEventListener('click', (event) => {
-            if (event.target === verificationApplicationModal) closeVerificationApplicationModal();
+            if (event.target === verificationApplicationModal)
+                closeVerificationApplicationModal();
         });
         verificationApplicationSubmit?.addEventListener('click', async () => {
             verificationApplicationSubmit.disabled = true;
             verificationApplicationError?.classList.add('hidden');
-            const { data, error } = await apiRequest('/server/api/verification-applications', {
-                method: 'POST',
-                body: {},
-            });
+            const { data, error } = await apiRequest(
+                '/server/api/verification-applications',
+                {
+                    method: 'POST',
+                    body: {},
+                },
+            );
             verificationApplicationSubmit.disabled = false;
             if (error) {
                 if (verificationApplicationError) {
-                    verificationApplicationError.textContent = error.message || '認証申請を送信できませんでした。';
+                    verificationApplicationError.textContent =
+                        error.message || '認証申請を送信できませんでした。';
                     verificationApplicationError.classList.remove('hidden');
                 }
                 return;
@@ -6803,11 +6984,11 @@ export function initApp() {
                 invalidateButton.textContent = '無効化';
                 invalidateButton.addEventListener('click', async () => {
                     if (
-                        !await showAppConfirm(
+                        !(await showAppConfirm(
                             session.current
                                 ? 'この端末のセッションを無効化してログアウトしますか？'
                                 : 'このセッションを無効化しますか？',
-                        )
+                        ))
                     )
                         return;
                     const { data: result, error: invalidateError } =
@@ -6836,9 +7017,9 @@ export function initApp() {
                     revokeButton.textContent = '信頼を取り消す';
                     revokeButton.addEventListener('click', async () => {
                         if (
-                            !await showAppConfirm(
+                            !(await showAppConfirm(
                                 'このIPアドレスの信頼を取り消し、同じIPアドレスの全セッションを無効化しますか？',
-                            )
+                            ))
                         )
                             return;
                         const { data: result, error: revokeError } =
@@ -6939,9 +7120,9 @@ export function initApp() {
                 revokeBtn.textContent = '無効化';
                 revokeBtn.addEventListener('click', async () => {
                     if (
-                        !await showAppConfirm(
+                        !(await showAppConfirm(
                             `APIキー「${token.name || token.tokenId}」を無効化しますか？\n無効化するとこのキーを使用したBotはアクセスできなくなります。`,
-                        )
+                        ))
                     )
                         return;
                     revokeBtn.disabled = true;
@@ -6964,10 +7145,14 @@ export function initApp() {
             });
         };
 
-        const resourceLinksList = document.getElementById('settings-resource-links');
+        const resourceLinksList = document.getElementById(
+            'settings-resource-links',
+        );
         if (resourceLinksList) {
             resourceLinksList.replaceChildren();
-            const resources = Array.isArray(RESOURCE_LINKS) ? RESOURCE_LINKS : [];
+            const resources = Array.isArray(RESOURCE_LINKS)
+                ? RESOURCE_LINKS
+                : [];
             if (resources.length === 0) {
                 const empty = document.createElement('p');
                 empty.className = 'settings-help-text';
@@ -6975,7 +7160,12 @@ export function initApp() {
                 resourceLinksList.appendChild(empty);
             } else {
                 resources.forEach((resource) => {
-                    if (!resource || typeof resource.name !== 'string' || typeof resource.url !== 'string') return;
+                    if (
+                        !resource ||
+                        typeof resource.name !== 'string' ||
+                        typeof resource.url !== 'string'
+                    )
+                        return;
                     const item = document.createElement('article');
                     item.className = 'settings-session-item';
                     const link = document.createElement('a');
@@ -6996,19 +7186,24 @@ export function initApp() {
             const bytes = Math.max(0, Number(value) || 0);
             if (bytes < 1024) return `${bytes} B`;
             if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-            if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+            if (bytes < 1024 * 1024 * 1024)
+                return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
             return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
         };
 
         const loadUserStorage = async () => {
             const summary = document.getElementById('settings-storage-summary');
-            const progress = document.getElementById('settings-storage-progress-value');
+            const progress = document.getElementById(
+                'settings-storage-progress-value',
+            );
             const fileList = document.getElementById('settings-storage-files');
             if (!summary || !progress || !fileList) return;
 
             summary.textContent = 'ストレージ使用量を読み込んでいます…';
             fileList.replaceChildren();
-            const { data, error } = await apiRequest('/server/api/posts/uploads/storage');
+            const { data, error } = await apiRequest(
+                '/server/api/posts/uploads/storage',
+            );
             if (error) {
                 summary.textContent = 'ストレージ情報の取得に失敗しました。';
                 progress.style.width = '0%';
@@ -7018,7 +7213,14 @@ export function initApp() {
             const payload = data?.data || data || {};
             const usedBytes = Math.max(0, Number(payload.used_bytes) || 0);
             const limitBytes = Math.max(1, Number(payload.limit_bytes) || 1);
-            const percent = Math.min(100, Math.max(0, Number(payload.used_percent) || ((usedBytes / limitBytes) * 100)));
+            const percent = Math.min(
+                100,
+                Math.max(
+                    0,
+                    Number(payload.used_percent) ||
+                        (usedBytes / limitBytes) * 100,
+                ),
+            );
             summary.textContent = `${formatStorageSize(usedBytes)} / ${formatStorageSize(limitBytes)}（${percent.toFixed(1)}% 使用）`;
             progress.style.width = `${percent}%`;
 
@@ -7038,10 +7240,13 @@ export function initApp() {
                 details.className = 'settings-session-details';
                 const title = document.createElement('div');
                 title.className = 'settings-session-title';
-                title.textContent = file.name || file.id || '名称不明のファイル';
+                title.textContent =
+                    file.name || file.id || '名称不明のファイル';
                 const meta = document.createElement('p');
                 meta.className = 'settings-session-dates';
-                const updatedAt = file.updatedAt ? formatSecurityTimestamp(file.updatedAt) : '日時不明';
+                const updatedAt = file.updatedAt
+                    ? formatSecurityTimestamp(file.updatedAt)
+                    : '日時不明';
                 meta.textContent = `サイズ: ${formatStorageSize(file.size)} / 更新: ${updatedAt}`;
                 details.append(title, meta);
 
@@ -7052,15 +7257,26 @@ export function initApp() {
                 deleteButton.className = 'settings-session-revoke-button';
                 deleteButton.textContent = '削除';
                 deleteButton.addEventListener('click', async () => {
-                    if (!file.id || !await showAppConfirm(`ファイル「${file.name || file.id}」を削除しますか？\n投稿やプロフィールで使用中の場合、表示できなくなることがあります。`)) return;
+                    if (
+                        !file.id ||
+                        !(await showAppConfirm(
+                            `ファイル「${file.name || file.id}」を削除しますか？\n投稿やプロフィールで使用中の場合、表示できなくなることがあります。`,
+                        ))
+                    )
+                        return;
                     deleteButton.disabled = true;
-                    const { error: deleteError } = await apiRequest('/server/api/posts/uploads', {
-                        method: 'DELETE',
-                        body: { fileIds: [file.id] },
-                    });
+                    const { error: deleteError } = await apiRequest(
+                        '/server/api/posts/uploads',
+                        {
+                            method: 'DELETE',
+                            body: { fileIds: [file.id] },
+                        },
+                    );
                     if (deleteError) {
                         deleteButton.disabled = false;
-                        showAppAlert(`ファイルの削除に失敗しました: ${deleteError.message || '不明なエラー'}`);
+                        showAppAlert(
+                            `ファイルの削除に失敗しました: ${deleteError.message || '不明なエラー'}`,
+                        );
                         return;
                     }
                     await loadUserStorage();
@@ -7071,9 +7287,11 @@ export function initApp() {
             });
         };
 
-        document.getElementById('settings-storage-refresh-btn')?.addEventListener('click', () => {
-            void loadUserStorage();
-        });
+        document
+            .getElementById('settings-storage-refresh-btn')
+            ?.addEventListener('click', () => {
+                void loadUserStorage();
+            });
 
         // APIグループでも関数初期化後に選択するため、
         // 直接ハッシュアクセス時にTemporal Dead Zoneへ入らない。
@@ -7093,7 +7311,9 @@ export function initApp() {
                         },
                     );
                     if (error) {
-                        showAppAlert(`APIキーの生成に失敗しました: ${error.message}`);
+                        showAppAlert(
+                            `APIキーの生成に失敗しました: ${error.message}`,
+                        );
                         return;
                     }
                     if (data?.token) {
@@ -7321,20 +7541,29 @@ export function initApp() {
     function formatModerationDate(value) {
         if (!value) return '日時不明';
         const date = new Date(value);
-        return Number.isNaN(date.getTime()) ? '日時不明' : date.toLocaleString('ja-JP');
+        return Number.isNaN(date.getTime())
+            ? '日時不明'
+            : date.toLocaleString('ja-JP');
     }
 
     function moderationTargetLabel(kind) {
-        return ({ user: 'ユーザー', post: 'ポスト', dm: 'DM' })[kind] || 'コンテンツ';
+        return (
+            { user: 'ユーザー', post: 'ポスト', dm: 'DM' }[kind] || 'コンテンツ'
+        );
     }
 
     function moderationEvidenceText(value) {
         if (typeof value === 'string') return escapeHTML(value);
-        try { return escapeHTML(JSON.stringify(value, null, 2)); } catch (_) { return '表示できません'; }
+        try {
+            return escapeHTML(JSON.stringify(value, null, 2));
+        } catch (_) {
+            return '表示できません';
+        }
     }
 
     function renderModerationSubject(user) {
-        if (!user) return '<p class="moderation-help-text">対象ユーザーの証跡はありません。</p>';
+        if (!user)
+            return '<p class="moderation-help-text">対象ユーザーの証跡はありません。</p>';
         return `<div class="moderation-content-evidence"><strong>${escapeHTML(user.name || '名称未設定')}</strong><br><span class="moderation-help-text">@${escapeHTML(user.scid || user.handle || String(user.id))}</span></div>`;
     }
 
@@ -7346,19 +7575,25 @@ export function initApp() {
             </div>`;
         showScreen('admin-reports-screen');
         const contentDiv = document.getElementById('admin-reports-content');
-        contentDiv.innerHTML = '<div class="admin-reports-container"><div class="spinner"></div></div>';
+        contentDiv.innerHTML =
+            '<div class="admin-reports-container"><div class="spinner"></div></div>';
         try {
-            const { data, error } = await apiRequest('/server/api/reports/assigned');
+            const { data, error } = await apiRequest(
+                '/server/api/reports/assigned',
+            );
             if (error) throw error;
             const reports = Array.isArray(data?.reports) ? data.reports : [];
             if (reports.length === 0) {
-                contentDiv.innerHTML = '<div class="admin-reports-container"><p class="moderation-help-text">現在、あなたに割り当てられているリクエストはありません。</p></div>';
+                contentDiv.innerHTML =
+                    '<div class="admin-reports-container"><p class="moderation-help-text">現在、あなたに割り当てられているリクエストはありません。</p></div>';
                 return;
             }
             contentDiv.innerHTML = `
                 <div class="admin-reports-container">
                     <div class="admin-reports-list">
-                        ${reports.map((report) => `
+                        ${reports
+                            .map(
+                                (report) => `
                             <button type="button" class="moderation-report-card" data-action="open-admin-report" data-report-id="${Number(report.id)}">
                                 <strong>${report.assignment_type === 'freeze_appeal' ? '凍結異議申し立て' : report.assignment_type === 'verification_application' ? '認証申請' : `${moderationTargetLabel(report.target_kind)}の報告`}</strong>
                                 <div class="moderation-report-meta">
@@ -7367,12 +7602,15 @@ export function initApp() {
                                 </div>
                                 <p>${escapeHTML(report.description || '説明は添付されていません。')}</p>
                             </button>
-                        `).join('')}
+                        `,
+                            )
+                            .join('')}
                     </div>
                 </div>`;
         } catch (error) {
             console.error('リクエスト一覧の取得に失敗:', error);
-            contentDiv.innerHTML = '<div class="admin-reports-container"><p class="error-message">リクエスト一覧の取得に失敗しました。</p></div>';
+            contentDiv.innerHTML =
+                '<div class="admin-reports-container"><p class="error-message">リクエスト一覧の取得に失敗しました。</p></div>';
         } finally {
             showLoading(false);
         }
@@ -7391,15 +7629,19 @@ export function initApp() {
             </div>`;
         showScreen('admin-reports-screen');
         const contentDiv = document.getElementById('admin-reports-content');
-        contentDiv.innerHTML = '<div class="admin-reports-container"><div class="spinner"></div></div>';
+        contentDiv.innerHTML =
+            '<div class="admin-reports-container"><div class="spinner"></div></div>';
         try {
-            const { data, error } = await apiRequest(`/server/api/reports/${normalizedReportId}`);
+            const { data, error } = await apiRequest(
+                `/server/api/reports/${normalizedReportId}`,
+            );
             if (error) throw error;
             const report = data?.report;
             if (!report) throw new Error('報告が見つかりません');
             const snapshot = report.target_snapshot || {};
             if (report.assignment_type === 'verification_application') {
-                DOM.pageHeader.querySelector('#page-title').textContent = '認証申請を確認';
+                DOM.pageHeader.querySelector('#page-title').textContent =
+                    '認証申請を確認';
                 contentDiv.innerHTML = `
                     <div class="moderation-review-layout">
                         <section class="moderation-review-section">
@@ -7416,35 +7658,67 @@ export function initApp() {
                             <p id="verification-decision-error" class="login-modal-message login-modal-error hidden" role="alert"></p>
                         </section>
                     </div>`;
-                document.querySelectorAll('[data-verification-decision]').forEach((button) => {
-                    button.addEventListener('click', async () => {
-                        const decision = button.dataset.verificationDecision;
-                        if (!await showAppConfirm(decision === 'approved'
-                            ? 'この認証申請を承認し、認証バッジを付与しますか？'
-                            : 'この認証申請を拒否しますか？')) return;
-                        const errorElement = document.getElementById('verification-decision-error');
-                        document.querySelectorAll('[data-verification-decision]').forEach((item) => { item.disabled = true; });
-                        errorElement?.classList.add('hidden');
-                        const { error: decisionError } = await apiRequest(`/server/api/reports/${Number(report.id)}/verification-decision`, {
-                            method: 'POST',
-                            body: { decision },
-                        });
-                        if (decisionError) {
-                            document.querySelectorAll('[data-verification-decision]').forEach((item) => { item.disabled = false; });
-                            if (errorElement) {
-                                errorElement.textContent = decisionError.message || '認証申請を処理できませんでした。';
-                                errorElement.classList.remove('hidden');
+                document
+                    .querySelectorAll('[data-verification-decision]')
+                    .forEach((button) => {
+                        button.addEventListener('click', async () => {
+                            const decision =
+                                button.dataset.verificationDecision;
+                            if (
+                                !(await showAppConfirm(
+                                    decision === 'approved'
+                                        ? 'この認証申請を承認し、認証バッジを付与しますか？'
+                                        : 'この認証申請を拒否しますか？',
+                                ))
+                            )
+                                return;
+                            const errorElement = document.getElementById(
+                                'verification-decision-error',
+                            );
+                            document
+                                .querySelectorAll(
+                                    '[data-verification-decision]',
+                                )
+                                .forEach((item) => {
+                                    item.disabled = true;
+                                });
+                            errorElement?.classList.add('hidden');
+                            const { error: decisionError } = await apiRequest(
+                                `/server/api/reports/${Number(report.id)}/verification-decision`,
+                                {
+                                    method: 'POST',
+                                    body: { decision },
+                                },
+                            );
+                            if (decisionError) {
+                                document
+                                    .querySelectorAll(
+                                        '[data-verification-decision]',
+                                    )
+                                    .forEach((item) => {
+                                        item.disabled = false;
+                                    });
+                                if (errorElement) {
+                                    errorElement.textContent =
+                                        decisionError.message ||
+                                        '認証申請を処理できませんでした。';
+                                    errorElement.classList.remove('hidden');
+                                }
+                                return;
                             }
-                            return;
-                        }
-                        await showAppAlert(decision === 'approved' ? '認証申請を承認しました。' : '認証申請を拒否しました。');
-                        window.location.hash = '#admin/reports';
+                            await showAppAlert(
+                                decision === 'approved'
+                                    ? '認証申請を承認しました。'
+                                    : '認証申請を拒否しました。',
+                            );
+                            window.location.hash = '#admin/reports';
+                        });
                     });
-                });
                 return;
             }
             if (report.assignment_type === 'freeze_appeal') {
-                DOM.pageHeader.querySelector('#page-title').textContent = '異議申し立てを確認';
+                DOM.pageHeader.querySelector('#page-title').textContent =
+                    '異議申し立てを確認';
                 contentDiv.innerHTML = `
                     <div class="moderation-review-layout">
                         <section class="moderation-review-section">
@@ -7469,48 +7743,84 @@ export function initApp() {
                             <p id="appeal-decision-error" class="login-modal-message login-modal-error hidden" role="alert"></p>
                         </section>
                     </div>`;
-                document.querySelectorAll('[data-appeal-decision]').forEach((button) => {
-                    button.addEventListener('click', async () => {
-                        const decision = button.dataset.appealDecision;
-                        if (!await showAppConfirm(decision === 'approved'
-                            ? 'この異議申し立てを承認し、アカウントの凍結を解除しますか？'
-                            : 'この異議申し立てを拒否しますか？')) return;
-                        const errorElement = document.getElementById('appeal-decision-error');
-                        document.querySelectorAll('[data-appeal-decision]').forEach((item) => { item.disabled = true; });
-                        errorElement?.classList.add('hidden');
-                        const { error: decisionError } = await apiRequest(`/server/api/reports/${Number(report.id)}/appeal-decision`, {
-                            method: 'POST',
-                            body: { decision },
-                        });
-                        if (decisionError) {
-                            document.querySelectorAll('[data-appeal-decision]').forEach((item) => { item.disabled = false; });
-                            if (errorElement) {
-                                errorElement.textContent = decisionError.message || '異議申し立てを処理できませんでした。';
-                                errorElement.classList.remove('hidden');
+                document
+                    .querySelectorAll('[data-appeal-decision]')
+                    .forEach((button) => {
+                        button.addEventListener('click', async () => {
+                            const decision = button.dataset.appealDecision;
+                            if (
+                                !(await showAppConfirm(
+                                    decision === 'approved'
+                                        ? 'この異議申し立てを承認し、アカウントの凍結を解除しますか？'
+                                        : 'この異議申し立てを拒否しますか？',
+                                ))
+                            )
+                                return;
+                            const errorElement = document.getElementById(
+                                'appeal-decision-error',
+                            );
+                            document
+                                .querySelectorAll('[data-appeal-decision]')
+                                .forEach((item) => {
+                                    item.disabled = true;
+                                });
+                            errorElement?.classList.add('hidden');
+                            const { error: decisionError } = await apiRequest(
+                                `/server/api/reports/${Number(report.id)}/appeal-decision`,
+                                {
+                                    method: 'POST',
+                                    body: { decision },
+                                },
+                            );
+                            if (decisionError) {
+                                document
+                                    .querySelectorAll('[data-appeal-decision]')
+                                    .forEach((item) => {
+                                        item.disabled = false;
+                                    });
+                                if (errorElement) {
+                                    errorElement.textContent =
+                                        decisionError.message ||
+                                        '異議申し立てを処理できませんでした。';
+                                    errorElement.classList.remove('hidden');
+                                }
+                                return;
                             }
-                            return;
-                        }
-                        await showAppAlert(decision === 'approved' ? '異議申し立てを承認し、凍結を解除しました。' : '異議申し立てを拒否しました。');
-                        window.location.hash = '#admin/reports';
+                            await showAppAlert(
+                                decision === 'approved'
+                                    ? '異議申し立てを承認し、凍結を解除しました。'
+                                    : '異議申し立てを拒否しました。',
+                            );
+                            window.location.hash = '#admin/reports';
+                        });
                     });
-                });
                 return;
             }
             const targetUsers = snapshot.subjectUser
                 ? [snapshot.subjectUser]
-                : (snapshot.dm?.members || []);
-            const selectableUsers = targetUsers.filter((user) => Number.isInteger(Number(user?.id)));
-            const targetOptions = selectableUsers.map((user) => (
-                `<option value="${Number(user.id)}">${escapeHTML(user.name || `@${user.id}`)} (@${escapeHTML(user.scid || user.handle || user.id)})</option>`
-            )).join('');
-            const dmEvidence = (snapshot.dm?.recentMessages || [])
-                .map((message) => `<div class="moderation-message-evidence">${moderationEvidenceText(message?.content || (message?.e2e ? '🔒 エンドツーエンド暗号化されたメッセージ' : message))}</div>`)
-                .join('') || 'メッセージ証跡はありません。';
-            const evidence = report.target_kind === 'post'
-                ? `<div class="moderation-review-section"><h3>報告されたポスト</h3>${renderModerationSubject(snapshot.subjectUser)}<div class="moderation-content-evidence">${moderationEvidenceText(snapshot.post?.content || '')}</div></div>`
-                : report.target_kind === 'dm_message'
-                    ? `<div class="moderation-review-section"><h3>報告されたDMメッセージ</h3>${renderModerationSubject(snapshot.subjectUser)}<div class="moderation-content-evidence">${moderationEvidenceText(snapshot.message?.content || (snapshot.message?.e2e ? '🔒 エンドツーエンド暗号化されたメッセージ' : '本文は記録されていません。'))}</div><p class="moderation-help-text">会話の前後関係として、サーバーに保存された直近${(snapshot.dm?.recentMessages || []).length}件のメッセージを表示します。</p><div class="moderation-content-evidence">${dmEvidence}</div></div>`
-                    : report.target_kind === 'dm'
+                : snapshot.dm?.members || [];
+            const selectableUsers = targetUsers.filter((user) =>
+                Number.isInteger(Number(user?.id)),
+            );
+            const targetOptions = selectableUsers
+                .map(
+                    (user) =>
+                        `<option value="${Number(user.id)}">${escapeHTML(user.name || `@${user.id}`)} (@${escapeHTML(user.scid || user.handle || user.id)})</option>`,
+                )
+                .join('');
+            const dmEvidence =
+                (snapshot.dm?.recentMessages || [])
+                    .map(
+                        (message) =>
+                            `<div class="moderation-message-evidence">${moderationEvidenceText(message?.content || (message?.e2e ? '🔒 エンドツーエンド暗号化されたメッセージ' : message))}</div>`,
+                    )
+                    .join('') || 'メッセージ証跡はありません。';
+            const evidence =
+                report.target_kind === 'post'
+                    ? `<div class="moderation-review-section"><h3>報告されたポスト</h3>${renderModerationSubject(snapshot.subjectUser)}<div class="moderation-content-evidence">${moderationEvidenceText(snapshot.post?.content || '')}</div></div>`
+                    : report.target_kind === 'dm_message'
+                      ? `<div class="moderation-review-section"><h3>報告されたDMメッセージ</h3>${renderModerationSubject(snapshot.subjectUser)}<div class="moderation-content-evidence">${moderationEvidenceText(snapshot.message?.content || (snapshot.message?.e2e ? '🔒 エンドツーエンド暗号化されたメッセージ' : '本文は記録されていません。'))}</div><p class="moderation-help-text">会話の前後関係として、サーバーに保存された直近${(snapshot.dm?.recentMessages || []).length}件のメッセージを表示します。</p><div class="moderation-content-evidence">${dmEvidence}</div></div>`
+                      : report.target_kind === 'dm'
                         ? `<div class="moderation-review-section"><h3>報告されたDM</h3><p class="moderation-help-text">サーバーに保存された直近${(snapshot.dm?.recentMessages || []).length}件のメッセージです。エンドツーエンド暗号化された本文は暗号文のまま表示されます。</p><div class="moderation-content-evidence">${dmEvidence}</div></div>`
                         : `<div class="moderation-review-section"><h3>報告されたユーザー</h3>${renderModerationSubject(snapshot.subjectUser)}</div>`;
             contentDiv.innerHTML = `
@@ -7540,32 +7850,56 @@ export function initApp() {
             const form = document.getElementById('moderation-resolution-form');
             form?.addEventListener('submit', async (event) => {
                 event.preventDefault();
-                const errorElement = document.getElementById('moderation-resolution-error');
-                const targetUserId = document.getElementById('moderation-target-user')?.value || null;
+                const errorElement = document.getElementById(
+                    'moderation-resolution-error',
+                );
+                const targetUserId =
+                    document.getElementById('moderation-target-user')?.value ||
+                    null;
                 const actions = {
-                    deletePost: Boolean(document.getElementById('moderation-delete-post')?.checked),
-                    searchExclude: Boolean(document.getElementById('moderation-search-exclude')?.checked),
-                    freeze: Boolean(document.getElementById('moderation-freeze')?.checked),
-                    freezeReason: document.getElementById('moderation-freeze-reason')?.value || '',
-                    notice: document.getElementById('moderation-notice')?.value || '',
+                    deletePost: Boolean(
+                        document.getElementById('moderation-delete-post')
+                            ?.checked,
+                    ),
+                    searchExclude: Boolean(
+                        document.getElementById('moderation-search-exclude')
+                            ?.checked,
+                    ),
+                    freeze: Boolean(
+                        document.getElementById('moderation-freeze')?.checked,
+                    ),
+                    freezeReason:
+                        document.getElementById('moderation-freeze-reason')
+                            ?.value || '',
+                    notice:
+                        document.getElementById('moderation-notice')?.value ||
+                        '',
                     targetUserId: targetUserId ? Number(targetUserId) : null,
                 };
-                const requiresTarget = actions.searchExclude || actions.freeze || actions.notice.trim();
+                const requiresTarget =
+                    actions.searchExclude ||
+                    actions.freeze ||
+                    actions.notice.trim();
                 if (requiresTarget && !actions.targetUserId) {
-                    errorElement.textContent = '対応対象ユーザーを選択してください。';
+                    errorElement.textContent =
+                        '対応対象ユーザーを選択してください。';
                     errorElement.classList.remove('hidden');
                     return;
                 }
                 const submit = form.querySelector('button[type="submit"]');
                 submit.disabled = true;
                 errorElement.classList.add('hidden');
-                const { error: resolveError } = await apiRequest(`/server/api/reports/${Number(report.id)}/resolve`, {
-                    method: 'POST',
-                    body: { actions },
-                });
+                const { error: resolveError } = await apiRequest(
+                    `/server/api/reports/${Number(report.id)}/resolve`,
+                    {
+                        method: 'POST',
+                        body: { actions },
+                    },
+                );
                 submit.disabled = false;
                 if (resolveError) {
-                    errorElement.textContent = resolveError.message || '対応を完了できませんでした。';
+                    errorElement.textContent =
+                        resolveError.message || '対応を完了できませんでした。';
                     errorElement.classList.remove('hidden');
                     return;
                 }
@@ -7574,7 +7908,8 @@ export function initApp() {
             });
         } catch (error) {
             console.error('報告詳細の取得に失敗:', error);
-            contentDiv.innerHTML = '<div class="admin-reports-container"><p class="error-message">報告詳細の取得に失敗しました。</p></div>';
+            contentDiv.innerHTML =
+                '<div class="admin-reports-container"><p class="error-message">報告詳細の取得に失敗しました。</p></div>';
         } finally {
             showLoading(false);
         }
@@ -7672,7 +8007,12 @@ export function initApp() {
         showLoading(false); // 初回のローディング表示を解除
     }
 
-    async function fetchOptimizedPostPage(type, options, page, beforeCursor = null) {
+    async function fetchOptimizedPostPage(
+        type,
+        options,
+        page,
+        beforeCursor = null,
+    ) {
         const params = new URLSearchParams({
             limit: String(POSTS_PER_PAGE),
             offset: String(page * POSTS_PER_PAGE),
@@ -7783,9 +8123,10 @@ export function initApp() {
                 const pageNumber = getCurrentPagination().page;
                 let optimizedPage = postPageCache?.pages.get(pageNumber);
                 if (!optimizedPage) {
-                    const previousPage = pageNumber > 0
-                        ? postPageCache?.pages.get(pageNumber - 1)
-                        : null;
+                    const previousPage =
+                        pageNumber > 0
+                            ? postPageCache?.pages.get(pageNumber - 1)
+                            : null;
                     optimizedPage = await fetchOptimizedPostPage(
                         type,
                         options,
@@ -8102,9 +8443,7 @@ export function initApp() {
             const cachedPage = userPageCache?.pages.get(pageNumber);
 
             if (cachedPage) {
-                users = Array.isArray(cachedPage.users)
-                    ? cachedPage.users
-                    : [];
+                users = Array.isArray(cachedPage.users) ? cachedPage.users : [];
                 hasMoreForPage = Boolean(cachedPage.hasMore);
             } else {
                 const selectColumns =
@@ -8156,7 +8495,8 @@ export function initApp() {
                         users.sort(options.sortResults);
                     }
                 }
-                if (type !== 'search') hasMoreForPage = users.length >= pageSize;
+                if (type !== 'search')
+                    hasMoreForPage = users.length >= pageSize;
                 if (!error && userPageCache)
                     savePostPageCache(userPageCache, pageNumber, {
                         users,
@@ -8164,7 +8504,10 @@ export function initApp() {
                     });
             }
 
-            if (typeof options.isCurrent === 'function' && !options.isCurrent()) {
+            if (
+                typeof options.isCurrent === 'function' &&
+                !options.isCurrent()
+            ) {
                 setIsLoadingMore(false);
                 return;
             }
@@ -8503,7 +8846,7 @@ export function initApp() {
             cmessage = 'このポストのピン留めを解除しますか?';
             emessage = 'ポストのピン留めの解除';
         }
-        if (!await showAppConfirm(cmessage)) return;
+        if (!(await showAppConfirm(cmessage))) return;
         showLoading(true);
         try {
             const { data: pinId, error: fetchError } = await api.rpc(
@@ -8526,7 +8869,7 @@ export function initApp() {
     };
     window.deletePost = async (postId) => {
         if (!getCurrentUser()) return showAppAlert('ログインが必要です。');
-        if (!await showAppConfirm('このポストを削除しますか?')) return;
+        if (!(await showAppConfirm('このポストを削除しますか?'))) return;
         showLoading(true);
         try {
             const { data: postData, error: fetchError } = await api
@@ -8989,7 +9332,12 @@ export function initApp() {
         userIdToRemove,
         userNameToRemove,
     ) {
-        if (!await showAppConfirm(`${userNameToRemove}さんをDMから削除しますか?`)) return;
+        if (
+            !(await showAppConfirm(
+                `${userNameToRemove}さんをDMから削除しますか?`,
+            ))
+        )
+            return;
 
         const { data: dm } = await api
             .from('dm')
@@ -9019,7 +9367,11 @@ export function initApp() {
     }
 
     async function handleSetHostDmMember(dmId, userIdToHost, userNameToHost) {
-        if (!await showAppConfirm(`${userNameToHost}さんに管理者権限を譲渡しますか?`))
+        if (
+            !(await showAppConfirm(
+                `${userNameToHost}さんに管理者権限を譲渡しますか?`,
+            ))
+        )
             return;
 
         // わんちゃん失敗するけど管理者権限無いとシステムメッセージ送れないので先に送信
@@ -9045,7 +9397,8 @@ export function initApp() {
     }
 
     async function handleAddDmMember(dmId, userIdToAdd, userNameToAdd) {
-        if (!await showAppConfirm(`${userNameToAdd}さんをDMに追加しますか？`)) return;
+        if (!(await showAppConfirm(`${userNameToAdd}さんをDMに追加しますか？`)))
+            return;
 
         const { data: dm } = await api
             .from('dm')
@@ -9079,7 +9432,7 @@ export function initApp() {
     }
 
     async function handleLeaveDm(dmId) {
-        if (!await showAppConfirm('本当にこのDMから退出しますか？')) return;
+        if (!(await showAppConfirm('本当にこのDMから退出しますか？'))) return;
         showLoading(true);
 
         try {
@@ -9112,7 +9465,11 @@ export function initApp() {
     }
 
     async function handleDisbandDm(dmId) {
-        if (!await showAppConfirm('本当にこのDMを解散しますか？この操作は取り消せません。'))
+        if (
+            !(await showAppConfirm(
+                '本当にこのDMを解散しますか？この操作は取り消せません。',
+            ))
+        )
             return;
         showLoading(true);
         try {
@@ -9199,7 +9556,9 @@ export function initApp() {
             '#edit-post-textarea',
         );
         if (!newContent)
-            return showAppAlert('内容を入力するか、ファイルを添付してください。');
+            return showAppAlert(
+                '内容を入力するか、ファイルを添付してください。',
+            );
 
         const button = DOM.editPostModal.querySelector('#update-post-button');
         button.disabled = true;
@@ -9267,11 +9626,11 @@ export function initApp() {
     // 秘密鍵は端末の localStorage にのみ保存し、サーバーには公開鍵だけを登録する。
     // ============================================
 
-	// 複数デバイスでのDM利用を優先するため、E2E暗号化は一時的に停止する。
-	// 既存の暗号化メッセージは、端末に残る鍵で閲覧できるよう復号処理だけ保持する。
-	const DM_E2E_ENABLED = false;
-	const DM_E2E_INFO_PREFIX = 'nyaitter-dm-v1';
-	const DM_E2E_KEY_STORAGE_PREFIX = 'nyaitter_dm_key_';
+    // 複数デバイスでのDM利用を優先するため、E2E暗号化は一時的に停止する。
+    // 既存の暗号化メッセージは、端末に残る鍵で閲覧できるよう復号処理だけ保持する。
+    const DM_E2E_ENABLED = false;
+    const DM_E2E_INFO_PREFIX = 'nyaitter-dm-v1';
+    const DM_E2E_KEY_STORAGE_PREFIX = 'nyaitter_dm_key_';
 
     function dmE2EBytesToBase64url(bytes) {
         let binary = '';
@@ -9551,7 +9910,11 @@ export function initApp() {
                 );
             }
             const targetUser = targetPayload.user;
-            if (!await showAppConfirm(`${targetUser.name}さんとのDMを開始しますか？`))
+            if (
+                !(await showAppConfirm(
+                    `${targetUser.name}さんとのDMを開始しますか？`,
+                ))
+            )
                 return;
 
             const members = [getCurrentUser().id, normalizedTargetUserId].sort(
@@ -9668,7 +10031,9 @@ export function initApp() {
 
             await emoji_picker_create(DOM.editDmMessageModalContent);
             attachMarkdownContentEditor(
-                DOM.editDmMessageModalContent.querySelector('#edit-dm-textarea'),
+                DOM.editDmMessageModalContent.querySelector(
+                    '#edit-dm-textarea',
+                ),
             );
 
             updatePreview();
@@ -9819,7 +10184,7 @@ export function initApp() {
     }
 
     async function handleDeleteDmMessage(dmId, messageId) {
-        if (!await showAppConfirm('このメッセージを削除しますか?')) return;
+        if (!(await showAppConfirm('このメッセージを削除しますか?'))) return;
         showLoading(true);
         try {
             const { data: dm, error: fetchError } = await api
@@ -10048,7 +10413,8 @@ export function initApp() {
         description.focus();
 
         modal.querySelector('.modal-close-btn').onclick = closeReportModal;
-        modal.querySelector('[data-action="close-report-modal"]').onclick = closeReportModal;
+        modal.querySelector('[data-action="close-report-modal"]').onclick =
+            closeReportModal;
         modal.onclick = (event) => {
             if (event.target === modal) closeReportModal();
         };
@@ -10061,20 +10427,28 @@ export function initApp() {
                 method: 'POST',
                 body: {
                     target_kind: targetKind,
-                    target_id: targetKind === 'dm' ? String(targetId) : Number(targetId),
+                    target_id:
+                        targetKind === 'dm'
+                            ? String(targetId)
+                            : Number(targetId),
                     description: description.value,
                 },
             });
             submit.disabled = false;
             if (error) {
                 if (errorElement) {
-                    errorElement.textContent = error.message || String(error) || '報告を送信できませんでした。';
+                    errorElement.textContent =
+                        error.message ||
+                        String(error) ||
+                        '報告を送信できませんでした。';
                     errorElement.classList.remove('hidden');
                 }
                 return;
             }
             closeReportModal();
-            await showAppAlert('報告を送信しました。ご協力ありがとうございます。');
+            await showAppAlert(
+                '報告を送信しました。ご協力ありがとうございます。',
+            );
         };
     }
 
@@ -10165,7 +10539,8 @@ export function initApp() {
 
             const freezeBtn = document.createElement('button');
             const isFrozen =
-                targetUser.account_state === 'frozen' || Boolean(targetUser.freeze);
+                targetUser.account_state === 'frozen' ||
+                Boolean(targetUser.freeze);
             freezeBtn.textContent = isFrozen
                 ? '凍結を解除'
                 : 'アカウントを凍結';
@@ -10198,7 +10573,11 @@ export function initApp() {
         const newVerifyStatus = !targetUser.verify;
         const actionText = newVerifyStatus ? '認証' : '認証の取り消し';
 
-        if (await showAppConfirm(`本当にこのユーザーの${actionText}を行いますか?`)) {
+        if (
+            await showAppConfirm(
+                `本当にこのユーザーの${actionText}を行いますか?`,
+            )
+        ) {
             const { error } = await api
                 .from('user')
                 .update({ verify: newVerifyStatus })
@@ -10216,7 +10595,11 @@ export function initApp() {
     }
 
     async function adminSendNotice(targetUserId) {
-        if (!await showAppConfirm('このユーザーへ管理者からのお知らせ通知を送信しますか？'))
+        if (
+            !(await showAppConfirm(
+                'このユーザーへ管理者からのお知らせ通知を送信しますか？',
+            ))
+        )
             return;
         await sendNotification(targetUserId, 'admin_notice', {
             kind: 'route',
@@ -10229,7 +10612,11 @@ export function initApp() {
         const newShadowStatus = !targetUser.shadow;
         const actionText = newShadowStatus ? '有効' : '無効';
 
-        if (await showAppConfirm(`本当にこのユーザーの検索除外を${actionText}にしますか?`)) {
+        if (
+            await showAppConfirm(
+                `本当にこのユーザーの検索除外を${actionText}にしますか?`,
+            )
+        ) {
             const { error } = await api.rpc('admin_set_status', {
                 p_id: targetUser.id,
                 p_shadow: newShadowStatus,
@@ -10252,7 +10639,9 @@ export function initApp() {
         );
         if (reason && reason.trim()) {
             if (
-                await showAppConfirm(`本当にこのユーザーを凍結しますか？\n理由: ${reason}`)
+                await showAppConfirm(
+                    `本当にこのユーザーを凍結しますか？\n理由: ${reason}`,
+                )
             ) {
                 const { error } = await api
                     .from('user')
@@ -10273,7 +10662,8 @@ export function initApp() {
     }
 
     async function adminUnfreezeAccount(targetUserId) {
-        if (!await showAppConfirm('このユーザーの凍結を解除しますか？')) return;
+        if (!(await showAppConfirm('このユーザーの凍結を解除しますか？')))
+            return;
 
         const { error } = await api
             .from('user')
@@ -10552,9 +10942,7 @@ export function initApp() {
         }
 
         const actionTarget = target.closest('[data-action]');
-        if (
-            actionTarget?.dataset.action === 'refresh-realtime-timeline'
-        ) {
+        if (actionTarget?.dataset.action === 'refresh-realtime-timeline') {
             e.preventDefault();
             clearRealtimeTimelineUpdate();
             void switchTimelineTab(getCurrentTimelineTab(), {
@@ -10584,9 +10972,18 @@ export function initApp() {
         }
         const reportDmMessageButton = target.closest('.report-dm-message-btn');
         if (reportDmMessageButton) {
-            const dmId = String(reportDmMessageButton.dataset.dmId || '').trim();
-            const messageId = String(reportDmMessageButton.dataset.messageId || '').trim();
-            if (dmId && messageId && dmId.length <= 128 && messageId.length <= 128) {
+            const dmId = String(
+                reportDmMessageButton.dataset.dmId || '',
+            ).trim();
+            const messageId = String(
+                reportDmMessageButton.dataset.messageId || '',
+            ).trim();
+            if (
+                dmId &&
+                messageId &&
+                dmId.length <= 128 &&
+                messageId.length <= 128
+            ) {
                 e.preventDefault();
                 e.stopPropagation();
                 openReportModal({
@@ -10594,7 +10991,9 @@ export function initApp() {
                     targetId: `${dmId}:${messageId}`,
                     targetLabel: 'このメッセージ',
                 });
-                reportDmMessageButton.closest('.post-menu')?.classList.remove('is-visible');
+                reportDmMessageButton
+                    .closest('.post-menu')
+                    ?.classList.remove('is-visible');
             }
             return;
         }

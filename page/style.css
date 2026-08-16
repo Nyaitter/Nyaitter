@@ -536,6 +536,8 @@ img.emoji {
     display: flex;
     justify-content: center;
     align-items: center;
+
+    transition: background-color 0.2s;
 }
 
 .timeline-tab-button:hover {
@@ -643,6 +645,7 @@ img.emoji {
 .post-form-actions #post-submit-button {
     background-color: var(--primary-color);
     color: white;
+    transition: background-color 0.2s;
 }
 
 .post-form-actions #post-submit-button:hover {
@@ -790,12 +793,14 @@ textarea.markdown-content-editor::placeholder {
     -webkit-text-fill-color: currentColor;
 }
 
-.markdown-textarea-editor.is-plain-textarea .markdown-content-editor::selection {
+.markdown-textarea-editor.is-plain-textarea
+    .markdown-content-editor::selection {
     color: var(--text-color);
     background: color-mix(in srgb, var(--primary-color) 35%, transparent);
 }
 
-.markdown-textarea-editor.is-plain-textarea .markdown-content-editor::placeholder {
+.markdown-textarea-editor.is-plain-textarea
+    .markdown-content-editor::placeholder {
     color: var(--secondary-text-color) !important;
     -webkit-text-fill-color: var(--secondary-text-color);
     opacity: 1;
@@ -996,7 +1001,6 @@ textarea.markdown-content-editor::placeholder {
     background: transparent;
 }
 
-
 .file-preview-item {
     position: relative;
 }
@@ -1152,7 +1156,6 @@ em-emoji-picker {
 }
 
 .post-content p,
-.dm-message p,
 .dm-system-message p {
     margin: 0 0 0.65rem;
 }
@@ -1172,13 +1175,19 @@ em-emoji-picker {
 
 .post-content h1,
 .dm-message h1,
-.dm-system-message h1 { font-size: 1.25em; }
+.dm-system-message h1 {
+    font-size: 1.25em;
+}
 .post-content h2,
 .dm-message h2,
-.dm-system-message h2 { font-size: 1.12em; }
+.dm-system-message h2 {
+    font-size: 1.12em;
+}
 .post-content h3,
 .dm-message h3,
-.dm-system-message h3 { font-size: 1em; }
+.dm-system-message h3 {
+    font-size: 1em;
+}
 
 .post-content blockquote,
 .dm-message blockquote,
@@ -1246,7 +1255,11 @@ em-emoji-picker {
 }
 
 .markdown-spoiler.is-revealed {
-    background: color-mix(in srgb, var(--secondary-text-color) 16%, transparent);
+    background: color-mix(
+        in srgb,
+        var(--secondary-text-color) 16%,
+        transparent
+    );
     cursor: text;
     user-select: text;
 }
@@ -2192,6 +2205,7 @@ body.dark .recommend-user button {
     color: var(--secondary-text-color);
     font-weight: 500;
     position: relative;
+    transition: background-color 0.2s;
 }
 
 .tab-button:hover {
@@ -2852,15 +2866,13 @@ body.dark .recommend-user button {
 .dm-message-form button:hover {
     background-color: var(--primary-hover-color);
 }
-#dm-attachment-btn:hover {
-    background-color: #e8f5fd;
-}
 
 .dm-message-form button svg {
     width: 20px;
     height: 20px;
     fill: none; /* デフォルトで塗りつぶしなし */
     stroke: currentColor;
+    transition: background-color 0.2s;
 }
 .dm-message-form #send-dm-btn svg {
     fill: none;
@@ -3035,7 +3047,7 @@ body.dark .recommend-user button {
 }
 .post-content p,
 .dm-message p {
-    margin-top: 0.8em; /* pタグの上にだけマージンを設定 */
+    margin-top: 0;
 }
 /* 連続するpタグはマージンを詰める */
 .post-content p + p,
@@ -4732,9 +4744,15 @@ body.dark .settings-bot-new-key-box {
 }
 
 @media (max-width: 480px) {
-    .freeze-panel { padding: 1.45rem; }
-    .freeze-appeal-modal-actions { flex-direction: column-reverse; }
-    .freeze-appeal-modal-actions button { width: 100%; }
+    .freeze-panel {
+        padding: 1.45rem;
+    }
+    .freeze-appeal-modal-actions {
+        flex-direction: column-reverse;
+    }
+    .freeze-appeal-modal-actions button {
+        width: 100%;
+    }
 }
 
 /* 認証申請 */
@@ -4915,7 +4933,10 @@ body.dark .settings-bot-new-key-box {
         z-index: 110;
         opacity: var(--pull-opacity);
         transform: translate(-50%, calc(-5.25rem + var(--pull-distance)));
-        transition: transform 180ms ease-out, opacity 150ms ease-out, color 150ms ease-out;
+        transition:
+            transform 180ms ease-out,
+            opacity 150ms ease-out,
+            color 150ms ease-out;
         will-change: transform, opacity;
     }
 
