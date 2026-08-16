@@ -107,7 +107,7 @@ Push通知を有効にするには、`VAPID_SUBJECT`、`VAPID_PUBLIC_KEY`、`VAP
 | APIパス | `NYAITTER_API_ENDPOINT`、`server.apiEndpoint` |
 | ユーザーファイル | `NYAITTER_USER_FILES_ENDPOINT`、`NYAITTER_USER_FILES_PORT`、`userFiles.endpoint`、`userFiles.port` |
 | Client同期 | `NYAITTER_CLIENT_REPOSITORY`、`client.repository` |
-| CORS | `NYAITTER_CORS_ALLOWED_ORIGINS`、`cors.allowedOrigins` |
+| CORS | `NYAITTER_CORS_ALLOWED_ORIGINS`、`NYAITTER_CORS_CREDENTIALS`、`cors.allowedOrigins`、`cors.credentials` |
 | DB | `DB_ADAPTER`、`DATABASE_URL`、`D1_WORKER_URL`、`D1_WORKER_TOKEN` |
 | ストレージ | `STORAGE_ADAPTER`、`STORAGE_USER_QUOTA_MB`、`R2_*` |
 | Push通知 | `VAPID_SUBJECT`、`VAPID_PUBLIC_KEY`、`VAPID_PRIVATE_KEY` |
@@ -118,18 +118,21 @@ CORSで別ドメインに配置したClientからAPIを利用する場合は、�
 {
   "cors": {
     "allowedOrigins": [
-      "https://client.example.com",
-      "https://admin.example.com"
-    ]
+      "https://nyaitter.jp"
+    ],
+    "credentials": true
   }
 }
 ```
 
 ```dotenv
-NYAITTER_CORS_ALLOWED_ORIGINS=https://client.example.com,https://admin.example.com
+NYAITTER_CORS_ALLOWED_ORIGINS=https://nyaitter.jp
+NYAITTER_CORS_CREDENTIALS=true
 ```
 
 環境変数が設定されている場合は `cors.allowedOrigins` より優先されます。既存の `ALLOWED_ORIGINS` も互換性のため引き続き利用できますが、新規の設定では `NYAITTER_CORS_ALLOWED_ORIGINS` を使用してください。
+
+Cookieを含む要求を別オリジンのClientから送る場合は、`cors.credentials` または `NYAITTER_CORS_CREDENTIALS=true` を設定します。この場合、許可オリジンはワイルドカードにせず、`https://nyaitter.jp` のように信頼するClientを明示指定してください。許可されたオリジンには `Access-Control-Allow-Credentials: true` を返し、Cookieを伴う状態変更要求もそのオリジンだけを受け付けます。
 
 ### 制限値とレート制限
 

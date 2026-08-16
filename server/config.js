@@ -226,7 +226,10 @@ const config = {
     // NYAITTER_CORS_ALLOWED_ORIGINS takes a comma-separated list of origins.
     // config.json uses an array at cors.allowedOrigins.
     allowedOrigins: normalizeCorsAllowedOrigins(corsAllowedOriginsSetting()),
-    credentials: get('cors.credentials', false),
+    credentials: envBoolean(
+      'NYAITTER_CORS_CREDENTIALS',
+      get('cors.credentials', false),
+    ),
     preflightMaxAge: get('cors.preflightMaxAge', 600),
   },
 

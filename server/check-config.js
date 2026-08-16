@@ -181,6 +181,33 @@ function inspect() {
         }
     }
 
+    const corsCredentialsValue = firstSetting(
+        ['NYAITTER_CORS_CREDENTIALS'],
+        config,
+        ['cors.credentials'],
+        false,
+    );
+    const corsCredentialsText = String(corsCredentialsValue).trim().toLowerCase();
+    const corsCredentialsEnabled = ['true', '1', 'yes', 'on'].includes(corsCredentialsText);
+    const corsCredentialsValid =
+        typeof corsCredentialsValue === 'boolean' ||
+        ['true', '1', 'yes', 'on', 'false', '0', 'no', 'off'].includes(corsCredentialsText);
+    if (!corsCredentialsValid) {
+        addIssue(
+            'error',
+            'CORS_CREDENTIALS_INVALID',
+            `CORS資格情報の設定が無効です: ${corsCredentialsValue}`,
+            'NYAITTER_CORS_CREDENTIALS または cors.credentials に true または false を設定してください。',
+        );
+    } else if (corsCredentialsEnabled && (!corsOrigins || corsOrigins.length === 0)) {
+        addIssue(
+            'error',
+            'CORS_CREDENTIALS_ORIGINS_REQUIRED',
+            '資格情報付きCORSが有効ですが、許可オリジンがありません。',
+            'NYAITTER_CORS_ALLOWED_ORIGINS または cors.allowedOrigins に、信頼するClientのHTTP(S)オリジンを設定してください。',
+        );
+    }
+
     const rangeSettings = [
         ['ポスト本文の文字数制限', 'NYAITTER_LIMIT_POST_CONTENT_LENGTH', 'limits.postContentLength', '..1000', 0, false],
         ['DM本文の文字数制限', 'NYAITTER_LIMIT_DM_CONTENT_LENGTH', 'limits.dmContentLength', '..2000', 0, false],

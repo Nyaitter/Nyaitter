@@ -143,12 +143,15 @@ function isSameOriginRequest(req) {
 
   if (config.federation?.publicUrl) {
     try {
-      return origin === new URL(config.federation.publicUrl).origin;
+      if (origin === new URL(config.federation.publicUrl).origin) return true;
     } catch (_) {
-      return false;
+      // Invalid federation URL is not an allowed browser origin.
     }
   }
-  return false;
+
+  // Cookieを伴うクロスオリジン要求は、資格情報付きCORSを明示的に有効化し、
+  // allowedOriginsへ登録したClientだけを信頼する。
+  return config.cors.credentials === true && (config.cors.allowedOrigins || []).includes(origin);
 }
 
 /**
