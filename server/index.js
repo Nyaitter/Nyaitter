@@ -58,7 +58,14 @@ const app = express();
 app.disable('x-powered-by'); // セキュリティ: Express バージョンを隠す
 
 const PORT = config.server.port;
+const API_ENDPOINT = config.server.apiEndpoint;
+const apiPath = (suffix = '') => {
+    const normalizedSuffix = String(suffix || '').replace(/^\/+/, '');
+    if (API_ENDPOINT === '/') return normalizedSuffix ? `/${normalizedSuffix}` : '/';
+    return normalizedSuffix ? `${API_ENDPOINT}/${normalizedSuffix}` : API_ENDPOINT;
+};
 const httpServer = http.createServer(app);
+let userFilesServer = null;
 const realtimeConnections = new ConnectionManager();
 const realtimeServer = new WebSocketServer({
     noServer: true,
@@ -71,30 +78,30 @@ applyTrustProxy(app);
 
 // API以外の静的アセットには本文解析・ID生成・CORS/CSRF処理を行わない。
 // 高頻度のCSS・JS・画像配信で不要なCPU消費と短命オブジェクトの生成を抑える。
-app.use('/server', express.json({ limit: config.server.jsonBodyLimit }));
+app.use(API_ENDPOINT, express.json({ limit: config.server.jsonBodyLimit }));
 app.use(
-    '/server',
+    API_ENDPOINT,
     express.urlencoded({
         extended: true,
         limit: config.server.jsonBodyLimit,
         parameterLimit: 100,
     }),
 );
-app.use('/server', requestId);
+app.use(API_ENDPOINT, requestId);
 
 app.use(securityHeaders);
 
-app.use('/server', flexibleCors);
-app.use('/server', csrfProtection);
+app.use(API_ENDPOINT, flexibleCors);
+app.use(API_ENDPOINT, csrfProtection);
 
-app.use('/server', generalLimiter);
-app.use('/server/auth', authLimiter);
-app.use('/server', requestLogger);
+app.use(API_ENDPOINT, generalLimiter);
+app.use(apiPath('/auth'), authLimiter);
+app.use(API_ENDPOINT, requestLogger);
 
 app.use(
-	'/server/apidocs',
-	swaggerUi.serve,
-	swaggerUi.setup(swaggerDocument)
+    apiPath('/apidocs'),
+    swaggerUi.serve,
+    swaggerUi.setup(swaggerDocument),
 );
 
 function isAllowedRealtimeOrigin(request) {
@@ -152,7 +159,7 @@ async function handleRealtimeUpgrade(request, socket, head) {
     } catch (_) {
         return rejectRealtimeUpgrade(socket, 400, 'Bad Request');
     }
-    if (parsedUrl.pathname !== '/server/realtime') {
+    if (parsedUrl.pathname !== apiPath('/realtime')) {
         return socket.destroy();
     }
     if (!isAllowedRealtimeOrigin(request)) {
@@ -244,7 +251,7 @@ const realtimeHeartbeat = setInterval(() => {
 }, 30000);
 realtimeHeartbeat.unref();
 
-app.get('/server/health', async (req, res) => {
+app.get(apiPath('/health'), async (req, res) => {
     const base = {
         status: 'ok',
         timestamp: new Date().toISOString(),
@@ -274,7 +281,7 @@ app.get('/server/health', async (req, res) => {
     res.json(base);
 });
 
-app.get('/server/ready', async (req, res) => {
+app.get(apiPath('/ready'), async (req, res) => {
     try {
         const db = app.locals.dbAdapter;
         if (db && typeof db.getUserById === 'function') {
@@ -286,30 +293,37 @@ app.get('/server/ready', async (req, res) => {
     }
 });
 
-app.use('/server/api', require('./routes/status'));
-app.use('/server/api/posts', require('./routes/posts'));
-app.use('/server/api/ranking', require('./routes/ranking'));
-app.use('/server/api/ui', require('./routes/ui'));
-app.use('/server/api/dm', require('./routes/dm'));
-app.use('/server/api/users', require('./routes/users'));
+const restRoutes = [
+    ['', require('./routes/status')],
+    ['posts', require('./routes/posts')],
+    ['uploads', require('./routes/uploads')],
+    ['ranking', require('./routes/ranking')],
+    ['ui', require('./routes/ui')],
+    ['dm', require('./routes/dm')],
+    ['users', require('./routes/users')],
+    ['notifications', require('./routes/notifications')],
+    ['reports', require('./routes/reports')],
+    ['appeals', require('./routes/appeals')],
+    ['verification-applications', require('./routes/verificationApplications')],
+    ['push', require('./routes/push')],
+];
 
-app.use('/server/api/notifications', require('./routes/notifications'));
-app.use('/server/api/reports', require('./routes/reports'));
-app.use('/server/api/appeals', require('./routes/appeals'));
-app.use(
-    '/server/api/verification-applications',
-    require('./routes/verificationApplications'),
-);
-app.use('/server/api/push', require('./routes/push'));
+for (const [resourcePath, router] of restRoutes) {
+    const resourceSuffix = resourcePath ? `/${resourcePath}` : '';
+    app.use(apiPath(resourceSuffix), router);
+    app.use(apiPath(`/api${resourceSuffix}`), router);
+}
 
-app.use('/server/auth', require('./routes/auth'));
+app.use(apiPath('/auth'), require('./routes/auth'));
 
 
 
 // Must come AFTER API routes so /server/* takes precedence
 
 const pageDir = path.join(__dirname, '../page');
+const hasStaticPage = fs.existsSync(pageDir) && fs.statSync(pageDir).isDirectory();
 
+if (hasStaticPage) {
 app.use((req, res, next) => {
     if (req.method !== 'GET' && req.method !== 'HEAD') {
         return next();
@@ -408,22 +422,47 @@ app.use(
         },
     }),
 );
+} else {
+    console.info('[server] page/ directory not found; static file serving is disabled.');
+}
 
-// Serve uploaded files (for local storage adapter). Resolve relative paths from
-// the process working directory, matching LocalStorageAdapter's resolution rule.
+// ユーザーファイルは、明示的に公開エンドポイントが設定された場合だけ配信する。
+// endpoint未設定時は、R2など外部ストレージの公開ドメインをClientから直接使う。
 const configuredUploadDir = config.storage?.local?.uploadDir || './uploads';
 const uploadsDir = path.isAbsolute(configuredUploadDir)
     ? configuredUploadDir
     : path.resolve(process.cwd(), configuredUploadDir);
-app.use(
-    '/uploads',
-    express.static(uploadsDir, {
-        maxAge: '7d',
-        setHeaders: (res) => {
-            res.setHeader('X-Content-Type-Options', 'nosniff');
-        },
-    }),
-);
+const userFilesEndpoint = config.userFiles?.endpoint;
+const userFilesPort = config.userFiles?.port;
+const createUserFilesApp = () => {
+    const userFilesApp = express();
+    userFilesApp.disable('x-powered-by');
+    userFilesApp.use(
+        userFilesEndpoint,
+        express.static(uploadsDir, {
+            maxAge: '7d',
+            setHeaders: (res) => {
+                res.setHeader('X-Content-Type-Options', 'nosniff');
+            },
+        }),
+    );
+    return userFilesApp;
+};
+
+if (userFilesEndpoint) {
+    if (userFilesPort) {
+        userFilesServer = http.createServer(createUserFilesApp());
+    } else {
+        app.use(userFilesEndpoint, express.static(uploadsDir, {
+            maxAge: '7d',
+            setHeaders: (res) => {
+                res.setHeader('X-Content-Type-Options', 'nosniff');
+            },
+        }));
+    }
+} else {
+    console.info('[server] User-file endpoint is not configured; user-file serving is disabled.');
+}
 
 // The app uses hash routing (#/post/123 etc.), so we do NOT need a catch-all
 // rewrite to index.html. If someone hits a non-existent deep path without
@@ -443,12 +482,14 @@ app.use((err, req, res, next) => {
     });
 });
 
-app.use('/server', (req, res) => {
-    res.status(404).json({
-        error: 'Not Found',
-        path: req.originalUrl,
+if (API_ENDPOINT !== '/') {
+    app.use(API_ENDPOINT, (req, res) => {
+        res.status(404).json({
+            error: 'Not Found',
+            path: req.originalUrl,
+        });
     });
-});
+}
 
 const dbAdapter = createDatabaseAdapter();
 const storageAdapter = createStorageAdapter();
@@ -528,13 +569,21 @@ async function startServer() {
 ╠══════════════════════════════════════════════════════════════
 ║  Server running at:   http://localhost:${PORT}
 ║
-║  Health check:        http://localhost:${PORT}/server/health
+║  Health check:        http://localhost:${PORT}${apiPath('/health')}
 ║  Frontend (SPA):      http://localhost:${PORT}/
 ║
 ║  DB Adapter:      ${process.env.DB_ADAPTER || 'memory'}
 ║  Storage Adapter: ${process.env.STORAGE_ADAPTER || 'local'}
 ╚══════════════════════════════════════════════════════════════
 `);
+        if (userFilesServer) {
+            userFilesServer.once('error', (error) => {
+                console.error(`[user-files] Failed to listen on port ${userFilesPort}:`, error.message);
+            });
+            userFilesServer.listen(userFilesPort, () => {
+                console.log(`[user-files] Serving ${userFilesEndpoint} on http://localhost:${userFilesPort}${userFilesEndpoint}`);
+            });
+        }
         console.log('[server] Ready. DB Adapter initialized.');
     });
 }
@@ -565,6 +614,11 @@ async function shutdown(signal) {
             if (!httpServer.listening) return resolve();
             httpServer.close(() => resolve());
         });
+        await new Promise((resolve) => {
+            if (!userFilesServer?.listening) return resolve();
+            userFilesServer.close(() => resolve());
+        });
+        userFilesServer = null;
 
         if (dbAdapter && typeof dbAdapter.disconnect === 'function') {
             await dbAdapter.disconnect();

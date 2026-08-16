@@ -31,16 +31,69 @@ function envNonNegativeInteger(name, fallback) {
   return Number.isInteger(normalizedFallback) && normalizedFallback >= 0 ? normalizedFallback : 0;
 }
 
+function normalizeApiEndpoint(value, fallback = '/server') {
+  const candidate = String(value === undefined || value === null ? fallback : value).trim();
+  if (!candidate) return fallback;
+  if (!candidate.startsWith('/')) {
+    console.warn('[config] API endpoint must start with "/"; using configured default.');
+    return normalizeApiEndpoint(fallback, '/server');
+  }
+  if (candidate === '/') return '/';
+  return `/${candidate.replace(/^\/+|\/+$/g, '')}`;
+}
+
+function normalizeUserFilesEndpoint(value) {
+  const candidate = String(value === undefined || value === null ? '' : value).trim();
+  if (!candidate) return null;
+  if (!candidate.startsWith('/')) {
+    console.warn('[config] User-files endpoint must start with "/"; file serving is disabled.');
+    return null;
+  }
+  if (candidate === '/') return '/';
+  return `/${candidate.replace(/^\/+|\/+$/g, '')}`;
+}
+
+function optionalPort(name, value) {
+  if (value === undefined || value === null || String(value).trim() === '') return null;
+  const parsed = Number(value);
+  if (Number.isInteger(parsed) && parsed >= 1 && parsed <= 65535) return parsed;
+  console.warn(`[config] ${name} must be an integer between 1 and 65535; file serving is disabled.`);
+  return null;
+}
+
 const config = {
   server: {
     port: parseInt(process.env.PORT, 10) || get('server.port', 3000),
     jsonBodyLimit: process.env.JSON_BODY_LIMIT || get('server.jsonBodyLimit', '2mb'),
     trustProxy: process.env.TRUST_PROXY === 'true' || get('server.trustProxy', false),
+    apiEndpoint: normalizeApiEndpoint(
+      process.env.NYAITTER_API_ENDPOINT || get('server.apiEndpoint', '/server'),
+    ),
+  },
+
+  userFiles: {
+    endpoint: normalizeUserFilesEndpoint(
+      process.env.NYAITTER_USER_FILES_ENDPOINT !== undefined
+        ? process.env.NYAITTER_USER_FILES_ENDPOINT
+        : get('userFiles.endpoint', ''),
+    ),
+    port: optionalPort(
+      'NYAITTER_USER_FILES_PORT',
+      process.env.NYAITTER_USER_FILES_PORT !== undefined
+        ? process.env.NYAITTER_USER_FILES_PORT
+        : get('userFiles.port', null),
+    ),
   },
 
   static: {
     jsCssCacheMaxAge: get('static.jsCssCacheMaxAge', 3600),
     assetCacheMaxAge: get('static.assetCacheMaxAge', 86400),
+  },
+
+  client: {
+    repository:
+      process.env.NYAITTER_CLIENT_REPOSITORY ||
+      get('client.repository', 'Nyaitter/Client'),
   },
 
   cors: {
@@ -226,6 +279,9 @@ function validateConfig() {
 
   if (config.server.port < 1 || config.server.port > 65535) {
     errors.push('server.port must be between 1 and 65535');
+  }
+  if (config.userFiles.port && config.userFiles.port === config.server.port) {
+    errors.push('userFiles.port must differ from server.port');
   }
 
   if (errors.length > 0) {

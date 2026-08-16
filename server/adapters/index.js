@@ -46,10 +46,14 @@ function createStorageAdapter() {
 		{ userQuotaMB: config.storage.userQuotaMB },
 	);
 
-	if (type === 'local' || type === 'filesystem') {
-		console.log('[adapters] Using LocalStorageAdapter');
-		return normalizeImages(new LocalStorageAdapter(config.storage.local));
-	}
+  if (type === 'local' || type === 'filesystem') {
+    console.log('[adapters] Using LocalStorageAdapter');
+    return normalizeImages(new LocalStorageAdapter({
+      ...config.storage.local,
+      publicEndpoint: config.userFiles.endpoint,
+      publicPort: config.userFiles.port,
+    }));
+  }
 
 	if (type === 'r2' || type === 'cloudflare-r2') {
 		console.log('[adapters] Using R2StorageAdapter');

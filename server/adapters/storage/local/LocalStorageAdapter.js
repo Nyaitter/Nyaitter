@@ -13,6 +13,13 @@ class LocalStorageAdapter extends StorageAdapter {
   constructor(options = {}) {
     super();
     this.uploadDir = path.resolve(options.uploadDir || './uploads');
+    this.publicEndpoint = typeof options.publicEndpoint === 'string'
+      ? options.publicEndpoint.replace(/\/+$/, '') || null
+      : null;
+  }
+
+  _getPublicUrl(normalizedKey) {
+    return this.publicEndpoint ? `${this.publicEndpoint}/${normalizedKey}` : null;
   }
 
   async _ensureDir(dir) {
@@ -53,7 +60,7 @@ class LocalStorageAdapter extends StorageAdapter {
 
     return {
       id: normalizedKey,
-      url: `/uploads/${normalizedKey}`,
+      url: this._getPublicUrl(normalizedKey),
       key: normalizedKey,
     };
   }
@@ -69,7 +76,7 @@ class LocalStorageAdapter extends StorageAdapter {
 
   async getPublicUrl(fileId) {
     const { normalizedKey } = this._resolveStorageKey(fileId);
-    return `/uploads/${normalizedKey}`;
+    return this._getPublicUrl(normalizedKey);
   }
 
   async deleteMany(fileIds) {

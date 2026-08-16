@@ -2,11 +2,19 @@
 	"server": {
 		"port": 3000,
 		"jsonBodyLimit": "7mb",
-		"trustProxy": false
+		"trustProxy": false,
+		"apiEndpoint": "/server"
+	},
+	"userFiles": {
+		"endpoint": "",
+		"port": null
 	},
 	"static": {
 		"jsCssCacheMaxAge": 3600,
 		"assetCacheMaxAge": 86400
+	},
+	"client": {
+		"repository": "Nyaitter/Client"
 	},
 	"cors": {
 		"allowedOrigins": ["http://localhost:3000", "http://127.0.0.1:3000"],

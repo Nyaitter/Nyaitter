@@ -4,10 +4,9 @@
   "private": true,
   "description": "Nyaitter Server",
   "scripts": {
-    "dev:server": "node server/index.js",
     "start": "node server/index.js",
-    "server": "node server/index.js",
-    "build:emoji-mart": "node audit/build_emoji_mart_local.js",
+    "check:config": "node server/check-config.js",
+    "sync:client": "node server/sync-client.js",
     "swagger": "node server/swagger.js",
     "cli": "node server/cli.js"
   },

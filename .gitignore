@@ -3,3 +3,7 @@ node_modules
 
 # Local server environment settings
 /server/.env
+
+# NyaitterClient is synced independently into page/
+/page/
+/uploads/
