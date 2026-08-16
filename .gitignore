@@ -6,4 +6,6 @@ node_modules
 
 # NyaitterClient is synced independently into page/
 /page/
+
+# Runtime-uploaded user files
 /uploads/
