@@ -251,4 +251,5 @@ module.exports = {
   securityHeaders,
   getAuthenticatedPrincipal,
   extractToken,
+  isSameOriginRequest,
 };

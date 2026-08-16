@@ -1,32 +1,16 @@
 const express = require('express');
 const config = require('../config');
-const { requireAuth, extractToken } = require('../middleware/auth');
+const {
+  requireAuth,
+  extractToken,
+  isSameOriginRequest,
+} = require('../middleware/auth');
 const SessionManager = require('../services/auth/SessionManager');
 
 const router = express.Router();
 
 function getPushService(req) {
   return req.app.locals.pushNotificationService;
-}
-
-function isSameOriginRequest(req) {
-  const origin = req.headers.origin;
-  if (!origin) return true;
-
-  // req.protocol は Express の trust proxy 設定に従うため、
-  // クライアントが偽造した x-forwarded-proto を無条件に信頼しない。
-  const protocol = req.protocol === 'https' ? 'https' : 'http';
-  const expectedOrigin = `${protocol}://${req.get('host')}`;
-  if (origin === expectedOrigin) return true;
-
-  if (config.federation?.publicUrl) {
-    try {
-      return origin === new URL(config.federation.publicUrl).origin;
-    } catch (_) {
-      return false;
-    }
-  }
-  return false;
 }
 
 function requireSessionPrincipal(req, res, next) {
