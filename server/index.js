@@ -5,6 +5,8 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 const path = require('path');
 const fs = require('fs');
+const swaggerUi = require('swagger-ui-express');
+const swaggerDocument = require('./swagger-output.json');
 
 const config = require('./config');
 
@@ -58,6 +60,12 @@ app.use('/server', generalLimiter);
 app.use('/server/auth', authLimiter);
 
 app.use(requestLogger);
+
+app.use(
+	'/server/apidocs',
+	swaggerUi.serve,
+	swaggerUi.setup(swaggerDocument)
+);
 
 function isAllowedRealtimeOrigin(request) {
 	const origin = request.headers.origin;
@@ -236,6 +244,8 @@ app.use('/server/api/notifications', require('./routes/notifications'));
 app.use('/server/api/push', require('./routes/push'));
 
 app.use('/server/auth', require('./routes/auth'));
+
+
 
 // Must come AFTER API routes so /server/* takes precedence
 
