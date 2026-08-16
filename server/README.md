@@ -22,6 +22,7 @@ npm run dev:server
 | `/server/api/dm` | ダイレクトメッセージ |
 | `/server/api/users` | ユーザー検索・プロフィール |
 | `/server/auth/*` | ログイン関連 |
+| `/server/apidocs` | 各APIに関する情報を取得する(β) |
 | それ以外 | `page/` フォルダの静的ファイル（フロント画面） |
 
 例：
@@ -114,6 +115,7 @@ app.use('/server/api/posts', require('./routes/posts'));
 ```
 
 3. データベースは `req.app.locals.dbAdapter` 経由で使う
+4. API Docsの更新を`npm run swagger`で行う
 
 ## セキュリティの注意
 
