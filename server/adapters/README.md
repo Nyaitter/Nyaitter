@@ -1,51 +1,57 @@
-# データベースとストレージのアダプター
+# データベースとストレージの選び方
 
-Nyaitter サーバーは、データベースとファイル保存の実装をアダプターとして分離しています。アプリケーション層は `DatabaseAdapter` と `StorageAdapter` の契約を通して操作するため、開発・本番・Cloudflare 構成を切り替えられます。
+Nyaitter は、データベースとファイル保存先をアダプターとして切り替えられます。アプリ本体は同じ操作方法を使うため、開発用の保存先から公開運用向けの保存先へ変更できます。
 
-## 利用可能なアダプター
+## 使えるアダプター
 
-| 分類 | 実装 | 設定値 | 主な用途 |
-|---|---|---|---|
-| データベース | `InMemoryAdapter` | `DB_ADAPTER=memory` | 開発・自動テスト。再起動でデータが消える |
-| データベース | `PostgresAdapter` | `DB_ADAPTER=postgres` | PostgreSQL を使う通常の本番構成 |
-| データベース | `D1Adapter` | `DB_ADAPTER=d1` | 認証済み Worker プロキシ経由の Cloudflare D1 |
-| ストレージ | `LocalStorageAdapter` | `STORAGE_ADAPTER=local` | 開発・単一サーバーでの簡易保存 |
-| ストレージ | `R2StorageAdapter` | `STORAGE_ADAPTER=r2` または `cloudflare-r2` | Cloudflare R2 を使う実運用向け保存 |
+| 種類 | 設定値 | 使いどころ |
+|---|---|---|
+| メモリDB | `DB_ADAPTER=memory` | ローカル開発。再起動でデータが消えます。 |
+| PostgreSQL | `DB_ADAPTER=postgres` | 一般的な公開運用。 |
+| Cloudflare D1 | `DB_ADAPTER=d1` | D1 Proxy Workerを使う公開運用。 |
+| ローカル保存 | `STORAGE_ADAPTER=local` | 開発、または単一サーバー。 |
+| Cloudflare R2 | `STORAGE_ADAPTER=r2` | 複数サーバーや公開運用向け。 |
 
-## 基本的な切り替え
+## おすすめの組み合わせ
 
-環境変数は `server/config.json` の既定値を上書きします。秘密情報は `server/.env` またはデプロイ先のシークレット管理機能に置き、リポジトリへ追加しないでください。
+| 場面 | DB | ファイル保存 |
+|---|---|---|
+| 手元で試す | `memory` | `local` |
+| 一般的な公開運用 | `postgres` | `r2` |
+| Cloudflare中心の運用 | `d1` | `r2` |
+
+## ファイル保存の共通仕様
+
+ローカル保存とR2では、次の動きが共通です。
+
+- ファイルは `attachments/{ユーザーID}` のユーザー別領域へ保存します。
+- すべてのファイル形式を保存できます。
+- 画像はEXIFや位置情報を削除し、大きい場合は縮小・WebP圧縮します。
+- 保存量は圧縮後のサイズで数えます。
+- 1ユーザーの上限は初期設定で1 GBです。`STORAGE_USER_QUOTA_MB` または `storage.userQuotaMB` で変更できます。
+- 設定画面から使用量、ファイル一覧、削除操作を確認できます。
+
+> アダプターを増やす場合は、保存・削除・公開URL取得に加えて、使用量取得とファイル一覧取得も実装してください。
+
+## 設定例
 
 ```bash
-# 開発: メモリDBとローカルファイル保存
-DB_ADAPTER=memory STORAGE_ADAPTER=local npm run dev:server
+# 開発
+DB_ADAPTER=memory
+STORAGE_ADAPTER=local
 
-# PostgreSQL と R2 を使う例
-DB_ADAPTER=postgres DATABASE_URL='postgres://...' STORAGE_ADAPTER=r2 npm start
-
-# Cloudflare D1 Worker を使う例
-DB_ADAPTER=d1 D1_WORKER_URL='https://d1-proxy.example.workers.dev' \
-D1_WORKER_TOKEN='...' npm start
+# PostgreSQL + R2
+DB_ADAPTER=postgres
+DATABASE_URL='postgres://user:password@host:5432/nyaitter'
+STORAGE_ADAPTER=r2
+STORAGE_USER_QUOTA_MB=1024
 ```
 
-## 実装上の責務
+秘密情報は `server/.env` またはデプロイ先のシークレット管理へ置きます。`config.json` やGitへ書き込まないでください。
 
-アダプターは永続化・取得・原子的な更新を担います。一方、投稿の非公開状態、検索除外、双方向ブロック関係、通知・DMの閲覧制御のような**利用者間の共通ルールはアプリケーション層で判定**します。
-
-> 新しいアダプターを追加する場合も、可視性ルールを各アダプターのクエリへ複製しないでください。共通サービス・ユーティリティを経由し、すべての保存先で同じ結果になるようにします。
-
-## 新しいアダプターを作るとき
-
-1. `DatabaseAdapter` または `StorageAdapter` の必要なメソッドを実装します。
-2. 返却値の型・フィールド名を既存アダプターと揃えます。特にページング結果、DM 未読数、添付ファイルURLは互換性を確認します。
-3. いいね、スター、未読数など同時更新が必要な操作は、保存先側で原子的に扱います。
-4. 失敗時は原因を追跡できるエラーを返し、秘密情報をログへ出さないようにします。
-5. InMemory・PostgreSQL・D1 を横断するスモークテストを追加または実行します。
-
-## 関連ドキュメント
+## 関連文書
 
 - [PostgreSQL のセットアップ](../help/database-postgres.md)
 - [Cloudflare D1 と Worker](../help/database-d1-worker.md)
-- [Cloudflare R2 ストレージ](../help/storage-r2.md)
 - [ローカルストレージ](../help/storage-local.md)
-- [アダプターの設計と切り替え](../help/adapters-overview.md)
+- [Cloudflare R2](../help/storage-r2.md)

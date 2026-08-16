@@ -10,7 +10,6 @@ const {
 	serializeNotification,
 } = require('../utils/serialize');
 const {
-	CONTENT_TYPE_EXTENSIONS,
 	isOwnedAttachmentKey,
 	normalizeContentType,
 } = require('../adapters/storage/safeStoragePath');
@@ -208,10 +207,8 @@ function validateAttachmentReferences(attachments, userId) {
 			throw new Error('Invalid attachment');
 		}
 		if (attachment.data !== undefined) {
-			const contentType = normalizeContentType(attachment.contentType);
-			if (!CONTENT_TYPE_EXTENSIONS.has(contentType)) {
-				throw new Error('Unsupported attachment content type');
-			}
+			// MIMEタイプはクライアント申告値を保存するだけで、形式による拒否は行わない。
+			normalizeContentType(attachment.contentType);
 			decodeBase64File(attachment.data);
 			continue;
 		}
@@ -248,9 +245,6 @@ router.post('/uploads', requireAuth, async (req, res) => {
 	}
 
 	const normalizedContentType = normalizeContentType(contentType);
-	if (!CONTENT_TYPE_EXTENSIONS.has(normalizedContentType)) {
-		return res.status(415).json({ error: 'Unsupported file content type' });
-	}
 
 	let buffer;
 	try {
@@ -276,13 +270,49 @@ router.post('/uploads', requireAuth, async (req, res) => {
 		});
 
 		res.json(result);
-	} catch (err) {
-		console.error('[posts] upload error:', err);
-		res.status(500).json({ error: 'ファイルのアップロードに失敗しました' });
-	}
-});
+		} catch (err) {
+			console.error('[posts] upload error:', err);
+			if (err?.code === 'STORAGE_QUOTA_EXCEEDED') {
+				return res.status(413).json({
+					error: 'ストレージの保存上限を超えるため、アップロードできません。',
+					limit_bytes: err.limitBytes,
+					used_bytes: err.usedBytes,
+				});
+			}
+			if (Number.isInteger(err?.statusCode)) {
+				return res.status(err.statusCode).json({ error: err.message });
+			}
+			res.status(500).json({ error: 'ファイルのアップロードに失敗しました' });
+		}
+	});
 
-router.delete('/uploads', requireAuth, async (req, res) => {
+	router.get('/uploads/storage', requireAuth, async (req, res) => {
+		const storage = getStorageAdapter(req);
+		if (!storage || typeof storage.getUsage !== 'function' || typeof storage.listFiles !== 'function') {
+			return res.status(501).json({ error: 'Storage inventory is not available' });
+		}
+
+		const folder = `attachments/${req.user.id}`;
+		const limitBytes = Math.max(1, Number(config.storage?.userQuotaMB || 1024)) * 1024 * 1024;
+		try {
+			const [usedBytes, files] = await Promise.all([
+				storage.getUsage(folder),
+				storage.listFiles(folder, { limit: 500 }),
+			]);
+			res.json({
+				limit_mb: Number(config.storage?.userQuotaMB || 1024),
+				limit_bytes: limitBytes,
+				used_bytes: Math.max(0, Number(usedBytes) || 0),
+				used_percent: Math.min(100, ((Math.max(0, Number(usedBytes) || 0) / limitBytes) * 100)),
+				files: Array.isArray(files) ? files : [],
+			});
+		} catch (err) {
+			console.error('[posts] storage inventory error:', err);
+			res.status(500).json({ error: 'ストレージ情報の取得に失敗しました' });
+		}
+	});
+
+	router.delete('/uploads', requireAuth, async (req, res) => {
 	const storage = getStorageAdapter(req);
 	const { fileIds } = req.body || {};
 
@@ -382,31 +412,22 @@ router.post('/', requireAuth, async (req, res) => {
 			repostTo: repost_to || null,
 		});
 
-		if (reply_to && post.replyTo) {
-			const parent = await db.getPostById(post.replyTo);
-			if (parent && parent.userId !== userId) {
-					const notification = await createNotificationIfAllowed(db, {
-						userId: parent.userId,
-						type: 'reply',
-						fromUserId: userId,
+		const replyTargetId = Number(reply_to);
+		if (Number.isInteger(replyTargetId) && replyTargetId > 0) {
+			const parent = await db.getPostById(replyTargetId);
+			if (parent && Number(parent.userId) !== Number(userId)) {
+				const notification = await createNotificationIfAllowed(db, {
+					userId: parent.userId,
+					type: 'reply',
+					fromUserId: userId,
 					target: { kind: 'post', id: post.id },
-					});
+				});
+				if (notification) {
 					await publishNewNotification(req, parent.userId, notification);
+				}
 			}
 		}
 
-		if (repost_to && post.repostTo) {
-			const original = await db.getPostById(post.repostTo);
-			if (original && original.userId !== userId) {
-					const notification = await createNotificationIfAllowed(db, {
-						userId: original.userId,
-						type: 'quote',
-						fromUserId: userId,
-						target: { kind: 'post', id: post.id },
-					});
-					await publishNewNotification(req, original.userId, notification);
-			}
-		}
 
 		await publishNewTimelinePost(req, userId, post.id);
 
@@ -416,6 +437,9 @@ router.post('/', requireAuth, async (req, res) => {
 		});
 	} catch (err) {
 		console.error('[posts] create error:', err);
+		if (Number.isInteger(err?.statusCode)) {
+			return res.status(err.statusCode).json({ error: err.message });
+		}
 		res.status(500).json({ error: '投稿の作成に失敗しました' });
 	}
 });

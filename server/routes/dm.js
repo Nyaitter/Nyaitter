@@ -2,7 +2,7 @@ const express = require('express');
 const crypto = require('crypto');
 const { requireAuth } = require('../middleware/auth');
 const { hasBlockRelationship } = require('../utils/blockRelationship');
-
+const config = require('../config');
 const router = express.Router();
 
 function getDbAdapter(req) {
@@ -89,6 +89,9 @@ function normalizeClientMessage(message, userId) {
 
 	// E2E暗号化メッセージ（平文 content を含まず、受信者ごとの暗号文を持つ）
 	if (message.e2e && typeof message.e2e === 'object') {
+		if (!config.dm.e2eEnabled) {
+			throw new Error('DM E2E encryption is temporarily disabled');
+		}
 		if (content) {
 			throw new Error('E2E messages must not contain plaintext content');
 		}
@@ -328,6 +331,9 @@ router.get('/find', requireAuth, async (req, res) => {
  * 指定ユーザーのDM用公開鍵（E2E暗号化）を一括取得（認証必須）
  */
 router.get('/keys', requireAuth, async (req, res) => {
+	if (!config.dm.e2eEnabled) {
+		return res.status(410).json({ error: 'DM E2E encryption is temporarily disabled' });
+	}
 	const db = getDbAdapter(req);
 
 	try {
@@ -356,6 +362,9 @@ router.get('/keys', requireAuth, async (req, res) => {
  * body: { public_key: string }
  */
 router.post('/keys', requireAuth, async (req, res) => {
+	if (!config.dm.e2eEnabled) {
+		return res.status(410).json({ error: 'DM E2E encryption is temporarily disabled' });
+	}
 	const db = getDbAdapter(req);
 	const { public_key } = req.body || {};
 

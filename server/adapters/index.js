@@ -4,6 +4,7 @@ const StorageAdapter = require('./storage/StorageAdapter');
 const InMemoryAdapter = require('./database/InMemoryAdapter');
 
 const LocalStorageAdapter = require('./storage/local/LocalStorageAdapter');
+const ImageNormalizingStorageAdapter = require('./storage/ImageNormalizingStorageAdapter');
 
 /**
  * データベースアダプターを生成する
@@ -39,16 +40,21 @@ function createDatabaseAdapter() {
  */
 function createStorageAdapter() {
 	const type = config.storage.adapter;
+	const normalizeImages = (storageAdapter) => new ImageNormalizingStorageAdapter(
+		storageAdapter,
+		config.imageUpload,
+		{ userQuotaMB: config.storage.userQuotaMB },
+	);
 
 	if (type === 'local' || type === 'filesystem') {
 		console.log('[adapters] Using LocalStorageAdapter');
-		return new LocalStorageAdapter(config.storage.local);
+		return normalizeImages(new LocalStorageAdapter(config.storage.local));
 	}
 
 	if (type === 'r2' || type === 'cloudflare-r2') {
 		console.log('[adapters] Using R2StorageAdapter');
 		const R2StorageAdapter = require('./storage/r2/R2StorageAdapter');
-		return new R2StorageAdapter(config.storage);
+		return normalizeImages(new R2StorageAdapter(config.storage));
 	}
 
 	console.warn(

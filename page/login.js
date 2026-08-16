@@ -14,6 +14,9 @@ document.addEventListener('DOMContentLoaded', () => {
   const errorMessage = document.getElementById('error-message');
   const copyMessage = document.getElementById('copy-message');
   const loginInstruction = document.getElementById('login-instruction');
+  const loginApprovalWaitModal = document.getElementById('login-approval-wait-modal');
+  const loginApprovalWaitStatus = document.getElementById('login-approval-wait-status');
+  const loginApprovalWaitCancelBtn = document.getElementById('login-approval-wait-cancel-btn');
 
   if (!authStep1 || !authStep2 || !profileLink || !usernameInput || !getCodeBtn
     || !verificationCodeElem || !verifyCommentBtn || !loadingOverlay || !errorMessage || !copyMessage || !loginInstruction) {
@@ -21,6 +24,7 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   let scratchUsername = '';
+  let activeApprovalWait = null;
 
   function showLoading(show) {
     loadingOverlay.classList.toggle('hidden', !show);
@@ -55,6 +59,28 @@ document.addEventListener('DOMContentLoaded', () => {
 
   const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
+  function showApprovalWait() {
+    const state = { cancelled: false };
+    activeApprovalWait = state;
+    loginModal?.classList.add('hidden');
+    showLoading(false);
+    if (loginApprovalWaitStatus) loginApprovalWaitStatus.textContent = '許可を待機しています…';
+    loginApprovalWaitModal?.classList.remove('hidden');
+    return state;
+  }
+
+  function closeApprovalWait({ restoreLogin = false } = {}) {
+    loginApprovalWaitModal?.classList.add('hidden');
+    if (restoreLogin) loginModal?.classList.remove('hidden');
+  }
+
+  function cancelApprovalWait() {
+    if (!activeApprovalWait) return;
+    activeApprovalWait.cancelled = true;
+    closeApprovalWait({ restoreLogin: true });
+    showError('ログインをキャンセルしました。');
+  }
+
   async function completeApprovedLogin(pendingLogin) {
     const approvalId = String(pendingLogin?.approval_id || '');
     const approvalToken = String(pendingLogin?.approval_token || '');
@@ -62,23 +88,38 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!/^[A-Za-z0-9_-]{16,128}$/.test(approvalId) || !/^[A-Za-z0-9_-]{20,128}$/.test(approvalToken)) {
       throw new Error('ログイン承認情報が無効です。最初からやり直してください。');
     }
-    showError('ログイン済み端末でこのログインを許可してください。');
-    while (Date.now() < expiresAt) {
-      await wait(2500);
-      const response = await fetch(`${AUTH_API}/login-approvals/${encodeURIComponent(approvalId)}/poll`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        credentials: 'same-origin',
-        body: JSON.stringify({ approval_token: approvalToken }),
-      });
-      const data = await response.json().catch(() => ({}));
-      if (response.status === 202 && data.pending) continue;
-      if (!response.ok || data.error || !data.success) {
-        throw new Error(data.error || 'ログイン要求は許可されませんでした。');
+    const waitState = showApprovalWait();
+    let approved = false;
+    try {
+      while (Date.now() < expiresAt) {
+        if (waitState.cancelled) throw new Error('ログインをキャンセルしました。');
+        await wait(2500);
+        if (waitState.cancelled) throw new Error('ログインをキャンセルしました。');
+        const response = await fetch(`${AUTH_API}/login-approvals/${encodeURIComponent(approvalId)}/poll`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({ approval_token: approvalToken }),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (response.status === 202 && data.pending) {
+          if (loginApprovalWaitStatus) loginApprovalWaitStatus.textContent = 'ログイン済み端末での許可を待っています…';
+          continue;
+        }
+        if (!response.ok || data.error || !data.success) {
+          throw new Error(data.error || 'ログイン要求は許可されませんでした。');
+        }
+        approved = true;
+        return data;
       }
-      return data;
+      throw new Error('ログイン承認の有効期限が切れました。最初からやり直してください。');
+    } finally {
+      const ownsWaitModal = activeApprovalWait === waitState;
+      if (ownsWaitModal) {
+        activeApprovalWait = null;
+        closeApprovalWait({ restoreLogin: !approved });
+      }
     }
-    throw new Error('ログイン承認の有効期限が切れました。最初からやり直してください。');
   }
 
   function updateLoginMode() {
@@ -131,6 +172,7 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   window.openNyaitterLoginModal = openLoginModal;
+  loginApprovalWaitCancelBtn?.addEventListener('click', cancelApprovalWait);
 
   if (loginModal) {
     loginModal.querySelector('.modal-close-btn')?.addEventListener('click', closeLoginModal);
@@ -434,9 +476,15 @@ document.addEventListener('DOMContentLoaded', () => {
     const nyaitterAddress = params.get('nyaitter_address') || '';
     const state = params.get('state') || '';
     const redirect = params.get('redirect') || '';
-    if (!nyaitterAddress || !state || !redirect) {
+    if (
+      !nyaitterAddress ||
+      !state ||
+      !redirect ||
+      !isNyaitterAddress(nyaitterAddress) ||
+      !isSafeExternalAuthUrl(redirect, nyaitterAddress)
+    ) {
       openExternalConfirmModal();
-      showExternalConfirmError('外部ログイン確認に必要な情報が不足しています。');
+      showExternalConfirmError('外部ログイン確認に必要な情報、または遷移先URLが正しくありません。');
       return true;
     }
 
@@ -481,6 +529,9 @@ document.addEventListener('DOMContentLoaded', () => {
       if (!response.ok || data.error || !data.redirect_url) {
         throw new Error(data.error || 'ログイン許可に失敗しました。');
       }
+      if (!isSafeExternalAuthUrl(data.redirect_url, pendingExternalConfirm.nyaitter_address)) {
+        throw new Error('外部ログインの遷移先URLを検証できませんでした。');
+      }
       window.location.assign(data.redirect_url);
     } catch (error) {
       showExternalConfirmError(error.message);
@@ -494,6 +545,12 @@ document.addEventListener('DOMContentLoaded', () => {
       return;
     }
     try {
+      if (!isSafeExternalAuthUrl(
+        pendingExternalConfirm.redirect,
+        pendingExternalConfirm.nyaitter_address,
+      )) {
+        throw new Error('Unsafe external redirect');
+      }
       const target = new URL(pendingExternalConfirm.redirect);
       target.searchParams.set('external_login', '1');
       target.searchParams.set('state', pendingExternalConfirm.state || '');

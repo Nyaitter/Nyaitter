@@ -1,4 +1,3 @@
-const CACHE_NAME = 'nyaitter-client';
 const STATIC_ASSET_PATTERN = /\.(?:html|css|js|mjs|json|webmanifest|png|jpe?g|gif|svg|ico|webp|avif|woff2?|ttf|otf)$/i;
 const APP_SHELL = [
   '/',
@@ -32,6 +31,28 @@ function getSafeNotificationUrl(value) {
   }
 }
 
+function parsePushIdentifier(value, minimum) {
+  if (
+    (typeof value !== 'number' && typeof value !== 'string') ||
+    String(value).trim() === ''
+  )
+    return null;
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed >= minimum ? parsed : null;
+}
+
+function getPushOpenUrl(value, userId, notificationId) {
+  const url = new URL(getSafeNotificationUrl(value));
+  const parsedUserId = parsePushIdentifier(userId, 0);
+  const parsedNotificationId = parsePushIdentifier(notificationId, 1);
+  if (parsedUserId !== null && parsedNotificationId !== null) {
+    // URLはアプリ起動後ただちにHistory APIで消去される一時的な引き継ぎ情報。
+    url.searchParams.set('push_user_id', String(parsedUserId));
+    url.searchParams.set('push_notification_id', String(parsedNotificationId));
+  }
+  return url.href;
+}
+
 function isCacheableStaticResponse(response) {
   if (!response || !response.ok || response.type !== 'basic') return false;
   const cacheControl = response.headers.get('Cache-Control') || '';
@@ -40,7 +61,7 @@ function isCacheableStaticResponse(response) {
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
-    caches.open(CACHE_NAME)
+    caches.open('nyaitter-client-v2')
       .then((cache) => cache.addAll(APP_SHELL))
       .then(() => self.skipWaiting()),
   );
@@ -50,7 +71,7 @@ self.addEventListener('activate', (event) => {
   event.waitUntil(
     caches.keys()
       .then((keys) => Promise.all(keys
-        .filter((key) => key.startsWith('nyaitter-client') && key !== CACHE_NAME)
+        .filter((key) => key.startsWith('nyaitter-client') && key !== 'nyaitter-client-v2')
         .map((key) => caches.delete(key))))
       .then(() => self.clients.claim()),
   );
@@ -72,7 +93,7 @@ self.addEventListener('fetch', (event) => {
         .then((response) => {
           if (isCacheableStaticResponse(response)) {
             const copy = response.clone();
-            caches.open(CACHE_NAME).then((cache) => cache.put(request.mode === 'navigate' ? '/index.html' : request, copy));
+            caches.open('nyaitter-client-v2').then((cache) => cache.put(request.mode === 'navigate' ? '/index.html' : request, copy));
           }
           return response;
         })
@@ -85,7 +106,7 @@ self.addEventListener('fetch', (event) => {
     caches.match(request).then((cached) => cached || fetch(request).then((response) => {
       if (!isCacheableStaticResponse(response)) return response;
       const copy = response.clone();
-      caches.open(CACHE_NAME).then((cache) => cache.put(request, copy));
+      caches.open('nyaitter-client-v2').then((cache) => cache.put(request, copy));
       return response;
     })),
   );
@@ -109,6 +130,7 @@ self.addEventListener('push', (event) => {
     renotify: false,
     data: {
       url: getSafeNotificationUrl(payload.url),
+      userId: payload.user_id || null,
       notificationId: payload.notification_id || null,
     },
   };
@@ -118,7 +140,11 @@ self.addEventListener('push', (event) => {
 
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
-  const targetUrl = getSafeNotificationUrl(event.notification.data?.url);
+  const targetUrl = getPushOpenUrl(
+    event.notification.data?.url,
+    event.notification.data?.userId,
+    event.notification.data?.notificationId,
+  );
 
   event.waitUntil((async () => {
     const windows = await clients.matchAll({ type: 'window', includeUncontrolled: true });

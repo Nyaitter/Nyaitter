@@ -39,8 +39,12 @@ class InMemoryAdapter extends DatabaseAdapter {
 		this.follows = new Map(); // `${followerId}:${followingId}` -> true
 		this.followingIdsByUser = new Map(); // followerId -> Set(followingId)
 		this.followerIdsByUser = new Map(); // followingId -> Set(followerId)
-		this.notifications = new Map(); // userId -> [notification]
-		this.pushSubscriptions = new Map(); // userId -> Map(endpoint -> subscription)
+			this.notifications = new Map(); // userId -> [notification]
+			this.notificationsById = new Map(); // notificationId -> notification
+			this.unreadNotificationCounts = new Map(); // userId -> unread count
+			this.moderationReports = new Map(); // reportId -> report record
+			this.nextModerationReportId = 1;
+			this.pushSubscriptions = new Map(); // userId -> Map(endpoint -> subscription)
 		this.reposts = new Map(); // `${userId}:${postId}` -> true
 		this.pinnedPosts = new Map(); // `${userId}:${postId}` -> true
 		this.nextPostId = 1;
@@ -315,12 +319,14 @@ class InMemoryAdapter extends DatabaseAdapter {
 	}
 
 	
-	async searchUsers(query, limit = 20) {
+	async searchUsers(query, limit = 20, offset = 0) {
 		if (!query || query.trim().length === 0) {
 			return [];
 		}
 
 		const q = query.toLowerCase();
+		const safeLimit = Math.max(Number(limit) || 0, 0);
+		const safeOffset = Math.max(Number(offset) || 0, 0);
 		const results = [];
 
 		for (const user of this.users.values()) {
@@ -339,12 +345,12 @@ class InMemoryAdapter extends DatabaseAdapter {
 				profile.includes(q)
 			) {
 				results.push(this._normalizeUserBlockList(user));
-
-				if (results.length >= limit) break;
 			}
 		}
 
-		return results;
+		return results
+			.sort((left, right) => Number(left.id) - Number(right.id))
+			.slice(safeOffset, safeOffset + safeLimit);
 	}
 
 	
@@ -627,26 +633,24 @@ class InMemoryAdapter extends DatabaseAdapter {
 	}
 
 	
-	async getPostDetail(id, currentUserId = null) {
-		const post = this.posts.get(id);
+		async getPostDetail(id, currentUserId = null) {
+		const postId = Number(id);
+		const post = this.posts.get(postId);
 		if (!post) return null;
 
-		const author = this.getUserById(post.userId);
-		const likeCount = this.getLikeCountForPost(id);
-		const starCount = this.getStarCountForPost(id);
-
-		const likedByMe = currentUserId
-			? this.hasUserLikedPost(currentUserId, id)
-			: false;
-		const starredByMe = currentUserId
-			? this.hasUserStarredPost(currentUserId, id)
-			: false;
-
+		// このアダプターでは関連データがすべてMap索引にあるため、非同期メソッドを
+		// 経由せず直接参照して、不要なPromise生成を避ける。
+		const author = this.users.get(Number(post.userId)) || null;
+		const likeCount = this.likeCountByPost.get(postId) || 0;
+		const starCount = this.starCountByPost.get(postId) || 0;
+		const viewerId = currentUserId == null ? null : Number(currentUserId);
+		const likedByMe = viewerId != null && this.likes.has(`${viewerId}:${postId}`);
+		const starredByMe = viewerId != null && this.stars.has(`${viewerId}:${postId}`);
 		let parentPost = null;
 		if (post.replyTo) {
-			const parent = this.posts.get(post.replyTo);
+			const parent = this.posts.get(Number(post.replyTo));
 			if (parent) {
-				const parentAuthor = this.getUserById(parent.userId);
+				const parentAuthor = this.users.get(Number(parent.userId)) || null;
 				parentPost = {
 					id: parent.id,
 					content: parent.content?.substring(
@@ -691,11 +695,13 @@ class InMemoryAdapter extends DatabaseAdapter {
 	}
 
 	
-	async getPostsByUserId(userId, limit = config.limits.timelineDefaultLimit, currentUserId = null) {
-		const ids = this.postIdsByUser.get(Number(userId)) || [];
-		const sliced = ids.slice(0, Math.max(0, Number(limit) || 0));
-		return Promise.all(sliced.map((id) => this.getPostDetail(id, currentUserId)));
-	}
+		async getPostsByUserId(userId, limit = config.limits.timelineDefaultLimit, _currentUserId = null) {
+			const ids = this.postIdsByUser.get(Number(userId)) || [];
+			return ids
+				.slice(0, Math.max(0, Number(limit) || 0))
+				.map((id) => this.posts.get(id))
+				.filter(Boolean);
+		}
 
 	async toggleLike(userId, postId) {
 		const key = `${userId}:${postId}`;
@@ -906,9 +912,11 @@ class InMemoryAdapter extends DatabaseAdapter {
 		return result;
 	}
 
-	async getGroupDm(dmId) {
-		return this.groupDms.get(Number(dmId)) || null;
-	}
+		async getGroupDm(dmId) {
+			return this.groupDms.get(dmId)
+				|| this.groupDms.get(Number(dmId))
+				|| null;
+		}
 
 	async createGroupDm(dmData) {
 		const id = this.nextDmId++;
@@ -1273,97 +1281,231 @@ class InMemoryAdapter extends DatabaseAdapter {
 		return this.getRepostCountForPost(postId);
 	}
 
-	async createNotification(notificationData) {
-		const id = this.nextNotificationId++;
-		const notification = {
-			id,
-			userId: notificationData.userId,
-			type: notificationData.type,
-			fromUserId: notificationData.fromUserId ?? null,
-			target: normalizeTarget(notificationData.target, {
-				postId: notificationData.postId,
-				open: notificationData.open,
-			}),
+		async createNotification(notificationData) {
+			const id = this.nextNotificationId++;
+			const userId = Number(notificationData.userId);
+			const notification = {
+				id,
+				userId,
+				type: notificationData.type,
+				fromUserId: notificationData.fromUserId ?? null,
+				target: normalizeTarget(notificationData.target, {
+					postId: notificationData.postId,
+					open: notificationData.open,
+				}),
 				read: false,
 				clicked: false,
+				message: typeof notificationData.message === 'string' ? notificationData.message : null,
 				createdAt: new Date(),
-		};
+			};
 
-		if (!this.notifications.has(notificationData.userId)) {
-			this.notifications.set(notificationData.userId, []);
+			if (!this.notifications.has(userId)) this.notifications.set(userId, []);
+			this.notifications.get(userId).push(notification);
+			this.notificationsById.set(id, notification);
+			this.unreadNotificationCounts.set(
+				userId,
+				(this.unreadNotificationCounts.get(userId) || 0) + 1,
+			);
+			return notification;
 		}
-		this.notifications.get(notificationData.userId).push(notification);
 
-		return notification;
-	}
-
-	async getNotifications(userId, limit = 50, offset = 0) {
-		const notifications = this.notifications.get(userId) || [];
-		const sorted = notifications
-			.slice()
-			.sort((a, b) => b.createdAt - a.createdAt);
-		return sorted.slice(offset, offset + limit);
-	}
-
-	async getNotificationById(notificationId) {
-		for (const notifications of this.notifications.values()) {
-			const notif = notifications.find((n) => n.id === notificationId);
-			if (notif) return notif;
+		async getNotifications(userId, limit = 50, offset = 0) {
+			const notifications = this.notifications.get(Number(userId)) || [];
+			// 追加順が古い→新しいなので、配列の複製・全件ソートを避けて後方から切り出す。
+			const start = Math.max(0, notifications.length - Math.max(0, Number(offset) || 0) - Math.max(0, Number(limit) || 0));
+			const end = Math.max(0, notifications.length - Math.max(0, Number(offset) || 0));
+			return notifications.slice(start, end).reverse();
 		}
-		return null;
-	}
 
-	async markNotificationAsRead(notificationId) {
-		for (const notifications of this.notifications.values()) {
-			const notif = notifications.find((n) => n.id === notificationId);
-			if (notif) {
-				notif.read = true;
-				return;
-			}
+		async getNotificationById(notificationId) {
+			return this.notificationsById.get(Number(notificationId)) || null;
 		}
-	}
+
+		async markNotificationAsRead(notificationId) {
+			const notification = this.notificationsById.get(Number(notificationId));
+			if (!notification || notification.read) return;
+			notification.read = true;
+			const userId = Number(notification.userId);
+			this.unreadNotificationCounts.set(
+				userId,
+				Math.max(0, (this.unreadNotificationCounts.get(userId) || 0) - 1),
+			);
+		}
 
 		async markNotificationAsClicked(notificationId) {
-			for (const notifications of this.notifications.values()) {
-				const notif = notifications.find((n) => n.id === notificationId);
-				if (notif) {
-					notif.clicked = true;
-					return;
-				}
-			}
+			const notification = this.notificationsById.get(Number(notificationId));
+			if (notification) notification.clicked = true;
 		}
 
 		async deleteNotification(notificationId) {
-		for (const [userId, notifications] of this.notifications.entries()) {
-			const index = notifications.findIndex(
-				(n) => n.id === notificationId,
-			);
-			if (index !== -1) {
-				notifications.splice(index, 1);
-				if (notifications.length === 0) {
-					this.notifications.delete(userId);
-				}
-				return true;
+			const notification = this.notificationsById.get(Number(notificationId));
+			if (!notification) return false;
+			const userId = Number(notification.userId);
+			const notifications = this.notifications.get(userId) || [];
+			const index = notifications.indexOf(notification);
+			if (index >= 0) notifications.splice(index, 1);
+			if (notifications.length === 0) this.notifications.delete(userId);
+			this.notificationsById.delete(Number(notificationId));
+			if (!notification.read) {
+				this.unreadNotificationCounts.set(
+					userId,
+					Math.max(0, (this.unreadNotificationCounts.get(userId) || 0) - 1),
+				);
 			}
+			return true;
 		}
-		return false;
-	}
 
-	async markAllNotificationsAsRead(userId) {
-		const notifications = this.notifications.get(userId);
-		if (notifications) {
-			for (const notif of notifications) {
-				notif.read = true;
+		async markAllNotificationsAsRead(userId) {
+			const normalizedUserId = Number(userId);
+			const notifications = this.notifications.get(normalizedUserId) || [];
+			for (const notification of notifications) notification.read = true;
+			this.unreadNotificationCounts.set(normalizedUserId, 0);
+		}
+
+		async markAllNotificationsAsClicked(userId) {
+			const normalizedUserId = Number(userId);
+			const notifications = this.notifications.get(normalizedUserId) || [];
+			for (const notification of notifications) {
+				notification.read = true;
+				notification.clicked = true;
 			}
+			this.unreadNotificationCounts.set(normalizedUserId, 0);
 		}
-	}
 
-	async getUnreadNotificationCount(userId) {
-		const notifications = this.notifications.get(userId) || [];
-		return notifications.filter((n) => !n.read).length;
-	}
+		async getUnreadNotificationCount(userId) {
+			return this.unreadNotificationCounts.get(Number(userId)) || 0;
+		}
 
-	async upsertPushSubscription(userId, subscription) {
+		_copyModerationReport(report) {
+			if (!report) return null;
+			return {
+				...report,
+				targetSnapshot: JSON.parse(JSON.stringify(report.targetSnapshot || {})),
+				excludedAdminIds: [...(report.excludedAdminIds || [])],
+				resolution: report.resolution == null
+					? null
+					: JSON.parse(JSON.stringify(report.resolution)),
+			};
+		}
+
+		async createModerationReport(reportData) {
+			const now = reportData.createdAt ? new Date(reportData.createdAt) : new Date();
+			const report = {
+				id: this.nextModerationReportId++,
+				reporterUserId: Number(reportData.reporterUserId),
+				targetKind: String(reportData.targetKind),
+				targetId: String(reportData.targetId),
+				description: String(reportData.description || ''),
+				targetSnapshot: JSON.parse(JSON.stringify(reportData.targetSnapshot || {})),
+				assignmentType: ['freeze_appeal', 'verification_application'].includes(reportData.assignmentType)
+					? reportData.assignmentType
+					: 'report',
+				status: 'pending',
+				assignedAdminId: null,
+				assignedAt: null,
+				excludedAdminIds: [],
+				resolution: null,
+				createdAt: now,
+				resolvedAt: null,
+			};
+			this.moderationReports.set(report.id, report);
+			return this._copyModerationReport(report);
+		}
+
+		async getOpenModerationAppealByUserId(userId) {
+			const appeal = [...this.moderationReports.values()]
+				.filter((report) => Number(report.reporterUserId) === Number(userId))
+				.filter((report) => report.assignmentType === 'freeze_appeal' && report.status !== 'resolved')
+				.sort((left, right) => new Date(right.createdAt) - new Date(left.createdAt))[0];
+			return this._copyModerationReport(appeal);
+		}
+
+		async getOpenModerationVerificationByUserId(userId) {
+			const request = [...this.moderationReports.values()]
+				.filter((report) => Number(report.reporterUserId) === Number(userId))
+				.filter((report) => report.assignmentType === 'verification_application' && report.status !== 'resolved')
+				.sort((left, right) => new Date(right.createdAt) - new Date(left.createdAt))[0];
+			return this._copyModerationReport(request);
+		}
+
+		async getModerationReportById(reportId) {
+			return this._copyModerationReport(this.moderationReports.get(Number(reportId)));
+		}
+
+		async listModerationReportsForAdmin(adminId, options = {}) {
+			const status = options.status || 'assigned';
+			const limit = Math.max(1, Math.min(Number(options.limit) || 50, 100));
+			const offset = Math.max(0, Number(options.offset) || 0);
+			return [...this.moderationReports.values()]
+				.filter((report) => Number(report.assignedAdminId) === Number(adminId))
+				.filter((report) => !status || report.status === status)
+				.sort((left, right) => new Date(right.assignedAt || right.createdAt) - new Date(left.assignedAt || left.createdAt))
+				.slice(offset, offset + limit)
+				.map((report) => this._copyModerationReport(report));
+		}
+
+		async getModerationAdminWorkloads(excludedAdminIds = []) {
+			const excluded = new Set((excludedAdminIds || []).map(Number));
+			return [...this.users.values()]
+				.filter((user) => Boolean(user.admin) && !user.freeze && !excluded.has(Number(user.id)))
+				.map((user) => ({
+					adminId: Number(user.id),
+					activeCount: [...this.moderationReports.values()].filter((report) => (
+						report.status === 'assigned' && Number(report.assignedAdminId) === Number(user.id)
+					)).length,
+				}));
+		}
+
+		async assignModerationReport(reportId, assignment = {}) {
+			const report = this.moderationReports.get(Number(reportId));
+			if (!report || report.status === 'resolved') return null;
+			if (
+				assignment.expectedAdminId !== undefined &&
+				Number(report.assignedAdminId) !== Number(assignment.expectedAdminId)
+			) return null;
+			report.status = 'assigned';
+			report.assignedAdminId = Number(assignment.adminId);
+			report.assignedAt = assignment.assignedAt
+				? new Date(assignment.assignedAt)
+				: new Date();
+			report.excludedAdminIds = [...new Set((assignment.excludedAdminIds || report.excludedAdminIds || [])
+				.map(Number)
+				.filter(Number.isInteger))];
+			return this._copyModerationReport(report);
+		}
+
+		async getOverdueModerationReports(cutoff) {
+			const deadline = new Date(cutoff);
+			return [...this.moderationReports.values()]
+				.filter((report) => report.status === 'assigned' && report.assignedAt && new Date(report.assignedAt) <= deadline)
+				.map((report) => this._copyModerationReport(report));
+		}
+
+		async getUnassignedModerationReports(limit = 100) {
+			return [...this.moderationReports.values()]
+				.filter((report) => report.status === 'pending')
+				.sort((left, right) => new Date(left.createdAt) - new Date(right.createdAt))
+				.slice(0, Math.max(1, Math.min(Number(limit) || 100, 100)))
+				.map((report) => this._copyModerationReport(report));
+		}
+
+		async resolveModerationReport(reportId, adminId, resolution) {
+			const report = this.moderationReports.get(Number(reportId));
+			if (
+				!report || report.status !== 'assigned' ||
+				Number(report.assignedAdminId) !== Number(adminId)
+			) return null;
+			report.status = 'resolved';
+			report.resolution = JSON.parse(JSON.stringify(resolution || {}));
+			report.resolvedAt = new Date();
+			return this._copyModerationReport(report);
+		}
+
+		async deleteModerationReport(reportId) {
+			return this.moderationReports.delete(Number(reportId));
+		}
+
+		async upsertPushSubscription(userId, subscription) {
 		const normalizedUserId = Number(userId);
 		if (!this.users.has(normalizedUserId)) return null;
 		if (!this.pushSubscriptions.has(normalizedUserId)) {
@@ -1472,14 +1614,9 @@ class InMemoryAdapter extends DatabaseAdapter {
 			return [...(this.starredPostIdsByUser.get(Number(userId)) || [])];
 		}
 
-	async getFollowIds(userId) {
-		const result = [];
-		for (const key of this.follows.keys()) {
-			const [followerId, followingId] = key.split(':').map(Number);
-			if (followerId === userId) result.push(followingId);
+		async getFollowIds(userId) {
+			return [...(this.followingIdsByUser.get(Number(userId)) || [])];
 		}
-		return result;
-	}
 
 	async getFollowRelationshipSnapshot(userId, candidateUserIds) {
 		const normalizedUserId = Number(userId);
@@ -1503,31 +1640,17 @@ class InMemoryAdapter extends DatabaseAdapter {
 		return null;
 	}
 
-	async getFollowingCount(userId) {
-		let count = 0;
-		for (const key of this.follows.keys()) {
-			const [followerId] = key.split(':').map(Number);
-			if (followerId === userId) count++;
+		async getFollowingCount(userId) {
+			return (this.followingIdsByUser.get(Number(userId)) || new Set()).size;
 		}
-		return count;
-	}
 
-	async getFollowerCount(userId) {
-		let count = 0;
-		for (const key of this.follows.keys()) {
-			const [, followingId] = key.split(':').map(Number);
-			if (followingId === userId) count++;
+		async getFollowerCount(userId) {
+			return (this.followerIdsByUser.get(Number(userId)) || new Set()).size;
 		}
-		return count;
-	}
 
-	async getPostCount(userId) {
-		let count = 0;
-		for (const post of this.posts.values()) {
-			if (post.userId === userId) count++;
+		async getPostCount(userId) {
+			return (this.postIdsByUser.get(Number(userId)) || []).length;
 		}
-		return count;
-	}
 
 	async getRanking(type, limit = 50) {
 		const fieldByType = {

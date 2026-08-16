@@ -1,101 +1,69 @@
-# Cloudflare D1 と Worker のセットアップ
+# Cloudflare D1 と Worker
 
-Nyaitter の Node.js サーバーから Cloudflare D1 を使う場合は、認証済みの D1 Proxy Worker を経由します。ブラウザが D1 やプロキシWorkerへ直接接続する構成ではありません。
+NyaitterでD1を使う場合、Node.jsサーバーは **D1 Proxy Worker** を通してD1へ接続します。ブラウザがD1やWorkerへ直接つながることはありません。
 
 ```text
-ブラウザ → Nyaitter Node.js サーバー → D1 Proxy Worker → Cloudflare D1
+ブラウザ → Nyaitterサーバー → D1 Proxy Worker → D1
 ```
 
-Node.js サーバーには Worker 認証用トークンを置き、Worker はアプリケーションに必要な固定操作だけを受け付けます。自由なSQLを受け取るAPIを公開してはいけません。
+## 準備するもの
 
-## 事前に決めること
+- Cloudflareアカウント
+- D1データベース
+- D1 Proxy Worker
+- WorkerとNode.jsサーバーで共有する長いランダムトークン
 
-- D1 をこの環境の主データベースとして使うか、PostgreSQLと役割を分けるか
-- D1の正本となるデータと、スキーマ変更の適用手順
-- WorkerのURL、`AUTH_TOKEN`、Node側の `D1_WORKER_TOKEN` の管理方法
-- 障害時のバックアップ・ロールバック方法
+## 手順
 
-## 1. D1 データベースを作成する
-
-Workerディレクトリで、用途ごとにD1データベースを作成します。
+### 1. D1を作る
 
 ```bash
 cd workers/d1-proxy
 npx wrangler d1 create nyaitter-d1
 ```
 
-出力された `database_id` を `workers/d1-proxy/wrangler.toml` の `[[d1_databases]]` に設定します。既定の `database_name` は `nyaitter-d1` です。
+表示された `database_id` を `wrangler.toml` に設定します。
 
-開発・ステージング・本番で別名のDBを使う場合、`wrangler.toml` の `database_name` と、次節のマイグレーションコマンドの対象名を同じ値に更新してください。
-
-## 2. Worker の認証シークレットを設定する
-
-`AUTH_TOKEN` は Worker が必須とする共有シークレットです。未設定の場合、Worker はすべてのリクエストを拒否します。
+### 2. Workerのトークンを設定する
 
 ```bash
-cd workers/d1-proxy
 npx wrangler secret put AUTH_TOKEN
 ```
 
-十分に長いランダム値を入力し、Node.js サーバー側の `D1_WORKER_TOKEN` に同じ値を設定します。トークンを Git、`wrangler.toml`、フロントエンド、ログに含めないでください。
+入力した値は、Node.jsサーバー側の `D1_WORKER_TOKEN` と同じにします。トークンをGit、`wrangler.toml`、ブラウザ、ログへ書かないでください。
 
-## 3. マイグレーションを適用する
-
-Workerの `package.json` は既定で `nyaitter-d1` に対してマイグレーションを実行します。
+### 3. マイグレーションとデプロイ
 
 ```bash
-cd workers/d1-proxy
 npm install
-npm run migrate:local   # WranglerのローカルD1
-npm run migrate:remote  # wrangler.tomlで設定したリモートD1
+npm run migrate:remote
 npm run deploy
 ```
 
-D1のスキーマは `workers/d1-proxy/migrations/` で管理します。現在は初期スキーマとPush購読トークン用の追加マイグレーションが含まれます。既存環境へ適用する前に、バックアップとステージング検証を行ってください。
+マイグレーションは `workers/d1-proxy/migrations/` にあります。現在は高頻度の投稿、通知、DM読み取りを助ける `0011_optimize_high_volume_reads.sql` まで含まれています。既存DBへ適用する前に、必ずバックアップとステージング確認を行ってください。
 
-## 4. Node.js サーバーを設定する
+### 4. Nyaitterサーバーを設定する
 
-`server/.env` またはデプロイ先のシークレット管理に設定します。
+`server/.env` に次を設定します。
 
 ```env
 DB_ADAPTER=d1
-D1_WORKER_URL=https://nyaitter-d1-proxy.<あなたのサブドメイン>.workers.dev
+D1_WORKER_URL=https://nyaitter-d1-proxy.example.workers.dev
 D1_WORKER_TOKEN=<AUTH_TOKENと同じ値>
-
-# 任意: タイムアウト、読み取り再試行、短時間キャッシュ
-D1_REQUEST_TIMEOUT_MS=10000
-D1_RETRY_ATTEMPTS=1
-D1_RETRY_BASE_DELAY_MS=120
-D1_READ_CACHE_SECONDS=0
-D1_BATCH_MAX_ITEMS=100
 ```
 
-`D1_READ_CACHE_SECONDS` は 0 で無効です。読み取りキャッシュを使う場合も、投稿・通知・DMなど閲覧者ごとに可視性が変わるAPIでは、キャッシュキーと無効化を慎重に設計してください。
+必要ならタイムアウトや再試行回数も `.env.example` を参考に追加できます。
 
-## D1スキーマの注意
+## 公開前の確認
 
-PostgreSQLの型・機能はD1（SQLite系）へそのまま移植できません。
+1. Workerがトークンなしのリクエストを拒否することを確認します。
+2. `/server/health` と `/server/ready` が成功することを確認します。
+3. 投稿、検索、通知、DM、ファイル保存をステージングで確認します。
+4. ブロック、非公開投稿、検索除外が期待どおりに動くことを確認します。
 
-| PostgreSQL | D1 での一般的な代替 |
-|---|---|
-| `JSONB` | JSON文字列を保存する `TEXT` |
-| `TIMESTAMPTZ` | ISO 8601 文字列または整数時刻 |
-| `SERIAL` | `INTEGER PRIMARY KEY` |
-| 配列型 | JSON文字列または中間テーブル |
-| PostgreSQL拡張 | SQLite・アプリケーション側の実装 |
+## 注意
 
-DBアダプターの返却値は PostgreSQL・InMemory の契約と揃える必要があります。特に投稿ページング、通知、DMメンバー、未読数、日時形式を確認してください。
+D1はSQLite系のDBです。PostgreSQLの型や拡張機能をそのまま使えない場合があります。D1を使う場合も、認可や投稿の表示ルールはNode.jsサーバー側で処理します。
 
-## デプロイ後の確認
-
-1. Workerへ認証なしのリクエストが拒否されることを確認します。
-2. Node.js サーバーを `DB_ADAPTER=d1` で起動し、`/server/health` と `/server/ready` を確認します。
-3. ログイン、投稿、検索、フォロー、通知、DM、Push購読をステージングで確認します。
-4. ブロック・検索除外・非公開投稿が保存先にかかわらず同じ可視性になることを確認します。
-
-## 関連ドキュメント
-
-- [D1 Proxy Worker README](../../workers/d1-proxy/README.md)
-- [PostgreSQL のセットアップ](./database-postgres.md)
-- [Cloudflare と組み合わせる構成](./cloudflare-hybrid.md)
+- [D1 Proxy Workerの説明](../../workers/d1-proxy/README.md)
 - [本番デプロイのチェックリスト](./production-checklist.md)

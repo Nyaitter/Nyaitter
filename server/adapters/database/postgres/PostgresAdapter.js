@@ -128,9 +128,11 @@ class PostgresAdapter extends DatabaseAdapter {
 		throw new Error('Could not allocate a unique Nyaitter ID');
 	}
 
-	async searchUsers(query, limit = 20) {
+	async searchUsers(query, limit = 20, offset = 0) {
 		const q = `%${query.toLowerCase()}%`;
 		const digits = String(query).replace(/^#/, '').replace(/\D/g, '');
+		const safeLimit = Math.max(Number(limit) || 0, 0);
+		const safeOffset = Math.max(Number(offset) || 0, 0);
 		const { rows } = await this.pool.query(
 			`SELECT id, name, scid, handle, nyaitter_address, auth_provider, provider_domain, external_id
 			 FROM users
@@ -139,8 +141,8 @@ class PostgresAdapter extends DatabaseAdapter {
 				OR LOWER(COALESCE(handle, '')) LIKE $1
 				OR CAST(id AS TEXT) LIKE $1
 				OR CAST(COALESCE(external_id, -1) AS TEXT) LIKE $1
-			 ORDER BY id DESC LIMIT $2`,
-			[digits ? `%${digits}%` : q, limit]
+			 ORDER BY id ASC LIMIT $2 OFFSET $3`,
+			[digits ? `%${digits}%` : q, safeLimit, safeOffset]
 		);
 		return rows;
 	}
@@ -529,13 +531,14 @@ class PostgresAdapter extends DatabaseAdapter {
 		return Number(rows[0].count);
 	}
 
-	async getPostsByUserId(userId, limit = 50, currentUserId = null) {
+	async getPostsByUserId(userId, limit = 50, _currentUserId = null) {
 		const { rows } = await this.pool.query(
 			`SELECT * FROM posts WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2`,
 			[userId, limit]
 		);
-		const posts = rows.map(r => this._normalizePost(r));
-		return Promise.all(posts.map(p => this.getPostDetail(p.id, currentUserId)));
+		// 呼び出し元は共通の serializePostsBatch() で必要な関連情報を一括取得する。
+		// ここで投稿ごとの getPostDetail() を行わず、N+1クエリを避ける。
+		return rows.map((row) => this._normalizePost(row));
 	}
 
 		async getProfilePostIds({ userId, subType = 'all', limit = 30, offset = 0, beforeId = null } = {}) {
@@ -838,30 +841,37 @@ class PostgresAdapter extends DatabaseAdapter {
 		}
 
 	async getPostDetail(id, currentUserId = null) {
-		const post = await this.getPostById(id);
-		if (!post) return null;
+			const post = await this.getPostById(id);
+			if (!post) return null;
 
-		const author = await this.getUserById(post.user_id);
-		const likeCount = await this.getLikeCount(id);
-		const starCount = await this.getStarCount(id);
+			// これらは相互に依存しないため、逐次クエリではなく並列に取得する。
+			const [author, likeCount, starCount, likedByMe, starredByMe] = await Promise.all([
+				this.getUserById(post.user_id),
+				this.getLikeCount(id),
+				this.getStarCount(id),
+				currentUserId ? this.hasUserLikedPost(currentUserId, id) : false,
+				currentUserId ? this.hasUserStarredPost(currentUserId, id) : false,
+			]);
 
-		let likedByMe = false;
-		let starredByMe = false;
-
-		if (currentUserId) {
-			likedByMe = await this.hasUserLikedPost(currentUserId, id);
-			starredByMe = await this.hasUserStarredPost(currentUserId, id);
-		}
-
-		let parentPost = null;
+			let parentPost = null;
 		if (post.reply_to) {
-			const parent = await this.getPostById(post.reply_to);
+			// 親投稿と投稿者を結合して取得し、詳細表示時の追加往復を1回に抑える。
+			const { rows: parentRows } = await this.pool.query(
+				`SELECT parent.id, parent.content,
+						author.id AS author_id, author.name AS author_name
+				 FROM posts parent
+				 LEFT JOIN users author ON author.id = parent.user_id
+				 WHERE parent.id = $1`,
+				[post.reply_to],
+			);
+			const parent = parentRows[0];
 			if (parent) {
-				const parentAuthor = await this.getUserById(parent.user_id);
 				parentPost = {
 					id: parent.id,
 					content: parent.content?.substring(0, 100),
-					author: parentAuthor ? { id: parentAuthor.id, name: parentAuthor.name } : null,
+					author: parent.author_id == null
+						? null
+						: { id: parent.author_id, name: parent.author_name || '' },
 				};
 			}
 		}
@@ -1562,17 +1572,18 @@ class PostgresAdapter extends DatabaseAdapter {
 			open: notificationData.open,
 		});
 		const { rows } = await this.pool.query(
-				`INSERT INTO notifications
-				 (user_id, type, from_user_id, post_id, target, read, clicked, created_at)
-				 VALUES ($1, $2, $3, $4, $5::jsonb, false, false, NOW())
-			 RETURNING *`,
-			[
-				notificationData.userId,
-				notificationData.type,
-				notificationData.fromUserId ?? null,
-				target?.kind === 'post' ? target.id : null,
-				JSON.stringify(target),
-			],
+					`INSERT INTO notifications
+					 (user_id, type, from_user_id, post_id, target, message, read, clicked, created_at)
+					 VALUES ($1, $2, $3, $4, $5::jsonb, $6, false, false, NOW())
+				 RETURNING *`,
+				[
+					notificationData.userId,
+					notificationData.type,
+					notificationData.fromUserId ?? null,
+					target?.kind === 'post' ? target.id : null,
+					JSON.stringify(target),
+					typeof notificationData.message === 'string' ? notificationData.message : null,
+				],
 		);
 		return rows[0];
 	}
@@ -1617,6 +1628,13 @@ class PostgresAdapter extends DatabaseAdapter {
 		);
 	}
 
+	async markAllNotificationsAsClicked(userId) {
+		await this.pool.query(
+			'UPDATE notifications SET read = true, clicked = true WHERE user_id = $1 AND (read = false OR clicked = false)',
+			[userId]
+		);
+	}
+
 	async deleteNotification(notificationId) {
 		await this.pool.query(
 			'DELETE FROM notifications WHERE id = $1',
@@ -1625,15 +1643,182 @@ class PostgresAdapter extends DatabaseAdapter {
 		return true;
 	}
 
-	async getUnreadNotificationCount(userId) {
-		const { rows } = await this.pool.query(
-			'SELECT COUNT(*)::int as count FROM notifications WHERE user_id = $1 AND read = false',
-			[userId]
-		);
-		return rows[0].count;
-	}
+		async getUnreadNotificationCount(userId) {
+			const { rows } = await this.pool.query(
+				'SELECT COUNT(*)::int as count FROM notifications WHERE user_id = $1 AND read = false',
+				[userId]
+			);
+			return rows[0].count;
+		}
 
-	async upsertPushSubscription(userId, subscription) {
+		_mapModerationReport(row) {
+			if (!row) return null;
+			return {
+				id: Number(row.id),
+				reporterUserId: Number(row.reporter_user_id),
+				targetKind: row.target_kind,
+				targetId: String(row.target_id),
+				description: row.description || '',
+				targetSnapshot: row.target_snapshot || {},
+				assignmentType: row.assignment_type || 'report',
+				status: row.status,
+				assignedAdminId: row.assigned_admin_id == null ? null : Number(row.assigned_admin_id),
+				assignedAt: row.assigned_at || null,
+				excludedAdminIds: Array.isArray(row.excluded_admin_ids)
+					? row.excluded_admin_ids.map(Number).filter(Number.isInteger)
+					: [],
+				resolution: row.resolution || null,
+				createdAt: row.created_at,
+				resolvedAt: row.resolved_at || null,
+			};
+		}
+
+		async createModerationReport(reportData) {
+			const { rows } = await this.pool.query(
+					`INSERT INTO moderation_reports
+						(reporter_user_id, target_kind, target_id, description, target_snapshot, assignment_type, status, created_at)
+					 VALUES ($1, $2, $3, $4, $5::jsonb, $6, 'pending', COALESCE($7::timestamptz, NOW()))
+					 RETURNING *`,
+				[
+					reportData.reporterUserId,
+					reportData.targetKind,
+					reportData.targetId,
+					String(reportData.description || ''),
+					JSON.stringify(reportData.targetSnapshot || {}),
+					['freeze_appeal', 'verification_application'].includes(reportData.assignmentType)
+						? reportData.assignmentType
+						: 'report',
+					reportData.createdAt || null,
+				],
+			);
+			return this._mapModerationReport(rows[0]);
+		}
+
+			async getOpenModerationAppealByUserId(userId) {
+				const { rows } = await this.pool.query(
+					`SELECT * FROM moderation_reports
+					 WHERE reporter_user_id = $1 AND assignment_type = 'freeze_appeal' AND status <> 'resolved'
+					 ORDER BY created_at DESC LIMIT 1`,
+					[userId],
+				);
+				return this._mapModerationReport(rows[0]);
+			}
+
+			async getOpenModerationVerificationByUserId(userId) {
+				const { rows } = await this.pool.query(
+					`SELECT * FROM moderation_reports
+					 WHERE reporter_user_id = $1 AND assignment_type = 'verification_application' AND status <> 'resolved'
+					 ORDER BY created_at DESC LIMIT 1`,
+					[userId],
+				);
+				return this._mapModerationReport(rows[0]);
+			}
+
+			async getModerationReportById(reportId) {
+				const { rows } = await this.pool.query(
+					'SELECT * FROM moderation_reports WHERE id = $1 LIMIT 1',
+					[reportId],
+				);
+				return this._mapModerationReport(rows[0]);
+			}
+
+		async listModerationReportsForAdmin(adminId, options = {}) {
+			const status = options.status || 'assigned';
+			const limit = Math.max(1, Math.min(Number(options.limit) || 50, 100));
+			const offset = Math.max(0, Number(options.offset) || 0);
+			const { rows } = await this.pool.query(
+				`SELECT * FROM moderation_reports
+				 WHERE assigned_admin_id = $1
+				   AND ($2::text IS NULL OR status = $2)
+				 ORDER BY COALESCE(assigned_at, created_at) DESC, id DESC
+				 LIMIT $3 OFFSET $4`,
+				[adminId, status || null, limit, offset],
+			);
+			return rows.map((row) => this._mapModerationReport(row));
+		}
+
+		async getModerationAdminWorkloads(excludedAdminIds = []) {
+			const excluded = [...new Set((excludedAdminIds || []).map(Number).filter(Number.isInteger))];
+			const { rows } = await this.pool.query(
+				`SELECT u.id AS admin_id, COUNT(r.id)::int AS active_count
+				 FROM users u
+				 LEFT JOIN moderation_reports r
+				   ON r.assigned_admin_id = u.id AND r.status = 'assigned'
+				 WHERE u.admin = TRUE
+				   AND COALESCE(u.freeze, '') = ''
+				   AND NOT (u.id = ANY($1::int[]))
+				 GROUP BY u.id`,
+				[excluded],
+			);
+			return rows.map((row) => ({
+				adminId: Number(row.admin_id),
+				activeCount: Number(row.active_count || 0),
+			}));
+		}
+
+		async assignModerationReport(reportId, assignment = {}) {
+			const excluded = [...new Set((assignment.excludedAdminIds || []).map(Number).filter(Number.isInteger))];
+			const hasExpected = Object.prototype.hasOwnProperty.call(assignment, 'expectedAdminId');
+			const { rows } = await this.pool.query(
+				`UPDATE moderation_reports
+				 SET status = 'assigned', assigned_admin_id = $2,
+					 assigned_at = COALESCE($3::timestamptz, NOW()),
+					 excluded_admin_ids = $4::jsonb
+				 WHERE id = $1 AND status <> 'resolved'
+				   AND ($5::boolean = false OR assigned_admin_id IS NOT DISTINCT FROM $6::int)
+				 RETURNING *`,
+				[
+					reportId,
+					assignment.adminId,
+					assignment.assignedAt || null,
+					JSON.stringify(excluded),
+					hasExpected,
+					hasExpected ? Number(assignment.expectedAdminId) : null,
+				],
+			);
+			return this._mapModerationReport(rows[0]);
+		}
+
+		async getOverdueModerationReports(cutoff) {
+			const { rows } = await this.pool.query(
+				`SELECT * FROM moderation_reports
+				 WHERE status = 'assigned' AND assigned_at IS NOT NULL AND assigned_at <= $1::timestamptz
+				 ORDER BY assigned_at ASC`,
+				[cutoff],
+			);
+			return rows.map((row) => this._mapModerationReport(row));
+		}
+
+		async getUnassignedModerationReports(limit = 100) {
+			const { rows } = await this.pool.query(
+				`SELECT * FROM moderation_reports
+				 WHERE status = 'pending'
+				 ORDER BY created_at ASC, id ASC LIMIT $1`,
+				[Math.max(1, Math.min(Number(limit) || 100, 100))],
+			);
+			return rows.map((row) => this._mapModerationReport(row));
+		}
+
+		async resolveModerationReport(reportId, adminId, resolution) {
+			const { rows } = await this.pool.query(
+				`UPDATE moderation_reports
+				 SET status = 'resolved', resolution = $3::jsonb, resolved_at = NOW()
+				 WHERE id = $1 AND assigned_admin_id = $2 AND status = 'assigned'
+				 RETURNING *`,
+				[reportId, adminId, JSON.stringify(resolution || {})],
+			);
+			return this._mapModerationReport(rows[0]);
+		}
+
+		async deleteModerationReport(reportId) {
+			const result = await this.pool.query(
+				'DELETE FROM moderation_reports WHERE id = $1',
+				[reportId],
+			);
+			return result.rowCount > 0;
+		}
+
+		async upsertPushSubscription(userId, subscription) {
 		const { rows } = await this.pool.query(
 			`INSERT INTO push_subscriptions
 				(user_id, endpoint, expiration_time, p256dh, auth, session_token, created_at, updated_at)

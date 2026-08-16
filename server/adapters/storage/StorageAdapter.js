@@ -38,6 +38,25 @@ class StorageAdapter {
   async deleteMany(fileIds) {
     throw new Error('deleteMany() must be implemented');
   }
+
+  /**
+   * 指定フォルダ配下の保存済み容量を返す。
+   * @param {string} folder
+   * @returns {Promise<number>} バイト数
+   */
+  async getUsage(folder) {
+    throw new Error('getUsage() must be implemented');
+  }
+
+  /**
+   * 指定フォルダ配下のファイルを一覧する。
+   * @param {string} folder
+   * @param {{limit?: number}} [options]
+   * @returns {Promise<Array<{id: string, name: string, size: number, updatedAt: string|null}>>}
+   */
+  async listFiles(folder, options = {}) {
+    throw new Error('listFiles() must be implemented');
+  }
 }
 
 module.exports = StorageAdapter;

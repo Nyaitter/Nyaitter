@@ -3,12 +3,14 @@ const {
   PutObjectCommand,
   DeleteObjectCommand,
   GetObjectCommand,
+  ListObjectsV2Command,
 } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const StorageAdapter = require('../StorageAdapter');
 const crypto = require('crypto');
 const {
-  getSafeExtension,
+  createStorageFileName,
+  getOriginalFileNameFromStorageKey,
   normalizeFolder,
   normalizeStorageKey,
 } = require('../safeStoragePath');
@@ -126,11 +128,12 @@ class R2StorageAdapter extends StorageAdapter {
   }
 
   async upload(params) {
-    const { file, fileName, contentType, folder = 'attachments' } = params;
+    const { file, fileName, originalFileName, contentType, folder = 'attachments' } = params;
     const normalizedFolder = normalizeFolder(folder);
     const id = crypto.randomBytes(16).toString('hex');
-    const ext = getSafeExtension(fileName, contentType);
-    const key = normalizeStorageKey(`${normalizedFolder}/${id}${ext}`);
+    const key = normalizeStorageKey(
+      `${normalizedFolder}/${createStorageFileName(id, originalFileName || fileName, contentType)}`,
+    );
 
     // AWS SDK v3 accepts Buffer and Node.js Readable bodies directly. Do not
     // concatenate async iterable chunks here: R2 can receive the stream while
@@ -188,6 +191,48 @@ class R2StorageAdapter extends StorageAdapter {
       }
     };
     await Promise.all(Array.from({ length: workerCount }, worker));
+  }
+
+  _getFolderPrefix(folder) {
+    return `${normalizeFolder(folder)}/`;
+  }
+
+  async _listObjects(folder) {
+    const prefix = this._getFolderPrefix(folder);
+    const objects = [];
+    let continuationToken = undefined;
+    do {
+      const page = await this._send(new ListObjectsV2Command({
+        Bucket: this.bucket,
+        Prefix: prefix,
+        ContinuationToken: continuationToken,
+        MaxKeys: 1000,
+      }));
+      objects.push(...(Array.isArray(page.Contents) ? page.Contents : []));
+      continuationToken = page.IsTruncated ? page.NextContinuationToken : undefined;
+    } while (continuationToken);
+    return objects;
+  }
+
+  async getUsage(folder) {
+    const objects = await this._listObjects(folder);
+    return objects.reduce((total, object) => total + Math.max(0, Number(object.Size) || 0), 0);
+  }
+
+  async listFiles(folder, { limit = 500 } = {}) {
+    const maxItems = Math.min(1000, Math.max(1, Math.floor(Number(limit) || 500)));
+    const prefix = this._getFolderPrefix(folder);
+    const objects = await this._listObjects(folder);
+    return objects
+      .filter((object) => object.Key && !String(object.Key).endsWith('/'))
+      .map((object) => ({
+        id: normalizeStorageKey(object.Key),
+        name: getOriginalFileNameFromStorageKey(object.Key),
+        size: Math.max(0, Number(object.Size) || 0),
+        updatedAt: object.LastModified ? new Date(object.LastModified).toISOString() : null,
+      }))
+      .sort((left, right) => String(right.updatedAt || '').localeCompare(String(left.updatedAt || '')))
+      .slice(0, maxItems);
   }
 
   async getSignedUploadUrl(key, contentType, expiresInSeconds = 3600) {

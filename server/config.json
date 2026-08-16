@@ -1,7 +1,7 @@
 {
 	"server": {
 		"port": 3000,
-		"jsonBodyLimit": "2mb",
+		"jsonBodyLimit": "7mb",
 		"trustProxy": false
 	},
 	"static": {
@@ -23,16 +23,33 @@
 		"dmMessagesMaxLimit": 100,
 		"parentPostPreviewLength": 100,
 		"followingDefaultLimit": 100,
-		"maxFileUploadSizeMB": 10
-	},
+	"maxFileUploadSizeMB": 5
+		},
+		"dm": {
+			"e2eEnabled": false
+		},
+		"imageUpload": {
+			"maxWidth": 2560,
+			"maxHeight": 2560,
+			"maxPixels": 40000000,
+			"maxOutputSizeMB": 5,
+			"webpQuality": 82,
+			"minWebpQuality": 60
+		},
 	"auth": {
 		"sessionExpiryDays": 30,
 		"verificationCodeExpiryMinutes": 15,
 		"botTokenPrefix": "bot_",
 		"sessionTokenBytes": 32,
 		"botTokenIdBytes": 16,
-		"verificationCodeBytes": 4
-	},
+			"verificationCodeBytes": 4,
+			"scratchVerification": {
+				"ipRestrictionEnabled": true,
+				"rejectNewScratcher": true,
+				"rejectStudentAccounts": true,
+				"minQualifiedFollowers": 25
+			}
+		},
 	"inMemory": {
 		"initialUserId": 0
 	},
@@ -48,8 +65,9 @@
 			"authToken": ""
 		}
 	},
-	"storage": {
-		"adapter": "local",
+		"storage": {
+			"adapter": "local",
+			"userQuotaMB": 1024,
 		"local": {
 			"uploadDir": "./uploads"
 		},
@@ -70,9 +88,9 @@
 		"enabled": true,
 		"windowMs": 60000,
 		"max": 1000,
-		"auth": {
-			"windowMs": 60000,
-"max": 20
+			"auth": {
+				"windowMs": 60000,
+				"max": 120
 			}
 	},
 	"security": {

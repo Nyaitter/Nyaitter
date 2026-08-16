@@ -36,6 +36,33 @@ function getSafeExtension(fileName, contentType) {
   return '';
 }
 
+function truncateUtf8(value, maxBytes) {
+  let result = '';
+  for (const character of String(value || 'file')) {
+    if (Buffer.byteLength(result + character, 'utf8') > maxBytes) break;
+    result += character;
+  }
+  return result || 'file';
+}
+
+function createStorageFileName(id, originalFileName, contentType) {
+  const encodedName = Buffer.from(truncateUtf8(originalFileName, 60), 'utf8').toString('base64url');
+  const extension = getSafeExtension(originalFileName, contentType);
+  return `${id}--n-${encodedName}${extension}`;
+}
+
+function getOriginalFileNameFromStorageKey(key) {
+  const fileName = String(key || '').split('/').pop() || '';
+  const match = /^[a-f0-9]{32}--n-([A-Za-z0-9_-]+)(?:\.[a-z0-9]{1,10})?$/i.exec(fileName);
+  if (!match) return fileName;
+  try {
+    const decoded = Buffer.from(match[1], 'base64url').toString('utf8');
+    return decoded || fileName;
+  } catch (_) {
+    return fileName;
+  }
+}
+
 function normalizeFolder(folder) {
   const value = String(folder || '').replace(/\\/g, '/');
   const parts = value.split('/');
@@ -75,6 +102,8 @@ function isOwnedAttachmentKey(key, userId) {
 
 module.exports = {
   CONTENT_TYPE_EXTENSIONS,
+  createStorageFileName,
+  getOriginalFileNameFromStorageKey,
   getSafeExtension,
   isOwnedAttachmentKey,
   normalizeContentType,
