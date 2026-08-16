@@ -8,8 +8,8 @@
     "start": "node server/index.js",
     "server": "node server/index.js",
     "build:emoji-mart": "node audit/build_emoji_mart_local.js",
-    "swagger": "node server/swagger.js"
-    "cli": "node server/cli.js",
+    "swagger": "node server/swagger.js",
+    "cli": "node server/cli.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1110.0",
