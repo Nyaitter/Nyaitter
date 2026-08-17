@@ -547,7 +547,7 @@ router.get('/page', optionalAuth, async (req, res) => {
 			}
 
 			const nextCursor = result.next_cursor ?? (
-				result.has_more && result.ids?.length > 0
+				!result.use_offset_pagination && result.has_more && result.ids?.length > 0
 					? result.ids[result.ids.length - 1]
 					: null
 			);

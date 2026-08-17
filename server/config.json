@@ -136,7 +136,7 @@
 	},
 	"federation": {
 		"publicUrl": "",
-		"domain": "nyaitter.jp",
+		"domain": "example.com",
 		"allow_external_login": false,
 		"trusted_servers": []
 	}

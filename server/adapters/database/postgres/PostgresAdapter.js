@@ -712,10 +712,8 @@ class PostgresAdapter extends DatabaseAdapter {
 				? Number(beforeId)
 				: null;
 			const normalizedViewerId = Number.isInteger(Number(viewerId)) ? Number(viewerId) : null;
-			const candidateLimit = Math.min(
-				1000,
-				Math.max(500, (normalizedBeforeId == null ? normalizedOffset : 0) + normalizedLimit + 1),
-			);
+			const scoringBlockSize = Math.max(240, normalizedLimit * 8);
+			const candidateLimit = scoringBlockSize + 1;
 			const values = [];
 			const candidateClauses = ['p.reply_to IS NULL'];
 			if (normalizedBeforeId != null) {
@@ -724,6 +722,10 @@ class PostgresAdapter extends DatabaseAdapter {
 			}
 			values.push(candidateLimit);
 			const candidateLimitParam = values.length;
+			values.push(normalizedOffset);
+			const candidateOffsetParam = values.length;
+			values.push(scoringBlockSize);
+			const scoringBlockSizeParam = values.length;
 			const personalScoreCtes = [];
 			if (normalizedViewerId != null) {
 				values.push(normalizedViewerId);
@@ -757,17 +759,18 @@ class PostgresAdapter extends DatabaseAdapter {
 					)`,
 				);
 			}
-			values.push(normalizedLimit + 1);
-			const pageLimitParam = values.length;
-			values.push(normalizedOffset);
-			const pageOffsetParam = values.length;
 			const { rows } = await this.pool.query(
-				`WITH candidates AS (
+				`WITH candidate_source AS (
 					SELECT p.id, p.user_id, p.created_at
 					FROM posts p
 					WHERE ${candidateClauses.join(' AND ')}
 					ORDER BY p.created_at DESC, p.id DESC
-					LIMIT $${candidateLimitParam}
+					LIMIT $${candidateLimitParam} OFFSET $${candidateOffsetParam}
+				), candidates AS (
+					SELECT id, user_id, created_at
+					FROM candidate_source
+					ORDER BY created_at DESC, id DESC
+					LIMIT $${scoringBlockSizeParam}
 				), like_counts AS (
 					SELECT l.post_id, COUNT(*)::int AS count
 					FROM likes l JOIN candidates c ON c.id = l.post_id
@@ -798,17 +801,29 @@ class PostgresAdapter extends DatabaseAdapter {
 					LEFT JOIN viewer_star_affinity vsa ON vsa.user_id = c.user_id
 					LEFT JOIN direct_follows df ON df.user_id = c.user_id
 					LEFT JOIN second_degree_follows sdf ON sdf.user_id = c.user_id` : ''}
+				), score_stats AS (
+					SELECT AVG(score) AS average_score FROM scored
 				)
-				SELECT id FROM scored
-				ORDER BY score DESC, created_at DESC, id DESC
-				LIMIT $${pageLimitParam} OFFSET $${pageOffsetParam}`,
+				SELECT
+					COALESCE(
+						array_agg(s.id ORDER BY s.score DESC, s.created_at DESC, s.id DESC),
+						ARRAY[]::integer[]
+					) AS ids,
+					(SELECT COUNT(*)::int FROM candidate_source) AS candidate_count
+				FROM scored s
+				CROSS JOIN score_stats stats
+				WHERE s.score >= stats.average_score * 0.75`,
 				values,
 			);
-			const ids = rows.slice(0, normalizedLimit).map((row) => row.id);
+			const ids = Array.isArray(rows[0]?.ids)
+				? rows[0].ids.map(Number).filter(Number.isInteger)
+				: [];
+			const candidateCount = Math.max(0, Number(rows[0]?.candidate_count) || 0);
 			return {
 				ids,
-				has_more: rows.length > normalizedLimit,
+				has_more: candidateCount > scoringBlockSize,
 				next_cursor: null,
+				next_offset: normalizedOffset + Math.min(candidateCount, scoringBlockSize),
 				use_offset_pagination: true,
 			};
 		}

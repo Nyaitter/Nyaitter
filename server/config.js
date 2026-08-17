@@ -580,7 +580,7 @@ const config = {
     // PUBLIC_URL is optional. When absent, public URLs are derived from each
     // request's protocol and host (with proxy headers honored only if trustProxy is enabled).
     publicUrl: process.env.PUBLIC_URL || get('federation.publicUrl', ''),
-    domain: process.env.SERVER_DOMAIN || get('federation.domain', 'nyaitter.jp'),
+    domain: process.env.SERVER_DOMAIN || get('federation.domain', 'example.com'),
     allow_external_login: get('federation.allow_external_login', true),
     trusted_servers: get('federation.trusted_servers', []),
   },

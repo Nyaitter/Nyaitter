@@ -1030,16 +1030,25 @@ export default {
 					const viewerId = viewerIdParam !== null && Number.isSafeInteger(Number(viewerIdParam))
 						? Number(viewerIdParam)
 						: null;
-					const candidateLimit = Math.min(1000, Math.max(500, offset + limit + 1));
-					const candidateWhere = beforeId != null ? 'p.reply_to IS NULL AND p.id < ?' : 'p.reply_to IS NULL';
-					const candidateBindings = beforeId != null ? [beforeId, candidateLimit] : [candidateLimit];
-					const commonCtes = `WITH candidates AS (
-						SELECT p.id, p.user_id, p.created_at
-						FROM posts p
-						WHERE ${candidateWhere}
-						ORDER BY p.created_at DESC, p.id DESC
-						LIMIT ?
-					), like_counts AS (
+											const scoringBlockSize = Math.max(240, limit * 8);
+						const candidateLimit = scoringBlockSize + 1;
+						const candidateWhere = beforeId != null ? 'p.reply_to IS NULL AND p.id < ?' : 'p.reply_to IS NULL';
+						const candidateBindings = beforeId != null
+							? [beforeId, candidateLimit, offset, scoringBlockSize]
+							: [candidateLimit, offset, scoringBlockSize];
+						const commonCtes = `WITH candidate_source AS (
+							SELECT p.id, p.user_id, p.created_at
+							FROM posts p
+							WHERE ${candidateWhere}
+							ORDER BY p.created_at DESC, p.id DESC
+							LIMIT ? OFFSET ?
+						), candidates AS (
+							SELECT id, user_id, created_at
+							FROM candidate_source
+							ORDER BY created_at DESC, id DESC
+							LIMIT ?
+						), like_counts AS (
+
 						SELECT l.post_id, COUNT(*) AS count
 						FROM likes l JOIN candidates c ON c.id = l.post_id
 						GROUP BY l.post_id
@@ -1065,7 +1074,14 @@ export default {
 							LEFT JOIN star_counts s ON s.post_id = c.id
 							LEFT JOIN repost_counts r ON r.post_id = c.id
 						)
-						SELECT id FROM scored ORDER BY score DESC, created_at DESC, id DESC LIMIT ? OFFSET ?`
+						SELECT COALESCE(json_group_array(id), '[]') AS ids,
+								(SELECT COUNT(*) FROM candidate_source) AS candidate_count
+							FROM (
+								SELECT s.id FROM scored s
+								CROSS JOIN (SELECT AVG(score) AS average_score FROM scored) stats
+								WHERE s.score >= stats.average_score * 0.75
+								ORDER BY s.score DESC, s.created_at DESC, s.id DESC
+							)`
 						: `${commonCtes}, viewer_like_affinity AS (
 							SELECT p.user_id, COUNT(*) AS count
 							FROM likes l JOIN posts p ON p.id = l.post_id
@@ -1097,17 +1113,31 @@ export default {
 							LEFT JOIN direct_follows df ON df.user_id = c.user_id
 							LEFT JOIN second_degree_follows sdf ON sdf.user_id = c.user_id
 						)
-						SELECT id FROM scored ORDER BY score DESC, created_at DESC, id DESC LIMIT ? OFFSET ?`;
+						SELECT COALESCE(json_group_array(id), '[]') AS ids,
+								(SELECT COUNT(*) FROM candidate_source) AS candidate_count
+							FROM (
+								SELECT s.id FROM scored s
+								CROSS JOIN (SELECT AVG(score) AS average_score FROM scored) stats
+								WHERE s.score >= stats.average_score * 0.75
+								ORDER BY s.score DESC, s.created_at DESC, s.id DESC
+							)`;
 					const bindings = viewerId == null
-						? [...candidateBindings, limit + 1, offset]
-						: [...candidateBindings, viewerId, viewerId, viewerId, viewerId, viewerId, limit + 1, offset];
+						? candidateBindings
+						: [...candidateBindings, viewerId, viewerId, viewerId, viewerId, viewerId];
 					const { results } = await db.prepare(query).bind(...bindings).all();
-					const rows = results || [];
-					const ids = rows.slice(0, limit).map((r) => r.id);
+					const row = (results || [])[0] || {};
+					let ids = [];
+					try {
+						ids = Array.isArray(row.ids) ? row.ids : JSON.parse(row.ids || '[]');
+					} catch (_) {
+						ids = [];
+					}
+					const candidateCount = Math.max(0, Number(row.candidate_count) || 0);
 					return json({
-						ids,
-						has_more: rows.length > limit,
+						ids: ids.map(Number).filter(Number.isSafeInteger),
+						has_more: candidateCount > scoringBlockSize,
 						next_cursor: null,
+						next_offset: offset + Math.min(candidateCount, scoringBlockSize),
 						use_offset_pagination: true,
 					});
 				}

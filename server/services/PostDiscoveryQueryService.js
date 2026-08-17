@@ -52,7 +52,18 @@ async function getDiscoverablePostPage({
 		});
 		const candidateIds = normalizePostIds(candidatePage?.ids);
 		requiresOffsetPagination ||= candidatePage?.use_offset_pagination === true;
-		if (candidateIds.length === 0) break;
+		const reportedNextOffset = Number(candidatePage?.next_offset);
+		const nextCandidateOffset =
+			Number.isInteger(reportedNextOffset) && reportedNextOffset > candidateOffset
+				? reportedNextOffset
+				: candidateOffset + candidateIds.length;
+		if (candidateIds.length === 0) {
+			if (!candidatePage?.has_more) break;
+			if (candidateBeforeId != null) break;
+			if (nextCandidateOffset <= candidateOffset) break;
+			candidateOffset = nextCandidateOffset;
+			continue;
+		}
 
 		const postsById = new Map(
 			(await db.getPostsByIds(candidateIds)).filter(Boolean).map((post) => [
@@ -95,12 +106,12 @@ async function getDiscoverablePostPage({
 		}
 
 		if (candidateBeforeId != null) {
-			candidateBeforeId = candidateIds[candidateIds.length - 1];
+			candidateBeforeId = candidatePage?.next_cursor ?? candidateIds[candidateIds.length - 1];
 		} else {
-			candidateOffset += candidateIds.length;
+			if (nextCandidateOffset <= candidateOffset) break;
+			candidateOffset = nextCandidateOffset;
 		}
-		if (!candidatePage?.has_more || candidateIds.length < candidateLimit)
-			break;
+		if (!candidatePage?.has_more) break;
 	}
 
 	const posts = collectedPosts.slice(0, normalizedLimit);
@@ -109,6 +120,7 @@ async function getDiscoverablePostPage({
 		ids,
 		posts,
 		has_more: hasMore,
+		use_offset_pagination: requiresOffsetPagination,
 		next_cursor: !requiresOffsetPagination && hasMore && ids.length > 0
 			? ids[ids.length - 1]
 			: null,

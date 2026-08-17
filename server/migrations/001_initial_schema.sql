@@ -10,7 +10,7 @@ CREATE TABLE IF NOT EXISTS users (
     scid TEXT UNIQUE,                          -- Scratch ID (legacy)
     name TEXT NOT NULL,
     handle TEXT,                               -- e.g. #1234
-    nyaitter_address TEXT UNIQUE,              -- e.g. #1234@nyaitter.jp
+    nyaitter_address TEXT UNIQUE,              -- e.g. #1234@example.com
     auth_provider TEXT DEFAULT 'local',        -- local | nyaitter | external
     provider_domain TEXT,                      -- for external logins
     external_id TEXT,                          -- ID on external server

@@ -1825,10 +1825,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 				? Number(beforeId)
 				: null;
 			const normalizedOffset = normalizedBeforeId == null ? Math.max(0, Number(offset) || 0) : 0;
-			const candidateLimit = Math.min(
-				1000,
-				Math.max(500, normalizedOffset + normalizedLimit + 1),
-			);
+			const scoringBlockSize = Math.max(240, normalizedLimit * 8);
 			const normalizedViewerId = Number.isInteger(Number(viewerId)) ? Number(viewerId) : null;
 			const directFollowIds = normalizedViewerId == null
 				? new Set()
@@ -1857,13 +1854,18 @@ class InMemoryAdapter extends DatabaseAdapter {
 				addAffinity(this.starredPostIdsByUser.get(normalizedViewerId) || [], 'stars');
 			}
 
-			const candidates = [];
+			const candidateSource = [];
 			for (const id of this.postIdsNewest) {
 				const post = this.posts.get(id);
 				if (!post || post.replyTo != null || (normalizedBeforeId != null && Number(id) >= normalizedBeforeId)) continue;
-				candidates.push(post);
-				if (candidates.length >= candidateLimit) break;
+				candidateSource.push(post);
+				if (candidateSource.length >= normalizedOffset + scoringBlockSize + 1) break;
 			}
+			const blockWithSentinel = candidateSource.slice(
+				normalizedOffset,
+				normalizedOffset + scoringBlockSize + 1,
+			);
+			const candidates = blockWithSentinel.slice(0, scoringBlockSize);
 			const now = Date.now();
 			const scored = candidates.map((post) => {
 				const authorId = Number(post.userId);
@@ -1884,17 +1886,20 @@ class InMemoryAdapter extends DatabaseAdapter {
 				);
 				return { post, score: recencyScore + graphScore + affinityScore + engagementScore };
 			});
-			scored.sort((left, right) => (
-				right.score - left.score
-				|| new Date(right.post.createdAt || right.post.created_at).getTime() - new Date(left.post.createdAt || left.post.created_at).getTime()
-				|| Number(right.post.id) - Number(left.post.id)
-			));
-			const window = scored.slice(normalizedOffset, normalizedOffset + normalizedLimit + 1);
-			const ids = window.slice(0, normalizedLimit).map(({ post }) => post.id);
+			const averageScore = scored.reduce((total, entry) => total + entry.score, 0) / scored.length;
+			const ids = scored
+				.filter((entry) => entry.score >= averageScore * 0.75)
+				.sort((left, right) => (
+					right.score - left.score
+					|| new Date(right.post.createdAt || right.post.created_at).getTime() - new Date(left.post.createdAt || left.post.created_at).getTime()
+					|| Number(right.post.id) - Number(left.post.id)
+				))
+				.map(({ post }) => post.id);
 			return {
 				ids,
-				has_more: window.length > normalizedLimit,
+				has_more: blockWithSentinel.length > scoringBlockSize,
 				next_cursor: null,
+				next_offset: normalizedOffset + Math.min(blockWithSentinel.length, scoringBlockSize),
 				use_offset_pagination: true,
 			};
 		}

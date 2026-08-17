@@ -859,7 +859,6 @@ router.get('/external/trusted', (req, res) => {
  *
  * 注意: nyaitter_address のドメイン部（#id@ドメイン）は、
  * そのNyaitterサーバーを実際にホストしているドメインに依存します。
- * 必ずしも nyaitter.jp であるとは限りません。
  */
 router.post('/external/init', async (req, res) => {
   const { nyaitter_address } = req.body;
