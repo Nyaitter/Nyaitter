@@ -576,10 +576,6 @@ const config = {
     detailed: get('health.detailed', false),
   },
 
-  // Contributor badges are server-managed so the browser does not depend on
-  // a separately deployed JSON asset.
-  contributors: get('contributors', []).filter(Number.isInteger),
-
   federation: {
     // PUBLIC_URL is optional. When absent, public URLs are derived from each
     // request's protocol and host (with proxy headers honored only if trustProxy is enabled).

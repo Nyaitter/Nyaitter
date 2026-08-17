@@ -85,6 +85,24 @@ async function sendScratchFallbackIcon(req, res, scid) {
 	return true;
 }
 
+async function sendStoredIcon(req, res, fileId) {
+	const storage = getStorageAdapter(req);
+	if (!storage || typeof storage.read !== 'function') return false;
+	try {
+		const file = await storage.read(fileId);
+		const contentType = String(file?.contentType || '').split(';', 1)[0].trim().toLowerCase();
+		const buffer = Buffer.isBuffer(file?.buffer) ? file.buffer : Buffer.from(file?.buffer || '');
+		if (!contentType.startsWith('image/') || buffer.length === 0) return false;
+		res.setHeader('Cache-Control', 'public, max-age=21600, stale-while-revalidate=86400');
+		res.setHeader('Content-Type', contentType);
+		res.send(buffer);
+		return true;
+	} catch (error) {
+		console.warn('[users/icon] stored icon read failed:', error.message);
+		return false;
+	}
+}
+
 async function publishNewNotification(req, userId, notification) {
 	const structuredNotification = await serializeNotification(
 		getDbAdapter(req),
@@ -183,17 +201,22 @@ async function handleUserIcon(req, res) {
 				// キーを相対リダイレクトすると現在の /server/api/users/... 配下として解決されるため、
 				if (!/^(?:https?:)?\/\//i.test(iconData) && !iconData.startsWith('/')) {
 					const storage = getStorageAdapter(req);
-					if (storage && typeof storage.getPublicUrl === 'function') {
-						try {
-							const publicUrl = await storage.getPublicUrl(iconData);
-							if (typeof publicUrl === 'string' && publicUrl && isAllowedIconRedirectUrl(publicUrl)) {
-								return res.redirect(302, publicUrl);
+											if (storage && typeof storage.getPublicUrl === 'function') {
+							try {
+								const publicUrl = await storage.getPublicUrl(iconData);
+								if (typeof publicUrl === 'string' && publicUrl && isAllowedIconRedirectUrl(publicUrl)) {
+									return res.redirect(302, publicUrl);
+								}
+							} catch (error) {
+								console.warn('[users/icon] stored icon URL resolution failed:', error.message);
 							}
-						} catch (error) {
-							console.warn('[users/icon] stored icon URL resolution failed:', error.message);
 						}
-					}
-					return res.redirect(302, '/logo.png');
+
+						// ユーザーファイルの公開URLを設定していない場合でも、Push通知が
+						// このAPIを読み込めるよう、保存済み画像を直接返す。
+						if (await sendStoredIcon(req, res, iconData)) return;
+						return res.redirect(302, '/logo.png');
+
 				}
 
 				// 同一オリジン相対パス、または許可済みScratch CDNのURLだけをリダイレクトする。

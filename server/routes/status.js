@@ -12,10 +12,6 @@ function getDbAdapter(req) {
 	return req.app.locals.dbAdapter;
 }
 
-router.get('/contributors', (req, res) => {
-	res.json({ contributors: config.contributors || [] });
-});
-
 router.get('/status', async (req, res) => {
 	let dbStatus = 'ok';
 
