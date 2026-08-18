@@ -85,6 +85,14 @@ APIの基準パスは `NYAITTER_API_ENDPOINT` または `server.apiEndpoint` で
 
 Clientの `config.js` でHTTPSの外部APIエンドポイントを指定した場合、リアルタイム接続は同じホストの `wss://` URLを使用します。ClientのCSPとServerが静的配信時に返すCSPは、HTTPS APIとWSS接続を許可しています。投稿のリアルタイム通知は、投稿者をフォローしている接続中のユーザーだけに送信し、返信投稿は対象にしません。
 
+### URLカード
+
+ポスト本文にHTTPS URLが含まれる場合、標準Clientは先頭の対象URLについてURLカードを表示します。URLを `<` と `>` で囲むと、通常のリンクとして残したままカード取得を止められます。ワンクッション付きのポストにはURLカードを表示しません。
+
+Serverは通常のOpen Graph、Twitter Card、HTMLタイトル、JSON-LDを順に利用します。加えて、ページ内またはHTTP `Link` ヘッダーで公開されているJSON oEmbedの自動検出を行います。YouTube、Vimeo、TikTok、SoundCloud、Flickr、Reddit、Tumblr、CodePen、Speaker Deck、Mixcloud、Dailymotion、Spotify、X、SlideShare、Sketchfab、Giphy、Pinterest、Imgur、Streamableには、oEmbedを自動検出できない場合の既知エンドポイントも用意しています。その他のサイトもOpen Graphなどの標準メタデータ、またはJSON oEmbed discoveryを実装していれば対応します。
+
+URLカードはサイト名、タイトル、説明文だけを表示します。oEmbedが返す埋め込みHTML、外部スクリプト、サムネイル画像は実行・表示しません。HTTPS以外、443番以外のポート、認証情報を含むURL、ローカルまたはプライベートIPへ解決されるURLは取得しません。リダイレクト先にも同じ検査を行い、本文とoEmbed応答にはサイズ上限、取得にはタイムアウトとリダイレクト回数の上限を適用します。
+
 ## Push通知とセッション
 
 Push通知を有効にするには、`VAPID_SUBJECT`、`VAPID_PUBLIC_KEY`、`VAPID_PRIVATE_KEY` を設定します。ブラウザが `POST /push/subscriptions` を実行すると、Push購読はその時点で認証に使用したセッションと紐付けて保存されます。
