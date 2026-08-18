@@ -5,6 +5,7 @@
 const crypto = require('crypto');
 
 const DEFAULT_MAX_SOURCE_BYTES = 2 * 1024 * 1024;
+const DEFAULT_FAILURE_CACHE_MS = 60 * 1000;
 const ALLOWED_SCRATCH_IMAGE_HOSTS = new Set([
   'uploads.scratch.mit.edu',
   'cdn2.scratch.mit.edu',
@@ -46,6 +47,11 @@ class ScratchIconService {
   constructor(options = {}) {
     this.fetchImpl = options.fetchImpl || globalThis.fetch;
     this.maxSourceBytes = Number(options.maxSourceBytes || DEFAULT_MAX_SOURCE_BYTES);
+    this.failureCacheMs = Math.max(
+      1000,
+      Number(options.failureCacheMs || DEFAULT_FAILURE_CACHE_MS),
+    );
+    this.failureCache = new Map();
   }
 
   async _fetchSourceImage(url) {
@@ -91,17 +97,28 @@ class ScratchIconService {
   async getSourceIcon(scid, resolveSourceUrl) {
     const normalizedScid = String(scid || '').trim();
     if (!normalizedScid) return null;
-    const sourceUrl = await resolveSourceUrl(normalizedScid);
-    if (!isAllowedScratchImageUrl(sourceUrl)) {
-      throw new Error('Scratch icon source URL is not allowed');
+
+    const now = Date.now();
+    const retryAt = this.failureCache.get(normalizedScid);
+    if (retryAt && retryAt > now) return null;
+    if (retryAt) this.failureCache.delete(normalizedScid);
+
+    try {
+      const sourceUrl = await resolveSourceUrl(normalizedScid);
+      if (!isAllowedScratchImageUrl(sourceUrl)) {
+        throw new Error('Scratch icon source URL is not allowed');
+      }
+      const source = await this._fetchSourceImage(sourceUrl);
+      return {
+        sourceUrl: source.sourceUrl,
+        buffer: source.buffer,
+        contentType: source.contentType,
+        etag: `"scratch-icon-${crypto.createHash('sha256').update(source.buffer).digest('hex')}"`,
+      };
+    } catch (error) {
+      this.failureCache.set(normalizedScid, now + this.failureCacheMs);
+      throw error;
     }
-    const source = await this._fetchSourceImage(sourceUrl);
-    return {
-      sourceUrl: source.sourceUrl,
-      buffer: source.buffer,
-      contentType: source.contentType,
-      etag: `"scratch-icon-${crypto.createHash('sha256').update(source.buffer).digest('hex')}"`,
-    };
   }
 }
 

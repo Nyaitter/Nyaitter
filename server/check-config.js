@@ -297,12 +297,12 @@ function inspect() {
     const databaseAdapter = String(
         setting('DB_ADAPTER', config, 'database.adapter', 'memory'),
     ).toLowerCase();
-    if (!['memory', 'inmemory', 'postgres', 'pg', 'cockroach', 'cockroachdb', 'cockroachdb-cloud', 'd1', 'cloudflare-d1'].includes(databaseAdapter)) {
+    if (!['memory', 'inmemory', 'postgres', 'pg', 'd1', 'cloudflare-d1'].includes(databaseAdapter)) {
         addIssue(
             'error',
             'DATABASE_ADAPTER_UNSUPPORTED',
             `未対応のDB_ADAPTERです: ${databaseAdapter || '(空)'}`,
-            'DB_ADAPTER を memory、postgres、cockroach、または d1 のいずれかに設定してください。',
+            'DB_ADAPTER を memory、postgres、または d1 のいずれかに設定してください。',
         );
     }
 
@@ -329,28 +329,6 @@ function inspect() {
         }
     }
 
-    if (['cockroach', 'cockroachdb', 'cockroachdb-cloud'].includes(databaseAdapter)) {
-        const databaseUrl = setting(
-            'COCKROACH_DATABASE_URL',
-            config,
-            'database.cockroach.connectionString',
-        ) || setting('DATABASE_URL', config, 'database.cockroach.connectionString');
-        if (!isHttpUrl(String(databaseUrl).replace(/^postgres(?:ql)?:/i, 'http:'))) {
-            addIssue(
-                'error',
-                'COCKROACH_DATABASE_URL_MISSING_OR_INVALID',
-                'CockroachDB Cloudを選択していますが、有効な接続文字列がありません。',
-                'COCKROACH_DATABASE_URL または DATABASE_URL に CockroachDB CloudのGeneral connection stringを設定してください。',
-            );
-        } else if (hasPlaceholder(databaseUrl)) {
-            addIssue(
-                'warning',
-                'COCKROACH_DATABASE_URL_PLACEHOLDER',
-                'CockroachDB Cloudの接続文字列に例示用の値が含まれている可能性があります。',
-                'COCKROACH_DATABASE_URL または database.cockroach.connectionString を実際の接続情報に置き換えてください。',
-            );
-        }
-    }
 
     if (databaseAdapter === 'd1' || databaseAdapter === 'cloudflare-d1') {
         const workerUrl = setting('D1_WORKER_URL', config, 'database.d1.workerUrl');

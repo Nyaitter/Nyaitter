@@ -99,10 +99,16 @@ function isAllowedIconRedirectUrl(value) {
 }
 
 async function sendScratchFallbackIcon(req, res, scid) {
-	const entry = await getScratchIconService(req).getSourceIcon(
-		scid,
-		getScratchUserIconUrl,
-	);
+	let entry;
+	try {
+		entry = await getScratchIconService(req).getSourceIcon(
+			scid,
+			getScratchUserIconUrl,
+		);
+	} catch (error) {
+		console.warn(`[users/icon] Scratch icon fetch error for ${scid}:`, error.message);
+		return false;
+	}
 	if (!entry) return false;
 
 	res.setHeader('Cache-Control', 'public, max-age=21600, stale-while-revalidate=86400');
@@ -258,10 +264,11 @@ async function handleUserIcon(req, res) {
 				return res.redirect(302, '/logo.png');
 			}
 
-			if (user && user.scid) {
-				await sendScratchFallbackIcon(req, res, user.scid);
-				return;
-			}
+				if (user && user.scid) {
+					if (await sendScratchFallbackIcon(req, res, user.scid)) return;
+					res.setHeader('Cache-Control', 'public, max-age=60');
+					return res.redirect(302, '/logo.png');
+				}
 
 	} catch (err) {
 		console.error('[users] icon route error:', err);

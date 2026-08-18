@@ -8,7 +8,6 @@ Nyaitter は、データベースとファイル保存先をアダプターと�
 |---|---|---|
 | メモリDB | `DB_ADAPTER=memory` | ローカル開発。再起動でデータが消えます。 |
 | PostgreSQL | `DB_ADAPTER=postgres` | 一般的な公開運用。 |
-| CockroachDB Cloud | `DB_ADAPTER=cockroach` | CockroachDB Cloudを使う公開運用。 |
 | Cloudflare D1 | `DB_ADAPTER=d1` | D1 Proxy Workerを使う公開運用。 |
 | ローカル保存 | `STORAGE_ADAPTER=local` | 開発、または単一サーバー。 |
 | Cloudflare R2 | `STORAGE_ADAPTER=r2` | 複数サーバーや公開運用向け。 |
@@ -18,7 +17,7 @@ Nyaitter は、データベースとファイル保存先をアダプターと�
 | 場面 | DB | ファイル保存 |
 |---|---|---|
 | 手元で試す | `memory` | `local` |
-| 一般的な公開運用 | `postgres` または `cockroach` | `r2` |
+| 一般的な公開運用 | `postgres` | `r2` |
 | Cloudflare中心の運用 | `d1` | `r2` |
 
 ## DBデータの移行

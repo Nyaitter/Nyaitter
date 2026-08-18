@@ -133,7 +133,7 @@ async function restorePostReferences(client, rows) {
 
 async function resetIdentitySequences(pool) {
   // 連番の再設定はデータ置換トランザクションを確定した後に行う。
-  // 明示名のシーケンスはPostgreSQLとCockroachDBの両方でsetvalを利用できる。
+  // 明示名のシーケンスはPostgreSQLでsetvalを利用できる。
   for (const [table, sequenceName] of Object.entries(ID_SEQUENCES)) {
     try {
       const { rows } = await pool.query(`SELECT COALESCE(MAX(id), 0) AS max_id FROM ${quoteIdentifier(table)}`);

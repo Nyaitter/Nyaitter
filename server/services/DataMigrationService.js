@@ -27,13 +27,12 @@ const TABLES = Object.freeze([
   'logs',
 ]);
 
-const ADAPTER_NAMES = new Set(['memory', 'postgres', 'cockroach', 'd1']);
+const ADAPTER_NAMES = new Set(['memory', 'postgres', 'd1']);
 
 function normalizeAdapterName(value) {
   const normalized = String(value || '').trim().toLowerCase();
   if (normalized === 'inmemory') return 'memory';
   if (normalized === 'pg') return 'postgres';
-  if (normalized === 'cockroachdb' || normalized === 'cockroachdb-cloud') return 'cockroach';
   if (normalized === 'cloudflare-d1') return 'd1';
   if (!ADAPTER_NAMES.has(normalized)) {
     throw new Error(`Unsupported database adapter: ${value || '(empty)'}`);
@@ -357,15 +356,13 @@ function createAdapter(adapterName, prefix) {
   }
   if (type === 'postgres') {
     const PostgresAdapter = require('../adapters/database/postgres/PostgresAdapter');
-    return new PostgresAdapter({ connectionString: variable('DATABASE_URL') || variable('POSTGRES_URL') });
-  }
-  if (type === 'cockroach') {
-    const CockroachAdapter = require('../adapters/database/cockroach/CockroachAdapter');
-    return new CockroachAdapter({
-      connectionString: variable('COCKROACH_DATABASE_URL') || variable('DATABASE_URL'),
+    return new PostgresAdapter({
+      connectionString: variable('DATABASE_URL') || variable('POSTGRES_URL'),
       sslCa: variable('SSL_CA') || undefined,
       poolSize: Number(variable('POOL_SIZE')) || undefined,
+      poolMin: Number(variable('POOL_MIN')) || undefined,
       transactionRetries: Number(variable('TRANSACTION_RETRIES')) || undefined,
+      retryBaseDelayMs: Number(variable('RETRY_BASE_DELAY_MS')) || undefined,
     });
   }
   const D1Adapter = require('../adapters/database/d1/D1Adapter');

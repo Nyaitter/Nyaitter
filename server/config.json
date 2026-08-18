@@ -82,14 +82,13 @@
 					"postgres": {
 				"connectionString": "postgres://user:pass@localhost:5432/nyaitter",
 				"poolSize": 10,
-				"ssl": false
-			},
-			"cockroach": {
-				"connectionString": "",
-				"sslCa": "",
-				"poolSize": 10,
+				"poolMin": 2,
+				"poolIdleTimeoutMs": 300000,
+				"connectionTimeoutMs": 15000,
 				"transactionRetries": 5,
-				"retryBaseDelayMs": 50
+				"retryBaseDelayMs": 50,
+				"ssl": false,
+				"sslCa": ""
 			},
 			"d1": {
 

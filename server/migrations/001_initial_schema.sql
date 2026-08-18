@@ -1,5 +1,5 @@
 -- Nyaitter Server の新規DB用スキーマ
--- PostgreSQL と CockroachDB Cloud の両方で使用する。
+-- PostgreSQLで使用する。
 
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY,

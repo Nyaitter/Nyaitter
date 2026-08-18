@@ -93,7 +93,6 @@ npm run migrate
 |---|---|---|
 | `memory` | 開発 | 不要 |
 | `postgres` | PostgreSQL | `server/migrations/`を適用 |
-| `cockroach` | CockroachDB Cloud | `server/migrations/`を適用 |
 | `d1` | Cloudflare D1 | Worker側のD1移行を適用 |
 
 ### PostgreSQL
@@ -103,14 +102,6 @@ DB_ADAPTER=postgres
 DATABASE_URL=postgres://user:password@db.example.com:5432/nyaitter?sslmode=require
 ```
 
-### CockroachDB Cloud
-
-```dotenv
-DB_ADAPTER=cockroach
-COCKROACH_DATABASE_URL=postgresql://user:password@cluster.cockroachlabs.cloud:26257/defaultdb?sslmode=verify-full
-```
-
-必要に応じて`COCKROACH_POOL_SIZE`、`COCKROACH_TRANSACTION_RETRIES`、`COCKROACH_RETRY_BASE_DELAY_MS`を設定します。専用CAが必要な場合は`COCKROACH_SSL_CA`へPEM本文を設定します。
 
 ### Cloudflare D1
 
@@ -128,14 +119,14 @@ D1_MIGRATION_TARGET=local npm run migrate
 
 ### DBデータの移行
 
-空の移行先DBへ先に`npm run migrate`で初期スキーマを作成します。`npm run migrate:data`は`memory`、`postgres`、`cockroach`、`d1`間のデータ移行に使います。
+空の移行先DBへ先に`npm run migrate`で初期スキーマを作成します。`npm run migrate:data`は`memory`、`postgres`、`d1`間のデータ移行に使います。
 
 ```bash
 # バックアップ
 npm run migrate:data -- --from d1 --output nyaitter-backup.json
 
 # 復元
-npm run migrate:data -- --to cockroach --input nyaitter-backup.json --replace
+npm run migrate:data -- --to postgres --input nyaitter-backup.json --replace
 ```
 
 `--replace`は移行先のデータを置き換えます。移行元は`NYAITTER_DATA_SOURCE_`、移行先は`NYAITTER_DATA_DESTINATION_`を接頭辞にして接続情報を設定します。
@@ -143,17 +134,16 @@ npm run migrate:data -- --to cockroach --input nyaitter-backup.json --replace
 | DB | 接続設定 |
 |---|---|
 | PostgreSQL | `DATABASE_URL` |
-| CockroachDB Cloud | `COCKROACH_DATABASE_URL` |
 | Cloudflare D1 | `D1_WORKER_URL`、`D1_WORKER_TOKEN` |
 | memory | `OPERATOR_SOCKET`（対象Serverの起動が必要） |
 
-D1からCockroachDB Cloudへ直接移す例です。
+D1からPostgreSQLへ直接移す例です。
 
 ```bash
 NYAITTER_DATA_SOURCE_D1_WORKER_URL=https://d1-proxy.example.workers.dev \
 NYAITTER_DATA_SOURCE_D1_WORKER_TOKEN=<D1のWorkerトークン> \
-NYAITTER_DATA_DESTINATION_COCKROACH_DATABASE_URL='postgresql://user:password@cluster.cockroachlabs.cloud:26257/defaultdb?sslmode=verify-full' \
-npm run migrate:data -- --from d1 --to cockroach --replace --output nyaitter-backup.json
+NYAITTER_DATA_DESTINATION_DATABASE_URL='postgresql://user:password@db.example.com:5432/nyaitter?sslmode=require' \
+npm run migrate:data -- --from d1 --to postgres --replace --output nyaitter-backup.json
 ```
 
 ## ファイル保存

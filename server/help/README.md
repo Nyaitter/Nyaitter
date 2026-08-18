@@ -13,4 +13,4 @@
 | Cloudflareを併用する | [Cloudflare構成](./cloudflare-hybrid.md) |
 | 公開前に確認する | [本番チェックリスト](./production-checklist.md) |
 
-公開運用では永続DB（`postgres`、`cockroach`、または`d1`）を使います。秘密情報は`server/.env`またはデプロイ先のシークレット管理に置き、Gitへ追加しません。
+公開運用では永続DB（`postgres`または`d1`）を使います。秘密情報は`server/.env`またはデプロイ先のシークレット管理に置き、Gitへ追加しません。

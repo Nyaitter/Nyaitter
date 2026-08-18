@@ -6,7 +6,7 @@
 - [ ] `DEV_BYPASS_AUTH`を有効にしていない。
 - [ ] 信頼できるリバースプロキシの背後でだけ`TRUST_PROXY=true`を設定した。
 - [ ] ClientのオリジンをCORS許可設定へ追加した。
-- [ ] 永続DBとして`postgres`、`cockroach`、または`d1`を設定した。
+- [ ] 永続DBとして`postgres`または`d1`を設定した。
 - [ ] DB・R2・D1・VAPID・外部APIの秘密情報をシークレット管理へ置いた。
 - [ ] DBのバックアップを取り、`npm run migrate`を実行した。
 - [ ] ファイル保存先と`STORAGE_USER_QUOTA_MB`を設定した。

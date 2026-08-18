@@ -23,11 +23,6 @@ function createDatabaseAdapter() {
 		return new PostgresAdapter(config.database.postgres);
 	}
 
-	if (type === 'cockroach' || type === 'cockroachdb' || type === 'cockroachdb-cloud') {
-		console.log('[adapters] Using CockroachAdapter');
-		const CockroachAdapter = require('./database/cockroach/CockroachAdapter');
-		return new CockroachAdapter(config.database.cockroach);
-	}
 
 	if (type === 'd1' || type === 'cloudflare-d1') {
 		console.log('[adapters] Using D1Adapter (via Worker proxy)');

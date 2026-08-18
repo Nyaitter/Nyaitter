@@ -8,7 +8,6 @@ NyaitterはDBとファイル保存先を別々に設定できます。APIとClie
 |---|---|
 | `memory` | 開発用。再起動で消えます。 |
 | `postgres` | PostgreSQL。 |
-| `cockroach` | CockroachDB Cloud。 |
 | `d1` | Cloudflare D1。D1 Proxy Workerが必要です。 |
 
 永続DBを設定または更新した後は、リポジトリのルートで移行します。

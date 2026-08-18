@@ -22,6 +22,14 @@ class PostgresAdapter extends DatabaseAdapter {
 		super();
 		this.config = options;
 		this.pool = null;
+		this.transactionRetries = Math.max(
+			0,
+			Math.min(10, Math.floor(Number(options.transactionRetries) || 5)),
+		);
+		this.retryBaseDelayMs = Math.max(
+			10,
+			Math.min(5000, Math.floor(Number(options.retryBaseDelayMs) || 50)),
+		);
 	}
 
 	async connect() {
@@ -31,15 +39,28 @@ class PostgresAdapter extends DatabaseAdapter {
 			throw new Error('PostgreSQL connection string is required (DATABASE_URL or config.connectionString)');
 		}
 
-		this.pool = new Pool({
+		const poolOptions = {
 			connectionString,
 			max: this.config.poolSize || 10,
-			ssl: this.config.ssl ? { rejectUnauthorized: false } : false,
-		});
+			min: Math.min(this.config.poolSize || 10, this.config.poolMin || 2),
+			idleTimeoutMillis: this.config.poolIdleTimeoutMs || 300000,
+			connectionTimeoutMillis: this.config.connectionTimeoutMs || 15000,
+			keepAlive: true,
+			keepAliveInitialDelayMillis: 10000,
+		};
+		if (this.config.sslCa) {
+			poolOptions.ssl = { ca: this.config.sslCa, rejectUnauthorized: true };
+		} else if (this.config.ssl === true) {
+			poolOptions.ssl = { rejectUnauthorized: false };
+		}
+		this.pool = new Pool(poolOptions);
 
 		const client = await this.pool.connect();
-		await client.query('SELECT 1');
-		client.release();
+		try {
+			await client.query('SELECT 1');
+		} finally {
+			client.release();
+		}
 
 		console.log('[PostgresAdapter] Connected to PostgreSQL');
 	}
@@ -54,7 +75,7 @@ class PostgresAdapter extends DatabaseAdapter {
 
 	async exportDataSnapshot() {
 		if (!this.pool) throw new Error('PostgreSQL adapter is not connected');
-		return exportPostgresSnapshot(this.pool, this.constructor.name === 'CockroachAdapter' ? 'cockroach' : 'postgres');
+		return exportPostgresSnapshot(this.pool, 'postgres');
 	}
 
 	async importDataSnapshot(snapshot, options = {}) {
@@ -78,27 +99,50 @@ class PostgresAdapter extends DatabaseAdapter {
 		return { snapshot: updated, changed };
 	}
 
+	_isRetryableTransactionError(error) {
+		return error?.code === '40001' || /restart transaction/i.test(error?.message || '');
+	}
+
+	async _waitForTransactionRetry(attempt) {
+		const delay = Math.min(
+			2000,
+			this.retryBaseDelayMs * (2 ** Math.max(0, attempt - 1)),
+		);
+		await new Promise((resolve) => setTimeout(resolve, delay));
+	}
+
 	async _withTransaction(operation) {
-		const client = await this.pool.connect();
-		let started = false;
-		try {
-			await client.query('BEGIN');
-			started = true;
-			const result = await operation(client);
-			await client.query('COMMIT');
-			return result;
-		} catch (error) {
-			if (started) {
-				try {
-					await client.query('ROLLBACK');
-				} catch (_) {
-					// The original query error is more useful to callers.
+		let lastError;
+		for (let attempt = 0; attempt <= this.transactionRetries; attempt += 1) {
+			const client = await this.pool.connect();
+			let started = false;
+			try {
+				await client.query('BEGIN');
+				started = true;
+				const result = await operation(client);
+				await client.query('COMMIT');
+				return result;
+			} catch (error) {
+				lastError = error;
+				if (started) {
+					try {
+						await client.query('ROLLBACK');
+					} catch (_) {
+						// The original query error is more useful to callers.
+					}
 				}
+				if (
+					!this._isRetryableTransactionError(error) ||
+					attempt >= this.transactionRetries
+				) {
+					throw error;
+				}
+				await this._waitForTransactionRetry(attempt + 1);
+			} finally {
+				client.release();
 			}
-			throw error;
-		} finally {
-			client.release();
 		}
+		throw lastError;
 	}
 
 	_normalizeUserBlockList(user) {
@@ -167,7 +211,7 @@ class PostgresAdapter extends DatabaseAdapter {
 			const address = userData.nyaitter_address || null;
 			try {
 				const { rows } = await this.pool.query(
-								`INSERT INTO users (id, scid, name, handle, nyaitter_address, auth_provider, provider_domain, external_id, external_profile, uuid, settings, block, bio, header_image, icon_data, created_at)
+								`INSERT INTO users (id, scid, name, handle, nyaitter_address, auth_provider, provider_domain, external_id, external_profile, uuid, settings, "block", bio, header_image, icon_data, created_at)
 								 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, $13, $14, $15, NOW()) RETURNING *`,
 							[id, userData.scid || null, userData.name || userData.scid || handle, handle, address,
 										 provider, userData.provider_domain || null, userData.external_id || null,
@@ -214,8 +258,8 @@ class PostgresAdapter extends DatabaseAdapter {
 		const { rows } = await this.pool.query(
 							`SELECT id, account_operation, name, scid, icon_data, handle, nyaitter_address,
 
-				auth_provider, provider_domain, external_id, settings, block, bio,
-				header_image, verify, admin, freeze, shadow, uuid, created_at
+				auth_provider, provider_domain, external_id, settings, "block", bio,
+				header_image, verify, admin, "freeze", shadow, uuid, created_at
 			 FROM users WHERE id = ANY($1::int[])`,
 			[ids]
 		);
@@ -1805,7 +1849,7 @@ class PostgresAdapter extends DatabaseAdapter {
 				 LEFT JOIN moderation_reports r
 				   ON r.assigned_admin_id = u.id AND r.status = 'assigned'
 				 WHERE u.admin = TRUE
-				   AND COALESCE(u.freeze, '') = ''
+				   AND COALESCE(u."freeze", '') = ''
 				   AND NOT (u.id = ANY($1::int[]))
 				 GROUP BY u.id`,
 				[excluded],
@@ -2003,7 +2047,7 @@ class PostgresAdapter extends DatabaseAdapter {
 			values.push(JSON.stringify(profileData.settings || {}));
 		}
 		if (profileData.block !== undefined) {
-			fields.push(`block = $${idx++}::jsonb`);
+			fields.push(`"block" = $${idx++}::jsonb`);
 			values.push(JSON.stringify(normalizeBlockList(profileData.block, userId)));
 		}
 		if (profileData.verify !== undefined) {
@@ -2103,11 +2147,11 @@ class PostgresAdapter extends DatabaseAdapter {
 
 			await client.query(
 				`UPDATE users
-				 SET block = COALESCE((
-					SELECT jsonb_agg(CASE WHEN value = to_jsonb($1::int) THEN to_jsonb($2::int) ELSE value END)
-					FROM jsonb_array_elements(COALESCE(block, '[]'::jsonb)) AS value
-				 ), '[]'::jsonb)
-				 WHERE block @> jsonb_build_array(to_jsonb($1::int))`,
+					 SET "block" = COALESCE((
+						SELECT jsonb_agg(CASE WHEN value = to_jsonb($1::int) THEN to_jsonb($2::int) ELSE value END)
+						FROM jsonb_array_elements(COALESCE("block", '[]'::jsonb)) AS value
+					 ), '[]'::jsonb)
+					 WHERE "block" @> jsonb_build_array(to_jsonb($1::int))`,
 				[previousId, nextId],
 			);
 			await client.query(
@@ -2241,12 +2285,12 @@ class PostgresAdapter extends DatabaseAdapter {
 
 			await client.query(
 				`UPDATE users
-				 SET block = COALESCE((
-					SELECT jsonb_agg(value)
-					FROM jsonb_array_elements_text(COALESCE(block, '[]'::jsonb)) AS value
-					WHERE value <> $1::text
-				 ), '[]'::jsonb)
-				 WHERE block @> jsonb_build_array($1::text)`,
+					 SET "block" = COALESCE((
+						SELECT jsonb_agg(value)
+						FROM jsonb_array_elements_text(COALESCE("block", '[]'::jsonb)) AS value
+						WHERE value <> $1::text
+					 ), '[]'::jsonb)
+					 WHERE "block" @> jsonb_build_array($1::text)`,
 				[userId],
 			);
 			await client.query('DELETE FROM moderation_reports WHERE reporter_user_id = $1', [userId]);

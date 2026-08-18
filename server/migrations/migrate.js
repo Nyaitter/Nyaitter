@@ -1,4 +1,5 @@
-#!/usr/bin/env node
+'use strict';
+
 const { spawnSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
@@ -11,20 +12,20 @@ const migrationFiles = fs.readdirSync(migrationsDir)
 const databaseAdapter = String(
   process.env.DB_ADAPTER || config.database.adapter || 'memory',
 ).toLowerCase();
-const useCockroach = ['cockroach', 'cockroachdb', 'cockroachdb-cloud'].includes(databaseAdapter);
-const usePostgres = ['postgres', 'pg'].includes(databaseAdapter) || useCockroach;
+const usePostgres = ['postgres', 'pg'].includes(databaseAdapter);
 const useD1 = ['d1', 'cloudflare-d1'].includes(databaseAdapter);
 const useMemory = ['memory', 'inmemory'].includes(databaseAdapter);
-const connectionString = useCockroach
-  ? process.env.COCKROACH_DATABASE_URL || config.database.cockroach.connectionString || process.env.DATABASE_URL
-  : process.env.DATABASE_URL || config.database.postgres.connectionString || process.env.POSTGRES_URL;
+const connectionString =
+  process.env.DATABASE_URL ||
+  config.database.postgres.connectionString ||
+  process.env.POSTGRES_URL;
 const transactionRetries = Math.max(
   0,
-  Math.min(10, Math.floor(Number(process.env.COCKROACH_TRANSACTION_RETRIES || config.database.cockroach.transactionRetries) || 5)),
+  Math.min(10, Math.floor(Number(config.database.postgres.transactionRetries) || 5)),
 );
 const retryBaseDelayMs = Math.max(
   10,
-  Math.min(5000, Math.floor(Number(process.env.COCKROACH_RETRY_BASE_DELAY_MS || config.database.cockroach.retryBaseDelayMs) || 50)),
+  Math.min(5000, Math.floor(Number(config.database.postgres.retryBaseDelayMs) || 50)),
 );
 
 function runD1Migrations() {
@@ -64,30 +65,15 @@ if (!usePostgres) {
   process.exit(1);
 }
 
-console.log(`Nyaitter Migration Runner (${useCockroach ? 'CockroachDB' : 'PostgreSQL'})`);
+console.log('Nyaitter Migration Runner (PostgreSQL)');
 console.log('---------------------------');
 
 if (!connectionString) {
-  const connectionVariable = useCockroach
-    ? 'COCKROACH_DATABASE_URL or DATABASE_URL'
-    : 'DATABASE_URL';
-  console.log(`No ${connectionVariable} found.`);
-  const manualConnectionVariable = useCockroach
-    ? 'COCKROACH_DATABASE_URL'
-    : 'DATABASE_URL';
+  console.log('No DATABASE_URL found.');
   console.log('Please run the migrations manually, in filename order:');
-  migrationFiles.forEach((file) => console.log(`psql $${manualConnectionVariable} -f ${path.join(migrationsDir, file)}`));
+  migrationFiles.forEach((file) => console.log(`psql $DATABASE_URL -f ${path.join(migrationsDir, file)}`));
   console.log('Or set the connection string and re-run this script (requires the pg package).');
   process.exit(0);
-}
-
-function getMigrationSql(filename) {
-  const sql = fs.readFileSync(path.join(migrationsDir, filename), 'utf8');
-  if (!useCockroach || filename !== '008_optimize_high_volume_post_reads.sql') {
-    return sql;
-  }
-  // CockroachDBにはトライグラム索引が組み込まれているため、PostgreSQL拡張の宣言だけを除く。
-  return sql.replace(/^\s*CREATE EXTENSION IF NOT EXISTS pg_trgm;\s*$/mi, '');
 }
 
 function isRetryableTransactionError(error) {
@@ -100,10 +86,9 @@ async function waitForRetry(attempt) {
 }
 
 async function applyMigration(client, file) {
-  const sql = getMigrationSql(file);
-  const maximumAttempts = useCockroach ? transactionRetries : 0;
+  const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf8');
 
-  for (let attempt = 0; attempt <= maximumAttempts; attempt += 1) {
+  for (let attempt = 0; attempt <= transactionRetries; attempt += 1) {
     let started = false;
     try {
       await client.query('BEGIN');
@@ -123,7 +108,7 @@ async function applyMigration(client, file) {
           // Preserve the original migration error for the caller.
         }
       }
-      if (!useCockroach || !isRetryableTransactionError(error) || attempt >= maximumAttempts) {
+      if (!isRetryableTransactionError(error) || attempt >= transactionRetries) {
         throw new Error(`${file}: ${error.message}`);
       }
       await waitForRetry(attempt + 1);
@@ -133,16 +118,16 @@ async function applyMigration(client, file) {
 
 async function run() {
   const { Client } = require('pg');
-  const client = new Client(
-    useCockroach
-      ? {
-          connectionString,
-          ssl: config.database.cockroach.sslCa
-            ? { ca: config.database.cockroach.sslCa, rejectUnauthorized: true }
-            : { rejectUnauthorized: true },
-        }
-      : { connectionString },
-  );
+  const clientOptions = { connectionString };
+  if (config.database.postgres.sslCa) {
+    clientOptions.ssl = {
+      ca: config.database.postgres.sslCa,
+      rejectUnauthorized: true,
+    };
+  } else if (config.database.postgres.ssl === true) {
+    clientOptions.ssl = { rejectUnauthorized: false };
+  }
+  const client = new Client(clientOptions);
 
   await client.connect();
   try {

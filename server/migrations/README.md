@@ -1,6 +1,6 @@
 # DBスキーマ
 
-`npm run migrate`は、選択中のDBへ**完全な初期スキーマ**を一度に作成します。PostgreSQL、CockroachDB Cloud、Cloudflare D1はいずれも新規の空DBで実行してください。
+`npm run migrate`は、選択中のDBへ**完全な初期スキーマ**を一度に作成します。PostgreSQLとCloudflare D1はいずれも新規の空DBで実行してください。
 
 ## 実行
 
@@ -13,7 +13,6 @@ npm run migrate
 | DB | 必要な主な設定 |
 |---|---|
 | PostgreSQL | `DB_ADAPTER=postgres`、`DATABASE_URL` |
-| CockroachDB Cloud | `DB_ADAPTER=cockroach`、`COCKROACH_DATABASE_URL` |
 | Cloudflare D1 | `DB_ADAPTER=d1`、`D1_WORKER_URL`、`D1_WORKER_TOKEN` |
 
 ローカルD1へ適用する場合は、次を実行します。

@@ -40,7 +40,7 @@ async function getSessionPrincipal(req, token) {
   const tokenHash = SessionManager.hashToken(token);
   let user = null;
 
-  // PostgreSQL/CockroachDBではセッションと利用者を結合して一度に取得する。
+  // PostgreSQLではセッションと利用者を結合して一度に取得する。
   // 他のアダプターは既存のセッション照合と利用者取得を維持する。
   if (typeof db.getUserBySessionToken === 'function') {
     user = await db.getUserBySessionToken(tokenHash);
