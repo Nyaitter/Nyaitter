@@ -542,23 +542,52 @@ class PostgresAdapter extends DatabaseAdapter {
 			return this._mapLoginApproval(rows[0]);
 		}
 
-		async createPost(postData) {
-			const { rows } = await this.pool.query(
-				`INSERT INTO posts (user_id, content, attachments, mask, lock, announcement, reply_to, repost_to, created_at)
-				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
-				 RETURNING *`,
-				[
-					postData.userId,
-					postData.content,
-					postData.attachments ? JSON.stringify(postData.attachments) : null,
-					!!postData.mask,
-					!!postData.lock,
-					!!postData.announcement,
-					postData.replyTo ? Number(postData.replyTo) : null,
-					postData.repostTo ? Number(postData.repostTo) : null,
-				]
-			);
-		return this._normalizePost(rows[0] || null);
+	async _synchronizePostIdSequence() {
+		// 外部データ移行などで明示IDが投入された後でも、シーケンスを後退させずに
+		// posts.id の最大値以上へ同期する。次回の nextval() は必ず未使用IDになる。
+		await this.pool.query(
+			`WITH table_state AS (
+				SELECT COALESCE(MAX(id), 0)::bigint AS max_id FROM posts
+			), sequence_state AS (
+				SELECT last_value::bigint AS last_value FROM nyaitter_posts_id_seq
+			)
+			SELECT setval(
+				'nyaitter_posts_id_seq',
+				GREATEST(table_state.max_id, sequence_state.last_value),
+				true
+			)
+			FROM table_state CROSS JOIN sequence_state`,
+		);
+	}
+
+	async createPost(postData) {
+		const values = [
+			postData.userId,
+			postData.content,
+			postData.attachments ? JSON.stringify(postData.attachments) : null,
+			!!postData.mask,
+			!!postData.lock,
+			!!postData.announcement,
+			postData.replyTo ? Number(postData.replyTo) : null,
+			postData.repostTo ? Number(postData.repostTo) : null,
+		];
+		const insertPost = () => this.pool.query(
+			`INSERT INTO posts (user_id, content, attachments, mask, lock, announcement, reply_to, repost_to, created_at)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+			 RETURNING *`,
+			values,
+		);
+
+		try {
+			const { rows } = await insertPost();
+			return this._normalizePost(rows[0] || null);
+		} catch (error) {
+			// 既存データの最大IDよりシーケンスが遅れている場合だけ、一度同期して再試行する。
+			if (error?.code !== '23505' || error?.constraint !== 'posts_pkey') throw error;
+			await this._synchronizePostIdSequence();
+			const { rows } = await insertPost();
+			return this._normalizePost(rows[0] || null);
+		}
 	}
 
 	async getPostById(id) {
