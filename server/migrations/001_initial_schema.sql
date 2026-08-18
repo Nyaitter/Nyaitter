@@ -27,8 +27,14 @@ CREATE TABLE IF NOT EXISTS users (
     CONSTRAINT users_account_operation_check CHECK (account_operation IS NULL OR account_operation IN ('reassigning', 'deleting'))
 );
 
+CREATE SEQUENCE IF NOT EXISTS nyaitter_posts_id_seq AS INTEGER START WITH 1 MINVALUE 1;
+CREATE SEQUENCE IF NOT EXISTS nyaitter_dm_messages_id_seq AS INTEGER START WITH 1 MINVALUE 1;
+CREATE SEQUENCE IF NOT EXISTS nyaitter_notifications_id_seq AS INTEGER START WITH 1 MINVALUE 1;
+CREATE SEQUENCE IF NOT EXISTS nyaitter_moderation_reports_id_seq AS INTEGER START WITH 1 MINVALUE 1;
+CREATE SEQUENCE IF NOT EXISTS nyaitter_logs_id_seq AS INTEGER START WITH 1 MINVALUE 1;
+
 CREATE TABLE IF NOT EXISTS posts (
-    id SERIAL PRIMARY KEY,
+    id INTEGER PRIMARY KEY DEFAULT nextval('nyaitter_posts_id_seq'),
     user_id INTEGER NOT NULL REFERENCES users(id) ON UPDATE CASCADE ON DELETE CASCADE,
     content TEXT NOT NULL,
     attachments JSONB,
@@ -82,7 +88,7 @@ CREATE TABLE IF NOT EXISTS dm_channels (
 );
 
 CREATE TABLE IF NOT EXISTS dm_messages (
-    id SERIAL PRIMARY KEY,
+    id INTEGER PRIMARY KEY DEFAULT nextval('nyaitter_dm_messages_id_seq'),
     channel_id TEXT NOT NULL REFERENCES dm_channels(id) ON DELETE CASCADE,
     sender_id INTEGER NOT NULL REFERENCES users(id) ON UPDATE CASCADE ON DELETE CASCADE,
     content TEXT NOT NULL,
@@ -109,7 +115,7 @@ CREATE TABLE IF NOT EXISTS dm_e2e_keys (
 );
 
 CREATE TABLE IF NOT EXISTS notifications (
-    id SERIAL PRIMARY KEY,
+    id INTEGER PRIMARY KEY DEFAULT nextval('nyaitter_notifications_id_seq'),
     user_id INTEGER NOT NULL REFERENCES users(id) ON UPDATE CASCADE ON DELETE CASCADE,
     type TEXT NOT NULL,
     from_user_id INTEGER REFERENCES users(id) ON UPDATE CASCADE ON DELETE SET NULL,
@@ -168,7 +174,6 @@ CREATE TABLE IF NOT EXISTS bot_tokens (
 );
 
 CREATE TABLE IF NOT EXISTS push_subscriptions (
-    id BIGSERIAL PRIMARY KEY,
     user_id INTEGER NOT NULL REFERENCES users(id) ON UPDATE CASCADE ON DELETE CASCADE,
     endpoint TEXT NOT NULL,
     expiration_time TIMESTAMPTZ,
@@ -177,11 +182,11 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (
     session_token TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT uq_push_subscriptions_user_endpoint UNIQUE (user_id, endpoint)
+    PRIMARY KEY (user_id, endpoint)
 );
 
 CREATE TABLE IF NOT EXISTS moderation_reports (
-    id BIGSERIAL PRIMARY KEY,
+    id INTEGER PRIMARY KEY DEFAULT nextval('nyaitter_moderation_reports_id_seq'),
     reporter_user_id INTEGER NOT NULL REFERENCES users(id) ON UPDATE CASCADE ON DELETE CASCADE,
     target_kind VARCHAR(16) NOT NULL,
     target_id TEXT NOT NULL,
@@ -201,7 +206,7 @@ CREATE TABLE IF NOT EXISTS moderation_reports (
 );
 
 CREATE TABLE IF NOT EXISTS logs (
-    id SERIAL PRIMARY KEY,
+    id INTEGER PRIMARY KEY DEFAULT nextval('nyaitter_logs_id_seq'),
     scratch_id TEXT,
     nyaitter_id INTEGER,
     masked_ip_uuid TEXT,

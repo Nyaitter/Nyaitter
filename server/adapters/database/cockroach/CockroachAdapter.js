@@ -28,6 +28,11 @@ class CockroachAdapter extends PostgresAdapter {
     this.pool = new Pool({
       connectionString,
       max: this.config.poolSize || 10,
+      min: Math.min(this.config.poolSize || 10, this.config.poolMin || 2),
+      idleTimeoutMillis: this.config.poolIdleTimeoutMs || 300000,
+      connectionTimeoutMillis: this.config.connectionTimeoutMs || 15000,
+      keepAlive: true,
+      keepAliveInitialDelayMillis: 10000,
       ssl: this.config.sslCa
         ? { ca: this.config.sslCa, rejectUnauthorized: true }
         : { rejectUnauthorized: true },

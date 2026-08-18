@@ -61,7 +61,13 @@ const INSERT_ORDER = Object.freeze([
 ]);
 
 const RESET_ORDER = Object.freeze([...INSERT_ORDER].reverse());
-const ID_TABLES = Object.freeze(['posts', 'dm_messages', 'notifications', 'moderation_reports', 'logs']);
+const ID_SEQUENCES = Object.freeze({
+  posts: 'nyaitter_posts_id_seq',
+  dm_messages: 'nyaitter_dm_messages_id_seq',
+  notifications: 'nyaitter_notifications_id_seq',
+  moderation_reports: 'nyaitter_moderation_reports_id_seq',
+  logs: 'nyaitter_logs_id_seq',
+});
 
 function quoteIdentifier(identifier) {
   if (!/^[a-z_][a-z0-9_]*$/.test(identifier)) throw new Error(`Invalid migration identifier: ${identifier}`);
@@ -127,16 +133,13 @@ async function restorePostReferences(client, rows) {
 
 async function resetIdentitySequences(pool) {
   // 連番の再設定はデータ置換トランザクションを確定した後に行う。
-  // PostgreSQLのSERIAL列ではALTER COLUMN ... RESTARTが使えないため、実際の連番を取得してsetvalを使う。
-  for (const table of ID_TABLES) {
+  // 明示名のシーケンスはPostgreSQLとCockroachDBの両方でsetvalを利用できる。
+  for (const [table, sequenceName] of Object.entries(ID_SEQUENCES)) {
     try {
-      const { rows } = await pool.query(`SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM ${quoteIdentifier(table)}`);
-      const nextId = Math.max(1, Number(rows[0]?.next_id || 1));
-      const sequenceResult = await pool.query('SELECT pg_get_serial_sequence($1, $2) AS sequence_name', [table, 'id']);
-      const sequenceName = sequenceResult.rows[0]?.sequence_name;
-      if (sequenceName) await pool.query('SELECT setval($1::regclass, $2, false)', [sequenceName, nextId]);
+      const { rows } = await pool.query(`SELECT COALESCE(MAX(id), 0) AS max_id FROM ${quoteIdentifier(table)}`);
+      const maxId = Math.max(0, Number(rows[0]?.max_id || 0));
+      await pool.query('SELECT setval($1, $2, $3)', [sequenceName, maxId || 1, maxId > 0]);
     } catch (error) {
-      // CockroachDBなど連番関数を持たない互換実装では、明示IDの復元後も既定の採番を使用できる。
       console.warn(`[data-migration] Could not reset sequence for ${table}: ${error.message}`);
     }
   }

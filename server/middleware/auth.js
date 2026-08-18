@@ -36,20 +36,27 @@ function extractToken(req) {
 }
 
 async function getSessionPrincipal(req, token) {
-  const sessionManager = new SessionManager({
-    dbAdapter: req.app.locals.dbAdapter,
-  });
-  const sessionInfo = await sessionManager.validateToken(token);
-  if (!sessionInfo) return null;
+  const db = req.app.locals.dbAdapter;
+  const tokenHash = SessionManager.hashToken(token);
+  let user = null;
 
-  const user = await req.app.locals.dbAdapter.getUserById(sessionInfo.userId);
+  // PostgreSQL/CockroachDBではセッションと利用者を結合して一度に取得する。
+  // 他のアダプターは既存のセッション照合と利用者取得を維持する。
+  if (typeof db.getUserBySessionToken === 'function') {
+    user = await db.getUserBySessionToken(tokenHash);
+  } else {
+    const sessionManager = new SessionManager({ dbAdapter: db });
+    const sessionInfo = await sessionManager.validateToken(token);
+    if (!sessionInfo) return null;
+    user = await db.getUserById(sessionInfo.userId);
+  }
   if (!user) return null;
 
   return {
     id: user.id,
     tokenType: 'session',
     // Push購読と同じハッシュを使い、WebSocket接続中の同一セッションを判定する。
-    sessionTokenHash: SessionManager.hashToken(token),
+    sessionTokenHash: tokenHash,
     isBot: false,
     admin: user.admin === true,
     frozen: Boolean(user.freeze),

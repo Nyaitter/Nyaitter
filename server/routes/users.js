@@ -270,7 +270,7 @@ async function handleUserIcon(req, res) {
 	return res.redirect(302, '/logo.png');
 }
 
-router.get('/:userId/icon', optionalAuth, handleUserIcon);
+router.get('/:userId/icon', handleUserIcon);
 
 router.get('/search', optionalAuth, async (req, res) => {
 	const db = getDbAdapter(req);

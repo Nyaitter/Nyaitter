@@ -285,6 +285,22 @@ class PostgresAdapter extends DatabaseAdapter {
 			return this._mapSession(rows[0]);
 		}
 
+		async getUserBySessionToken(token) {
+			const { rows } = await this.pool.query(
+				`SELECT u.*
+				 FROM sessions AS s
+				 INNER JOIN users AS u ON u.id = s.user_id
+				 WHERE s.token = $1 AND s.expires_at > NOW()
+				 LIMIT 1`,
+				[token],
+			);
+			if (!rows[0]) {
+				await this.pool.query('DELETE FROM sessions WHERE token = $1 AND expires_at <= NOW()', [token]);
+				return null;
+			}
+			return this._normalizeUserBlockList(rows[0]);
+		}
+
 		async invalidateSession(token) {
 			const { rowCount } = await this.pool.query('DELETE FROM sessions WHERE token = $1', [token]);
 			return rowCount > 0;
