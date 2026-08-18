@@ -554,8 +554,8 @@ class PostgresAdapter extends DatabaseAdapter {
 					!!postData.mask,
 					!!postData.lock,
 					!!postData.announcement,
-					postData.replyTo || null,
-					postData.repostTo || null
+					postData.replyTo ? Number(postData.replyTo) : null,
+					postData.repostTo ? Number(postData.repostTo) : null,
 				]
 			);
 		return this._normalizePost(rows[0] || null);
@@ -581,58 +581,77 @@ class PostgresAdapter extends DatabaseAdapter {
 	}
 
 	async getPostMetricsBatch(postIds, currentUserId = null) {
-		const ids = [...new Set((postIds || []).map(Number).filter(Number.isInteger))];
+		// D1 Workerと同じく、DBからは各集計行・閲覧者のリアクション行だけを取得し、
+		// APIへ返す値はアプリケーション側のMap / Setで組み立てる。
+		const ids = [...new Set((postIds || []).map(Number)
+			.filter((id) => Number.isSafeInteger(id) && id > 0))];
 		if (ids.length === 0) return [];
-		const { rows } = await this.pool.query(
-			`WITH RECURSIVE requested AS (
-				SELECT DISTINCT UNNEST($1::int[]) AS post_id
+
+		const parsedViewerId = Number(currentUserId);
+		const viewerId = Number.isSafeInteger(parsedViewerId) && parsedViewerId > 0
+			? parsedViewerId
+			: null;
+		const [likeResult, starResult, repostResult, replyResult, myLikesResult, myStarsResult] = await Promise.all([
+			this.pool.query(
+				`SELECT post_id, COUNT(*)::int AS count FROM likes
+				 WHERE post_id = ANY($1::int[])
+				 GROUP BY post_id`,
+				[ids],
 			),
-			like_counts AS (
-				SELECT post_id, COUNT(*)::int AS count FROM likes
-				WHERE post_id = ANY($1::int[]) GROUP BY post_id
+			this.pool.query(
+				`SELECT post_id, COUNT(*)::int AS count FROM stars
+				 WHERE post_id = ANY($1::int[])
+				 GROUP BY post_id`,
+				[ids],
 			),
-			star_counts AS (
-				SELECT post_id, COUNT(*)::int AS count FROM stars
-				WHERE post_id = ANY($1::int[]) GROUP BY post_id
+			this.pool.query(
+				`SELECT post_id, COUNT(*)::int AS count FROM reposts
+				 WHERE post_id = ANY($1::int[])
+				 GROUP BY post_id`,
+				[ids],
 			),
-				reply_tree AS (
-					SELECT requested.post_id AS root_post_id, child.id, ARRAY[child.id] AS path
-					FROM requested
-					JOIN posts child ON child.reply_to = requested.post_id
-					UNION ALL
-					SELECT tree.root_post_id, child.id, tree.path || child.id
-					FROM reply_tree tree
-					JOIN posts child ON child.reply_to = tree.id
-					WHERE NOT child.id = ANY(tree.path)
+			this.pool.query(
+				`SELECT reply_to AS post_id, COUNT(*)::int AS count FROM posts
+				 WHERE reply_to = ANY($1::int[])
+				 GROUP BY reply_to`,
+				[ids],
+			),
+			viewerId == null
+				? Promise.resolve({ rows: [] })
+				: this.pool.query(
+					`SELECT post_id FROM likes
+					 WHERE user_id = $1 AND post_id = ANY($2::int[])`,
+					[viewerId, ids],
 				),
-				reply_counts AS (
-					SELECT root_post_id AS post_id, COUNT(*)::int AS count
-					FROM reply_tree
-					GROUP BY root_post_id
+			viewerId == null
+				? Promise.resolve({ rows: [] })
+				: this.pool.query(
+					`SELECT post_id FROM stars
+					 WHERE user_id = $1 AND post_id = ANY($2::int[])`,
+					[viewerId, ids],
 				),
-			repost_counts AS (
-				SELECT post_id, COUNT(*)::int AS count FROM reposts
-				WHERE post_id = ANY($1::int[]) GROUP BY post_id
-			)
-			SELECT requested.post_id,
-				COALESCE(like_counts.count, 0)::int AS like_count,
-				COALESCE(star_counts.count, 0)::int AS star_count,
-				COALESCE(reply_counts.count, 0)::int AS reply_count,
-				COALESCE(repost_counts.count, 0)::int AS repost_count,
-				CASE WHEN $2::int IS NULL THEN false ELSE EXISTS(
-					SELECT 1 FROM likes WHERE user_id = $2::int AND post_id = requested.post_id
-				) END AS liked_by_me,
-				CASE WHEN $2::int IS NULL THEN false ELSE EXISTS(
-					SELECT 1 FROM stars WHERE user_id = $2::int AND post_id = requested.post_id
-				) END AS starred_by_me
-			FROM requested
-			LEFT JOIN like_counts ON like_counts.post_id = requested.post_id
-			LEFT JOIN star_counts ON star_counts.post_id = requested.post_id
-			LEFT JOIN reply_counts ON reply_counts.post_id = requested.post_id
-			LEFT JOIN repost_counts ON repost_counts.post_id = requested.post_id`,
-			[ids, currentUserId == null ? null : Number(currentUserId)],
-		);
-		return rows;
+		]);
+
+		const countMap = (rows) => new Map((rows || []).map((row) => [
+			Number(row.post_id),
+			Math.max(0, Number(row.count) || 0),
+		]));
+		const likeMap = countMap(likeResult.rows);
+		const starMap = countMap(starResult.rows);
+		const repostMap = countMap(repostResult.rows);
+		const replyMap = countMap(replyResult.rows);
+		const myLikesSet = new Set((myLikesResult.rows || []).map((row) => Number(row.post_id)));
+		const myStarsSet = new Set((myStarsResult.rows || []).map((row) => Number(row.post_id)));
+
+		return ids.map((id) => ({
+			post_id: id,
+			like_count: likeMap.get(id) || 0,
+			star_count: starMap.get(id) || 0,
+			repost_count: repostMap.get(id) || 0,
+			reply_count: replyMap.get(id) || 0,
+			liked_by_me: myLikesSet.has(id),
+			starred_by_me: myStarsSet.has(id),
+		}));
 	}
 
 	async updatePost(postId, fields) {
@@ -667,7 +686,7 @@ class PostgresAdapter extends DatabaseAdapter {
 
 	async getRecentPosts(limit = 30) {
 		const { rows } = await this.pool.query(
-			`SELECT * FROM posts WHERE reply_to IS NULL ORDER BY created_at DESC LIMIT $1`,
+			`SELECT * FROM posts WHERE reply_to IS NULL ORDER BY created_at DESC, id DESC LIMIT $1`,
 			[limit]
 		);
 		return rows.map(r => this._normalizePost(r));
@@ -683,7 +702,7 @@ class PostgresAdapter extends DatabaseAdapter {
 
 	async getPostsByUserId(userId, limit = 50, _currentUserId = null) {
 		const { rows } = await this.pool.query(
-			`SELECT * FROM posts WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2`,
+			`SELECT * FROM posts WHERE user_id = $1 ORDER BY created_at DESC, id DESC LIMIT $2`,
 			[userId, limit]
 		);
 		// 呼び出し元は共通の serializePostsBatch() で必要な関連情報を一括取得する。
@@ -1006,19 +1025,13 @@ class PostgresAdapter extends DatabaseAdapter {
 		}
 
 	async getPostDetail(id, currentUserId = null) {
-		// 投稿、投稿者、集計、閲覧者のリアクション、親投稿を1回で取得する。
-		// D1の詳細取得と同じ形にそろえ、DBとの往復を減らす。
-		const parsedViewerId = Number(currentUserId);
-		const viewerId = Number.isInteger(parsedViewerId) && parsedViewerId >= 0 ? parsedViewerId : null;
+		// D1のバッチメトリクスと同じ契約にそろえ、リアクション状態は
+		// PostgreSQLのEXISTS列ではなく共通のアプリケーション側組み立て値を使う。
 		const { rows } = await this.pool.query(
 			`SELECT p.*,
 				author.id AS author_id,
 				author.name AS author_name,
 				author.scid AS author_scid,
-				COALESCE((SELECT COUNT(*)::int FROM likes WHERE post_id = p.id), 0) AS like_count,
-				COALESCE((SELECT COUNT(*)::int FROM stars WHERE post_id = p.id), 0) AS star_count,
-				EXISTS(SELECT 1 FROM likes WHERE user_id = $1 AND post_id = p.id) AS liked_by_me,
-				EXISTS(SELECT 1 FROM stars WHERE user_id = $1 AND post_id = p.id) AS starred_by_me,
 				parent.id AS parent_id,
 				parent.content AS parent_content,
 				parent_author.id AS parent_author_id,
@@ -1027,27 +1040,28 @@ class PostgresAdapter extends DatabaseAdapter {
 			 LEFT JOIN users author ON author.id = p.user_id
 			 LEFT JOIN posts parent ON parent.id = p.reply_to
 			 LEFT JOIN users parent_author ON parent_author.id = parent.user_id
-			 WHERE p.id = $2`,
-			[viewerId, id],
+			 WHERE p.id = $1`,
+			[id],
 		);
 		const detail = rows[0];
 		if (!detail) return null;
+		const [metric] = await this.getPostMetricsBatch([id], currentUserId);
 
 		const normalized = this._normalizePost(detail);
 		return {
 			...normalized,
 			author: detail.author_id == null
 				? null
-				: { id: detail.author_id, name: detail.author_name || '', scid: detail.author_scid },
-			like_count: Number(detail.like_count || 0),
-			star_count: Number(detail.star_count || 0),
-			liked_by_me: Boolean(detail.liked_by_me),
-			starred_by_me: Boolean(detail.starred_by_me),
+				: { id: detail.author_id, name: detail.author_name || '', scid: detail.author_scid || null },
+			like_count: Number(metric.like_count || 0),
+			star_count: Number(metric.star_count || 0),
+			liked_by_me: !!metric.liked_by_me,
+			starred_by_me: !!metric.starred_by_me,
 			parent_post: detail.parent_id == null
 				? null
 				: {
 					id: detail.parent_id,
-					content: detail.parent_content?.substring(0, 100),
+					content: detail.parent_content ? String(detail.parent_content).substring(0, 100) : '',
 					author: detail.parent_author_id == null
 						? null
 						: { id: detail.parent_author_id, name: detail.parent_author_name || '' },
@@ -1160,7 +1174,7 @@ class PostgresAdapter extends DatabaseAdapter {
 		const { rows } = await this.pool.query(
 			`SELECT post_id FROM likes
 			 WHERE user_id = $1
-			 ORDER BY created_at DESC, post_id ASC`,
+			 ORDER BY created_at DESC`,
 			[userId]
 		);
 		return rows.map((row) => Number(row.post_id));
@@ -1170,7 +1184,7 @@ class PostgresAdapter extends DatabaseAdapter {
 		const { rows } = await this.pool.query(
 			`SELECT post_id FROM stars
 			 WHERE user_id = $1
-			 ORDER BY created_at DESC, post_id ASC`,
+			 ORDER BY created_at DESC`,
 			[userId]
 		);
 		return rows.map((row) => Number(row.post_id));
@@ -1591,13 +1605,14 @@ class PostgresAdapter extends DatabaseAdapter {
 				'SELECT user_id FROM posts WHERE id = $1',
 				[postId]
 			);
-			if (postRows.length === 0 || postRows[0].user_id !== userId) {
+			if (postRows.length === 0 || Number(postRows[0].user_id) !== Number(userId)) {
 				return false;
 			}
 
 			await client.query('DELETE FROM likes WHERE post_id = $1', [postId]);
 			await client.query('DELETE FROM stars WHERE post_id = $1', [postId]);
-			// Add more cleanup if you have pinned_posts, reposts tables, etc.
+			await client.query('DELETE FROM reposts WHERE post_id = $1', [postId]);
+			await client.query('DELETE FROM pinned_posts WHERE post_id = $1', [postId]);
 			await client.query('DELETE FROM posts WHERE id = $1', [postId]);
 			return true;
 		});
@@ -1608,7 +1623,7 @@ class PostgresAdapter extends DatabaseAdapter {
 			'SELECT user_id FROM posts WHERE id = $1',
 			[postId]
 		);
-		if (postRows.length === 0 || postRows[0].user_id !== userId) {
+			if (postRows.length === 0 || Number(postRows[0].user_id) !== Number(userId)) {
 			throw new Error('Cannot pin a post you do not own');
 		}
 
@@ -1644,10 +1659,10 @@ class PostgresAdapter extends DatabaseAdapter {
 			 ORDER BY pp.created_at DESC`,
 			[userId]
 		);
-		return rows;
-	}
+			return rows.map((row) => this._normalizePost(row));
+		}
 
-	async getPinnedPostId(userId) {
+		async getPinnedPostId(userId) {
 		const { rows } = await this.pool.query(
 			`SELECT post_id FROM pinned_posts
 			 WHERE user_id = $1
@@ -1692,10 +1707,10 @@ class PostgresAdapter extends DatabaseAdapter {
 			 ORDER BY r.created_at DESC`,
 			[userId]
 		);
-		return rows;
-	}
+			return rows.map((row) => this._normalizePost(row));
+		}
 
-	async getRepostsOfPost(postId, limit = 50) {
+		async getRepostsOfPost(postId, limit = 50) {
 		const { rows } = await this.pool.query(
 			`SELECT u.id as user_id, u.name, u.handle FROM reposts r
 			 JOIN users u ON u.id = r.user_id
@@ -2031,8 +2046,8 @@ class PostgresAdapter extends DatabaseAdapter {
 		const { rows } = await this.pool.query(
 			`SELECT * FROM posts 
 			 WHERE LOWER(content) LIKE $1 
-			 ORDER BY created_at DESC 
-			 LIMIT $2`,
+				 ORDER BY created_at DESC, id DESC
+				 LIMIT $2`,
 			[q, limit]
 		);
 
@@ -2052,10 +2067,10 @@ class PostgresAdapter extends DatabaseAdapter {
 			 LIMIT $1`,
 			[limit]
 		);
-		return rows.map(r => this._normalizePost(r));
-	}
+			return rows.map(({ score: _score, ...row }) => this._normalizePost(row));
+		}
 
-	async getTrendingHashtags(limit = 10) {
+		async getTrendingHashtags(limit = 10) {
 		const normalizedLimit = Math.max(1, Math.min(Number(limit) || 10, 50));
 		const { rows } = await this.pool.query(
 			'SELECT content FROM posts ORDER BY created_at DESC LIMIT 500'
