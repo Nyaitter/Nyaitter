@@ -1145,7 +1145,7 @@ class PostgresAdapter extends DatabaseAdapter {
 
 	async getGroupDmsForUser(userId) {
 		const { rows } = await this.pool.query(
-			`SELECT * FROM group_dms WHERE $1 = ANY(member) ORDER BY time DESC`,
+			`SELECT * FROM group_dms WHERE $1::INTEGER = ANY(member) ORDER BY time DESC`,
 			[userId]
 		);
 		return rows.map((row) => this._serializeGroupDmRow(row, userId));
