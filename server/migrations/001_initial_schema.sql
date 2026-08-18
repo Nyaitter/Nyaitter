@@ -35,8 +35,8 @@ CREATE TABLE IF NOT EXISTS posts (
     mask BOOLEAN DEFAULT false,
     lock BOOLEAN NOT NULL DEFAULT false,
     announcement BOOLEAN NOT NULL DEFAULT false,
-    reply_to INTEGER REFERENCES posts(id),
-    repost_to INTEGER REFERENCES posts(id),
+    reply_to INTEGER,
+    repost_to INTEGER,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -113,7 +113,7 @@ CREATE TABLE IF NOT EXISTS notifications (
     user_id INTEGER NOT NULL REFERENCES users(id) ON UPDATE CASCADE ON DELETE CASCADE,
     type TEXT NOT NULL,
     from_user_id INTEGER REFERENCES users(id) ON UPDATE CASCADE ON DELETE SET NULL,
-    post_id INTEGER REFERENCES posts(id) ON DELETE CASCADE,
+    post_id INTEGER,
     message TEXT,
     open TEXT DEFAULT '',
     target JSONB,
