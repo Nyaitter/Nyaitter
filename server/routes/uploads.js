@@ -1,9 +1,11 @@
 const express = require('express');
+const sharp = require('sharp');
 const { requireAuth } = require('../middleware/auth');
 const config = require('../config');
 const {
 	isOwnedAttachmentKey,
 	normalizeContentType,
+	normalizeStorageKey,
 } = require('../adapters/storage/safeStoragePath');
 
 const router = express.Router();
@@ -23,6 +25,52 @@ function decodeBase64File(value) {
 	}
 	return Buffer.from(value, 'base64');
 }
+
+router.get('/preview', async (req, res) => {
+	const storage = getStorageAdapter(req);
+	if (!storage || typeof storage.read !== 'function') {
+		return res.status(501).json({ error: 'Storage adapter not available' });
+	}
+
+	let fileId;
+	try {
+		fileId = normalizeStorageKey(req.query.file_id);
+	} catch (_) {
+		return res.status(400).json({ error: 'Invalid file_id' });
+	}
+	if (!fileId.startsWith('attachments/')) {
+		return res.status(404).json({ error: 'Preview not found' });
+	}
+
+	try {
+		const file = await storage.read(fileId);
+		const contentType = normalizeContentType(file?.contentType);
+		if (!contentType.startsWith('image/')) {
+			return res.status(415).json({ error: 'Preview is only available for images' });
+		}
+		const preview = await sharp(file.buffer, {
+			animated: false,
+			limitInputPixels: 40_000_000,
+			failOn: 'error',
+		})
+			.rotate()
+			.resize({ width: 480, height: 480, fit: 'inside', withoutEnlargement: true })
+			.webp({ quality: 38, effort: 3, smartSubsample: true })
+			.toBuffer();
+		res.set({
+			'Content-Type': 'image/webp',
+			'Cache-Control': 'public, max-age=604800, immutable',
+			'X-Content-Type-Options': 'nosniff',
+		});
+		res.send(preview);
+	} catch (err) {
+		if (err?.code === 'ENOENT' || err?.name === 'NoSuchKey') {
+			return res.status(404).json({ error: 'Preview not found' });
+		}
+		console.warn('[uploads] preview error:', err.message);
+		res.status(404).json({ error: 'Preview not found' });
+	}
+});
 
 router.post('/', requireAuth, uploadLimiter, async (req, res) => {
 	const storage = getStorageAdapter(req);

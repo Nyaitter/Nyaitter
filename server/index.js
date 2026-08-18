@@ -300,6 +300,7 @@ const restRoutes = [
     ['', require('./routes/status')],
     ['posts', require('./routes/posts')],
     ['uploads', require('./routes/uploads')],
+    ['url-cards', require('./routes/urlCards')],
     ['ranking', require('./routes/ranking')],
     ['ui', require('./routes/ui')],
     ['dm', require('./routes/dm')],
