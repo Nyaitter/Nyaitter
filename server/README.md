@@ -195,6 +195,12 @@ GEMINI_MOD_MAX_IMAGES=0
 | 通報作成・対応 | `rateLimit.reportCreate`、`rateLimit.reportAction` | `NYAITTER_RATE_LIMIT_REPORT_CREATE`、`NYAITTER_RATE_LIMIT_REPORT_ACTION` | `10 / 1min`、`30 / 1min` |
 | 認証申請 | `rateLimit.verificationApplication` | `NYAITTER_RATE_LIMIT_VERIFICATION_APPLICATION` | `5 / 1min` |
 
+### Clientへの制限情報の公開
+
+`GET /server/status` は、`client_limits` にClientで利用できる制限情報を返します。`input` にはポスト本文、DM本文、表示名、自己紹介、Scratchユーザー名の最小・最大文字数、`upload` にはファイル容量、`rate_limits` には各レート制限の有効状態、上限回数、時間（ミリ秒）が含まれます。
+
+標準のNyaitterClientは起動時にこの情報を取得し、ポスト・DMの作成と編集、表示名、自己紹介の入力欄へ `minlength` と `maxlength` を自動設定します。Server側の検証は常に有効なため、独自Clientを使う場合も同じ制限に従ってください。
+
 `config.json` の例です。
 
 ```json

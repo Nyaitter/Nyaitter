@@ -12,6 +12,55 @@ function getDbAdapter(req) {
 	return req.app.locals.dbAdapter;
 }
 
+function serializeIntegerRange(range) {
+	return {
+		min: Number.isInteger(range?.min) ? range.min : null,
+		max: Number.isInteger(range?.max) ? range.max : null,
+	};
+}
+
+function serializeRateLimit(limit) {
+	return {
+		window_ms: Number.isInteger(limit?.windowMs) ? limit.windowMs : null,
+		max: Number.isInteger(limit?.max) ? limit.max : null,
+	};
+}
+
+function getPublicClientLimits() {
+	const rateLimits = {};
+	Object.entries(config.rateLimit || {}).forEach(([name, limit]) => {
+		if (name === 'enabled' || !limit || typeof limit !== 'object') return;
+		rateLimits[name] = serializeRateLimit(limit);
+	});
+
+	return {
+		input: {
+			post_content_length: serializeIntegerRange(
+				config.limits.postContentLength,
+			),
+			dm_content_length: serializeIntegerRange(
+				config.limits.dmContentLength,
+			),
+			user_name_length: serializeIntegerRange(
+				config.limits.userNameLength,
+			),
+			profile_bio_length: serializeIntegerRange(
+				config.limits.profileBioLength,
+			),
+			scratch_username_length: serializeIntegerRange(
+				config.limits.scratchUsernameLength,
+			),
+		},
+		upload: {
+			max_file_size_bytes: config.limits.maxFileUploadSizeMB * 1024 * 1024,
+		},
+		rate_limits: {
+			enabled: Boolean(config.rateLimit?.enabled),
+			limits: rateLimits,
+		},
+	};
+}
+
 router.get('/status', async (req, res) => {
 	let dbStatus = 'ok';
 
@@ -50,6 +99,7 @@ router.get('/status', async (req, res) => {
 				domain: server.domain,
 			})),
 		},
+		client_limits: getPublicClientLimits(),
 	});
 });
 
