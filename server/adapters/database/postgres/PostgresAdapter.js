@@ -33,10 +33,32 @@ class PostgresAdapter extends DatabaseAdapter {
 	}
 
 	async connect() {
-		const connectionString = this.config.connectionString || process.env.DATABASE_URL;
+		const connectionString = String(
+			this.config.connectionString || process.env.DATABASE_URL || '',
+		).trim();
 
 		if (!connectionString) {
-			throw new Error('PostgreSQL connection string is required (DATABASE_URL or config.connectionString)');
+			throw new Error('PostgreSQL connection string is required (DATABASE_URL or config.database.postgres.connectionString)');
+		}
+
+		let parsedConnectionString;
+		try {
+			parsedConnectionString = new URL(connectionString);
+		} catch (_) {
+			throw new Error('Invalid PostgreSQL connection string. Set DATABASE_URL to a complete postgres:// or postgresql:// URL.');
+		}
+		if (!['postgres:', 'postgresql:'].includes(parsedConnectionString.protocol)) {
+			throw new Error('Invalid PostgreSQL connection string protocol. DATABASE_URL must start with postgres:// or postgresql://.');
+		}
+		if (!parsedConnectionString.hostname && !parsedConnectionString.searchParams.get('host')) {
+			throw new Error('Invalid PostgreSQL connection string host. Set a hostname in DATABASE_URL, or use the host query parameter for a local Unix socket.');
+		}
+		const sslMode = parsedConnectionString.searchParams.get('sslmode');
+		if (
+			sslMode &&
+			!['disable', 'allow', 'prefer', 'require', 'verify-ca', 'verify-full', 'no-verify'].includes(sslMode)
+		) {
+			throw new Error('Invalid PostgreSQL sslmode. Use disable, allow, prefer, require, verify-ca, verify-full, or no-verify.');
 		}
 
 		const poolOptions = {
@@ -55,11 +77,19 @@ class PostgresAdapter extends DatabaseAdapter {
 		}
 		this.pool = new Pool(poolOptions);
 
-		const client = await this.pool.connect();
+		let client;
 		try {
+			client = await this.pool.connect();
 			await client.query('SELECT 1');
+		} catch (error) {
+			await this.pool.end();
+			this.pool = null;
+			if (['EAI_AGAIN', 'ENOTFOUND'].includes(error?.code)) {
+				throw new Error(`PostgreSQL host "${error.hostname || 'unknown'}" could not be resolved. Check DATABASE_URL and set the complete database connection URL, not a name such as "base".`);
+			}
+			throw error;
 		} finally {
-			client.release();
+			client?.release();
 		}
 
 		console.log('[PostgresAdapter] Connected to PostgreSQL');
@@ -1031,22 +1061,35 @@ class PostgresAdapter extends DatabaseAdapter {
 	}
 
 	async toggleLike(userId, postId) {
-		const { rows } = await this.pool.query(
-			`WITH deleted AS (
-				DELETE FROM likes WHERE user_id = $1 AND post_id = $2 RETURNING 1
-			), inserted AS (
-				INSERT INTO likes (user_id, post_id, created_at)
-				SELECT $1, $2, NOW() WHERE NOT EXISTS (SELECT 1 FROM deleted)
-				ON CONFLICT (user_id, post_id) DO NOTHING
-				RETURNING 1
-			)
-			SELECT EXISTS (SELECT 1 FROM inserted) AS liked,
-				(SELECT COUNT(*)::int FROM likes WHERE post_id = $2)
-				+ CASE WHEN EXISTS (SELECT 1 FROM inserted) THEN 1
-					WHEN EXISTS (SELECT 1 FROM deleted) THEN -1 ELSE 0 END AS count`,
-			[userId, postId],
-		);
-		return { liked: !!rows[0]?.liked, count: Number(rows[0]?.count || 0) };
+		return this._withTransaction(async (client) => {
+			const deleted = await client.query(
+				'DELETE FROM likes WHERE user_id = $1 AND post_id = $2 RETURNING 1',
+				[userId, postId],
+			);
+			let liked = false;
+			if (deleted.rowCount === 0) {
+				const inserted = await client.query(
+					`INSERT INTO likes (user_id, post_id, created_at)
+					 VALUES ($1, $2, NOW())
+					 ON CONFLICT (user_id, post_id) DO NOTHING
+					 RETURNING 1`,
+					[userId, postId],
+				);
+				liked = inserted.rowCount > 0;
+				if (!liked) {
+					const existing = await client.query(
+						'SELECT 1 FROM likes WHERE user_id = $1 AND post_id = $2',
+						[userId, postId],
+					);
+					liked = existing.rowCount > 0;
+				}
+			}
+			const countResult = await client.query(
+				'SELECT COUNT(*)::int AS count FROM likes WHERE post_id = $1',
+				[postId],
+			);
+			return { liked, count: Number(countResult.rows[0]?.count || 0) };
+		});
 	}
 
 	async getLikeCount(postId) {
@@ -1066,22 +1109,35 @@ class PostgresAdapter extends DatabaseAdapter {
 	}
 
 	async toggleStar(userId, postId) {
-		const { rows } = await this.pool.query(
-			`WITH deleted AS (
-				DELETE FROM stars WHERE user_id = $1 AND post_id = $2 RETURNING 1
-			), inserted AS (
-				INSERT INTO stars (user_id, post_id, created_at)
-				SELECT $1, $2, NOW() WHERE NOT EXISTS (SELECT 1 FROM deleted)
-				ON CONFLICT (user_id, post_id) DO NOTHING
-				RETURNING 1
-			)
-			SELECT EXISTS (SELECT 1 FROM inserted) AS starred,
-				(SELECT COUNT(*)::int FROM stars WHERE post_id = $2)
-				+ CASE WHEN EXISTS (SELECT 1 FROM inserted) THEN 1
-					WHEN EXISTS (SELECT 1 FROM deleted) THEN -1 ELSE 0 END AS count`,
-			[userId, postId],
-		);
-		return { starred: !!rows[0]?.starred, count: Number(rows[0]?.count || 0) };
+		return this._withTransaction(async (client) => {
+			const deleted = await client.query(
+				'DELETE FROM stars WHERE user_id = $1 AND post_id = $2 RETURNING 1',
+				[userId, postId],
+			);
+			let starred = false;
+			if (deleted.rowCount === 0) {
+				const inserted = await client.query(
+					`INSERT INTO stars (user_id, post_id, created_at)
+					 VALUES ($1, $2, NOW())
+					 ON CONFLICT (user_id, post_id) DO NOTHING
+					 RETURNING 1`,
+					[userId, postId],
+				);
+				starred = inserted.rowCount > 0;
+				if (!starred) {
+					const existing = await client.query(
+						'SELECT 1 FROM stars WHERE user_id = $1 AND post_id = $2',
+						[userId, postId],
+					);
+					starred = existing.rowCount > 0;
+				}
+			}
+			const countResult = await client.query(
+				'SELECT COUNT(*)::int AS count FROM stars WHERE post_id = $1',
+				[postId],
+			);
+			return { starred, count: Number(countResult.rows[0]?.count || 0) };
+		});
 	}
 
 	async getStarCount(postId) {

@@ -97,6 +97,8 @@ npm run migrate
 
 ### PostgreSQL
 
+PostgreSQL互換DBも`postgres`を使います。`DATABASE_URL`にはホスト名だけではなく、完全な`postgres://`または`postgresql://`接続文字列を設定します。
+
 ```dotenv
 DB_ADAPTER=postgres
 DATABASE_URL=postgres://user:password@db.example.com:5432/nyaitter?sslmode=require
