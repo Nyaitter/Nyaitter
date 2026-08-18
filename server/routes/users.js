@@ -1,5 +1,6 @@
 const express = require('express');
-const { optionalAuth, requireAuth } = require('../middleware/auth');
+const { optionalAuth, requireAuth, requireAuthAllowFrozen } = require('../middleware/auth');
+const crypto = require('crypto');
 const config = require('../config');
 const { isWithinRange, describeIntegerRange } = require('../utils/settingFormats');
 const {
@@ -10,7 +11,7 @@ const {
 	serializePostsBatch,
 	serializeNotification,
 } = require('../utils/serialize');
-const { getPublicUrl } = require('../utils/nyaitterAddress');
+const { getPublicUrl, getUserNyaitterId } = require('../utils/nyaitterAddress');
 const { filterViewablePosts } = require('../utils/postVisibility');
 const { ScratchIconService } = require('../services/ScratchIconService');
 const {
@@ -20,6 +21,36 @@ const {
 const router = express.Router();
 const { createRateLimiter } = require('../middleware/rateLimit');
 const profileUpdateLimiter = createRateLimiter(config.rateLimit.profileUpdate);
+const accountOperationLimiter = createRateLimiter(config.rateLimit.profileUpdate);
+const accountDeletionConfirmations = new Map();
+const ACCOUNT_CONFIRMATION_TTL_MS = 5 * 60 * 1000;
+
+function requireInteractiveSession(req, res, next) {
+	if (req.user?.tokenType !== 'session' || !req.user?.sessionTokenHash) {
+		return res.status(403).json({ error: 'ログイン済み端末のセッションが必要です。' });
+	}
+	return next();
+}
+
+function getAccountConfirmationKey(token) {
+	return crypto.createHash('sha256').update(String(token)).digest('hex');
+}
+
+function discardExpiredAccountConfirmations(now = Date.now()) {
+	for (const [key, value] of accountDeletionConfirmations) {
+		if (!value || value.expiresAt <= now) accountDeletionConfirmations.delete(key);
+	}
+}
+
+async function deleteStoredAccountAttachments(storage, keys) {
+	if (!storage || !Array.isArray(keys) || keys.length === 0) return;
+	try {
+		if (typeof storage.deleteMany === 'function') await storage.deleteMany(keys);
+		else if (typeof storage.delete === 'function') await Promise.all(keys.map((key) => storage.delete(key)));
+	} catch (error) {
+		console.warn('[users] account attachment deletion failed:', error.message);
+	}
+}
 
 function getDbAdapter(req) {
 	return req.app.locals.dbAdapter;
@@ -643,6 +674,80 @@ router.get('/:userId/pin', optionalAuth, async (req, res) => {
 	} catch (err) {
 		console.error('[users] pin error:', err);
 		res.status(500).json({ error: 'ピン留め取得に失敗しました' });
+	}
+});
+
+router.post('/me/nyaitter-id/reassign', requireAuthAllowFrozen, requireInteractiveSession, accountOperationLimiter, async (req, res) => {
+	const db = getDbAdapter(req);
+	const userId = req.user.id;
+	if (req.user.accountOperation) return res.status(409).json({ error: '別のアカウント処理が進行中です。' });
+	let started = null;
+	let operationUserId = userId;
+	try {
+		started = await db.beginAccountOperation(userId, 'reassigning');
+		if (!started) return res.status(409).json({ error: 'NyaitterIDを再割り当てできません。' });
+		req.app.locals.realtime?.closeUser?.(userId, 1012, 'Nyaitter ID reassignment');
+					const updated = await db.reassignUserId(userId);
+			if (!updated) throw new Error('Nyaitter ID reassignment did not complete');
+			const reassignedUserId = Number(updated.id);
+			operationUserId = reassignedUserId;
+			const completedUser = await db.finishAccountOperation(reassignedUserId, 'reassigning') || updated;
+			const notification = await db.createNotification({
+				userId: reassignedUserId,
+				type: 'admin_notice',
+				message: `NyaitterIDを${getUserNyaitterId(updated)}へ再割り当てしました。`,
+				target: { kind: 'route', value: '#settings' },
+			});
+			if (notification) await publishNewNotification(req, reassignedUserId, notification);
+			return res.json({ user: await serializeUser(db, completedUser, reassignedUserId, getPublicUrl(req)) });
+
+	} catch (error) {
+		console.error('[users] NyaitterID reassignment failed:', error);
+		if (started) await db.finishAccountOperation(operationUserId, 'reassigning').catch(() => {});
+		return res.status(500).json({ error: 'NyaitterIDの再割り当てに失敗しました。' });
+	}
+});
+
+router.post('/me/account/delete/prepare', requireAuthAllowFrozen, requireInteractiveSession, accountOperationLimiter, (req, res) => {
+	if (req.user.accountOperation) return res.status(409).json({ error: '別のアカウント処理が進行中です。' });
+	discardExpiredAccountConfirmations();
+	const confirmationToken = crypto.randomBytes(32).toString('base64url');
+	accountDeletionConfirmations.set(getAccountConfirmationKey(confirmationToken), {
+		userId: req.user.id,
+		sessionTokenHash: req.user.sessionTokenHash,
+		expiresAt: Date.now() + ACCOUNT_CONFIRMATION_TTL_MS,
+	});
+	return res.json({ confirmation_token: confirmationToken, expires_in_seconds: ACCOUNT_CONFIRMATION_TTL_MS / 1000 });
+});
+
+router.delete('/me/account', requireAuthAllowFrozen, requireInteractiveSession, accountOperationLimiter, async (req, res) => {
+	const confirmationToken = String(req.body?.confirmation_token || '');
+	const key = getAccountConfirmationKey(confirmationToken);
+	const confirmation = accountDeletionConfirmations.get(key);
+	accountDeletionConfirmations.delete(key);
+	if (!confirmation || confirmation.expiresAt <= Date.now() || confirmation.userId !== req.user.id || confirmation.sessionTokenHash !== req.user.sessionTokenHash) {
+		return res.status(400).json({ error: 'アカウント削除の確認が無効または期限切れです。' });
+	}
+
+	const db = getDbAdapter(req);
+	const storage = getStorageAdapter(req);
+	let started = null;
+	try {
+		started = await db.beginAccountOperation(req.user.id, 'deleting');
+		if (!started) return res.status(409).json({ error: 'アカウント削除を開始できません。' });
+		req.app.locals.realtime?.closeUser?.(req.user.id, 1012, 'Account deletion');
+		const attachmentKeys = await db.getAccountAttachmentKeys(req.user.id);
+		await db.invalidateAllSessions(req.user.id);
+		const deleted = await db.deleteAccount(req.user.id);
+		if (!deleted) throw new Error('Account deletion did not complete');
+		await deleteStoredAccountAttachments(storage, attachmentKeys);
+		res.clearCookie('nyaitter_session');
+		res.clearCookie('nyaitter_accounts');
+		return res.json({ success: true });
+	} catch (error) {
+		console.error('[users] account deletion failed:', error);
+		if (started) await db.finishAccountOperation(req.user.id, 'deleting').catch(() => {});
+		return res.status(500).json({ error: 'アカウント削除に失敗しました。' });
 	}
 });
 

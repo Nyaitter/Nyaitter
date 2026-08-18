@@ -174,10 +174,11 @@ async function getValidRememberedAccounts(req, db) {
   const valid = [];
   for (const account of remembered) {
     const session = await db.getSessionByToken(SessionManager.hashToken(account.token));
-    if (!session || Number(session.userId) !== account.userId) continue;
-    const user = await db.getUserById(account.userId);
+    if (!session) continue;
+    const userId = Number(session.userId);
+    const user = await db.getUserById(userId);
     if (!user) continue;
-    valid.push({ ...account, session, user });
+    valid.push({ token: account.token, userId, session, user });
   }
   return valid;
 }

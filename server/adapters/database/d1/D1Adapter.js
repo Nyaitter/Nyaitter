@@ -477,6 +477,36 @@ class D1Adapter extends DatabaseAdapter {
 		return this._write(`/users/${requireId(userId, 'userId')}/status`, status);
 	}
 
+	async beginAccountOperation(userId, operation) {
+		return normalizeUser(await this._write(
+			`/users/${requireId(userId, 'userId')}/account-operation/begin`,
+			{ operation },
+		));
+	}
+
+	async finishAccountOperation(userId, operation) {
+		return normalizeUser(await this._write(
+			`/users/${requireId(userId, 'userId')}/account-operation/finish`,
+			{ operation },
+		));
+	}
+
+	async reassignUserId(userId) {
+		return normalizeUser(await this._write(
+			`/users/${requireId(userId, 'userId')}/nyaitter-id/reassign`,
+		));
+	}
+
+	async getAccountAttachmentKeys(userId) {
+		const keys = await this._read(`/users/${requireId(userId, 'userId')}/account/attachments`, { cacheSeconds: 0 });
+		return Array.isArray(keys) ? keys.filter((key) => typeof key === 'string') : [];
+	}
+
+	async deleteAccount(userId) {
+		const result = await this._write(`/users/${requireId(userId, 'userId')}/account/delete`);
+		return result === true || Boolean(result?.success);
+	}
+
 	async updateUserProfile(userId, profileData) {
 		return normalizeUser(await this._write(
 			`/users/${requireId(userId, 'userId')}/profile`,

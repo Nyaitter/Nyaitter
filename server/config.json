@@ -79,12 +79,20 @@
 	},
 	"database": {
 		"adapter": "memory",
-		"postgres": {
-			"connectionString": "postgres://user:pass@localhost:5432/nyaitter",
-			"poolSize": 10,
-			"ssl": false
-		},
-		"d1": {
+					"postgres": {
+				"connectionString": "postgres://user:pass@localhost:5432/nyaitter",
+				"poolSize": 10,
+				"ssl": false
+			},
+			"cockroach": {
+				"connectionString": "",
+				"sslCa": "",
+				"poolSize": 10,
+				"transactionRetries": 5,
+				"retryBaseDelayMs": 50
+			},
+			"d1": {
+
 			"workerUrl": "",
 			"authToken": ""
 		}

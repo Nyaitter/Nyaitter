@@ -94,6 +94,7 @@ function normalizeUserRow(row) {
 	if (!row) return null;
 	return {
 		id: row.id,
+		account_operation: row.account_operation || null,
 		scid: row.scid || null,
 		name: row.name || '',
 		handle: row.handle || formatNyaitterId(row.id),
@@ -464,9 +465,10 @@ export default {
 
 				await db.prepare(
 						`INSERT INTO users (id, scid, name, handle, nyaitter_address, auth_provider, provider_domain, external_id, external_profile, block, bio, header_image, icon_data, created_at)
-						 VALUES (?, ?, ?, ?, ?, 'nyaitter', ?, ?, ?, ?, ?, ?, ?, ?)`
+								 VALUES (?, ?, ?, ?, ?, 'nyaitter', ?, ?, ?, ?, ?, ?, ?, ?)`
+
 					).bind(
-						id, null, profile.name || handle, handle, address, providerDomain, externalId,
+						id, profile.name || handle, handle, address, providerDomain, externalId,
 						JSON.stringify(profile.external_profile || profile),
 						JSON.stringify(normalizeBlockList(profile.block, id)),
 						profile.bio || profile.me || '', profile.header_image || null,
@@ -485,19 +487,22 @@ export default {
 					const countRow = await db.prepare('SELECT COUNT(*) as count FROM users').first();
 					const count = Number(countRow?.count || 0);
 					const digits = Math.max(4, String(Math.max(count, 1)).length);
-					const id = Math.floor(Math.random() * (10 ** digits));
-					const handle = provider === 'nyaitter' && userData.external_id != null
-						? formatNyaitterId(userData.external_id)
-						: formatNyaitterId(id);
+						const id = Math.floor(Math.random() * (10 ** digits));
+						const handle = provider === 'nyaitter' && userData.external_id != null
+							? formatNyaitterId(userData.external_id)
+							: formatNyaitterId(id);
+
 					const address = userData.nyaitter_address || null;
 					const now = new Date().toISOString();
 
 					try {
 						await db.prepare(
-							`INSERT INTO users (id, scid, name, handle, nyaitter_address, auth_provider, provider_domain, external_id, external_profile, uuid, settings, block, bio, header_image, icon_data, created_at)
-							 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+								`INSERT INTO users (id, scid, name, handle, nyaitter_address, auth_provider, provider_domain, external_id, external_profile, uuid, settings, block, bio, header_image, icon_data, created_at)
+									 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+
 						).bind(
-							id, userData.scid || null, userData.name || userData.scid || handle, handle, address,
+															id, userData.scid || null, userData.name || userData.scid || handle, handle, address,
+
 							provider, userData.provider_domain || null, userData.external_id || null,
 							userData.external_profile ? JSON.stringify(userData.external_profile) : null,
 							userData.uuid || null, userData.settings ? JSON.stringify(userData.settings) : '{}',
@@ -522,15 +527,15 @@ export default {
 				const queryPattern = `%${q.toLowerCase()}%`;
 				const digits = q.replace(/^#/, '').replace(/\D/g, '');
 
-				const { results } = await db.prepare(
-					`SELECT id, name, scid, handle, nyaitter_address, auth_provider, provider_domain, external_id, icon_data
-					 FROM users
-					 WHERE LOWER(COALESCE(scid, '')) LIKE ?
-					    OR LOWER(COALESCE(name, '')) LIKE ?
-					    OR LOWER(COALESCE(handle, '')) LIKE ?
-					    OR CAST(id AS TEXT) LIKE ?
-					 ORDER BY id DESC LIMIT ?`
-				).bind(queryPattern, queryPattern, queryPattern, digits ? `%${digits}%` : queryPattern, limit).all();
+					const { results } = await db.prepare(
+						`SELECT id, name, scid, handle, nyaitter_address, auth_provider, provider_domain, external_id, icon_data
+						 FROM users
+						 WHERE LOWER(COALESCE(scid, '')) LIKE ?
+						    OR LOWER(COALESCE(name, '')) LIKE ?
+						    OR LOWER(COALESCE(handle, '')) LIKE ?
+						    OR CAST(id AS TEXT) LIKE ?
+						 ORDER BY id DESC LIMIT ?`
+					).bind(queryPattern, queryPattern, queryPattern, digits ? `%${digits}%` : queryPattern, limit).all();
 
 				return json((results || []).map(normalizeUserRow));
 			}
@@ -553,7 +558,206 @@ export default {
 				return json((results || []).map(normalizeUserRow));
 			}
 
-			if (method === 'GET' && pathname.match(/^\/users\/(\d+)\/status$/)) {
+							if (method === 'POST' && pathname.match(/^\/users\/(\d+)\/account-operation\/begin$/)) {
+					const userId = Number(pathname.split('/')[2]);
+					const body = await request.json();
+					const operation = String(body.operation || '');
+					if (!['reassigning', 'deleting'].includes(operation)) return badRequest('Invalid account operation');
+					const result = await db.prepare(
+						`UPDATE users SET account_operation = ?
+						 WHERE id = ? AND auth_provider <> 'nyaitter' AND account_operation IS NULL`
+					).bind(operation, userId).run();
+					if (result.meta.changes === 0) return json(null);
+					return json(normalizeUserRow(await db.prepare('SELECT * FROM users WHERE id = ?').bind(userId).first()));
+				}
+
+				if (method === 'POST' && pathname.match(/^\/users\/(\d+)\/account-operation\/finish$/)) {
+					const userId = Number(pathname.split('/')[2]);
+					const body = await request.json();
+					const operation = String(body.operation || '');
+					const result = await db.prepare('UPDATE users SET account_operation = NULL WHERE id = ? AND account_operation = ?')
+						.bind(userId, operation).run();
+					if (result.meta.changes === 0) return json(null);
+					return json(normalizeUserRow(await db.prepare('SELECT * FROM users WHERE id = ?').bind(userId).first()));
+				}
+
+					if (method === 'POST' && pathname.match(/^\/users\/(\d+)\/nyaitter-id\/reassign$/)) {
+						const previousId = Number(pathname.split('/')[2]);
+						const user = await db.prepare(
+							`SELECT * FROM users WHERE id = ? AND auth_provider <> 'nyaitter' AND account_operation = 'reassigning'`
+						).bind(previousId).first();
+						if (!user) return json(null);
+
+						const countRow = await db.prepare('SELECT COUNT(*) AS count FROM users').first();
+						const upperBound = 10 ** Math.max(4, String(Math.max(Number(countRow?.count) || 1, 1)).length);
+						let nextId = null;
+						for (let attempt = 0; attempt < 100; attempt += 1) {
+							const candidate = Math.floor(Math.random() * upperBound);
+							if (candidate === previousId) continue;
+							const collision = await db.prepare('SELECT 1 FROM users WHERE id = ? LIMIT 1').bind(candidate).first();
+							if (!collision) {
+								nextId = candidate;
+								break;
+							}
+						}
+						if (nextId == null) throw new Error('Could not allocate a unique Nyaitter ID');
+
+													const [{ results: channels }, { results: groups }, { results: blockedUsers }, { results: reports }] = await db.batch([
+								db.prepare('SELECT id, participants FROM dm_channels WHERE participants LIKE ?').bind(`%${previousId}%`),
+								db.prepare('SELECT id, host_id, member, post, unread FROM group_dms WHERE host_id = ? OR member LIKE ? OR unread LIKE ?').bind(previousId, `%${previousId}%`, `%\"${previousId}\"%`),
+								db.prepare('SELECT id, block FROM users WHERE block LIKE ?').bind(`%${previousId}%`),
+								db.prepare('SELECT id, target_kind, target_id, target_snapshot, excluded_admin_ids FROM moderation_reports'),
+							]);
+
+						const statements = [
+							db.prepare(
+								`INSERT INTO users (id, scid, name, handle, nyaitter_address, auth_provider, provider_domain, external_id, external_profile, uuid, settings, block, bio, header_image, icon_data, verify, admin, freeze, shadow, created_at, account_operation)
+								 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+							).bind(
+								nextId, user.scid, user.name, formatNyaitterId(nextId), user.nyaitter_address,
+								user.auth_provider, user.provider_domain, user.external_id, user.external_profile,
+								user.uuid, user.settings, user.block, user.bio, user.header_image, user.icon_data,
+								user.verify, user.admin, user.freeze, user.shadow, user.created_at, user.account_operation,
+							),
+							db.prepare('UPDATE sessions SET user_id = ? WHERE user_id = ?').bind(nextId, previousId),
+							db.prepare('UPDATE trusted_login_ips SET user_id = ? WHERE user_id = ?').bind(nextId, previousId),
+							db.prepare('UPDATE login_approvals SET user_id = ? WHERE user_id = ?').bind(nextId, previousId),
+							db.prepare('UPDATE bot_tokens SET user_id = ? WHERE user_id = ?').bind(nextId, previousId),
+							db.prepare('UPDATE posts SET user_id = ? WHERE user_id = ?').bind(nextId, previousId),
+							db.prepare('UPDATE likes SET user_id = ? WHERE user_id = ?').bind(nextId, previousId),
+							db.prepare('UPDATE stars SET user_id = ? WHERE user_id = ?').bind(nextId, previousId),
+							db.prepare('UPDATE reposts SET user_id = ? WHERE user_id = ?').bind(nextId, previousId),
+							db.prepare('UPDATE pinned_posts SET user_id = ? WHERE user_id = ?').bind(nextId, previousId),
+							db.prepare('UPDATE dm_messages SET sender_id = ? WHERE sender_id = ?').bind(nextId, previousId),
+							db.prepare('UPDATE follows SET follower_id = ? WHERE follower_id = ?').bind(nextId, previousId),
+							db.prepare('UPDATE follows SET following_id = ? WHERE following_id = ?').bind(nextId, previousId),
+							db.prepare('UPDATE dm_e2e_keys SET user_id = ? WHERE user_id = ?').bind(nextId, previousId),
+							db.prepare('UPDATE notifications SET user_id = ? WHERE user_id = ?').bind(nextId, previousId),
+															db.prepare('UPDATE notifications SET from_user_id = ? WHERE from_user_id = ?').bind(nextId, previousId),
+								db.prepare(`UPDATE notifications SET target = json_set(target, '$.id', ?)
+									WHERE json_extract(target, '$.kind') = 'user' AND CAST(json_extract(target, '$.id') AS INTEGER) = ?`).bind(nextId, previousId),
+								db.prepare('UPDATE push_subscriptions SET user_id = ? WHERE user_id = ?').bind(nextId, previousId),
+
+							db.prepare('UPDATE moderation_reports SET reporter_user_id = ? WHERE reporter_user_id = ?').bind(nextId, previousId),
+							db.prepare('UPDATE moderation_reports SET assigned_admin_id = ? WHERE assigned_admin_id = ?').bind(nextId, previousId),
+							db.prepare('UPDATE logs SET nyaitter_id = ? WHERE nyaitter_id = ?').bind(nextId, previousId),
+						];
+						for (const channel of channels || []) {
+							const participants = parseJsonSafe(channel.participants, []).map((id) => Number(id) === previousId ? nextId : Number(id));
+							statements.push(db.prepare('UPDATE dm_channels SET participants = ? WHERE id = ?').bind(JSON.stringify(participants), channel.id));
+						}
+						for (const group of groups || []) {
+							const member = parseJsonSafe(group.member, []).map((id) => Number(id) === previousId ? nextId : Number(id));
+							const post = parseJsonSafe(group.post, []).map((message) => (
+								Number(message?.userid) === previousId ? { ...message, userid: nextId } : message
+							));
+							const unread = { ...parseJsonSafe(group.unread, {}) };
+							if (Object.prototype.hasOwnProperty.call(unread, String(previousId))) {
+								unread[String(nextId)] = unread[String(previousId)];
+								delete unread[String(previousId)];
+							}
+							statements.push(
+								db.prepare('UPDATE group_dms SET host_id = ?, member = ?, post = ?, unread = ? WHERE id = ?')
+									.bind(Number(group.host_id) === previousId ? nextId : Number(group.host_id), JSON.stringify(member), JSON.stringify(post), JSON.stringify(unread), group.id),
+							);
+						}
+						for (const blockedUser of blockedUsers || []) {
+							const block = normalizeBlockList(parseJsonSafe(blockedUser.block, []).map((id) => Number(id) === previousId ? nextId : id), Number(blockedUser.id) === previousId ? nextId : blockedUser.id);
+							statements.push(db.prepare('UPDATE users SET block = ? WHERE id = ?').bind(JSON.stringify(block), blockedUser.id));
+						}
+													for (const report of reports || []) {
+								const targetSnapshot = parseJsonSafe(report.target_snapshot, {});
+								let snapshotChanged = false;
+								if (Number(targetSnapshot?.subjectUser?.id) === previousId) {
+									targetSnapshot.subjectUser.id = nextId;
+									snapshotChanged = true;
+								}
+								for (const member of targetSnapshot?.dm?.members || []) {
+									if (Number(member?.id) !== previousId) continue;
+									member.id = nextId;
+									snapshotChanged = true;
+								}
+								const targetId = report.target_kind === 'user' && Number(report.target_id) === previousId
+									? String(nextId)
+									: report.target_id;
+								const excluded = parseJsonSafe(report.excluded_admin_ids, []).map((id) => Number(id) === previousId ? nextId : Number(id));
+								const excludedChanged = excluded.some((id, index) => Number(id) !== Number(parseJsonSafe(report.excluded_admin_ids, [])[index]));
+								if (!snapshotChanged && targetId === report.target_id && !excludedChanged) continue;
+								statements.push(
+									db.prepare('UPDATE moderation_reports SET target_id = ?, target_snapshot = ?, excluded_admin_ids = ? WHERE id = ?')
+										.bind(targetId, JSON.stringify(targetSnapshot), JSON.stringify(excluded), report.id),
+								);
+							}
+
+						statements.push(db.prepare('DELETE FROM users WHERE id = ? AND account_operation = ?').bind(previousId, 'reassigning'));
+						await db.batch(statements);
+						return json(normalizeUserRow(await db.prepare('SELECT * FROM users WHERE id = ?').bind(nextId).first()));
+					}
+
+				if (method === 'GET' && pathname.match(/^\/users\/(\d+)\/account\/attachments$/)) {
+					const userId = Number(pathname.split('/')[2]);
+					const { results } = await db.prepare('SELECT attachments FROM posts WHERE user_id = ?').bind(userId).all();
+					const keys = new Set();
+					for (const row of results || []) {
+						for (const attachment of parseJsonSafe(row.attachments, [])) {
+															const key = attachment?.id || attachment?.key;
+								if (typeof key === 'string' && key.startsWith('attachments/')) keys.add(key);
+
+						}
+					}
+					return json([...keys]);
+				}
+
+				if (method === 'POST' && pathname.match(/^\/users\/(\d+)\/account\/delete$/)) {
+					const userId = Number(pathname.split('/')[2]);
+					const user = await db.prepare("SELECT id FROM users WHERE id = ? AND account_operation = 'deleting'").bind(userId).first();
+					if (!user) return json({ success: false });
+					const { results: posts } = await db.prepare('SELECT id FROM posts WHERE user_id = ?').bind(userId).all();
+					const postIds = (posts || []).map((row) => Number(row.id));
+					const { results: channels } = await db.prepare('SELECT * FROM dm_channels WHERE participants LIKE ?').bind(`%${userId}%`).all();
+					const { results: groups } = await db.prepare('SELECT * FROM group_dms WHERE host_id = ? OR member LIKE ?').bind(userId, `%${userId}%`).all();
+					const { results: users } = await db.prepare('SELECT id, block FROM users WHERE block LIKE ?').bind(`%${userId}%`).all();
+					const statements = [];
+					if (postIds.length > 0) {
+						const placeholders = postIds.map(() => '?').join(',');
+						statements.push(db.prepare(`UPDATE posts SET reply_to = NULL WHERE reply_to IN (${placeholders})`).bind(...postIds));
+						statements.push(db.prepare(`UPDATE posts SET repost_to = NULL WHERE repost_to IN (${placeholders})`).bind(...postIds));
+					}
+					for (const channel of channels || []) {
+						const participants = parseJsonSafe(channel.participants, []).map(Number).filter((id) => id !== userId);
+						if (participants.length < 2) statements.push(db.prepare('DELETE FROM dm_channels WHERE id = ?').bind(channel.id));
+						else statements.push(db.prepare('UPDATE dm_channels SET participants = ? WHERE id = ?').bind(JSON.stringify(participants), channel.id));
+					}
+					for (const group of groups || []) {
+						const members = parseJsonSafe(group.member, []).map(Number).filter((id) => id !== userId);
+						if (members.length === 0) statements.push(db.prepare('DELETE FROM group_dms WHERE id = ?').bind(group.id));
+						else {
+							const messages = parseJsonSafe(group.post, []).filter((message) => Number(message?.userid) !== userId);
+							const unread = { ...parseJsonSafe(group.unread, {}) }; delete unread[String(userId)];
+							const hostId = Number(group.host_id) === userId ? members[0] : Number(group.host_id);
+							statements.push(db.prepare('UPDATE group_dms SET host_id = ?, member = ?, post = ?, unread = ? WHERE id = ?')
+								.bind(hostId, JSON.stringify(members), JSON.stringify(messages), JSON.stringify(unread), group.id));
+						}
+					}
+					for (const candidate of users || []) {
+						const block = normalizeBlockList(parseJsonSafe(candidate.block, []).filter((id) => Number(id) !== userId), candidate.id);
+						statements.push(db.prepare('UPDATE users SET block = ? WHERE id = ?').bind(JSON.stringify(block), candidate.id));
+					}
+					statements.push(
+						db.prepare('DELETE FROM sessions WHERE user_id = ?').bind(userId),
+						db.prepare('DELETE FROM bot_tokens WHERE user_id = ?').bind(userId),
+						db.prepare('DELETE FROM trusted_login_ips WHERE user_id = ?').bind(userId),
+						db.prepare('DELETE FROM login_approvals WHERE user_id = ?').bind(userId),
+						db.prepare('DELETE FROM push_subscriptions WHERE user_id = ?').bind(userId),
+						db.prepare('DELETE FROM moderation_reports WHERE reporter_user_id = ?').bind(userId),
+						db.prepare('DELETE FROM users WHERE id = ?').bind(userId),
+					);
+					await db.batch(statements);
+					return json({ success: true });
+				}
+
+				if (method === 'GET' && pathname.match(/^\/users\/(\d+)\/status$/)) {
+
 				const userId = Number(pathname.split('/')[2]);
 				const row = await db.prepare('SELECT shadow FROM users WHERE id = ?').bind(userId).first();
 				return json(row ? { shadow: Boolean(row.shadow) } : null);

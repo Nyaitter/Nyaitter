@@ -87,6 +87,22 @@ class DatabaseAdapter {
 		throw new Error('setUserStatus() must be implemented');
 	}
 
+	async beginAccountOperation(userId, operation) {
+		throw new Error('beginAccountOperation() must be implemented');
+	}
+	async finishAccountOperation(userId, operation) {
+		throw new Error('finishAccountOperation() must be implemented');
+	}
+	async reassignUserId(userId) {
+		throw new Error('reassignUserId() must be implemented');
+	}
+	async deleteAccount(userId) {
+		throw new Error('deleteAccount() must be implemented');
+	}
+	async getAccountAttachmentKeys(userId) {
+		throw new Error('getAccountAttachmentKeys() must be implemented');
+	}
+
 	async createBotToken(userId, tokenId, tokenHash, name) { throw new Error('createBotToken() must be implemented'); }
 	async getBotTokenById(tokenId) { throw new Error('getBotTokenById() must be implemented'); }
 	async getUserBotTokens(userId) { throw new Error('getUserBotTokens() must be implemented'); }

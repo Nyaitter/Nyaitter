@@ -44,6 +44,45 @@ class PostgresAdapter extends DatabaseAdapter {
 		}
 	}
 
+	_reassignReportSnapshotUserIds(snapshot, previousId, nextId) {
+		if (!snapshot || typeof snapshot !== 'object') return { snapshot, changed: false };
+		const updated = JSON.parse(JSON.stringify(snapshot));
+		let changed = false;
+		if (Number(updated?.subjectUser?.id) === previousId) {
+			updated.subjectUser.id = nextId;
+			changed = true;
+		}
+		for (const member of updated?.dm?.members || []) {
+			if (Number(member?.id) !== previousId) continue;
+			member.id = nextId;
+			changed = true;
+		}
+		return { snapshot: updated, changed };
+	}
+
+	async _withTransaction(operation) {
+		const client = await this.pool.connect();
+		let started = false;
+		try {
+			await client.query('BEGIN');
+			started = true;
+			const result = await operation(client);
+			await client.query('COMMIT');
+			return result;
+		} catch (error) {
+			if (started) {
+				try {
+					await client.query('ROLLBACK');
+				} catch (_) {
+					// The original query error is more useful to callers.
+				}
+			}
+			throw error;
+		} finally {
+			client.release();
+		}
+	}
+
 	_normalizeUserBlockList(user) {
 		if (!user) return null;
 		return {
@@ -102,22 +141,23 @@ class PostgresAdapter extends DatabaseAdapter {
 			const countResult = await this.pool.query('SELECT COUNT(*)::bigint AS count FROM users');
 			const count = Number(countResult.rows[0].count);
 			const digits = Math.max(4, String(Math.max(count, 1)).length);
-			const id = crypto.randomInt(0, 10 ** digits);
-			const handle = provider === 'nyaitter' && userData.external_id != null
-				? formatNyaitterId(userData.external_id)
-				: formatNyaitterId(id);
+							const id = crypto.randomInt(0, 10 ** digits);
+				const handle = provider === 'nyaitter' && userData.external_id != null
+					? formatNyaitterId(userData.external_id)
+					: formatNyaitterId(id);
+
 			const address = userData.nyaitter_address || null;
 			try {
 				const { rows } = await this.pool.query(
-							`INSERT INTO users (id, scid, name, handle, nyaitter_address, auth_provider, provider_domain, external_id, external_profile, uuid, settings, block, bio, header_image, icon_data, created_at)
-							 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13, $14, $15, NOW()) RETURNING *`,
-						[id, userData.scid || null, userData.name || userData.scid || handle, handle, address,
-								 provider, userData.provider_domain || null, userData.external_id || null,
-								 userData.external_profile || null, userData.uuid || null,
-								 userData.settings ? JSON.stringify(userData.settings) : '{}',
-								 JSON.stringify(normalizeBlockList(userData.block, id)),
-								 userData.bio || userData.me || '', userData.header_image || null,
-								 userData.icon_data || null],
+								`INSERT INTO users (id, scid, name, handle, nyaitter_address, auth_provider, provider_domain, external_id, external_profile, uuid, settings, block, bio, header_image, icon_data, created_at)
+								 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, $13, $14, $15, NOW()) RETURNING *`,
+							[id, userData.scid || null, userData.name || userData.scid || handle, handle, address,
+										 provider, userData.provider_domain || null, userData.external_id || null,
+										 userData.external_profile || null, userData.uuid || null,
+										 userData.settings ? JSON.stringify(userData.settings) : '{}',
+										 JSON.stringify(normalizeBlockList(userData.block, id)),
+										 userData.bio || userData.me || '', userData.header_image || null,
+										 userData.icon_data || null],
 
 				);
 			return this._normalizeUserBlockList(rows[0]);
@@ -138,9 +178,10 @@ class PostgresAdapter extends DatabaseAdapter {
 			 FROM users
 			 WHERE LOWER(COALESCE(scid, '')) LIKE $1
 				OR LOWER(COALESCE(name, '')) LIKE $1
-				OR LOWER(COALESCE(handle, '')) LIKE $1
-				OR CAST(id AS TEXT) LIKE $1
-				OR CAST(COALESCE(external_id, -1) AS TEXT) LIKE $1
+									OR LOWER(COALESCE(handle, '')) LIKE $1
+					OR CAST(id AS TEXT) LIKE $1
+					OR CAST(COALESCE(external_id, -1) AS TEXT) LIKE $1
+
 			 ORDER BY id ASC LIMIT $2 OFFSET $3`,
 			[digits ? `%${digits}%` : q, safeLimit, safeOffset]
 		);
@@ -153,7 +194,8 @@ class PostgresAdapter extends DatabaseAdapter {
 		// 投稿・通知の可視性とシリアライズでは settings / shadow / 権限情報も必要になる。
 		// ここで必要な属性をまとめて返すことで、呼び出し側のユーザーごとの再取得を避ける。
 		const { rows } = await this.pool.query(
-			`SELECT id, name, scid, icon_data, handle, nyaitter_address,
+							`SELECT id, account_operation, name, scid, icon_data, handle, nyaitter_address,
+
 				auth_provider, provider_domain, external_id, settings, block, bio,
 				header_image, verify, admin, freeze, shadow, uuid, created_at
 			 FROM users WHERE id = ANY($1::int[])`,
@@ -856,50 +898,52 @@ class PostgresAdapter extends DatabaseAdapter {
 		}
 
 	async getPostDetail(id, currentUserId = null) {
-			const post = await this.getPostById(id);
-			if (!post) return null;
+		// 投稿、投稿者、集計、閲覧者のリアクション、親投稿を1回で取得する。
+		// D1の詳細取得と同じ形にそろえ、DBとの往復を減らす。
+		const parsedViewerId = Number(currentUserId);
+		const viewerId = Number.isInteger(parsedViewerId) && parsedViewerId >= 0 ? parsedViewerId : null;
+		const { rows } = await this.pool.query(
+			`SELECT p.*,
+				author.id AS author_id,
+				author.name AS author_name,
+				author.scid AS author_scid,
+				COALESCE((SELECT COUNT(*)::int FROM likes WHERE post_id = p.id), 0) AS like_count,
+				COALESCE((SELECT COUNT(*)::int FROM stars WHERE post_id = p.id), 0) AS star_count,
+				EXISTS(SELECT 1 FROM likes WHERE user_id = $1 AND post_id = p.id) AS liked_by_me,
+				EXISTS(SELECT 1 FROM stars WHERE user_id = $1 AND post_id = p.id) AS starred_by_me,
+				parent.id AS parent_id,
+				parent.content AS parent_content,
+				parent_author.id AS parent_author_id,
+				parent_author.name AS parent_author_name
+			 FROM posts p
+			 LEFT JOIN users author ON author.id = p.user_id
+			 LEFT JOIN posts parent ON parent.id = p.reply_to
+			 LEFT JOIN users parent_author ON parent_author.id = parent.user_id
+			 WHERE p.id = $2`,
+			[viewerId, id],
+		);
+		const detail = rows[0];
+		if (!detail) return null;
 
-			// これらは相互に依存しないため、逐次クエリではなく並列に取得する。
-			const [author, likeCount, starCount, likedByMe, starredByMe] = await Promise.all([
-				this.getUserById(post.user_id),
-				this.getLikeCount(id),
-				this.getStarCount(id),
-				currentUserId ? this.hasUserLikedPost(currentUserId, id) : false,
-				currentUserId ? this.hasUserStarredPost(currentUserId, id) : false,
-			]);
-
-			let parentPost = null;
-		if (post.reply_to) {
-			// 親投稿と投稿者を結合して取得し、詳細表示時の追加往復を1回に抑える。
-			const { rows: parentRows } = await this.pool.query(
-				`SELECT parent.id, parent.content,
-						author.id AS author_id, author.name AS author_name
-				 FROM posts parent
-				 LEFT JOIN users author ON author.id = parent.user_id
-				 WHERE parent.id = $1`,
-				[post.reply_to],
-			);
-			const parent = parentRows[0];
-			if (parent) {
-				parentPost = {
-					id: parent.id,
-					content: parent.content?.substring(0, 100),
-					author: parent.author_id == null
-						? null
-						: { id: parent.author_id, name: parent.author_name || '' },
-				};
-			}
-		}
-
-		const normalized = this._normalizePost(post);
+		const normalized = this._normalizePost(detail);
 		return {
 			...normalized,
-			author: author ? { id: author.id, name: author.name, scid: author.scid } : null,
-			like_count: likeCount,
-			star_count: starCount,
-			liked_by_me: likedByMe,
-			starred_by_me: starredByMe,
-			parent_post: parentPost,
+			author: detail.author_id == null
+				? null
+				: { id: detail.author_id, name: detail.author_name || '', scid: detail.author_scid },
+			like_count: Number(detail.like_count || 0),
+			star_count: Number(detail.star_count || 0),
+			liked_by_me: Boolean(detail.liked_by_me),
+			starred_by_me: Boolean(detail.starred_by_me),
+			parent_post: detail.parent_id == null
+				? null
+				: {
+					id: detail.parent_id,
+					content: detail.parent_content?.substring(0, 100),
+					author: detail.parent_author_id == null
+						? null
+						: { id: detail.parent_author_id, name: detail.parent_author_name || '' },
+				},
 		};
 	}
 
@@ -1176,18 +1220,13 @@ class PostgresAdapter extends DatabaseAdapter {
 	async appendToGroupDm(dmId, message, senderId = null) {
 		// unread の増分はメンバーごとに個別の値になるため、SQL側で一括計算せず
 		// 現在値を読んでJS側で計算してから書き戻す（InMemoryAdapterと同じロジック）。
-		const client = await this.pool.connect();
-		try {
-			await client.query('BEGIN');
+		return this._withTransaction(async (client) => {
 			const { rows: existingRows } = await client.query(
 				'SELECT * FROM group_dms WHERE id = $1 FOR UPDATE',
 				[dmId]
 			);
 			const row = existingRows[0];
-			if (!row) {
-				await client.query('ROLLBACK');
-				return null;
-			}
+			if (!row) return null;
 
 			const time = message.time || new Date().toISOString();
 			const unread = { ...(row.unread || {}) };
@@ -1209,14 +1248,8 @@ class PostgresAdapter extends DatabaseAdapter {
 				 RETURNING *`,
 				[JSON.stringify(message), time, JSON.stringify(unread), dmId]
 			);
-			await client.query('COMMIT');
 			return this._serializeGroupDmRow(rows[0], senderId);
-		} catch (error) {
-			await client.query('ROLLBACK');
-			throw error;
-		} finally {
-			client.release();
-		}
+		});
 	}
 
 	async markGroupDmRead(dmId, userId) {
@@ -1418,33 +1451,21 @@ class PostgresAdapter extends DatabaseAdapter {
 	}
 
 	async deletePost(postId, userId) {
-		const client = await this.pool.connect();
-		try {
-			await client.query('BEGIN');
-
+		return this._withTransaction(async (client) => {
 			const { rows: postRows } = await client.query(
 				'SELECT user_id FROM posts WHERE id = $1',
 				[postId]
 			);
 			if (postRows.length === 0 || postRows[0].user_id !== userId) {
-				await client.query('ROLLBACK');
 				return false;
 			}
 
 			await client.query('DELETE FROM likes WHERE post_id = $1', [postId]);
 			await client.query('DELETE FROM stars WHERE post_id = $1', [postId]);
 			// Add more cleanup if you have pinned_posts, reposts tables, etc.
-
 			await client.query('DELETE FROM posts WHERE id = $1', [postId]);
-
-			await client.query('COMMIT');
 			return true;
-		} catch (err) {
-			await client.query('ROLLBACK');
-			throw err;
-		} finally {
-			client.release();
-		}
+		});
 	}
 
 	async togglePin(userId, postId) {
@@ -1560,25 +1581,14 @@ class PostgresAdapter extends DatabaseAdapter {
 	}
 
 	async adminDeletePost(postId) {
-		const client = await this.pool.connect();
-		try {
-			await client.query('BEGIN');
-
+		return this._withTransaction(async (client) => {
 			await client.query('DELETE FROM likes WHERE post_id = $1', [postId]);
 			await client.query('DELETE FROM stars WHERE post_id = $1', [postId]);
 			await client.query('DELETE FROM reposts WHERE post_id = $1', [postId]);
 			await client.query('DELETE FROM pinned_posts WHERE post_id = $1', [postId]);
-
 			await client.query('DELETE FROM posts WHERE id = $1', [postId]);
-
-			await client.query('COMMIT');
 			return true;
-		} catch (err) {
-			await client.query('ROLLBACK');
-			throw err;
-		} finally {
-			client.release();
-		}
+		});
 	}
 
 	async createNotification(notificationData) {
@@ -1891,20 +1901,6 @@ class PostgresAdapter extends DatabaseAdapter {
 			[q, limit]
 		);
 
-		if (query.trim().startsWith('#')) {
-			const tagQ = `%${query.toLowerCase()}%`;
-			const tagRows = await this.pool.query(
-				`SELECT * FROM posts 
-				 WHERE LOWER(content) LIKE $1 
-				 ORDER BY created_at DESC 
-				 LIMIT $2`,
-				[tagQ, limit]
-			);
-			for (const r of tagRows.rows) {
-				if (!rows.find(x => x.id === r.id)) rows.push(r);
-				if (rows.length >= limit) break;
-			}
-		}
 
 		return rows.map(r => this._normalizePost(r));
 	}
@@ -2017,6 +2013,212 @@ class PostgresAdapter extends DatabaseAdapter {
 		);
 		if (!rows[0]) return null;
 		return { shadow: !!rows[0].shadow };
+	}
+
+	async beginAccountOperation(userId, operation) {
+		if (!['reassigning', 'deleting'].includes(operation)) throw new Error('Invalid account operation');
+		const { rows } = await this.pool.query(
+			`UPDATE users
+			 SET account_operation = $2
+			 WHERE id = $1
+			   AND auth_provider <> 'nyaitter'
+			   AND account_operation IS NULL
+			 RETURNING *`,
+			[userId, operation],
+		);
+		return this._normalizeUserBlockList(rows[0] || null);
+	}
+
+	async finishAccountOperation(userId, operation) {
+		const { rows } = await this.pool.query(
+			`UPDATE users SET account_operation = NULL
+			 WHERE id = $1 AND account_operation = $2
+			 RETURNING *`,
+			[userId, operation],
+		);
+		return this._normalizeUserBlockList(rows[0] || null);
+	}
+
+	async reassignUserId(userId) {
+		return this._withTransaction(async (client) => {
+			const { rows: userRows } = await client.query(
+				`SELECT * FROM users
+				 WHERE id = $1 AND auth_provider <> 'nyaitter' AND account_operation = 'reassigning'
+				 FOR UPDATE`,
+				[userId],
+			);
+			const user = userRows[0];
+			if (!user) return null;
+
+			const previousId = Number(user.id);
+			const { rows: countRows } = await client.query('SELECT COUNT(*)::bigint AS count FROM users');
+			const digits = Math.max(4, String(Math.max(Number(countRows[0]?.count) || 1, 1)).length);
+			const upperBound = 10 ** digits;
+			let nextId = null;
+			for (let attempt = 0; attempt < 100; attempt += 1) {
+				const candidate = crypto.randomInt(0, upperBound);
+				if (candidate === previousId) continue;
+				const { rows } = await client.query('SELECT 1 FROM users WHERE id = $1 LIMIT 1', [candidate]);
+				if (rows.length === 0) {
+					nextId = candidate;
+					break;
+				}
+			}
+			if (nextId == null) throw new Error('Could not allocate a unique Nyaitter ID');
+
+			await client.query(
+				`UPDATE users
+				 SET block = COALESCE((
+					SELECT jsonb_agg(CASE WHEN value = to_jsonb($1::int) THEN to_jsonb($2::int) ELSE value END)
+					FROM jsonb_array_elements(COALESCE(block, '[]'::jsonb)) AS value
+				 ), '[]'::jsonb)
+				 WHERE block @> jsonb_build_array(to_jsonb($1::int))`,
+				[previousId, nextId],
+			);
+			await client.query(
+				'UPDATE dm_channels SET participants = array_replace(participants, $1, $2) WHERE $1 = ANY(participants)',
+				[previousId, nextId],
+			);
+			await client.query(
+				`UPDATE group_dms
+				 SET member = array_replace(member, $1, $2),
+					 post = COALESCE((
+						SELECT jsonb_agg(CASE
+							WHEN message->>'userid' = $1::text THEN jsonb_set(message, '{userid}', to_jsonb($2::int), true)
+							ELSE message
+						END)
+						FROM jsonb_array_elements(COALESCE(post, '[]'::jsonb)) AS message
+					 ), '[]'::jsonb),
+					 unread = CASE
+						WHEN unread ? $1::text THEN (unread - $1::text) || jsonb_build_object($2::text, unread -> $1::text)
+						ELSE unread
+					 END
+				 WHERE $1 = ANY(member) OR host_id = $1 OR unread ? $1::text`,
+				[previousId, nextId],
+			);
+			await client.query(
+				`UPDATE notifications
+				 SET target = jsonb_set(target, '{id}', to_jsonb($2::int), false)
+				 WHERE target->>'kind' = 'user' AND target->>'id' = $1::text`,
+				[previousId, nextId],
+			);
+			const { rows: reportRows } = await client.query(
+				'SELECT id, target_kind, target_id, target_snapshot, excluded_admin_ids FROM moderation_reports FOR UPDATE',
+			);
+			for (const report of reportRows) {
+				const { snapshot, changed } = this._reassignReportSnapshotUserIds(report.target_snapshot, previousId, nextId);
+				const targetId = report.target_kind === 'user' && String(report.target_id) === String(previousId)
+					? String(nextId)
+					: report.target_id;
+				const excluded = Array.isArray(report.excluded_admin_ids)
+					? report.excluded_admin_ids.map((id) => Number(id) === previousId ? nextId : Number(id))
+					: report.excluded_admin_ids;
+				const excludedChanged = Array.isArray(report.excluded_admin_ids)
+					&& excluded.some((id, index) => Number(id) !== Number(report.excluded_admin_ids[index]));
+				if (!changed && targetId === report.target_id && !excludedChanged) continue;
+				await client.query(
+					`UPDATE moderation_reports
+					 SET target_id = $2, target_snapshot = $3::jsonb, excluded_admin_ids = $4::jsonb
+					 WHERE id = $1`,
+					[report.id, targetId, JSON.stringify(snapshot || {}), JSON.stringify(excluded || [])],
+				);
+			}
+			await client.query('UPDATE logs SET nyaitter_id = $2 WHERE nyaitter_id = $1', [previousId, nextId]);
+
+			const { rows } = await client.query(
+				`UPDATE users
+				 SET id = $2, handle = $3
+				 WHERE id = $1
+				 RETURNING *`,
+				[previousId, nextId, formatNyaitterId(nextId)],
+			);
+			return this._normalizeUserBlockList(rows[0] || null);
+		});
+	}
+
+	async getAccountAttachmentKeys(userId) {
+		const { rows } = await this.pool.query(
+			'SELECT attachments FROM posts WHERE user_id = $1',
+			[userId],
+		);
+		const keys = new Set();
+		for (const row of rows) {
+			const attachments = Array.isArray(row.attachments) ? row.attachments : [];
+			for (const attachment of attachments) {
+				const key = attachment?.id || attachment?.key;
+				if (typeof key === 'string' && key.startsWith('attachments/')) keys.add(key);
+			}
+		}
+		return [...keys];
+	}
+
+	async deleteAccount(userId) {
+		return this._withTransaction(async (client) => {
+			const { rows: userRows } = await client.query(
+				`SELECT id FROM users WHERE id = $1 AND account_operation = 'deleting' FOR UPDATE`,
+				[userId],
+			);
+			if (!userRows[0]) return false;
+
+			const { rows: postRows } = await client.query('SELECT id FROM posts WHERE user_id = $1', [userId]);
+			const postIds = postRows.map((row) => Number(row.id));
+			if (postIds.length > 0) {
+				await client.query('UPDATE posts SET reply_to = NULL WHERE reply_to = ANY($1::int[])', [postIds]);
+				await client.query('UPDATE posts SET repost_to = NULL WHERE repost_to = ANY($1::int[])', [postIds]);
+			}
+
+			const { rows: channelRows } = await client.query(
+				`SELECT id, participants FROM dm_channels WHERE $1 = ANY(participants) FOR UPDATE`,
+				[userId],
+			);
+			for (const channel of channelRows) {
+				const participants = (channel.participants || []).map(Number).filter((id) => id !== Number(userId));
+				if (participants.length < 2) await client.query('DELETE FROM dm_channels WHERE id = $1', [channel.id]);
+				else await client.query('UPDATE dm_channels SET participants = $2::int[] WHERE id = $1', [channel.id, participants]);
+			}
+
+			const { rows: groupRows } = await client.query(
+				`SELECT id, host_id, member, post, unread
+				 FROM group_dms
+				 WHERE host_id = $1 OR $1 = ANY(member)
+				 FOR UPDATE`,
+				[userId],
+			);
+			for (const group of groupRows) {
+				const members = (group.member || []).map(Number).filter((id) => id !== Number(userId));
+				if (members.length === 0) {
+					await client.query('DELETE FROM group_dms WHERE id = $1', [group.id]);
+					continue;
+				}
+				const messages = Array.isArray(group.post)
+					? group.post.filter((message) => Number(message?.userid) !== Number(userId))
+					: [];
+				const unread = { ...(group.unread || {}) };
+				delete unread[String(userId)];
+				const hostId = Number(group.host_id) === Number(userId) ? members[0] : Number(group.host_id);
+				await client.query(
+					`UPDATE group_dms
+					 SET host_id = $2, member = $3::int[], post = $4::jsonb, unread = $5::jsonb
+					 WHERE id = $1`,
+					[group.id, hostId, members, JSON.stringify(messages), JSON.stringify(unread)],
+				);
+			}
+
+			await client.query(
+				`UPDATE users
+				 SET block = COALESCE((
+					SELECT jsonb_agg(value)
+					FROM jsonb_array_elements_text(COALESCE(block, '[]'::jsonb)) AS value
+					WHERE value <> $1::text
+				 ), '[]'::jsonb)
+				 WHERE block @> jsonb_build_array($1::text)`,
+				[userId],
+			);
+			await client.query('DELETE FROM moderation_reports WHERE reporter_user_id = $1', [userId]);
+			await client.query('DELETE FROM logs WHERE nyaitter_id = $1', [String(userId)]);
+			const result = await client.query('DELETE FROM users WHERE id = $1', [userId]);
+			return result.rowCount > 0;
+		});
 	}
 
 	async addLog(entry) {

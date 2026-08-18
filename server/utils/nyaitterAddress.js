@@ -113,9 +113,10 @@ function parseNyaitterAddress(value) {
 function getUserNyaitterId(user) {
 	if (!user) return null;
 	return formatNyaitterId(
-		user.auth_provider === 'nyaitter' && user.external_id != null
-			? user.external_id
-			: user.id,
+				user.auth_provider === 'nyaitter' && user.external_id != null
+				? user.external_id
+				: user.id,
+
 	);
 }
 

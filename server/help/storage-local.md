@@ -1,38 +1,27 @@
 # ローカルストレージ
 
-`LocalStorageAdapter` は、添付ファイルをサーバーのディスクへ保存します。ローカル開発や1台だけの小規模なサーバーに向いています。複数サーバーや長期の公開運用にはR2をおすすめします。
-
-## 使う場面
-
-| 場面 | 向いているか |
-|---|---|
-| 手元での開発 | 向いています。 |
-| 自動テスト | 向いています。テスト後にファイルを消します。 |
-| 1台のサーバー | 永続ディスクとバックアップがあれば使えます。 |
-| 複数台のサーバー | 向いていません。各サーバーでファイルが分かれます。 |
+`local`は添付ファイルをServerのディスクへ保存します。開発または永続ディスクを持つ単一Serverで使います。
 
 ## 設定
 
-```env
+```dotenv
 STORAGE_ADAPTER=local
 STORAGE_USER_QUOTA_MB=1024
 ```
 
-保存先は `server/config.json` の `storage.local.uploadDir` で変更できます。初期設定では `./uploads` です。コンテナやPaaSで使う場合は、再起動後も残る書き込み可能なボリュームを指定してください。
+保存先は`storage.local.uploadDir`で変更できます。既定値は`./uploads`です。
 
-## ファイルの扱い
+Serverからファイルを配信する場合は、Clientの`userFileEndpoint`とServerの`NYAITTER_USER_FILES_ENDPOINT`へ同じパスを設定します。
 
-- ファイルはユーザー別の `attachments/{ユーザーID}` に保存されます。
-- すべてのファイル形式を保存できます。
-- 画像はEXIFや位置情報を削除し、必要に応じて縮小・WebP圧縮します。
-- 初期設定では1ユーザー当たり1 GBまでです。`STORAGE_USER_QUOTA_MB` でMB単位に変更できます。
-- ユーザーは **設定 → ストレージ** で使用量、保存ファイル、削除操作を確認できます。
+```js
+// page/config.js
+userFileEndpoint: '/uploads'
+```
 
-ローカル保存時のファイルは `/uploads/*` として配信されます。アップロード先を `page/` の中に置かず、アプリのファイルを上書きできないようにしてください。
+```dotenv
+NYAITTER_USER_FILES_ENDPOINT=/uploads
+```
 
-## 運用時の注意
+`uploads/`はGitへ追加せず、公開運用では永続ボリュームとバックアップを用意します。
 
-`uploads/` はGitへ追加しません。実運用で使うなら、ディスク使用量の監視、定期バックアップ、復旧方法を準備してください。複数サーバーにする場合はR2など共有できる保存先へ移行します。
-
-- [Cloudflare R2](./storage-r2.md)
-- [保存先の選び方](./adapters-overview.md)
+関連: [R2](./storage-r2.md) / [保存先の選び方](./adapters-overview.md)

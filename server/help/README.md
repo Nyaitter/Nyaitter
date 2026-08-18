@@ -1,24 +1,15 @@
 # セットアップ・運用ガイド
 
-このフォルダには、公開運用で必要になるデータベース、ファイル保存、Cloudflare、本番確認の説明があります。まずは [`../README.md`](../README.md) の起動方法と設定一覧を確認してください。
+まずは[Server README](../README.md)で起動と共通設定を確認してください。ここでは保存先ごとの設定を説明します。
 
-## 目的別の文書
-
-| やりたいこと | 読む文書 |
+| やりたいこと | 文書 |
 |---|---|
-| DBと保存先を選びたい | [アダプターの概要](./adapters-overview.md) |
-| PostgreSQLを使いたい | [PostgreSQL のセットアップ](./database-postgres.md) |
-| Cloudflare D1を使いたい | [D1 と Worker](./database-d1-worker.md) |
-| ローカルへファイルを保存したい | [ローカルストレージ](./storage-local.md) |
-| R2へファイルを保存したい | [Cloudflare R2](./storage-r2.md) |
-| Cloudflareを段階的に使いたい | [ハイブリッド構成](./cloudflare-hybrid.md) |
-| 公開前後の確認をしたい | [本番デプロイのチェックリスト](./production-checklist.md) |
+| DB・保存先を選ぶ | [保存先の選び方](./adapters-overview.md) |
+| PostgreSQLを使う | [PostgreSQL](./database-postgres.md) |
+| Cloudflare D1を使う | [D1とWorker](./database-d1-worker.md) |
+| ローカルへ保存する | [ローカルストレージ](./storage-local.md) |
+| R2へ保存する | [Cloudflare R2](./storage-r2.md) |
+| Cloudflareを併用する | [Cloudflare構成](./cloudflare-hybrid.md) |
+| 公開前に確認する | [本番チェックリスト](./production-checklist.md) |
 
-## まず知っておくこと
-
-- 開発では `memory` と `local` が使えますが、サーバー再起動でメモリDBの内容は消えます。
-- 公開運用では、DBにPostgreSQLまたはD1、ファイル保存にR2を使う構成をおすすめします。
-- ファイルはユーザー別に保存され、初期設定では1ユーザー当たり1 GBまでです。
-- `.env`、DB接続文字列、R2/D1の鍵、VAPID秘密鍵はGitへ追加しないでください。
-
-D1 Proxy Workerの詳しいデプロイ手順は [`../../workers/d1-proxy/README.md`](../../workers/d1-proxy/README.md) にあります。
+公開運用では永続DB（`postgres`、`cockroach`、または`d1`）を使います。秘密情報は`server/.env`またはデプロイ先のシークレット管理に置き、Gitへ追加しません。

@@ -189,6 +189,9 @@ async function handleRealtimeUpgrade(request, socket, head) {
     if (!principal) {
         return rejectRealtimeUpgrade(socket, 401, 'Unauthorized');
     }
+    if (principal.accountOperation) {
+        return rejectRealtimeUpgrade(socket, 423, 'Account maintenance in progress');
+    }
 
     realtimeServer.handleUpgrade(request, socket, head, (webSocket) => {
         realtimeServer.emit('connection', webSocket, request, principal);

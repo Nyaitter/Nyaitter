@@ -253,10 +253,12 @@ class InMemoryAdapter extends DatabaseAdapter {
 			verify: false,
 			freeze: null,
 			shadow: false,
-			lock: false,
-			...(user || {}),
-		};
-		normalized.block = normalizeBlockList(normalized.block, normalized.id);
+							lock: false,
+				account_operation: null,
+				...(user || {}),
+			};
+			normalized.block = normalizeBlockList(normalized.block, normalized.id);
+
 		return normalized;
 	}
 
@@ -271,10 +273,11 @@ class InMemoryAdapter extends DatabaseAdapter {
 			.map((s) => s.trim())
 			.filter(Boolean);
 
-		const user = this._withUserDefaults({
-			id,
+					const user = this._withUserDefaults({
+				id,
 				name: userData.name || userData.scid || userData.handle,
 				me: userData.me || userData.bio || '',
+
 				bio: userData.bio || userData.me || '',
 				icon_data: userData.icon_data || null,
 				header_image: userData.header_image || null,
@@ -1962,6 +1965,264 @@ class InMemoryAdapter extends DatabaseAdapter {
 		if (!user) return null;
 		if (status.shadow !== undefined) user.shadow = !!status.shadow;
 		return { shadow: !!user.shadow };
+	}
+
+	async beginAccountOperation(userId, operation) {
+		if (!['reassigning', 'deleting'].includes(operation)) throw new Error('Invalid account operation');
+		const user = this.users.get(Number(userId));
+		if (!user || user.auth_provider === 'nyaitter' || user.account_operation) return null;
+		user.account_operation = operation;
+		return user;
+	}
+
+	async finishAccountOperation(userId, operation) {
+		const user = this.users.get(Number(userId));
+		if (!user || user.account_operation !== operation) return null;
+		user.account_operation = null;
+		return user;
+	}
+
+		async reassignUserId(userId) {
+			const previousId = Number(userId);
+			const user = this.users.get(previousId);
+			if (!user || user.auth_provider === 'nyaitter' || user.account_operation !== 'reassigning') return null;
+
+			const nextId = this._allocateUserId();
+			if (!Number.isInteger(nextId) || nextId < 0 || nextId === previousId) {
+				throw new Error('Could not allocate a unique Nyaitter ID');
+			}
+
+			this.users.delete(previousId);
+			user.id = nextId;
+			user.handle = formatNyaitterId(nextId);
+			this.users.set(nextId, user);
+			if (user.scid) this.scidToId.set(user.scid, nextId);
+			if (user.nyaitter_address) this.nyaitterAddressToId.set(user.nyaitter_address, nextId);
+
+			for (const session of this.sessions.values()) {
+				if (Number(session.userId) === previousId) session.userId = nextId;
+			}
+			const updatedTrustedLoginIps = new Map();
+			for (const record of this.trustedLoginIps.values()) {
+				const updated = Number(record.userId) === previousId
+					? { ...record, userId: nextId }
+					: record;
+				updatedTrustedLoginIps.set(`${updated.userId}:${updated.ipHash}`, updated);
+			}
+			this.trustedLoginIps = updatedTrustedLoginIps;
+			for (const approval of this.loginApprovals.values()) {
+				if (Number(approval.userId) === previousId) approval.userId = nextId;
+			}
+			for (const token of this.botTokens.values()) {
+				if (Number(token.userId) === previousId) token.userId = nextId;
+			}
+
+			const postIds = [];
+			for (const post of this.posts.values()) {
+				if (Number(post.userId) === previousId) {
+					post.userId = nextId;
+					postIds.push(Number(post.id));
+				}
+			}
+			this.postIdsByUser.delete(previousId);
+			if (postIds.length > 0) {
+				postIds.sort((left, right) => this.postIdsNewest.indexOf(left) - this.postIdsNewest.indexOf(right));
+				this.postIdsByUser.set(nextId, postIds);
+			}
+
+			const rekeyUserPostMap = (map) => {
+				for (const [key, value] of [...map.entries()]) {
+					const [ownerId, postId] = String(key).split(':');
+					if (Number(ownerId) !== previousId) continue;
+					map.delete(key);
+					map.set(`${nextId}:${postId}`, value);
+				}
+			};
+			rekeyUserPostMap(this.likes);
+			rekeyUserPostMap(this.stars);
+			rekeyUserPostMap(this.reposts);
+			rekeyUserPostMap(this.pinnedPosts);
+			for (const index of [this.likedPostIdsByUser, this.starredPostIdsByUser]) {
+				const values = index.get(previousId);
+				if (values) {
+					index.delete(previousId);
+					index.set(nextId, values);
+				}
+			}
+
+			for (const channel of this.dmChannels.values()) {
+				channel.participants = (channel.participants || []).map((id) => Number(id) === previousId ? nextId : Number(id));
+				channel.messages = (channel.messages || []).map((message) => {
+					if (Number(message?.senderId) !== previousId && Number(message?.userid) !== previousId) return message;
+					const updated = { ...message };
+					if (Number(updated.senderId) === previousId) updated.senderId = nextId;
+					if (Number(updated.userid) === previousId) updated.userid = nextId;
+					return updated;
+				});
+			}
+			for (const dm of this.groupDms.values()) {
+				this._removeGroupDmMemberIndexes(dm);
+				dm.host_id = Number(dm.host_id) === previousId ? nextId : Number(dm.host_id);
+				dm.member = (dm.member || []).map((id) => Number(id) === previousId ? nextId : Number(id));
+				dm.post = (dm.post || []).map((message) => (
+					Number(message?.userid) === previousId ? { ...message, userid: nextId } : message
+				));
+				if (dm.unread && Object.prototype.hasOwnProperty.call(dm.unread, String(previousId))) {
+					dm.unread[String(nextId)] = dm.unread[String(previousId)];
+					delete dm.unread[String(previousId)];
+				}
+				this._addGroupDmMemberIndexes(dm);
+			}
+			for (const [key] of [...this.follows]) {
+				const [followerId, followingId] = String(key).split(':').map(Number);
+				if (followerId !== previousId && followingId !== previousId) continue;
+				this.follows.delete(key);
+				this.follows.set(`${followerId === previousId ? nextId : followerId}:${followingId === previousId ? nextId : followingId}`, true);
+			}
+			this.followingIdsByUser.clear();
+			this.followerIdsByUser.clear();
+			for (const key of this.follows.keys()) {
+				const [followerId, followingId] = String(key).split(':').map(Number);
+				this._updateFollowIndexes(followerId, followingId, true);
+			}
+			for (const candidate of this.users.values()) {
+				candidate.block = normalizeBlockList((candidate.block || []).map((id) => (
+					Number(id) === previousId ? nextId : id
+				)), candidate.id);
+			}
+
+			const updatedNotifications = new Map();
+			for (const [ownerId, notifications] of this.notifications.entries()) {
+				for (const notification of notifications) {
+					if (Number(notification.userId) === previousId) notification.userId = nextId;
+					if (Number(notification.fromUserId) === previousId) notification.fromUserId = nextId;
+					if (notification.target?.kind === 'user' && Number(notification.target.id) === previousId) {
+						notification.target = { ...notification.target, id: nextId };
+					}
+				}
+				updatedNotifications.set(Number(ownerId) === previousId ? nextId : Number(ownerId), notifications);
+			}
+			this.notifications = updatedNotifications;
+			if (this.unreadNotificationCounts.has(previousId)) {
+				const unread = this.unreadNotificationCounts.get(previousId);
+				this.unreadNotificationCounts.delete(previousId);
+				this.unreadNotificationCounts.set(nextId, unread);
+			}
+			if (this.dmE2EKeys.has(previousId)) {
+				const key = this.dmE2EKeys.get(previousId);
+				this.dmE2EKeys.delete(previousId);
+				this.dmE2EKeys.set(nextId, key);
+			}
+			if (this.pushSubscriptions.has(previousId)) {
+				const subscriptions = this.pushSubscriptions.get(previousId);
+				this.pushSubscriptions.delete(previousId);
+				this.pushSubscriptions.set(nextId, subscriptions);
+			}
+			for (const report of this.moderationReports.values()) {
+				if (Number(report.reporterUserId) === previousId) report.reporterUserId = nextId;
+				if (Number(report.assignedAdminId) === previousId) report.assignedAdminId = nextId;
+				if (report.targetKind === 'user' && Number(report.targetId) === previousId) report.targetId = String(nextId);
+				if (Number(report.targetSnapshot?.subjectUser?.id) === previousId) report.targetSnapshot.subjectUser.id = nextId;
+				for (const member of report.targetSnapshot?.dm?.members || []) {
+					if (Number(member?.id) === previousId) member.id = nextId;
+				}
+				report.excludedAdminIds = (report.excludedAdminIds || []).map((id) => Number(id) === previousId ? nextId : Number(id));
+			}
+			for (const log of this.logs) {
+				if (Number(log.nyaitter_id) === previousId) log.nyaitter_id = nextId;
+			}
+
+			return user;
+		}
+
+	async getAccountAttachmentKeys(userId) {
+		const keys = new Set();
+		for (const post of this.posts.values()) {
+			if (Number(post.userId) !== Number(userId)) continue;
+			for (const attachment of Array.isArray(post.attachments) ? post.attachments : []) {
+				const key = attachment?.id || attachment?.key;
+				if (typeof key === 'string' && key.startsWith('attachments/')) keys.add(key);
+			}
+		}
+		return [...keys];
+	}
+
+	async deleteAccount(userId) {
+		const normalizedUserId = Number(userId);
+		const user = this.users.get(normalizedUserId);
+		if (!user || user.account_operation !== 'deleting') return false;
+
+		const ownedPostIds = new Set([...this.posts.values()]
+			.filter((post) => Number(post.userId) === normalizedUserId)
+			.map((post) => Number(post.id)));
+		for (const post of this.posts.values()) {
+			if (ownedPostIds.has(Number(post.id))) continue;
+			if (ownedPostIds.has(Number(post.replyTo))) post.replyTo = null;
+			if (ownedPostIds.has(Number(post.repostTo))) post.repostTo = null;
+		}
+		for (const postId of ownedPostIds) await this.adminDeletePost(postId);
+
+		for (const [channelId, channel] of this.dmChannels.entries()) {
+			const participants = (channel.participants || []).map(Number).filter((id) => id !== normalizedUserId);
+			if (participants.length < 2) {
+				this.dmChannels.delete(channelId);
+				continue;
+			}
+			channel.participants = participants;
+			channel.messages = (channel.messages || []).filter((message) => Number(message.senderId ?? message.userid) !== normalizedUserId);
+		}
+		for (const [dmId, dm] of this.groupDms.entries()) {
+			if (!(dm.member || []).map(Number).includes(normalizedUserId)) continue;
+			this._removeGroupDmMemberIndexes(dm);
+			dm.member = dm.member.map(Number).filter((id) => id !== normalizedUserId);
+			dm.post = (dm.post || []).filter((message) => Number(message?.userid) !== normalizedUserId);
+			delete dm.unread?.[String(normalizedUserId)];
+			if (dm.member.length === 0) this.groupDms.delete(dmId);
+			else {
+				if (Number(dm.host_id) === normalizedUserId) dm.host_id = dm.member[0];
+				this._addGroupDmMemberIndexes(dm);
+			}
+		}
+
+		for (const key of [...this.follows.keys()]) {
+			if (key.split(':').map(Number).includes(normalizedUserId)) this.follows.delete(key);
+		}
+		this.followingIdsByUser.delete(normalizedUserId);
+		this.followerIdsByUser.delete(normalizedUserId);
+		for (const candidate of this.users.values()) {
+			candidate.block = normalizeBlockList((candidate.block || []).filter((id) => Number(id) !== normalizedUserId), candidate.id);
+		}
+		for (const notifications of this.notifications.values()) {
+			for (const notification of notifications) {
+				if (Number(notification.fromUserId) === normalizedUserId) notification.fromUserId = null;
+			}
+		}
+		this.notifications.delete(normalizedUserId);
+		for (const [id, notification] of this.notificationsById.entries()) {
+			if (Number(notification.userId) === normalizedUserId) this.notificationsById.delete(id);
+		}
+		this.unreadNotificationCounts.delete(normalizedUserId);
+		this.sessions.forEach((session, token) => { if (Number(session.userId) === normalizedUserId) this.sessions.delete(token); });
+		this.trustedLoginIps.forEach((record, key) => { if (Number(record.userId) === normalizedUserId) this.trustedLoginIps.delete(key); });
+		this.loginApprovals.forEach((approval, id) => { if (Number(approval.userId) === normalizedUserId) this.loginApprovals.delete(id); });
+		this.botTokens.forEach((token, id) => { if (Number(token.userId) === normalizedUserId) this.botTokens.delete(id); });
+		this.pushSubscriptions.delete(normalizedUserId);
+		this.dmE2EKeys.delete(normalizedUserId);
+		this.likedPostIdsByUser.delete(normalizedUserId);
+		this.starredPostIdsByUser.delete(normalizedUserId);
+		for (const key of [...this.likes.keys()]) if (key.startsWith(`${normalizedUserId}:`)) this.likes.delete(key);
+		for (const key of [...this.stars.keys()]) if (key.startsWith(`${normalizedUserId}:`)) this.stars.delete(key);
+		for (const key of [...this.reposts.keys()]) if (key.startsWith(`${normalizedUserId}:`)) this.reposts.delete(key);
+		for (const key of [...this.pinnedPosts.keys()]) if (key.startsWith(`${normalizedUserId}:`)) this.pinnedPosts.delete(key);
+		this.moderationReports.forEach((report, id) => {
+			if (Number(report.reporterUserId) === normalizedUserId) this.moderationReports.delete(id);
+			else if (Number(report.assignedAdminId) === normalizedUserId) report.assignedAdminId = null;
+		});
+		this.logs = this.logs.filter((entry) => Number(entry.nyaitter_id) !== normalizedUserId);
+		if (user.scid) this.scidToId.delete(user.scid);
+		if (user.nyaitter_address) this.nyaitterAddressToId.delete(user.nyaitter_address);
+		this.users.delete(normalizedUserId);
+		return true;
 	}
 
 	async addLog(entry) {

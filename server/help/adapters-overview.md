@@ -1,49 +1,29 @@
 # 保存先の選び方
 
-Nyaitter は、DBとファイル保存先を入れ替えられます。画面やAPIの使い方は変わらないため、開発用の構成から公開運用向けの構成へ移行できます。
+NyaitterはDBとファイル保存先を別々に設定できます。APIとClientの使い方は変わりません。
 
-## 役割
+## DB
 
-| 部分 | 担当すること |
+| `DB_ADAPTER` | 用途 |
 |---|---|
-| サーバーのルート・サービス | 認証、投稿の公開範囲、ブロック、通知、DMの表示ルール |
-| DBアダプター | 投稿やユーザーなどのデータ保存・検索 |
-| ストレージアダプター | 添付ファイルの保存、一覧、使用量、削除、URL発行 |
+| `memory` | 開発用。再起動で消えます。 |
+| `postgres` | PostgreSQL。 |
+| `cockroach` | CockroachDB Cloud。 |
+| `d1` | Cloudflare D1。D1 Proxy Workerが必要です。 |
 
-## 選べる保存先
-
-| 種類 | 設定値 | 注意点 |
-|---|---|---|
-| メモリDB | `memory` | 開発用です。再起動すると消えます。 |
-| PostgreSQL | `postgres` | 一般的な公開運用に向きます。 |
-| D1 | `d1` | D1 Proxy Workerが必要です。 |
-| ローカル保存 | `local` | 1台のサーバーで使う場合に向きます。 |
-| R2 | `r2` | 公開運用や複数サーバーに向きます。 |
-
-## ファイル保存の共通ルール
-
-ファイルはユーザーごとの領域へ保存されます。画像はEXIFなどを削除してから保存し、それ以外のファイルも保存できます。初期設定では1ユーザー当たり1 GBまでです。
+永続DBを設定または更新した後は、リポジトリのルートで移行します。
 
 ```bash
-# 保存上限を500 MBにする例
-STORAGE_USER_QUOTA_MB=500
+npm run migrate
 ```
 
-ユーザーは設定画面の **ストレージ** で、使用率、保存済みファイル、削除操作を確認できます。
+## ファイル保存
 
-## 構成の目安
-
-| 場面 | おすすめ |
+| `STORAGE_ADAPTER` | 用途 |
 |---|---|
-| 手元で画面を試す | `memory` + `local` |
-| 通常の公開運用 | `postgres` + `r2` |
-| Cloudflare中心で運用 | `d1` + `r2` |
+| `local` | 開発または永続ディスクを持つ単一Server。 |
+| `r2` | Cloudflare R2。 |
 
-秘密情報は `server/.env` やデプロイ先のシークレット管理に置き、Gitへ追加しないでください。
+ユーザーごとの保存上限は`STORAGE_USER_QUOTA_MB`で設定します。
 
-## 関連文書
-
-- [PostgreSQL のセットアップ](./database-postgres.md)
-- [Cloudflare D1 と Worker](./database-d1-worker.md)
-- [ローカルストレージ](./storage-local.md)
-- [Cloudflare R2](./storage-r2.md)
+関連: [PostgreSQL](./database-postgres.md) / [D1とWorker](./database-d1-worker.md) / [ローカルストレージ](./storage-local.md) / [Cloudflare R2](./storage-r2.md)

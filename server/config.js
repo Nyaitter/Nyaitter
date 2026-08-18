@@ -445,7 +445,18 @@ const config = {
 
   database: {
     adapter: process.env.DB_ADAPTER || get('database.adapter', 'memory'),
-    postgres: get('database.postgres', {}),
+    postgres: {
+      ...get('database.postgres', {}),
+      connectionString: process.env.DATABASE_URL || process.env.POSTGRES_URL || get('database.postgres.connectionString', ''),
+    },
+    cockroach: {
+      ...get('database.cockroach', {}),
+      connectionString: process.env.COCKROACH_DATABASE_URL || get('database.cockroach.connectionString', ''),
+      sslCa: process.env.COCKROACH_SSL_CA || get('database.cockroach.sslCa', ''),
+      poolSize: Math.min(100, Math.max(1, Math.floor(Number(process.env.COCKROACH_POOL_SIZE || get('database.cockroach.poolSize', 10)) || 10))),
+      transactionRetries: Math.min(10, Math.max(0, Math.floor(Number(process.env.COCKROACH_TRANSACTION_RETRIES || get('database.cockroach.transactionRetries', 5)) || 0))),
+      retryBaseDelayMs: Math.min(5000, Math.max(10, Math.floor(Number(process.env.COCKROACH_RETRY_BASE_DELAY_MS || get('database.cockroach.retryBaseDelayMs', 50)) || 10))),
+    },
     d1: {
       ...get('database.d1', {}),
       workerUrl: process.env.D1_WORKER_URL || get('database.d1.workerUrl', ''),

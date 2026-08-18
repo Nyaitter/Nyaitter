@@ -247,6 +247,24 @@ class ConnectionManager {
     return deliveredCount;
   }
 
+  closeUser(userId, code = 1012, reason = 'Account maintenance') {
+    const normalizedUserId = Number(userId);
+    const sockets = this.connectionsByUser.get(normalizedUserId);
+    if (!sockets) return 0;
+    let closed = 0;
+    for (const socket of sockets) {
+      try {
+        socket.close(code, reason);
+        closed += 1;
+      } catch (_) {
+        // Socket may already be closed.
+      }
+      this.sessionHashBySocket.delete(socket);
+    }
+    this.connectionsByUser.delete(normalizedUserId);
+    return closed;
+  }
+
   closeAll(code = 1001, reason = 'Server shutting down') {
     for (const sockets of this.connectionsByUser.values()) {
       for (const socket of sockets) {

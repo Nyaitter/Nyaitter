@@ -9,3 +9,6 @@ node_modules
 
 # Runtime-uploaded user files
 /uploads/
+
+# Local development server logs
+/.nyaitter-dev-server.log

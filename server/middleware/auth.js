@@ -53,6 +53,7 @@ async function getSessionPrincipal(req, token) {
     isBot: false,
     admin: user.admin === true,
     frozen: Boolean(user.freeze),
+    accountOperation: user.account_operation || null,
   };
 }
 
@@ -78,6 +79,7 @@ async function getAuthenticatedPrincipal(req) {
         name: botInfo.name,
         admin: false,
         frozen: Boolean(owner.freeze),
+        accountOperation: owner.account_operation || null,
       };
     }
   }
@@ -115,6 +117,12 @@ async function requireAuth(req, res, next) {
       return res.status(403).json({
         error: 'Account frozen',
         message: '凍結中のアカウントではこの操作を実行できません。',
+      });
+    }
+    if (principal.accountOperation) {
+      return res.status(423).json({
+        error: 'Account maintenance in progress',
+        message: 'NyaitterIDの処理中です。完了するまで接続できません。',
       });
     }
     req.user = principal;
