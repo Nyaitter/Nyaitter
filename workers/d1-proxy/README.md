@@ -38,7 +38,7 @@ DB_ADAPTER=d1 npm run migrate
 DB_ADAPTER=d1 D1_MIGRATION_TARGET=local npm run migrate
 ```
 
-他のDBとのデータ移行は、Workerを準備した後にServer側で`npm run migrate:data`を実行します。詳細は[Server設定](../../server/README.md#dbデータの移行)を参照してください。
+他のDBとのデータ移行は、空のD1へ初期スキーマを作成した後にServer側で`npm run migrate:data`を実行します。詳細は[Server設定](../../server/README.md#dbデータの移行)を参照してください。
 
 Workerをデプロイします。
 

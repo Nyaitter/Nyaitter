@@ -21,9 +21,9 @@ npm run migrate
 npm start
 ```
 
-`npm run migrate`は`server/migrations/`の未適用分を適用します。
+`npm run migrate`は空のPostgreSQL DBへ完全な初期スキーマを作成します。
 
-他のDBからPostgreSQLへデータを移す場合は、スキーマを最新化した後に`npm run migrate:data`を実行します。接続設定と実行例は[Server README](../README.md#dbデータの移行)を参照してください。
+他のDBからPostgreSQLへデータを移す場合は、空のPostgreSQL DBへ初期スキーマを作成した後に`npm run migrate:data`を実行します。接続設定と実行例は[Server README](../README.md#dbデータの移行)を参照してください。
 
 ## 確認
 

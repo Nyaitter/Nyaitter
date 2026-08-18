@@ -128,7 +128,7 @@ D1_MIGRATION_TARGET=local npm run migrate
 
 ### DBデータの移行
 
-移行先のスキーマを先に`npm run migrate`で最新化します。`npm run migrate:data`は`memory`、`postgres`、`cockroach`、`d1`間のデータ移行に使います。
+空の移行先DBへ先に`npm run migrate`で初期スキーマを作成します。`npm run migrate:data`は`memory`、`postgres`、`cockroach`、`d1`間のデータ移行に使います。
 
 ```bash
 # バックアップ

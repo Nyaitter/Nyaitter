@@ -23,7 +23,7 @@ Nyaitter は、データベースとファイル保存先をアダプターと�
 
 ## DBデータの移行
 
-移行先のスキーマを`npm run migrate`で最新化してから、`npm run migrate:data`を実行します。接続設定と実行例は[Server README](../README.md#dbデータの移行)を参照してください。
+空の移行先DBへ`npm run migrate`で初期スキーマを作成してから、`npm run migrate:data`を実行します。接続設定と実行例は[Server README](../README.md#dbデータの移行)を参照してください。
 
 ## ファイル保存の共通仕様
 
