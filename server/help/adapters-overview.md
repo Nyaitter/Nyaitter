@@ -17,6 +17,10 @@ NyaitterはDBとファイル保存先を別々に設定できます。APIとClie
 npm run migrate
 ```
 
+## DBデータの移行
+
+移行先のスキーマを`npm run migrate`で最新化してから、`npm run migrate:data`を実行します。バックアップ、復元、接続設定は[Server README](../README.md#dbデータの移行)を参照してください。
+
 ## ファイル保存
 
 | `STORAGE_ADAPTER` | 用途 |

@@ -168,6 +168,22 @@ class D1Adapter extends DatabaseAdapter {
 		this.inFlightReads.clear();
 	}
 
+	async exportDataSnapshot() {
+		const { createSnapshot } = require('../../../services/DataMigrationService');
+		const snapshot = await this._read('/migration/snapshot', { cacheSeconds: 0 });
+		return createSnapshot('d1', snapshot?.tables || {});
+	}
+
+	async importDataSnapshot(snapshot, { replace = false } = {}) {
+		if (replace !== true) throw new Error('Destination replacement requires replace=true');
+		const { normalizeSnapshot } = require('../../../services/DataMigrationService');
+		const result = await this._write('/migration/snapshot/import', {
+			replace: true,
+			snapshot: normalizeSnapshot(snapshot),
+		});
+		return result?.counts || {};
+	}
+
 	_clearReadCache() {
 		this.readCache.clear();
 	}

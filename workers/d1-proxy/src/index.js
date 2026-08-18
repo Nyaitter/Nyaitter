@@ -73,6 +73,85 @@ function parseJsonSafe(value, fallback = null) {
 	}
 }
 
+const MIGRATION_TABLES = [
+	'users', 'sessions', 'trusted_login_ips', 'login_approvals', 'bot_tokens', 'posts',
+	'likes', 'stars', 'reposts', 'pinned_posts', 'follows', 'dm_channels', 'dm_messages',
+	'group_dms', 'dm_e2e_keys', 'notifications', 'push_subscriptions', 'moderation_reports', 'logs',
+];
+const MIGRATION_COLUMNS = {
+	users: ['id', 'scid', 'name', 'handle', 'nyaitter_address', 'auth_provider', 'provider_domain', 'external_id', 'external_profile', 'uuid', 'settings', 'bio', 'header_image', 'icon_data', 'verify', 'freeze', 'admin', 'shadow', 'block', 'account_operation', 'created_at'],
+	sessions: ['session_id', 'token', 'user_id', 'ip_hash', 'ip_masked', 'user_agent', 'expires_at', 'created_at'],
+	trusted_login_ips: ['user_id', 'ip_hash', 'ip_masked', 'created_at', 'last_used_at'],
+	login_approvals: ['id', 'user_id', 'ip_hash', 'ip_masked', 'user_agent', 'poll_token_hash', 'status', 'created_at', 'expires_at', 'decided_at', 'consumed_at'],
+	bot_tokens: ['token_id', 'token_hash', 'user_id', 'name', 'created_at', 'last_used_at'],
+	posts: ['id', 'user_id', 'content', 'attachments', 'mask', 'lock', 'announcement', 'reply_to', 'repost_to', 'created_at'],
+	likes: ['user_id', 'post_id', 'created_at'],
+	stars: ['user_id', 'post_id', 'created_at'],
+	reposts: ['user_id', 'post_id', 'created_at'],
+	pinned_posts: ['user_id', 'post_id', 'created_at'],
+	follows: ['follower_id', 'following_id', 'created_at'],
+	dm_channels: ['id', 'participants', 'created_at'],
+	dm_messages: ['id', 'channel_id', 'sender_id', 'content', 'sent_at', 'read_at'],
+	group_dms: ['id', 'host_id', 'title', 'member', 'post', 'unread', 'time', 'created_at'],
+	dm_e2e_keys: ['user_id', 'public_key', 'created_at', 'updated_at'],
+	notifications: ['id', 'user_id', 'type', 'from_user_id', 'post_id', 'target', 'message', 'read', 'clicked', 'created_at'],
+	push_subscriptions: ['user_id', 'endpoint', 'expiration_time', 'p256dh', 'auth', 'session_token', 'created_at', 'updated_at'],
+	moderation_reports: ['id', 'reporter_user_id', 'target_kind', 'target_id', 'description', 'target_snapshot', 'assignment_type', 'status', 'assigned_admin_id', 'assigned_at', 'excluded_admin_ids', 'resolution', 'created_at', 'resolved_at'],
+	logs: ['id', 'scratch_id', 'nyaitter_id', 'masked_ip_uuid', 'log_time'],
+};
+const MIGRATION_JSON_COLUMNS = new Set(['external_profile', 'settings', 'block', 'attachments', 'participants', 'member', 'post', 'unread', 'target', 'target_snapshot', 'excluded_admin_ids', 'resolution']);
+const MIGRATION_BOOLEAN_COLUMNS = new Set(['verify', 'admin', 'shadow', 'mask', 'lock', 'announcement', 'read', 'clicked']);
+const MIGRATION_INSERT_ORDER = ['users', 'posts', 'dm_channels', 'group_dms', 'dm_e2e_keys', 'sessions', 'trusted_login_ips', 'login_approvals', 'bot_tokens', 'follows', 'likes', 'stars', 'reposts', 'pinned_posts', 'dm_messages', 'notifications', 'push_subscriptions', 'moderation_reports', 'logs'];
+
+function migrationValue(column, value) {
+	if (value == null) return null;
+	if (MIGRATION_JSON_COLUMNS.has(column)) return JSON.stringify(value);
+	if (MIGRATION_BOOLEAN_COLUMNS.has(column)) return value ? 1 : 0;
+	return value;
+}
+
+function safeMigrationIdentifier(value) {
+	return /^[a-z_][a-z0-9_]*$/.test(value) ? value : null;
+}
+
+async function exportMigrationSnapshot(db) {
+	const tables = {};
+	for (const table of MIGRATION_TABLES) {
+		const { results } = await db.prepare(`SELECT * FROM ${table}`).all();
+		tables[table] = results || [];
+	}
+	return { version: 1, created_at: new Date().toISOString(), source_adapter: 'd1', tables };
+}
+
+async function importMigrationSnapshot(db, snapshot) {
+	if (!snapshot || Number(snapshot.version) !== 1 || !snapshot.tables || typeof snapshot.tables !== 'object') {
+		throw new Error('Invalid migration snapshot');
+	}
+	for (const table of MIGRATION_INSERT_ORDER.slice().reverse()) {
+		await db.prepare(`DELETE FROM ${table}`).run();
+	}
+	for (const table of MIGRATION_INSERT_ORDER) {
+		const columns = MIGRATION_COLUMNS[table];
+		const rows = Array.isArray(snapshot.tables[table]) ? snapshot.tables[table] : [];
+		for (const originalRow of rows) {
+			const row = table === 'posts'
+				? { ...originalRow, reply_to: null, repost_to: null }
+				: originalRow;
+			const placeholders = columns.map(() => '?').join(', ');
+			await db.prepare(`INSERT INTO ${table} (${columns.join(', ')}) VALUES (${placeholders})`)
+				.bind(...columns.map((column) => migrationValue(column, row[column])))
+				.run();
+		}
+	}
+	for (const row of (snapshot.tables.posts || [])) {
+		if (row.reply_to == null && row.repost_to == null) continue;
+		await db.prepare('UPDATE posts SET reply_to = ?, repost_to = ? WHERE id = ?')
+			.bind(row.reply_to ?? null, row.repost_to ?? null, row.id)
+			.run();
+	}
+	return Object.fromEntries(MIGRATION_TABLES.map((table) => [table, Array.isArray(snapshot.tables[table]) ? snapshot.tables[table].length : 0]));
+}
+
 function normalizeBlockUserId(value) {
 	if (value === null || value === undefined || (typeof value === 'string' && value.trim() === '')) {
 		return null;
@@ -207,9 +286,19 @@ export default {
 		const pathname = url.pathname;
 		const method = request.method;
 
-		try {
+					try {
+				if (method === 'GET' && pathname === '/migration/snapshot') {
+					return json(await exportMigrationSnapshot(db));
+				}
 
-			if (method === 'POST' && pathname === '/sessions') {
+				if (method === 'POST' && pathname === '/migration/snapshot/import') {
+					const body = await request.json();
+					if (body?.replace !== true) return badRequest('replace must be true');
+					return json({ counts: await importMigrationSnapshot(db, body.snapshot) });
+				}
+
+				if (method === 'POST' && pathname === '/sessions') {
+
 				const body = await request.json();
 				const userId = Number(body.userId);
 				const token = body.token || crypto.randomUUID().replace(/-/g, '') + crypto.randomUUID().replace(/-/g, '');

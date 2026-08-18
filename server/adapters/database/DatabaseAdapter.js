@@ -103,6 +103,14 @@ class DatabaseAdapter {
 		throw new Error('getAccountAttachmentKeys() must be implemented');
 	}
 
+	// 全アダプター間のデータ移行に使う中立スナップショット。
+	async exportDataSnapshot() {
+		throw new Error('exportDataSnapshot() must be implemented');
+	}
+	async importDataSnapshot(snapshot, options = {}) {
+		throw new Error('importDataSnapshot() must be implemented');
+	}
+
 	async createBotToken(userId, tokenId, tokenHash, name) { throw new Error('createBotToken() must be implemented'); }
 	async getBotTokenById(tokenId) { throw new Error('getBotTokenById() must be implemented'); }
 	async getUserBotTokens(userId) { throw new Error('getUserBotTokens() must be implemented'); }

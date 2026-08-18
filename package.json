@@ -8,6 +8,7 @@
     "check:config": "node server/check-config.js",
     "sync:client": "node server/sync-client.js",
     "migrate": "node server/migrations/migrate.js",
+    "migrate:data": "node server/migrations/migrate-data.js",
     "swagger": "node server/swagger.js",
     "cli": "node server/cli.js"
   },

@@ -5,7 +5,7 @@
 --   { id, title, member: [userId...], host_id, time, post: [message...], unread: {userId: count} }
 
 CREATE TABLE IF NOT EXISTS group_dms (
-    id SERIAL PRIMARY KEY,
+    id TEXT PRIMARY KEY,
     host_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     title TEXT DEFAULT '',
     member INTEGER[] NOT NULL DEFAULT '{}',

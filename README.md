@@ -20,7 +20,7 @@ Node.js 18 以上を用意し、リポジトリのルートで実行します。
 
 ```bash
 npm install
-npm run dev:server
+npm start
 ```
 
 ブラウザで <http://localhost:3000/> を開きます。稼働確認には <http://localhost:3000/server/health> を利用できます。
@@ -36,5 +36,5 @@ NyaitterClient と NyaitterServer は **MIT ライセンス**です。著作権�
 - サーバーの起動、API、認証、リアルタイム配信: [`server/README.md`](./server/README.md)
 - DB・ストレージアダプター: [`server/adapters/README.md`](./server/adapters/README.md)
 - PostgreSQL、D1、R2、ローカルストレージ、本番運用: [`server/help/README.md`](./server/help/README.md)
-- PostgreSQL マイグレーション: [`server/migrations/README.md`](./server/migrations/README.md)
+- DBスキーマ・データ移行: [`server/migrations/README.md`](./server/migrations/README.md)
 - Cloudflare D1 Proxy Worker: [`workers/d1-proxy/README.md`](./workers/d1-proxy/README.md)

@@ -8,6 +8,14 @@ const {
 const appConfig = require('../../../config');
 const { normalizeTarget } = require('../../../utils/notification');
 const { normalizeBlockList } = require('../../../utils/blockList');
+const {
+	createSnapshot,
+	normalizeSnapshot,
+} = require('../../../services/DataMigrationService');
+const {
+	exportPostgresSnapshot,
+	importPostgresSnapshot,
+} = require('../../../services/DataMigrationSql');
 
 class PostgresAdapter extends DatabaseAdapter {
 	constructor(options = {}) {
@@ -42,6 +50,16 @@ class PostgresAdapter extends DatabaseAdapter {
 			this.pool = null;
 			console.log('[PostgresAdapter] Disconnected from PostgreSQL');
 		}
+	}
+
+	async exportDataSnapshot() {
+		if (!this.pool) throw new Error('PostgreSQL adapter is not connected');
+		return exportPostgresSnapshot(this.pool, this.constructor.name === 'CockroachAdapter' ? 'cockroach' : 'postgres');
+	}
+
+	async importDataSnapshot(snapshot, options = {}) {
+		if (!this.pool) throw new Error('PostgreSQL adapter is not connected');
+		return importPostgresSnapshot(this.pool, normalizeSnapshot(snapshot), options);
 	}
 
 	_reassignReportSnapshotUserIds(snapshot, previousId, nextId) {
@@ -1154,11 +1172,12 @@ class PostgresAdapter extends DatabaseAdapter {
 
 	async createGroupDm(dmData) {
 		const member = Array.from(new Set((dmData.member || []).map(Number)));
+		const id = crypto.randomUUID();
 		const { rows } = await this.pool.query(
-			`INSERT INTO group_dms (host_id, title, member, post, unread, time, created_at)
-			 VALUES ($1, $2, $3, '[]'::jsonb, '{}'::jsonb, NOW(), NOW())
+			`INSERT INTO group_dms (id, host_id, title, member, post, unread, time, created_at)
+			 VALUES ($1, $2, $3, $4, '[]'::jsonb, '{}'::jsonb, NOW(), NOW())
 			 RETURNING *`,
-			[dmData.hostId, dmData.title || '', member]
+			[id, dmData.hostId, dmData.title || '', member]
 		);
 		return this._serializeGroupDmRow(rows[0], dmData.hostId);
 	}

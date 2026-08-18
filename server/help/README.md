@@ -5,6 +5,7 @@
 | やりたいこと | 文書 |
 |---|---|
 | DB・保存先を選ぶ | [保存先の選び方](./adapters-overview.md) |
+| DBデータを移す | [Server README](../README.md#dbデータの移行) |
 | PostgreSQLを使う | [PostgreSQL](./database-postgres.md) |
 | Cloudflare D1を使う | [D1とWorker](./database-d1-worker.md) |
 | ローカルへ保存する | [ローカルストレージ](./storage-local.md) |

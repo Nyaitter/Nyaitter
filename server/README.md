@@ -126,6 +126,36 @@ D1_WORKER_TOKEN=<WorkerのAUTH_TOKENと同じ値>
 D1_MIGRATION_TARGET=local npm run migrate
 ```
 
+### DBデータの移行
+
+移行先のスキーマを先に`npm run migrate`で最新化します。`npm run migrate:data`は`memory`、`postgres`、`cockroach`、`d1`間のデータ移行に使います。
+
+```bash
+# バックアップ
+npm run migrate:data -- --from d1 --output nyaitter-backup.json
+
+# 復元
+npm run migrate:data -- --to cockroach --input nyaitter-backup.json --replace
+```
+
+`--replace`は移行先のデータを置き換えます。移行元は`NYAITTER_DATA_SOURCE_`、移行先は`NYAITTER_DATA_DESTINATION_`を接頭辞にして接続情報を設定します。
+
+| DB | 接続設定 |
+|---|---|
+| PostgreSQL | `DATABASE_URL` |
+| CockroachDB Cloud | `COCKROACH_DATABASE_URL` |
+| Cloudflare D1 | `D1_WORKER_URL`、`D1_WORKER_TOKEN` |
+| memory | `OPERATOR_SOCKET`（対象Serverの起動が必要） |
+
+D1からCockroachDB Cloudへ直接移す例です。
+
+```bash
+NYAITTER_DATA_SOURCE_D1_WORKER_URL=https://d1-proxy.example.workers.dev \
+NYAITTER_DATA_SOURCE_D1_WORKER_TOKEN=<D1のWorkerトークン> \
+NYAITTER_DATA_DESTINATION_COCKROACH_DATABASE_URL='postgresql://user:password@cluster.cockroachlabs.cloud:26257/defaultdb?sslmode=verify-full' \
+npm run migrate:data -- --from d1 --to cockroach --replace --output nyaitter-backup.json
+```
+
 ## ファイル保存
 
 | `STORAGE_ADAPTER` | 用途 |

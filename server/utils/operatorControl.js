@@ -4,6 +4,7 @@ const fs = require('fs');
 const net = require('net');
 const os = require('os');
 const path = require('path');
+const { writeSnapshot, readSnapshot } = require('../services/DataMigrationService');
 
 const MAX_COMMAND_BYTES = 8 * 1024;
 
@@ -59,6 +60,24 @@ function createCommandHandler({ dbAdapter, shutdown, getStatus }) {
       };
     }
 
+    if (command.action === 'export-data') {
+      const filePath = typeof command.filePath === 'string' ? command.filePath : '';
+      if (!filePath) return { ok: false, error: 'export-data requires filePath' };
+      const snapshot = await dbAdapter.exportDataSnapshot();
+      const savedPath = await writeSnapshot(filePath, snapshot);
+      return { ok: true, filePath: savedPath };
+    }
+
+    if (command.action === 'import-data') {
+      const filePath = typeof command.filePath === 'string' ? command.filePath : '';
+      if (!filePath || command.replace !== true) {
+        return { ok: false, error: 'import-data requires filePath and replace=true' };
+      }
+      const snapshot = await readSnapshot(filePath);
+      const counts = await dbAdapter.importDataSnapshot(snapshot, { replace: true });
+      return { ok: true, counts };
+    }
+
     if (command.action === 'shutdown') {
       // 応答を先に返すため、CLIは停止要求の受領を確認できる。
       setImmediate(() => shutdown('operator-cli'));
@@ -86,7 +105,8 @@ async function startOperatorControlServer({ dbAdapter, shutdown, getStatus }) {
   await removeStaleSocket(socketPath);
   const handleCommand = createCommandHandler({ dbAdapter, shutdown, getStatus });
 
-  const server = net.createServer((socket) => {
+  // クライアントは要求送信後に書込み側だけを閉じる。非同期操作の完了応答を返すため半閉接続を許可する。
+  const server = net.createServer({ allowHalfOpen: true }, (socket) => {
     socket.setEncoding('utf8');
     let input = '';
     let completed = false;
@@ -146,8 +166,7 @@ async function startOperatorControlServer({ dbAdapter, shutdown, getStatus }) {
   };
 }
 
-function requestOperatorCommand(command, { timeoutMs = 3000 } = {}) {
-  const socketPath = getOperatorSocketPath();
+function requestOperatorCommand(command, { timeoutMs = 3000, socketPath = getOperatorSocketPath() } = {}) {
   return new Promise((resolve, reject) => {
     const socket = net.createConnection(socketPath);
     let response = '';

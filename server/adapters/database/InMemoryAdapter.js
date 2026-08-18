@@ -35,7 +35,8 @@ class InMemoryAdapter extends DatabaseAdapter {
 		this.groupDms = new Map(); // dmId -> { id, title, member, host_id, time, post, unread }
 		this.groupDmIdsByMember = new Map(); // userId -> Set(dmId)
 		this.groupDmUnreadTotalByMember = new Map(); // userId -> unread total
-		this.dmE2EKeys = new Map(); // userId -> public key (base64url)
+					this.dmE2EKeys = new Map(); // userId -> { public_key, created_at, updated_at }
+
 		this.follows = new Map(); // `${followerId}:${followingId}` -> true
 		this.followingIdsByUser = new Map(); // followerId -> Set(followingId)
 		this.followerIdsByUser = new Map(); // followingId -> Set(followerId)
@@ -53,6 +54,218 @@ class InMemoryAdapter extends DatabaseAdapter {
 		this.logs = []; // { scratch_id, nyaitter_id, masked_ip_uuid, log_time }
 
 		this.nyaitterAddressToId = new Map();
+	}
+
+	async exportDataSnapshot() {
+		const { createSnapshot } = require('../../services/DataMigrationService');
+		const rows = {
+			users: [...this.users.values()],
+			sessions: [...this.sessions.values()],
+			trusted_login_ips: [...this.trustedLoginIps.values()],
+			login_approvals: [...this.loginApprovals.values()],
+			bot_tokens: [...this.botTokens.values()],
+			posts: [...this.posts.values()],
+			likes: [...this.likes.entries()].map(([key, created_at]) => {
+				const [user_id, post_id] = key.split(':').map(Number);
+				return { user_id, post_id, created_at };
+			}),
+			stars: [...this.stars.entries()].map(([key, created_at]) => {
+				const [user_id, post_id] = key.split(':').map(Number);
+				return { user_id, post_id, created_at };
+			}),
+			reposts: [...this.reposts.entries()].map(([key, created_at]) => {
+				const [user_id, post_id] = key.split(':').map(Number);
+				return { user_id, post_id, created_at };
+			}),
+			pinned_posts: [...this.pinnedPosts.entries()].map(([key, created_at]) => {
+				const [user_id, post_id] = key.split(':').map(Number);
+				return { user_id, post_id, created_at };
+			}),
+			follows: [...this.follows.entries()].map(([key, created_at]) => {
+				const [follower_id, following_id] = key.split(':').map(Number);
+				return { follower_id, following_id, created_at };
+			}),
+			dm_channels: [...this.dmChannels.values()].map((channel) => ({
+				id: channel.id,
+				participants: channel.participants,
+				created_at: channel.createdAt,
+			})),
+			dm_messages: [...this.dmChannels.values()].flatMap((channel) => (channel.messages || []).map((message) => ({
+				id: message.id,
+				channel_id: channel.id,
+				sender_id: message.senderId,
+				content: message.content,
+				sent_at: message.sentAt,
+				read_at: message.readAt,
+			}))),
+			group_dms: [...this.groupDms.values()],
+							dm_e2e_keys: [...this.dmE2EKeys.entries()].map(([user_id, record]) => ({
+					user_id,
+					public_key: record.public_key,
+					created_at: record.created_at,
+					updated_at: record.updated_at,
+				})),
+
+			notifications: [...this.notificationsById.values()],
+			push_subscriptions: [...this.pushSubscriptions.entries()].flatMap(([user_id, subscriptions]) => (
+				[...subscriptions.values()].map((subscription) => ({ user_id, ...subscription }))
+			)),
+			moderation_reports: [...this.moderationReports.values()],
+			logs: this.logs,
+		};
+		return createSnapshot('memory', rows);
+	}
+
+	async importDataSnapshot(snapshot, { replace = false } = {}) {
+		if (replace !== true) throw new Error('Destination replacement requires replace=true');
+		const { normalizeSnapshot } = require('../../services/DataMigrationService');
+		const data = normalizeSnapshot(snapshot);
+		const empty = new InMemoryAdapter();
+		Object.assign(this, empty);
+
+		for (const row of data.tables.users) {
+			const user = {
+				...row,
+				me: row.bio,
+				createdAt: row.created_at ? new Date(row.created_at) : new Date(),
+			};
+			this.users.set(user.id, user);
+			if (user.scid) this.scidToId.set(user.scid, user.id);
+			if (user.nyaitter_address) this.nyaitterAddressToId.set(String(user.nyaitter_address).toLowerCase(), user.id);
+		}
+		for (const row of data.tables.sessions) {
+			if (!row.token) continue;
+			this.sessions.set(row.token, {
+				id: row.session_id,
+				session_id: row.session_id,
+				token: row.token,
+				userId: row.user_id,
+				user_id: row.user_id,
+				ipHash: row.ip_hash,
+				ipMasked: row.ip_masked,
+				userAgent: row.user_agent,
+				expiresAt: row.expires_at,
+				createdAt: row.created_at,
+			});
+		}
+		for (const row of data.tables.trusted_login_ips) {
+			this.trustedLoginIps.set(`${row.user_id}:${row.ip_hash}`, {
+				userId: row.user_id, ipHash: row.ip_hash, ipMasked: row.ip_masked,
+				createdAt: row.created_at, lastUsedAt: row.last_used_at,
+			});
+		}
+		for (const row of data.tables.login_approvals) {
+			this.loginApprovals.set(row.id, {
+				id: row.id, userId: row.user_id, ipHash: row.ip_hash, ipMasked: row.ip_masked,
+				userAgent: row.user_agent, pollTokenHash: row.poll_token_hash, status: row.status,
+				createdAt: row.created_at, expiresAt: row.expires_at, decidedAt: row.decided_at, consumedAt: row.consumed_at,
+			});
+		}
+		for (const row of data.tables.bot_tokens) {
+			this.botTokens.set(row.token_id, {
+				tokenId: row.token_id, tokenHash: row.token_hash, userId: row.user_id,
+				name: row.name, createdAt: row.created_at, lastUsedAt: row.last_used_at,
+			});
+		}
+		for (const row of [...data.tables.posts].sort((left, right) => String(left.created_at).localeCompare(String(right.created_at)))) {
+			const post = {
+				id: row.id, userId: row.user_id, content: row.content, attachments: row.attachments,
+				mask: row.mask, lock: row.lock, announcement: row.announcement,
+				replyTo: row.reply_to, repostTo: row.repost_to, createdAt: row.created_at,
+			};
+			this.posts.set(post.id, post);
+			this._addPostIndexes(post);
+			this.nextPostId = Math.max(this.nextPostId, Number(post.id) + 1);
+		}
+		for (const row of data.tables.follows) {
+			const key = `${row.follower_id}:${row.following_id}`;
+			this.follows.set(key, row.created_at);
+			if (!this.followingIdsByUser.has(row.follower_id)) this.followingIdsByUser.set(row.follower_id, new Set());
+			if (!this.followerIdsByUser.has(row.following_id)) this.followerIdsByUser.set(row.following_id, new Set());
+			this.followingIdsByUser.get(row.follower_id).add(row.following_id);
+			this.followerIdsByUser.get(row.following_id).add(row.follower_id);
+		}
+		for (const [table, target, countMap, userIndex] of [
+			['likes', this.likes, this.likeCountByPost, this.likedPostIdsByUser],
+			['stars', this.stars, this.starCountByPost, this.starredPostIdsByUser],
+		]) {
+			for (const row of data.tables[table]) {
+				const key = `${row.user_id}:${row.post_id}`;
+				target.set(key, row.created_at);
+				countMap.set(row.post_id, (countMap.get(row.post_id) || 0) + 1);
+				this._updateUserReactionIndex(userIndex, row.user_id, row.post_id, true);
+			}
+		}
+		for (const [table, target, countMap] of [
+			['reposts', this.reposts, this.repostCountByPost],
+			['pinned_posts', this.pinnedPosts, null],
+		]) {
+			for (const row of data.tables[table]) {
+				target.set(`${row.user_id}:${row.post_id}`, row.created_at);
+				if (countMap) countMap.set(row.post_id, (countMap.get(row.post_id) || 0) + 1);
+			}
+		}
+		for (const row of data.tables.dm_channels) {
+			this.dmChannels.set(row.id, {
+				id: row.id, participants: row.participants, messages: [], createdAt: row.created_at,
+				unreadCounts: Object.fromEntries(row.participants.map((userId) => [userId, 0])),
+			});
+		}
+		for (const row of [...data.tables.dm_messages].sort((left, right) => String(left.sent_at).localeCompare(String(right.sent_at)))) {
+			const channel = this.dmChannels.get(row.channel_id);
+			if (!channel) continue;
+			channel.messages.push({ id: row.id, channelId: row.channel_id, senderId: row.sender_id, content: row.content, sentAt: row.sent_at, readAt: row.read_at });
+			this.nextDmId = Math.max(this.nextDmId, Number(row.id) + 1);
+			if (!row.read_at) {
+				for (const userId of channel.participants) {
+					if (userId !== row.sender_id) channel.unreadCounts[userId] = (channel.unreadCounts[userId] || 0) + 1;
+				}
+			}
+		}
+		for (const row of data.tables.group_dms) {
+			const dm = { ...row, host_id: row.host_id, member: row.member, post: row.post, unread: row.unread, time: row.time };
+			this.groupDms.set(dm.id, dm);
+			this._addGroupDmMemberIndexes(dm);
+		}
+					for (const row of data.tables.dm_e2e_keys) {
+				this.dmE2EKeys.set(row.user_id, {
+					public_key: row.public_key,
+					created_at: row.created_at,
+					updated_at: row.updated_at,
+				});
+			}
+
+		for (const row of data.tables.notifications) {
+			const notification = {
+				id: row.id, userId: row.user_id, type: row.type, fromUserId: row.from_user_id,
+				postId: row.post_id, target: row.target, message: row.message, read: row.read,
+				clicked: row.clicked, createdAt: row.created_at,
+			};
+			this.notificationsById.set(notification.id, notification);
+			if (!this.notifications.has(notification.userId)) this.notifications.set(notification.userId, []);
+			this.notifications.get(notification.userId).push(notification);
+			if (!notification.read) this.unreadNotificationCounts.set(notification.userId, (this.unreadNotificationCounts.get(notification.userId) || 0) + 1);
+			this.nextNotificationId = Math.max(this.nextNotificationId, Number(notification.id) + 1);
+		}
+		for (const row of data.tables.push_subscriptions) {
+			if (!this.pushSubscriptions.has(row.user_id)) this.pushSubscriptions.set(row.user_id, new Map());
+			this.pushSubscriptions.get(row.user_id).set(row.endpoint, { ...row });
+		}
+		for (const row of data.tables.moderation_reports) {
+			const report = {
+				id: row.id, reporterUserId: row.reporter_user_id, targetKind: row.target_kind, targetId: row.target_id,
+				description: row.description, targetSnapshot: row.target_snapshot, assignmentType: row.assignment_type,
+				status: row.status, assignedAdminId: row.assigned_admin_id, assignedAt: row.assigned_at,
+				excludedAdminIds: row.excluded_admin_ids, resolution: row.resolution, createdAt: row.created_at, resolvedAt: row.resolved_at,
+			};
+			this.moderationReports.set(report.id, report);
+			this.nextModerationReportId = Math.max(this.nextModerationReportId, Number(report.id) + 1);
+		}
+		this.logs = data.tables.logs.map((row) => ({
+			id: row.id, scratch_id: row.scratch_id, nyaitter_id: row.nyaitter_id,
+			masked_ip_uuid: row.masked_ip_uuid, log_time: row.log_time,
+		}));
+		return Object.fromEntries(Object.entries(data.tables).map(([table, rows]) => [table, rows.length]));
 	}
 
 		_updateReplyCountsForAncestors(parentPostId, delta) {
@@ -715,9 +928,10 @@ class InMemoryAdapter extends DatabaseAdapter {
 				this.likes.delete(key);
 				this._updateUserReactionIndex(this.likedPostIdsByUser, userId, postId, false);
 				this.likeCountByPost.set(postId, Math.max(0, currentCount - 1));
-			} else {
-				this.likes.set(key, true);
-				this._updateUserReactionIndex(this.likedPostIdsByUser, userId, postId, true);
+						} else {
+					this.likes.set(key, new Date().toISOString());
+					this._updateUserReactionIndex(this.likedPostIdsByUser, userId, postId, true);
+
 				this.likeCountByPost.set(postId, currentCount + 1);
 			}
 
@@ -750,9 +964,10 @@ class InMemoryAdapter extends DatabaseAdapter {
 				this.stars.delete(key);
 				this._updateUserReactionIndex(this.starredPostIdsByUser, userId, postId, false);
 				this.starCountByPost.set(postId, Math.max(0, currentCount - 1));
-			} else {
-				this.stars.set(key, true);
-				this._updateUserReactionIndex(this.starredPostIdsByUser, userId, postId, true);
+						} else {
+					this.stars.set(key, new Date().toISOString());
+					this._updateUserReactionIndex(this.starredPostIdsByUser, userId, postId, true);
+
 				this.starCountByPost.set(postId, currentCount + 1);
 			}
 
@@ -1041,11 +1256,18 @@ class InMemoryAdapter extends DatabaseAdapter {
 		);
 		return ids
 			.filter((id) => this.dmE2EKeys.has(id))
-			.map((id) => ({ user_id: id, public_key: this.dmE2EKeys.get(id) }));
+			.map((id) => ({ user_id: id, public_key: this.dmE2EKeys.get(id).public_key }));
 	}
 
 	async setDmPublicKey(userId, publicKey) {
-		this.dmE2EKeys.set(Number(userId), String(publicKey));
+		const id = Number(userId);
+		const existing = this.dmE2EKeys.get(id);
+		const now = new Date().toISOString();
+		this.dmE2EKeys.set(id, {
+			public_key: String(publicKey),
+			created_at: existing?.created_at || now,
+			updated_at: now,
+		});
 	}
 
 	async toggleFollow(followerId, followingId) {
@@ -1059,9 +1281,10 @@ class InMemoryAdapter extends DatabaseAdapter {
 		if (currentlyFollowing) {
 			this.follows.delete(key);
 			this._updateFollowIndexes(followerId, followingId, false);
-		} else {
-			this.follows.set(key, true);
-			this._updateFollowIndexes(followerId, followingId, true);
+					} else {
+				this.follows.set(key, new Date().toISOString());
+				this._updateFollowIndexes(followerId, followingId, true);
+
 		}
 
 		return {
@@ -1184,9 +1407,9 @@ class InMemoryAdapter extends DatabaseAdapter {
 
 		if (currentlyPinned) {
 			this.pinnedPosts.delete(key);
-		} else {
-			this.pinnedPosts.set(key, true);
-		}
+			} else {
+				this.pinnedPosts.set(key, new Date().toISOString());
+			}
 
 		return {
 			pinned: !currentlyPinned,
@@ -1218,8 +1441,8 @@ class InMemoryAdapter extends DatabaseAdapter {
 			throw new Error('Already reposted');
 		}
 
-		this.reposts.set(key, true);
-		this.repostCountByPost.set(postId, (this.repostCountByPost.get(postId) || 0) + 1);
+			this.reposts.set(key, new Date().toISOString());
+			this.repostCountByPost.set(postId, (this.repostCountByPost.get(postId) || 0) + 1);
 
 		const repostId = this.nextPostId++;
 		const repost = {
@@ -2073,11 +2296,11 @@ class InMemoryAdapter extends DatabaseAdapter {
 				}
 				this._addGroupDmMemberIndexes(dm);
 			}
-			for (const [key] of [...this.follows]) {
+			for (const [key, createdAt] of [...this.follows]) {
 				const [followerId, followingId] = String(key).split(':').map(Number);
 				if (followerId !== previousId && followingId !== previousId) continue;
 				this.follows.delete(key);
-				this.follows.set(`${followerId === previousId ? nextId : followerId}:${followingId === previousId ? nextId : followingId}`, true);
+				this.follows.set(`${followerId === previousId ? nextId : followerId}:${followingId === previousId ? nextId : followingId}`, createdAt);
 			}
 			this.followingIdsByUser.clear();
 			this.followerIdsByUser.clear();
