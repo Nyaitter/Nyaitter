@@ -83,14 +83,20 @@ function isPublicAddress(address) {
   );
 }
 
+function decodeUrlEntities(value) {
+  return String(value || '')
+    .replace(/&amp;|&#0*38;|&#x0*26;/gi, '&');
+}
+
 function normalizeTargetUrl(value) {
   if (typeof value !== 'string' || value.length === 0 || value.length > MAX_URL_LENGTH) {
     return null;
   }
-  if (/[\u0000-\u001F\u007F]/.test(value)) return null;
+  const decodedValue = decodeUrlEntities(value);
+  if (/[\u0000-\u001F\u007F]/.test(decodedValue)) return null;
 
   try {
-    const target = new URL(value);
+    const target = new URL(decodedValue);
     const hostname = target.hostname.toLowerCase().replace(/\.$/, '');
     if (
       target.protocol !== 'https:' ||
@@ -341,7 +347,13 @@ function fetchResource(targetUrl, { type, maxBytes, redirectCount = 0 }) {
             Range: `bytes=0-${maxBytes - 1}`,
           },
           servername: targetUrl.hostname,
-          lookup: (_hostname, _options, callback) => {
+          lookup: (_hostname, options, callback) => {
+            // Node.jsのautoSelectFamilyはlookupへall:trueを渡す。
+            // 単一値だけ返すとERR_INVALID_IP_ADDRESSになり、oEmbed取得全体がnullへ後退する。
+            if (options?.all) {
+              callback(null, [{ address: address.address, family: address.family }]);
+              return;
+            }
             callback(null, address.address, address.family);
           },
         },
