@@ -412,10 +412,14 @@ router.post('/login-approvals/:approvalId/poll', async (req, res) => {
 
 router.get('/me', requireAuthAllowFrozen, async (req, res) => {
   const db = getDbAdapter(req);
-  // requireAuthAllowFrozenはセッション・Bot認証時に完全なユーザー行を設定済み。
-  // auth/meで同じユーザーを再取得せず、リモートPostgreSQLへの往復を1回省く。
-  const user = req.user;
+  // 認証ミドルウェアが取得済みの完全なユーザー行を使う。principalは認可用の
+  // 最小情報だけなので、そのままシリアライズするとプロフィールと設定が欠落する。
+  const user = req.user?.visibilityUser || await db.getUserById(req.user.id);
+  if (!user) return res.status(401).json({ error: 'Authentication required' });
 
+  // 設定・リアクション・プロフィールを含む本人専用の状態は、ETagの304や
+  // ブラウザキャッシュから古い値を再利用させない。
+  res.set('Cache-Control', 'no-store, private');
   res.json({
     user: await serializeUser(db, user, req.user.id, getPublicUrl(req)),
     isBot: req.user.isBot || false,
