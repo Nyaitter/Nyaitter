@@ -564,6 +564,23 @@ class PostgresAdapter extends DatabaseAdapter {
 		);
 	}
 
+	async _synchronizeNotificationIdSequence() {
+		// 外部データ移行などで明示IDが投入された後でも、通知採番を既存IDの最大値まで進める。
+		await this.pool.query(
+			`WITH table_state AS (
+				SELECT COALESCE(MAX(id), 0)::bigint AS max_id FROM notifications
+			), sequence_state AS (
+				SELECT last_value::bigint AS last_value FROM nyaitter_notifications_id_seq
+			)
+			SELECT setval(
+				'nyaitter_notifications_id_seq',
+				GREATEST(table_state.max_id, sequence_state.last_value),
+				true
+			)
+			FROM table_state CROSS JOIN sequence_state`,
+		);
+	}
+
 	async createPost(postData) {
 		const values = [
 			postData.userId,
@@ -1790,21 +1807,30 @@ class PostgresAdapter extends DatabaseAdapter {
 			postId: notificationData.postId,
 			open: notificationData.open,
 		});
-		const { rows } = await this.pool.query(
-					`INSERT INTO notifications
-					 (user_id, type, from_user_id, post_id, target, message, read, clicked, created_at)
-					 VALUES ($1, $2, $3, $4, $5::jsonb, $6, false, false, NOW())
-				 RETURNING *`,
-				[
-					notificationData.userId,
-					notificationData.type,
-					notificationData.fromUserId ?? null,
-					target?.kind === 'post' ? target.id : null,
-					JSON.stringify(target),
-					typeof notificationData.message === 'string' ? notificationData.message : null,
-				],
+		const values = [
+			notificationData.userId,
+			notificationData.type,
+			notificationData.fromUserId ?? null,
+			target?.kind === 'post' ? target.id : null,
+			JSON.stringify(target),
+			typeof notificationData.message === 'string' ? notificationData.message : null,
+		];
+		const insertNotification = () => this.pool.query(
+			`INSERT INTO notifications
+				 (user_id, type, from_user_id, post_id, target, message, read, clicked, created_at)
+				 VALUES ($1, $2, $3, $4, $5::jsonb, $6, false, false, NOW())
+			 RETURNING *`,
+			values,
 		);
-		return rows[0];
+		try {
+			const { rows } = await insertNotification();
+			return rows[0] || null;
+		} catch (error) {
+			if (error?.code !== '23505' || error?.constraint !== 'notifications_pkey') throw error;
+			await this._synchronizeNotificationIdSequence();
+			const { rows } = await insertNotification();
+			return rows[0] || null;
+		}
 	}
 
 	async getNotifications(userId, limit = 50, offset = 0) {
