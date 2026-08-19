@@ -168,7 +168,13 @@ async function serializeUser(db, user, viewerId = null, publicUrl = null) {
 	};
 }
 
-async function serializePublicProfile(db, user, viewerId = null, publicUrl = null) {
+async function serializePublicProfile(
+	db,
+	user,
+	viewerId = null,
+	publicUrl = null,
+	viewerUser = null,
+) {
 	if (!user) return null;
 	const isSelf = viewerId != null && Number(viewerId) === Number(user.id);
 	const settings = user.settings || {};
@@ -181,16 +187,34 @@ async function serializePublicProfile(db, user, viewerId = null, publicUrl = nul
 		followers: state(settings.show_follower !== false),
 		posts: isSelf || !settings.lock ? 'public' : 'followers_only',
 	};
-	const viewer = viewerId != null && db.getUserById ? await db.getUserById(viewerId) : null;
+	const viewerPromise = viewerUser
+		? Promise.resolve(viewerUser)
+		: (viewerId != null && db.getUserById ? db.getUserById(viewerId) : null);
+	const statsPromise = typeof db.getPublicProfileStats === 'function'
+		? db.getPublicProfileStats(user.id)
+		: Promise.all([
+			db.getFollowingCount
+				? db.getFollowingCount(user.id)
+				: (db.getFollowIds ? db.getFollowIds(user.id).then((ids) => ids.length) : 0),
+			db.getFollowerCount ? db.getFollowerCount(user.id) : 0,
+			db.getPostCount ? db.getPostCount(user.id) : 0,
+			db.getMediaCount ? db.getMediaCount(user.id) : 0,
+			db.getPinnedPostId ? db.getPinnedPostId(user.id) : null,
+		]).then(([followingCount, followerCount, postCount, mediaCount, pinnedPostId]) => ({
+			followingCount,
+			followerCount,
+			postCount,
+			mediaCount,
+			pinnedPostId,
+		}));
+	const [viewer, stats] = await Promise.all([viewerPromise, statsPromise]);
 	const viewerBlocksProfile = Boolean(viewer?.block?.map(Number).includes(Number(user.id)));
 	const profileBlocksViewer = Boolean(viewerId != null && user.block?.map(Number).includes(Number(viewerId)));
-	const [followingCount, followerCount, postCount, mediaCount, pinnedPostId] = await Promise.all([
-		db.getFollowingCount ? db.getFollowingCount(user.id) : (db.getFollowIds ? db.getFollowIds(user.id).then((ids) => ids.length) : 0),
-		db.getFollowerCount ? db.getFollowerCount(user.id) : 0,
-		db.getPostCount ? db.getPostCount(user.id) : 0,
-		db.getMediaCount ? db.getMediaCount(user.id) : 0,
-		db.getPinnedPostId ? db.getPinnedPostId(user.id) : null,
-	]);
+	const followingCount = stats?.followingCount || 0;
+	const followerCount = stats?.followerCount || 0;
+	const postCount = stats?.postCount || 0;
+	const mediaCount = stats?.mediaCount || 0;
+	const pinnedPostId = stats?.pinnedPostId || null;
 
 	return {
 		id: user.id,

@@ -320,6 +320,24 @@ class PostgresAdapter extends DatabaseAdapter {
 		return rows.map((row) => this._normalizeUserBlockList(row));
 	}
 
+	async getRecommendedUsers(limit = 3, excludedUserId = null) {
+		const normalizedLimit = Math.min(Math.max(Number(limit) || 3, 1), 100);
+		const values = [normalizedLimit];
+		const exclusion = excludedUserId != null && Number.isInteger(Number(excludedUserId))
+			? `WHERE id <> $${values.push(Number(excludedUserId))}`
+			: '';
+		const { rows } = await this.pool.query(
+			`SELECT id, name, scid, icon_data, admin, verify,
+				auth_provider, provider_domain, external_id, bio, created_at
+			 FROM users
+			 ${exclusion}
+			 ORDER BY created_at DESC, id ASC
+			 LIMIT $1`,
+			values,
+		);
+		return rows.map((row) => this._normalizeUserBlockList(row));
+	}
+
 		_mapSession(session) {
 			return {
 				id: session.session_id,
@@ -394,12 +412,58 @@ class PostgresAdapter extends DatabaseAdapter {
 			return this._normalizeUserBlockList(rows[0]);
 		}
 
-		async invalidateSession(token) {
-			const { rowCount } = await this.pool.query('DELETE FROM sessions WHERE token = $1', [token]);
-			return rowCount > 0;
-		}
+	async invalidateSession(token) {
+		const { rowCount } = await this.pool.query('DELETE FROM sessions WHERE token = $1', [token]);
+		return rowCount > 0;
+	}
 
-		async getUserSessions(userId) {
+	async invalidateUserSessionById(userId, sessionId) {
+		const { rows } = await this.pool.query(
+			`DELETE FROM sessions
+			 WHERE user_id = $1 AND session_id = $2 AND expires_at > NOW()
+			 RETURNING token`,
+			[userId, sessionId],
+		);
+		return rows[0]?.token || null;
+	}
+
+	async revokeUserSessionsBySessionId(userId, sessionId) {
+		const { rows } = await this.pool.query(
+			`WITH target AS MATERIALIZED (
+				SELECT ip_hash FROM sessions
+				WHERE user_id = $1 AND session_id = $2 AND expires_at > NOW()
+			), revoked_trust AS (
+				DELETE FROM trusted_login_ips
+				WHERE user_id = $1
+					AND ip_hash = (SELECT ip_hash FROM target)
+					AND (SELECT ip_hash FROM target) IS NOT NULL
+				RETURNING 1
+			), invalidated AS (
+				DELETE FROM sessions
+				WHERE user_id = $1
+					AND ip_hash = (SELECT ip_hash FROM target)
+					AND (SELECT ip_hash FROM target) IS NOT NULL
+				RETURNING token
+			)
+			SELECT
+				EXISTS (SELECT 1 FROM target) AS found,
+				(SELECT ip_hash FROM target) AS ip_hash,
+				COALESCE((SELECT array_agg(token) FROM invalidated), ARRAY[]::TEXT[]) AS tokens,
+				(SELECT COUNT(*)::int FROM invalidated) AS invalidated,
+				EXISTS (SELECT 1 FROM revoked_trust) AS trust_revoked`,
+			[userId, sessionId],
+		);
+		const result = rows[0] || {};
+		return {
+			found: !!result.found,
+			ipHash: result.ip_hash || null,
+			tokens: Array.isArray(result.tokens) ? result.tokens : [],
+			invalidated: Math.max(0, Number(result.invalidated) || 0),
+			trustRevoked: !!result.trust_revoked,
+		};
+	}
+
+	async getUserSessions(userId) {
 			const { rows } = await this.pool.query(
 				`SELECT session_id, token, user_id, expires_at, created_at, ip_hash, ip_masked, user_agent
 				 FROM sessions WHERE user_id = $1 AND expires_at > NOW() ORDER BY created_at DESC`,
@@ -838,6 +902,31 @@ class PostgresAdapter extends DatabaseAdapter {
 			[userId]
 		);
 		return Number(rows[0].count);
+	}
+
+	async getPublicProfileStats(userId) {
+		const { rows } = await this.pool.query(
+			`SELECT
+				(SELECT COUNT(*)::int FROM follows WHERE follower_id = $1) AS following_count,
+				(SELECT COUNT(*)::int FROM follows WHERE following_id = $1) AS follower_count,
+				(SELECT COUNT(*)::int FROM posts WHERE user_id = $1) AS post_count,
+				(SELECT COUNT(*)::int FROM posts
+					WHERE user_id = $1
+						AND jsonb_typeof(attachments) = 'array'
+						AND jsonb_array_length(attachments) > 0) AS media_count,
+				(SELECT post_id FROM pinned_posts
+					WHERE user_id = $1
+					ORDER BY created_at DESC LIMIT 1) AS pinned_post_id`,
+			[userId],
+		);
+		const stats = rows[0] || {};
+		return {
+			followingCount: Math.max(0, Number(stats.following_count) || 0),
+			followerCount: Math.max(0, Number(stats.follower_count) || 0),
+			postCount: Math.max(0, Number(stats.post_count) || 0),
+			mediaCount: Math.max(0, Number(stats.media_count) || 0),
+			pinnedPostId: stats.pinned_post_id == null ? null : Number(stats.pinned_post_id),
+		};
 	}
 
 	async getMediaPosts(userId, limit = 15, offset = 0) {
@@ -1694,27 +1783,22 @@ class PostgresAdapter extends DatabaseAdapter {
 			throw new Error('Cannot follow yourself');
 		}
 
-		const { rows: existing } = await this.pool.query(
-			'SELECT 1 FROM follows WHERE follower_id = $1 AND following_id = $2',
-			[followerId, followingId]
+		const { rows } = await this.pool.query(
+			`WITH deleted AS (
+				DELETE FROM follows
+				WHERE follower_id = $1 AND following_id = $2
+				RETURNING 1
+			), inserted AS (
+				INSERT INTO follows (follower_id, following_id, created_at)
+				SELECT $1, $2, NOW()
+				WHERE NOT EXISTS (SELECT 1 FROM deleted)
+				ON CONFLICT (follower_id, following_id) DO NOTHING
+				RETURNING 1
+			)
+			SELECT EXISTS (SELECT 1 FROM inserted) AS following`,
+			[followerId, followingId],
 		);
-
-		let following;
-		if (existing.length > 0) {
-			await this.pool.query(
-				'DELETE FROM follows WHERE follower_id = $1 AND following_id = $2',
-				[followerId, followingId]
-			);
-			following = false;
-		} else {
-			await this.pool.query(
-				'INSERT INTO follows (follower_id, following_id, created_at) VALUES ($1, $2, NOW())',
-				[followerId, followingId]
-			);
-			following = true;
-		}
-
-		return { following };
+		return { following: !!rows[0]?.following };
 	}
 
 	async isFollowing(followerId, followingId) {
@@ -1813,36 +1897,28 @@ class PostgresAdapter extends DatabaseAdapter {
 	}
 
 	async togglePin(userId, postId) {
-		const { rows: postRows } = await this.pool.query(
-			'SELECT user_id FROM posts WHERE id = $1',
-			[postId]
+		const { rows } = await this.pool.query(
+			`WITH owned AS (
+				SELECT 1 FROM posts WHERE id = $2 AND user_id = $1
+			), deleted AS (
+				DELETE FROM pinned_posts
+				WHERE user_id = $1 AND post_id = $2
+					AND EXISTS (SELECT 1 FROM owned)
+				RETURNING 1
+			), inserted AS (
+				INSERT INTO pinned_posts (user_id, post_id, created_at)
+				SELECT $1, $2, NOW()
+				WHERE EXISTS (SELECT 1 FROM owned)
+					AND NOT EXISTS (SELECT 1 FROM deleted)
+				ON CONFLICT (user_id, post_id) DO NOTHING
+				RETURNING 1
+			)
+			SELECT EXISTS (SELECT 1 FROM owned) AS owned,
+				EXISTS (SELECT 1 FROM inserted) AS pinned`,
+			[userId, postId],
 		);
-			if (postRows.length === 0 || Number(postRows[0].user_id) !== Number(userId)) {
-			throw new Error('Cannot pin a post you do not own');
-		}
-
-		// Simple implementation using a pins table (create if not exists in migration)
-		const { rows: existing } = await this.pool.query(
-			'SELECT 1 FROM pinned_posts WHERE user_id = $1 AND post_id = $2',
-			[userId, postId]
-		);
-
-		let pinned;
-		if (existing.length > 0) {
-			await this.pool.query(
-				'DELETE FROM pinned_posts WHERE user_id = $1 AND post_id = $2',
-				[userId, postId]
-			);
-			pinned = false;
-		} else {
-			await this.pool.query(
-				'INSERT INTO pinned_posts (user_id, post_id, created_at) VALUES ($1, $2, NOW())',
-				[userId, postId]
-			);
-			pinned = true;
-		}
-
-		return { pinned };
+		if (!rows[0]?.owned) throw new Error('Cannot pin a post you do not own');
+		return { pinned: !!rows[0].pinned };
 	}
 
 	async getPinnedPosts(userId) {
@@ -1868,29 +1944,33 @@ class PostgresAdapter extends DatabaseAdapter {
 	}
 
 	async repostPost(userId, postId) {
-		const original = await this.getPostById(postId);
-		if (!original) throw new Error('Post not found');
-
-		const { rows: existing } = await this.pool.query(
-			'SELECT 1 FROM reposts WHERE user_id = $1 AND post_id = $2',
-			[userId, postId]
-		);
-		if (existing.length > 0) throw new Error('Already reposted');
-
-		await this.pool.query(
-			'INSERT INTO reposts (user_id, post_id, created_at) VALUES ($1, $2, NOW())',
-			[userId, postId]
-		);
-
-		// Create a repost entry as a new post record (simple approach)
 		const { rows } = await this.pool.query(
-			`INSERT INTO posts (user_id, content, attachments, mask, lock, repost_to, created_at)
-			 VALUES ($1, $2, $3, $4, $5, $6, NOW())
-			 RETURNING *`,
-			[userId, original.content, original.attachments, original.mask, !!original.lock, postId]
+			`WITH original AS MATERIALIZED (
+				SELECT content, attachments, mask, lock
+				FROM posts WHERE id = $2
+			), registered AS (
+				INSERT INTO reposts (user_id, post_id, created_at)
+				SELECT $1, $2, NOW()
+				WHERE EXISTS (SELECT 1 FROM original)
+				ON CONFLICT (user_id, post_id) DO NOTHING
+				RETURNING 1
+			), created AS (
+				INSERT INTO posts (user_id, content, attachments, mask, lock, repost_to, created_at)
+				SELECT $1, original.content, original.attachments, original.mask, original.lock, $2, NOW()
+				FROM original
+				WHERE EXISTS (SELECT 1 FROM registered)
+				RETURNING *
+			)
+			SELECT created.*, EXISTS (SELECT 1 FROM original) AS post_exists,
+				EXISTS (SELECT 1 FROM registered) AS repost_created
+			FROM (SELECT 1) AS state
+			LEFT JOIN created ON TRUE`,
+			[userId, postId],
 		);
-
-		return this._normalizePost(rows[0] || null);
+		const result = rows[0] || {};
+		if (!result.post_exists) throw new Error('Post not found');
+		if (!result.repost_created) throw new Error('Already reposted');
+		return this._normalizePost(result);
 	}
 
 	async getReposts(userId) {

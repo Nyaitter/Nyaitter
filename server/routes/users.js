@@ -364,17 +364,22 @@ router.get('/recommended', optionalAuth, async (req, res) => {
 	const viewerId = req.user ? req.user.id : null;
 
 	try {
-		const allUsers = db.getAllUsers ? await db.getAllUsers() : [];
-		let candidates = allUsers
-			.slice()
-			.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-		if (viewerId) {
-			candidates = candidates.filter(
-				(u) => u.id !== Number(viewerId),
-			);
+		let selected;
+		if (typeof db.getRecommendedUsers === 'function') {
+			selected = await db.getRecommendedUsers(3, viewerId);
+		} else {
+			const allUsers = db.getAllUsers ? await db.getAllUsers() : [];
+			let candidates = allUsers
+				.slice()
+				.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+			if (viewerId) {
+				candidates = candidates.filter(
+					(u) => u.id !== Number(viewerId),
+				);
+			}
+			selected = candidates.slice(0, 3);
 		}
-					const selected = candidates.slice(0, 3);
-			res.json({ users: selected.map((user) => serializeUserCard(user, getPublicUrl(req))) });
+		res.json({ users: selected.map((user) => serializeUserCard(user, getPublicUrl(req))) });
 
 	} catch (err) {
 		console.error('[users] recommended error:', err);
@@ -417,7 +422,13 @@ router.get('/:userId', optionalAuth, async (req, res) => {
 
 			const viewerId = req.user ? req.user.id : null;
 			res.json({
-				user: await serializePublicProfile(db, user, viewerId, getPublicUrl(req)),
+				user: await serializePublicProfile(
+					db,
+					user,
+					viewerId,
+					getPublicUrl(req),
+					req.user || null,
+				),
 			});
 	} catch (err) {
 		console.error('[users] profile error:', err);

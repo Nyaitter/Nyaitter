@@ -509,16 +509,23 @@ router.get('/sessions', requireAuth, requireInteractiveSession, async (req, res)
  */
 router.delete('/sessions/:sessionId', requireAuth, requireInteractiveSession, async (req, res) => {
   const db = getDbAdapter(req);
-  const sessions = await db.getUserSessions(req.user.id);
-  const target = sessions.find((session) => session.id === req.params.sessionId);
-  if (!target) return res.status(404).json({ error: 'セッションが見つかりません。' });
+  let targetToken;
+  if (typeof db.invalidateUserSessionById === 'function') {
+    targetToken = await db.invalidateUserSessionById(req.user.id, req.params.sessionId);
+    if (!targetToken) return res.status(404).json({ error: 'セッションが見つかりません。' });
+  } else {
+    const sessions = await db.getUserSessions(req.user.id);
+    const target = sessions.find((session) => session.id === req.params.sessionId);
+    if (!target) return res.status(404).json({ error: 'セッションが見つかりません。' });
+    targetToken = target.token;
+    await db.invalidateSession(targetToken);
+  }
 
-  await db.invalidateSession(target.token);
   const currentToken = getCookieValue(req, 'nyaitter_session');
   const remaining = readRememberedAccounts(req)
-    .filter((account) => SessionManager.hashToken(account.token) !== target.token);
+    .filter((account) => SessionManager.hashToken(account.token) !== targetToken);
   setRememberedAccountsCookie(res, remaining);
-  const activeRemoved = Boolean(currentToken && SessionManager.hashToken(currentToken) === target.token);
+  const activeRemoved = Boolean(currentToken && SessionManager.hashToken(currentToken) === targetToken);
   if (activeRemoved) clearSessionCookie(res);
   res.set('Cache-Control', 'no-store');
   return res.json({ success: true, invalidated: 1, active_removed: activeRemoved });
@@ -530,16 +537,27 @@ router.delete('/sessions/:sessionId', requireAuth, requireInteractiveSession, as
  */
 router.post('/sessions/:sessionId/revoke-ip', requireAuth, requireInteractiveSession, async (req, res) => {
   const db = getDbAdapter(req);
-  const sessions = await db.getUserSessions(req.user.id);
-  const target = sessions.find((session) => session.id === req.params.sessionId);
-  if (!target) return res.status(404).json({ error: 'セッションが見つかりません。' });
-  if (!target.ipHash) return res.status(409).json({ error: '旧セッションのため、このIPの信頼を取り消せません。' });
-
-  const affectedTokens = sessions
-    .filter((session) => session.ipHash === target.ipHash)
-    .map((session) => session.token);
-  const revokedTrust = await db.revokeTrustedLoginIp(req.user.id, target.ipHash);
-  const invalidated = await db.invalidateSessionsByIp(req.user.id, target.ipHash);
+  let affectedTokens;
+  let revokedTrust;
+  let invalidated;
+  if (typeof db.revokeUserSessionsBySessionId === 'function') {
+    const result = await db.revokeUserSessionsBySessionId(req.user.id, req.params.sessionId);
+    if (!result.found) return res.status(404).json({ error: 'セッションが見つかりません。' });
+    if (!result.ipHash) return res.status(409).json({ error: '旧セッションのため、このIPの信頼を取り消せません。' });
+    affectedTokens = result.tokens;
+    revokedTrust = result.trustRevoked;
+    invalidated = result.invalidated;
+  } else {
+    const sessions = await db.getUserSessions(req.user.id);
+    const target = sessions.find((session) => session.id === req.params.sessionId);
+    if (!target) return res.status(404).json({ error: 'セッションが見つかりません。' });
+    if (!target.ipHash) return res.status(409).json({ error: '旧セッションのため、このIPの信頼を取り消せません。' });
+    affectedTokens = sessions
+      .filter((session) => session.ipHash === target.ipHash)
+      .map((session) => session.token);
+    revokedTrust = await db.revokeTrustedLoginIp(req.user.id, target.ipHash);
+    invalidated = await db.invalidateSessionsByIp(req.user.id, target.ipHash);
+  }
   const currentToken = getCookieValue(req, 'nyaitter_session');
   const activeRemoved = Boolean(currentToken && affectedTokens.includes(SessionManager.hashToken(currentToken)));
   setRememberedAccountsCookie(res, readRememberedAccounts(req)
