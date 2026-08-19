@@ -8,6 +8,12 @@ function getPostAuthorId(post) {
 	return Number.isInteger(id) ? id : null;
 }
 
+function getReplyToPostId(post) {
+	const value = post?.replyTo ?? post?.reply_to ?? post?.reply_id;
+	const id = Number(value);
+	return Number.isInteger(id) && id > 0 ? id : null;
+}
+
 function normalizeUserId(value) {
 	const id = Number(value);
 	return Number.isInteger(id) ? id : null;
@@ -82,7 +88,6 @@ async function getFollowRelationshipSnapshot(db, viewerId, authorIds) {
 				ids,
 			));
 		} catch (error) {
-			// 段階デプロイ時に旧D1 Workerへ接続した場合などは、旧プリミティブへ安全に後退する。
 			console.warn('[postVisibility] batch follow relationship fallback:', error.message);
 		}
 	}
@@ -129,14 +134,42 @@ async function createPostVisibilityContext(
 		&& Number(knownViewer?.id) === normalizedViewerId
 		&& Object.prototype.hasOwnProperty.call(knownViewer, 'settings')
 		&& Object.prototype.hasOwnProperty.call(knownViewer, 'block');
-	const [viewer, followSnapshot] = await Promise.all([
+
+	// 返信先ポストの作者情報を解決
+	const replyToPostIds = [...new Set(values
+		.map(getReplyToPostId)
+		.filter((id) => id != null))];
+	const existingPostsById = new Map(values.map((p) => [Number(p.id), p]));
+	const missingParentIds = replyToPostIds.filter((id) => !existingPostsById.has(id));
+
+	const [viewer, followSnapshot, fetchedParents] = await Promise.all([
 		canReuseKnownViewer
 			? knownViewer
 			: normalizedViewerId != null && typeof db.getUserById === 'function'
 				? db.getUserById(normalizedViewerId)
 				: null,
 		getFollowRelationshipSnapshot(db, normalizedViewerId, authorIds),
+		missingParentIds.length > 0 && typeof db.getPostsByIds === 'function'
+			? db.getPostsByIds(missingParentIds).catch((err) => {
+				console.warn('[postVisibility] batch parent posts fallback:', err.message);
+				return [];
+			})
+			: [],
 	]);
+
+	const replyToAuthorIdsByReplyId = new Map();
+	for (const post of values) {
+		if (post?.id) {
+			const authorId = getPostAuthorId(post);
+			if (authorId != null) replyToAuthorIdsByReplyId.set(Number(post.id), authorId);
+		}
+	}
+	for (const parent of fetchedParents || []) {
+		if (parent?.id) {
+			const authorId = getPostAuthorId(parent);
+			if (authorId != null) replyToAuthorIdsByReplyId.set(Number(parent.id), authorId);
+		}
+	}
 
 	return {
 		viewerId: normalizedViewerId,
@@ -146,6 +179,7 @@ async function createPostVisibilityContext(
 		followingIds: followSnapshot.followingIds,
 		followerIds: followSnapshot.followerIds,
 		relationshipAuthorIds: new Set(authorIds.filter((id) => id !== normalizedViewerId)),
+		replyToAuthorIdsByReplyId,
 	};
 }
 
@@ -184,12 +218,41 @@ async function extendPostVisibilityContext(
 	const missingRelationshipAuthorIds = authorIds.filter((authorId) => (
 		authorId !== normalizedViewerId && !knownRelationshipAuthorIds.has(authorId)
 	));
-	const additionalRelationships = await getFollowRelationshipSnapshot(
-		db,
-		normalizedViewerId,
-		missingRelationshipAuthorIds,
-	);
+
+	// 返信先ポストの作者情報を解決
+	const replyToPostIds = [...new Set(values
+		.map(getReplyToPostId)
+		.filter((id) => id != null))];
+	const mergedReplyToAuthorIds = new Map(visibilityContext.replyToAuthorIdsByReplyId || []);
+	for (const post of values) {
+		if (post?.id) {
+			const authorId = getPostAuthorId(post);
+			if (authorId != null) mergedReplyToAuthorIds.set(Number(post.id), authorId);
+		}
+	}
+	const missingParentIds = replyToPostIds.filter((id) => !mergedReplyToAuthorIds.has(id));
+
+	const [additionalRelationships, fetchedParents] = await Promise.all([
+		getFollowRelationshipSnapshot(
+			db,
+			normalizedViewerId,
+			missingRelationshipAuthorIds,
+		),
+		missingParentIds.length > 0 && typeof db.getPostsByIds === 'function'
+			? db.getPostsByIds(missingParentIds).catch((err) => {
+				console.warn('[postVisibility] batch parent posts fallback:', err.message);
+				return [];
+			})
+			: [],
+	]);
+
 	for (const authorId of missingRelationshipAuthorIds) knownRelationshipAuthorIds.add(authorId);
+	for (const parent of fetchedParents || []) {
+		if (parent?.id) {
+			const authorId = getPostAuthorId(parent);
+			if (authorId != null) mergedReplyToAuthorIds.set(Number(parent.id), authorId);
+		}
+	}
 
 	const viewer = visibilityContext.viewer || (
 		normalizedViewerId != null && Number(knownViewer?.id) === normalizedViewerId
@@ -215,13 +278,14 @@ async function extendPostVisibilityContext(
 			...additionalRelationships.followerIds,
 		]),
 		relationshipAuthorIds: knownRelationshipAuthorIds,
+		replyToAuthorIdsByReplyId: mergedReplyToAuthorIds,
 	};
 }
 
 function hasBlockRelationshipInContext(context, authorId) {
 	if (!context || context.viewerId == null || context.viewerId === authorId) return false;
-	if (context.viewerBlockedIds.has(authorId)) return true;
-	const author = context.authorsById.get(authorId) || null;
+	if (context.viewerBlockedIds?.has(authorId)) return true;
+	const author = context.authorsById?.get(authorId) || null;
 	return normalizeBlockList(author?.block, author?.id).includes(context.viewerId);
 }
 
@@ -229,18 +293,29 @@ function canViewPostWithContext(post, context) {
 	if (!post || !context) return false;
 	const authorId = getPostAuthorId(post);
 	if (authorId == null) return false;
-	const author = context.authorsById.get(authorId) || null;
+	const author = context.authorsById?.get(authorId) || null;
 
 	if (hasBlockRelationshipInContext(context, authorId)) return false;
 	if (!isPrivatePost(post, author)) return true;
 	if (context.viewerId == null) return false;
 	if (context.viewerId === authorId) return true;
+
+	// 返信先ポストがある場合、返信先の作成者は相互フォロー関係でなくても閲覧可能
+	const replyToId = getReplyToPostId(post);
+	if (replyToId != null) {
+		const replyToAuthorId = context.replyToAuthorIdsByReplyId?.get(replyToId)
+			?? getPostAuthorId(post.replyToPost ?? post.parent_post ?? post.parentPost);
+		if (replyToAuthorId != null && replyToAuthorId === context.viewerId) {
+			return true;
+		}
+	}
+
 	return context.followingIds.has(authorId) && context.followerIds.has(authorId);
 }
 
 /**
  * 投稿の閲覧可否を判定する。
- * 非公開投稿は投稿者本人、または投稿者と相互フォローであるログイン済みユーザーだけが閲覧できる。
+ * 非公開投稿は投稿者本人、返信先の投稿者、または投稿者と相互フォローであるログイン済みユーザーだけが閲覧できる。
  * 未許可時は投稿の存在自体を明かさないため false を返す。
  */
 async function canViewPost(
@@ -256,8 +331,7 @@ async function canViewPost(
 	if (authorId == null) return false;
 	if (visibilityContext) return canViewPostWithContext(post, visibilityContext);
 
-	const authorsById = new Map();
-	if (author) authorsById.set(authorId, author);
+	const authorsById = author ? new Map([[authorId, author]]) : null;
 	const context = await createPostVisibilityContext(
 		db,
 		[post],
@@ -279,18 +353,13 @@ async function filterViewablePosts(db, posts, viewerId = null, visibilityContext
 
 /**
  * 検索除外ユーザーの投稿を発見可能な一覧へ載せるか判定する。
- *
- * 検索除外は投稿自体の公開範囲を変えない。プロフィール等の直接一覧は
- * 別途 `filterViewablePosts` を使うため、ここはタイムライン・おすすめ・
- * 検索のような発見経路にだけ適用する。検索除外中の投稿者本人と、投稿者を
- * フォローしているログイン済みユーザーは投稿を発見できる。
  */
 async function filterDiscoverablePosts(db, posts, viewerId = null, visibilityContext = null) {
 	const values = (posts || []).filter(Boolean);
 	const context = visibilityContext || await createPostVisibilityContext(db, values, viewerId);
 	return values.filter((post) => {
 		const authorId = getPostAuthorId(post);
-		const author = context.authorsById.get(authorId) || null;
+		const author = context.authorsById?.get(authorId) || null;
 		if (!author?.shadow) return true;
 		if (context.viewerId == null) return false;
 		if (context.viewerId === authorId) return true;
@@ -307,6 +376,7 @@ module.exports = {
 	extendPostVisibilityContext,
 	getFollowRelationshipSnapshot,
 	getPostAuthorId,
+	getReplyToPostId,
 	getAuthorsById,
 	isPrivatePost,
 };
