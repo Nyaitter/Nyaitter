@@ -7,7 +7,7 @@ const { normalizeNotificationRecord } = require('./notification');
 const {
 	canViewPost,
 	canViewPostWithContext,
-	createPostVisibilityContext,
+	extendPostVisibilityContext,
 	isPrivatePost,
 } = require('./postVisibility');
 const { getVisibleDmUnreadCount } = require('../services/DmVisibilityService');
@@ -318,7 +318,14 @@ async function fetchPostMetrics(db, postIds, currentUserId) {
  * Authors, metrics and up to two levels of reply/repost references are loaded
  * once per page rather than once per individual post.
  */
-async function serializePostsBatch(db, rootPosts, currentUserId = null, publicUrl = null) {
+async function serializePostsBatch(
+	db,
+	rootPosts,
+	currentUserId = null,
+	publicUrl = null,
+	knownViewer = null,
+	knownVisibilityContext = null,
+) {
 	const initialPosts = (rootPosts || []).filter(Boolean);
 	if (initialPosts.length === 0) return [];
 
@@ -355,17 +362,26 @@ async function serializePostsBatch(db, rootPosts, currentUserId = null, publicUr
 	}
 
 	const allPosts = [...postsById.values()];
-	const [users, metrics] = await Promise.all([
-		fetchUsersByIds(db, allPosts.map((post) => post.userId)),
+	const knownAuthorsById = knownVisibilityContext?.authorsById instanceof Map
+		? knownVisibilityContext.authorsById
+		: new Map();
+	const missingAuthorIds = [...new Set(allPosts
+		.map((post) => Number(post.userId))
+		.filter((authorId) => Number.isInteger(authorId) && !knownAuthorsById.has(authorId)))];
+	const [additionalUsers, metrics] = await Promise.all([
+		fetchUsersByIds(db, missingAuthorIds),
 		fetchPostMetrics(db, allPosts.map((post) => post.id), currentUserId),
 	]);
-	const usersById = new Map(users.map((user) => [Number(user.id), user]));
+	const usersById = new Map(knownAuthorsById);
+	for (const user of additionalUsers) usersById.set(Number(user.id), user);
 	const metricsByPostId = new Map(metrics.map((metric) => [Number(metric.post_id), metric]));
-	const visibilityContext = await createPostVisibilityContext(
+	const visibilityContext = await extendPostVisibilityContext(
 		db,
+		knownVisibilityContext,
 		allPosts,
 		currentUserId,
 		usersById,
+		knownViewer,
 	);
 	const visibleByPostId = new Map(allPosts.map((post) => [
 		Number(post.id),
@@ -447,9 +463,22 @@ async function serializePostsBatch(db, rootPosts, currentUserId = null, publicUr
 	return initialPosts.map((post) => compose(post)).filter(Boolean);
 }
 
-async function serializePost(db, post, currentUserId = null, depth = 0, publicUrl = null) {
+async function serializePost(
+	db,
+	post,
+	currentUserId = null,
+	depth = 0,
+	publicUrl = null,
+	knownViewer = null,
+) {
 	if (!post) return null;
-	const [serialized] = await serializePostsBatch(db, [post], currentUserId, publicUrl);
+	const [serialized] = await serializePostsBatch(
+		db,
+		[post],
+		currentUserId,
+		publicUrl,
+		knownViewer,
+	);
 	return serialized || null;
 }
 
@@ -489,11 +518,25 @@ async function serializeReply(db, post, currentUserId = null, publicUrl = null) 
 	};
 }
 
-async function serializePostsByIds(db, postIds, currentUserId = null, publicUrl = null) {
+async function serializePostsByIds(
+	db,
+	postIds,
+	currentUserId = null,
+	publicUrl = null,
+	knownViewer = null,
+	knownVisibilityContext = null,
+) {
 	const posts = await fetchPostsByIds(db, postIds);
 	const byId = new Map(posts.map((post) => [Number(post.id), post]));
 	const ordered = (postIds || []).map((id) => byId.get(Number(id))).filter(Boolean);
-	return serializePostsBatch(db, ordered, currentUserId, publicUrl);
+	return serializePostsBatch(
+		db,
+		ordered,
+		currentUserId,
+		publicUrl,
+		knownViewer,
+		knownVisibilityContext,
+	);
 }
 
 module.exports = {

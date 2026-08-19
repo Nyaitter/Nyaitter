@@ -19,6 +19,7 @@ function normalizePostIds(ids) {
 async function getDiscoverablePostPage({
 	db,
 	viewerId = null,
+	knownViewer = null,
 	limit = 30,
 	offset = 0,
 	beforeId = null,
@@ -43,6 +44,7 @@ async function getDiscoverablePostPage({
 	const collectedPosts = [];
 	let hasMore = false;
 	let requiresOffsetPagination = false;
+	let visibilityContext = null;
 
 	while (true) {
 		const candidatePage = await fetchCandidatePage({
@@ -74,22 +76,40 @@ async function getDiscoverablePostPage({
 		const orderedPosts = candidateIds
 			.map((id) => postsById.get(id))
 			.filter(Boolean);
-			const visibilityContext = await createPostVisibilityContext(
+			const candidateVisibilityContext = await createPostVisibilityContext(
 				db,
 				orderedPosts,
 				viewerId,
+				null,
+				knownViewer,
 			);
+			if (!visibilityContext) {
+				visibilityContext = candidateVisibilityContext;
+			} else {
+				for (const [authorId, author] of candidateVisibilityContext.authorsById) {
+					visibilityContext.authorsById.set(Number(authorId), author);
+				}
+				for (const authorId of candidateVisibilityContext.relationshipAuthorIds || []) {
+					visibilityContext.relationshipAuthorIds.add(authorId);
+				}
+				for (const authorId of candidateVisibilityContext.followingIds) {
+					visibilityContext.followingIds.add(authorId);
+				}
+				for (const authorId of candidateVisibilityContext.followerIds) {
+					visibilityContext.followerIds.add(authorId);
+				}
+			}
 			const viewablePosts = await filterViewablePosts(
 				db,
 				orderedPosts,
 				viewerId,
-				visibilityContext,
+				candidateVisibilityContext,
 			);
 			const discoverablePosts = await filterDiscoverablePosts(
 				db,
 				viewablePosts,
 				viewerId,
-				visibilityContext,
+				candidateVisibilityContext,
 			);
 
 		for (const post of discoverablePosts) {
@@ -119,6 +139,7 @@ async function getDiscoverablePostPage({
 	return {
 		ids,
 		posts,
+		visibilityContext,
 		has_more: hasMore,
 		use_offset_pagination: requiresOffsetPagination,
 		next_cursor: !requiresOffsetPagination && hasMore && ids.length > 0

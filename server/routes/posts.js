@@ -125,18 +125,35 @@ function safeParsePostId(idStr) {
 	return Number.isInteger(n) && n > 0 ? n : null;
 }
 
-async function getViewablePostIds(db, postIds, viewerId = null) {
+// 軽量なメトリクスAPIは投稿本体を返さないため、可視性検証だけを行う。
+async function getViewablePostIds(db, postIds, viewerId = null, knownViewer = null) {
 	const uniqueIds = [...new Set((postIds || []).map(Number).filter(Number.isInteger))];
 	if (uniqueIds.length === 0) return [];
 	const posts = await db.getPostsByIds(uniqueIds);
-	const viewable = await filterViewablePosts(db, posts, viewerId);
+	const visibilityContext = await createPostVisibilityContext(
+		db,
+		posts,
+		viewerId,
+		null,
+		knownViewer,
+	);
+	const viewable = await filterViewablePosts(db, posts, viewerId, visibilityContext);
 	const visibleIds = new Set(viewable.map((post) => Number(post.id)));
 	return uniqueIds.filter((id) => visibleIds.has(id));
 }
 
 async function getDiscoverableModePage(
 	db,
-	{ mode, tab = 'foryou', query = '', viewerId = null, limit, offset, beforeId = null },
+	{
+		mode,
+		tab = 'foryou',
+		query = '',
+		viewerId = null,
+		knownViewer = null,
+		limit,
+		offset,
+		beforeId = null,
+	},
 ) {
 	const followIds =
 		mode === 'timeline' && tab === 'following' && viewerId != null && db.getFollowIds
@@ -146,6 +163,7 @@ async function getDiscoverableModePage(
 	return getDiscoverablePostPage({
 		db,
 		viewerId,
+		knownViewer,
 		limit,
 		offset,
 		beforeId,
@@ -358,10 +376,17 @@ router.post('/', requireAuth, postWriteLimiter, async (req, res) => {
 router.get('/', optionalAuth, async (req, res) => {
 	const db = getDbAdapter(req);
 
-	try {
-					const posts = await db.getRecentPosts(config.limits.timelinePageSize);
-			const currentUserId = req.user ? req.user.id : null;
-			const visibilityContext = await createPostVisibilityContext(db, posts, currentUserId);
+		try {
+						const posts = await db.getRecentPosts(config.limits.timelinePageSize);
+				const currentUserId = req.user ? req.user.id : null;
+				const knownViewer = req.user?.visibilityUser || null;
+				const visibilityContext = await createPostVisibilityContext(
+					db,
+					posts,
+					currentUserId,
+					null,
+					knownViewer,
+				);
 				const viewablePosts = await filterViewablePosts(
 					db,
 					posts,
@@ -375,13 +400,14 @@ router.get('/', optionalAuth, async (req, res) => {
 				visibilityContext,
 			);
 
-			const enriched = await serializePostsBatch(
-				db,
-				discoverablePosts,
+				const enriched = await serializePostsBatch(
+					db,
+					discoverablePosts,
 
-				currentUserId,
-				getPublicUrl(req),
-			);
+					currentUserId,
+					getPublicUrl(req),
+					knownViewer,
+				);
 			res.json({ posts: enriched });
 
 	} catch (err) {
@@ -394,10 +420,17 @@ router.get('/trending', optionalAuth, async (req, res) => {
 	const db = getDbAdapter(req);
 	const limit = Math.min(parseInt(req.query.limit, 10) || 20, 50);
 
-	try {
-					const posts = await db.getTrendingPosts(limit);
-			const currentUserId = req.user ? req.user.id : null;
-			const visibilityContext = await createPostVisibilityContext(db, posts, currentUserId);
+		try {
+						const posts = await db.getTrendingPosts(limit);
+				const currentUserId = req.user ? req.user.id : null;
+				const knownViewer = req.user?.visibilityUser || null;
+				const visibilityContext = await createPostVisibilityContext(
+					db,
+					posts,
+					currentUserId,
+					null,
+					knownViewer,
+				);
 				const viewablePosts = await filterViewablePosts(
 					db,
 					posts,
@@ -416,6 +449,7 @@ router.get('/trending', optionalAuth, async (req, res) => {
 
 				currentUserId,
 				getPublicUrl(req),
+				knownViewer,
 			);
 			res.json({ posts: hydrated });
 
@@ -438,20 +472,29 @@ router.get('/search', optionalAuth, async (req, res) => {
 
 		try {
 			const currentUserId = req.user ? req.user.id : null;
-				const { posts: discoveredPosts = [], has_more, next_cursor } = await getDiscoverableModePage(db, {
-					mode: 'search',
-					query: q,
-					viewerId: currentUserId,
-					limit,
-					offset,
-					beforeId,
-				});
-				const posts = await serializePostsBatch(
-					db,
-					discoveredPosts,
-					currentUserId,
-					getPublicUrl(req),
-				);
+			const knownViewer = req.user?.visibilityUser || null;
+			const {
+				posts: discoveredPosts = [],
+				visibilityContext,
+				has_more,
+				next_cursor,
+			} = await getDiscoverableModePage(db, {
+				mode: 'search',
+				query: q,
+				viewerId: currentUserId,
+				knownViewer,
+				limit,
+				offset,
+				beforeId,
+			});
+			const posts = await serializePostsBatch(
+				db,
+				discoveredPosts,
+				currentUserId,
+				getPublicUrl(req),
+				knownViewer,
+				visibilityContext,
+			);
 				res.json({ posts, has_next: has_more, next_cursor });
 	} catch (err) {
 		console.error('[posts] search error:', err);
@@ -467,9 +510,16 @@ router.get('/recommended', optionalAuth, async (req, res) => {
 
 		try {
 			const currentUserId = req.user ? req.user.id : null;
-			const { posts: discoveredPosts = [], has_more, next_cursor } = await getDiscoverableModePage(db, {
+			const knownViewer = req.user?.visibilityUser || null;
+			const {
+				posts: discoveredPosts = [],
+				visibilityContext,
+				has_more,
+				next_cursor,
+			} = await getDiscoverableModePage(db, {
 				mode: 'recommended',
 				viewerId: currentUserId,
+				knownViewer,
 				limit,
 				offset,
 				beforeId,
@@ -479,6 +529,8 @@ router.get('/recommended', optionalAuth, async (req, res) => {
 				discoveredPosts,
 				currentUserId,
 				getPublicUrl(req),
+				knownViewer,
+				visibilityContext,
 			);
 			res.json({ posts, has_next: has_more, next_cursor });
 	} catch (err) {
@@ -495,6 +547,7 @@ router.get('/page', optionalAuth, async (req, res) => {
 	const beforeId = safeParsePostId(req.query.before_id);
 	const offset = beforeId == null ? Math.max(parseInt(req.query.offset, 10) || 0, 0) : 0;
 	const currentUserId = req.user ? req.user.id : null;
+	const knownViewer = req.user?.visibilityUser || null;
 
 		try {
 			let result = { ids: [], has_more: false };
@@ -509,6 +562,7 @@ router.get('/page', optionalAuth, async (req, res) => {
 					tab,
 					query: String(req.query.q || ''),
 					viewerId: currentUserId,
+					knownViewer,
 					limit,
 					offset,
 					beforeId,
@@ -554,12 +608,28 @@ router.get('/page', optionalAuth, async (req, res) => {
 			const discoveredPosts = isDiscoverableMode && Array.isArray(result.posts)
 				? result.posts
 				: null;
-			const viewableIds = discoveredPosts
+			const discoveredPostIds = discoveredPosts
 				? discoveredPosts.map((post) => Number(post.id))
-				: await getViewablePostIds(db, result.ids || [], currentUserId);
+				: null;
+			// serializePostsBatch() は可視性判定まで一括で行う。
+			// ここでの事前判定を省くことで、著者・閲覧者・フォロー関係の重複取得を防ぐ。
 			const posts = discoveredPosts
-				? await serializePostsBatch(db, discoveredPosts, currentUserId, getPublicUrl(req))
-				: await serializePostsByIds(db, viewableIds, currentUserId, getPublicUrl(req));
+				? await serializePostsBatch(
+					db,
+					discoveredPosts,
+					currentUserId,
+					getPublicUrl(req),
+					knownViewer,
+					result.visibilityContext || null,
+				)
+				: await serializePostsByIds(
+					db,
+					result.ids || [],
+					currentUserId,
+					getPublicUrl(req),
+					knownViewer,
+				);
+			const requestedPostCount = discoveredPostIds?.length ?? posts.length;
 		const postContext = collectPostContext(posts);
 		const authorIds = new Set(postContext.authors.keys());
 		const missingMentionIds = postContext.mentionedIds.filter((id) => !authorIds.has(id));
@@ -585,7 +655,7 @@ router.get('/page', optionalAuth, async (req, res) => {
 			},
 			meta: {
 				mode,
-				requested_count: viewableIds.length,
+				requested_count: requestedPostCount,
 				post_count: posts.length,
 				includes_metrics: true,
 			},
@@ -639,8 +709,15 @@ router.post('/hydrate', optionalAuth, async (req, res) => {
 		.filter((id) => Number.isInteger(id) && id > 0))].slice(0, config.limits.postBatchSize);
 
 	try {
-		const currentUserId = req.user ? req.user.id : null;
-		const posts = await serializePostsByIds(db, postIds, currentUserId, getPublicUrl(req));
+			const currentUserId = req.user ? req.user.id : null;
+			const knownViewer = req.user?.visibilityUser || null;
+			const posts = await serializePostsByIds(
+				db,
+				postIds,
+				currentUserId,
+				getPublicUrl(req),
+				knownViewer,
+			);
 		res.json({ posts });
 	} catch (err) {
 		console.error('[posts] hydrate error:', err);
@@ -655,8 +732,14 @@ router.post('/metrics', optionalAuth, async (req, res) => {
 		.filter((id) => Number.isInteger(id) && id > 0))].slice(0, config.limits.postBatchSize);
 
 	try {
-		const currentUserId = req.user ? req.user.id : null;
-		const viewableIds = await getViewablePostIds(db, postIds, currentUserId);
+			const currentUserId = req.user ? req.user.id : null;
+			const knownViewer = req.user?.visibilityUser || null;
+			const viewableIds = await getViewablePostIds(
+				db,
+				postIds,
+				currentUserId,
+				knownViewer,
+			);
 		const metrics = db.getPostMetricsBatch
 			? await db.getPostMetricsBatch(viewableIds, currentUserId)
 			: await Promise.all(viewableIds.map(async (postId) => ({
@@ -678,9 +761,10 @@ router.get('/:id/thread', optionalAuth, async (req, res) => {
 	const postId = safeParsePostId(req.params.id);
 	if (!postId) return res.status(400).json({ error: 'Invalid post id' });
 
-	try {
-		const currentUserId = req.user ? req.user.id : null;
-		const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 100);
+		try {
+			const currentUserId = req.user ? req.user.id : null;
+			const knownViewer = req.user?.visibilityUser || null;
+			const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 100);
 		const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
 		const root = await db.getPostById(postId);
 		const replyPage = await getThreadReplyPostIds(db, postId, limit, offset);
@@ -699,6 +783,7 @@ router.get('/:id/thread', optionalAuth, async (req, res) => {
 				orderedReplyPosts,
 				currentUserId,
 				getPublicUrl(req),
+				knownViewer,
 			);
 			if (replies.length === 0) {
 				return res.status(404).json({ error: 'Post not found' });
@@ -722,6 +807,7 @@ router.get('/:id/thread', optionalAuth, async (req, res) => {
 			[root, ...orderedReplyPosts],
 			currentUserId,
 			getPublicUrl(req),
+			knownViewer,
 		);
 		const mainPost = serializedPosts[0] || null;
 		if (!mainPost) {
@@ -745,6 +831,7 @@ router.get('/:id', optionalAuth, async (req, res) => {
 	const db = getDbAdapter(req);
 	const postId = safeParsePostId(req.params.id);
 	const currentUserId = req.user ? req.user.id : null;
+	const knownViewer = req.user?.visibilityUser || null;
 
 	if (!postId) {
 		return res.status(400).json({ error: 'Invalid post id' });
@@ -755,7 +842,14 @@ router.get('/:id', optionalAuth, async (req, res) => {
 		if (!post) {
 			return res.status(404).json({ error: 'Post not found' });
 		}
-		const serializedPost = await serializePost(db, post, currentUserId, 0, getPublicUrl(req));
+			const serializedPost = await serializePost(
+				db,
+				post,
+				currentUserId,
+				0,
+				getPublicUrl(req),
+				knownViewer,
+			);
 		if (!serializedPost) {
 			return res.status(404).json({ error: 'Post not found' });
 		}
@@ -771,6 +865,7 @@ router.get('/:id/replies', optionalAuth, async (req, res) => {
 	const db = getDbAdapter(req);
 	const postId = safeParsePostId(req.params.id);
 	const currentUserId = req.user ? req.user.id : null;
+	const knownViewer = req.user?.visibilityUser || null;
 
 	if (!postId) {
 		return res.status(400).json({ error: 'Invalid post id' });
@@ -795,6 +890,7 @@ router.get('/:id/replies', optionalAuth, async (req, res) => {
 			[root, ...orderedReplyPosts],
 			currentUserId,
 			getPublicUrl(req),
+			knownViewer,
 		);
 		if (!serializedPosts[0]) {
 			return res.status(404).json({ error: 'Post not found' });

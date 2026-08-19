@@ -52,7 +52,7 @@ async function getSessionPrincipal(req, token) {
   }
   if (!user) return null;
 
-  return {
+  const principal = {
     id: user.id,
     tokenType: 'session',
     // Push購読と同じハッシュを使い、WebSocket接続中の同一セッションを判定する。
@@ -62,6 +62,11 @@ async function getSessionPrincipal(req, token) {
     frozen: Boolean(user.freeze),
     accountOperation: user.account_operation || null,
   };
+  Object.defineProperty(principal, 'visibilityUser', {
+    value: user,
+    enumerable: false,
+  });
+  return principal;
 }
 
 async function getAuthenticatedPrincipal(req) {
@@ -79,7 +84,7 @@ async function getAuthenticatedPrincipal(req) {
       // 所有者が凍結済みの場合、Botトークン経由で制限を回避させない。
       const owner = await req.app.locals.dbAdapter.getUserById(botInfo.userId);
       if (!owner) return null;
-      return {
+      const principal = {
         id: botInfo.userId,
         tokenType: 'bot',
         isBot: true,
@@ -88,6 +93,11 @@ async function getAuthenticatedPrincipal(req) {
         frozen: Boolean(owner.freeze),
         accountOperation: owner.account_operation || null,
       };
+      Object.defineProperty(principal, 'visibilityUser', {
+        value: owner,
+        enumerable: false,
+      });
+      return principal;
     }
   }
 

@@ -112,17 +112,29 @@ async function getFollowRelationshipSnapshot(db, viewerId, authorIds) {
  * 候補投稿者に限定した関係スナップショットで判定するため、投稿件数に比例した
  * DB/Worker呼び出しを発生させない。
  */
-async function createPostVisibilityContext(db, posts, viewerId = null, authorsById = null) {
+async function createPostVisibilityContext(
+	db,
+	posts,
+	viewerId = null,
+	authorsById = null,
+	knownViewer = null,
+) {
 	const values = (posts || []).filter(Boolean);
 	const normalizedViewerId = normalizeUserId(viewerId);
 	const resolvedAuthorsById = authorsById || await getAuthorsById(db, values);
 	const authorIds = [...new Set(values
 		.map(getPostAuthorId)
 		.filter((id) => id != null))];
+	const canReuseKnownViewer = normalizedViewerId != null
+		&& Number(knownViewer?.id) === normalizedViewerId
+		&& Object.prototype.hasOwnProperty.call(knownViewer, 'settings')
+		&& Object.prototype.hasOwnProperty.call(knownViewer, 'block');
 	const [viewer, followSnapshot] = await Promise.all([
-		normalizedViewerId != null && typeof db.getUserById === 'function'
-			? db.getUserById(normalizedViewerId)
-			: null,
+		canReuseKnownViewer
+			? knownViewer
+			: normalizedViewerId != null && typeof db.getUserById === 'function'
+				? db.getUserById(normalizedViewerId)
+				: null,
 		getFollowRelationshipSnapshot(db, normalizedViewerId, authorIds),
 	]);
 
@@ -133,6 +145,76 @@ async function createPostVisibilityContext(db, posts, viewerId = null, authorsBy
 		viewerBlockedIds: new Set(normalizeBlockList(viewer?.block, viewer?.id)),
 		followingIds: followSnapshot.followingIds,
 		followerIds: followSnapshot.followerIds,
+		relationshipAuthorIds: new Set(authorIds.filter((id) => id !== normalizedViewerId)),
+	};
+}
+
+/**
+ * 既存の可視性コンテキストを、追加の投稿者に必要な関係だけ取得して拡張する。
+ * 投稿参照の投稿者が探索結果の候補に含まれていない場合も、公開範囲を緩めずに判定できる。
+ */
+async function extendPostVisibilityContext(
+	db,
+	visibilityContext,
+	posts,
+	viewerId = null,
+	authorsById = null,
+	knownViewer = null,
+) {
+	const normalizedViewerId = normalizeUserId(viewerId);
+	if (!visibilityContext || visibilityContext.viewerId !== normalizedViewerId) {
+		return createPostVisibilityContext(db, posts, viewerId, authorsById, knownViewer);
+	}
+
+	const values = (posts || []).filter(Boolean);
+	const resolvedAuthorsById = authorsById || await getAuthorsById(db, values);
+	const mergedAuthorsById = new Map(visibilityContext.authorsById || []);
+	for (const [authorId, author] of resolvedAuthorsById) {
+		mergedAuthorsById.set(Number(authorId), author);
+	}
+
+	const authorIds = [...new Set(values
+		.map(getPostAuthorId)
+		.filter((id) => id != null))];
+	const knownRelationshipAuthorIds = new Set(
+		[...(visibilityContext.relationshipAuthorIds || [])]
+			.map(normalizeUserId)
+			.filter((id) => id != null),
+	);
+	const missingRelationshipAuthorIds = authorIds.filter((authorId) => (
+		authorId !== normalizedViewerId && !knownRelationshipAuthorIds.has(authorId)
+	));
+	const additionalRelationships = await getFollowRelationshipSnapshot(
+		db,
+		normalizedViewerId,
+		missingRelationshipAuthorIds,
+	);
+	for (const authorId of missingRelationshipAuthorIds) knownRelationshipAuthorIds.add(authorId);
+
+	const viewer = visibilityContext.viewer || (
+		normalizedViewerId != null && Number(knownViewer?.id) === normalizedViewerId
+			? knownViewer
+			: null
+	);
+	if (normalizedViewerId != null && !viewer) {
+		return createPostVisibilityContext(db, posts, viewerId, mergedAuthorsById, knownViewer);
+	}
+	return {
+		viewerId: normalizedViewerId,
+		viewer,
+		authorsById: mergedAuthorsById,
+		viewerBlockedIds: new Set(
+			visibilityContext.viewerBlockedIds || normalizeBlockList(viewer?.block, viewer?.id),
+		),
+		followingIds: new Set([
+			...(visibilityContext.followingIds || []),
+			...additionalRelationships.followingIds,
+		]),
+		followerIds: new Set([
+			...(visibilityContext.followerIds || []),
+			...additionalRelationships.followerIds,
+		]),
+		relationshipAuthorIds: knownRelationshipAuthorIds,
 	};
 }
 
@@ -209,6 +291,7 @@ module.exports = {
 	filterViewablePosts,
 	filterDiscoverablePosts,
 	createPostVisibilityContext,
+	extendPostVisibilityContext,
 	getFollowRelationshipSnapshot,
 	getPostAuthorId,
 	getAuthorsById,
