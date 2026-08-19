@@ -40,6 +40,16 @@ class StorageAdapter {
   }
 
   /**
+   * 保存済みファイルを別のキーへ複製する。ソースは削除しない。
+   * @param {string} sourceFileId
+   * @param {string} destinationFileId
+   * @returns {Promise<{id: string, key: string, url: string|null}>}
+   */
+  async copy(sourceFileId, destinationFileId) {
+    throw new Error('copy() must be implemented');
+  }
+
+  /**
    * 複数ファイルを一括削除
    * @param {string[]} fileIds
    * @returns {Promise<void>}

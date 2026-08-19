@@ -518,6 +518,14 @@ class D1Adapter extends DatabaseAdapter {
 		return Array.isArray(keys) ? keys.filter((key) => typeof key === 'string') : [];
 	}
 
+	async rewriteAccountAttachmentKeys(userId, replacements) {
+		const result = await this._write(
+			`/users/${requireId(userId, 'userId')}/account/attachments/rewrite`,
+			{ replacements: Array.isArray(replacements) ? replacements : [] },
+		);
+		return Math.max(0, Number(result?.updatedCount) || 0);
+	}
+
 	async deleteAccount(userId) {
 		const result = await this._write(`/users/${requireId(userId, 'userId')}/account/delete`);
 		return result === true || Boolean(result?.success);

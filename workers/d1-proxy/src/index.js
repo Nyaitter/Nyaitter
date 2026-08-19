@@ -73,6 +73,39 @@ function parseJsonSafe(value, fallback = null) {
 	}
 }
 
+function createAttachmentReplacementMap(replacements) {
+	const replacementMap = new Map();
+	for (const replacement of Array.isArray(replacements) ? replacements : []) {
+		const sourceKey = typeof replacement?.sourceKey === 'string' ? replacement.sourceKey : null;
+		const destinationKey = typeof replacement?.destinationKey === 'string' ? replacement.destinationKey : null;
+		if (!sourceKey || !destinationKey) continue;
+		replacementMap.set(sourceKey, { destinationKey, url: replacement.url ?? null });
+	}
+	return replacementMap;
+}
+
+function rewriteAttachmentReferences(attachments, replacementMap) {
+	if (!Array.isArray(attachments) || replacementMap.size === 0) {
+		return { attachments: Array.isArray(attachments) ? attachments : [], changed: false };
+	}
+	let changed = false;
+	const rewritten = attachments.map((attachment) => {
+		if (!attachment || typeof attachment !== 'object' || Array.isArray(attachment)) return attachment;
+		const sourceKey = typeof attachment.id === 'string'
+			? attachment.id
+			: (typeof attachment.key === 'string' ? attachment.key : null);
+		const replacement = sourceKey ? replacementMap.get(sourceKey) : null;
+		if (!replacement) return attachment;
+		changed = true;
+		const next = { ...attachment };
+		if (typeof attachment.id === 'string') next.id = replacement.destinationKey;
+		if (typeof attachment.key === 'string') next.key = replacement.destinationKey;
+		if (Object.prototype.hasOwnProperty.call(next, 'url')) next.url = replacement.url;
+		return next;
+	});
+	return { attachments: rewritten, changed };
+}
+
 const MIGRATION_TABLES = [
 	'users', 'sessions', 'trusted_login_ips', 'login_approvals', 'bot_tokens', 'posts',
 	'likes', 'stars', 'reposts', 'pinned_posts', 'follows', 'dm_channels', 'dm_messages',
@@ -783,19 +816,34 @@ export default {
 						return json(normalizeUserRow(await db.prepare('SELECT * FROM users WHERE id = ?').bind(nextId).first()));
 					}
 
-				if (method === 'GET' && pathname.match(/^\/users\/(\d+)\/account\/attachments$/)) {
-					const userId = Number(pathname.split('/')[2]);
-					const { results } = await db.prepare('SELECT attachments FROM posts WHERE user_id = ?').bind(userId).all();
-					const keys = new Set();
-					for (const row of results || []) {
-						for (const attachment of parseJsonSafe(row.attachments, [])) {
-															const key = attachment?.id || attachment?.key;
-								if (typeof key === 'string' && key.startsWith('attachments/')) keys.add(key);
-
+					if (method === 'POST' && pathname.match(/^\/users\/(\d+)\/account\/attachments\/rewrite$/)) {
+						const userId = Number(pathname.split('/')[2]);
+						const body = await request.json();
+						const replacementMap = createAttachmentReplacementMap(body?.replacements);
+						if (replacementMap.size === 0) return json({ updatedCount: 0 });
+						const { results } = await db.prepare('SELECT id, attachments FROM posts WHERE user_id = ?').bind(userId).all();
+						const statements = [];
+						for (const row of results || []) {
+							const { attachments, changed } = rewriteAttachmentReferences(parseJsonSafe(row.attachments, []), replacementMap);
+							if (!changed) continue;
+							statements.push(db.prepare('UPDATE posts SET attachments = ? WHERE id = ?').bind(JSON.stringify(attachments), row.id));
 						}
+						if (statements.length > 0) await db.batch(statements);
+						return json({ updatedCount: statements.length });
 					}
-					return json([...keys]);
-				}
+
+					if (method === 'GET' && pathname.match(/^\/users\/(\d+)\/account\/attachments$/)) {
+						const userId = Number(pathname.split('/')[2]);
+						const { results } = await db.prepare('SELECT attachments FROM posts WHERE user_id = ?').bind(userId).all();
+						const keys = new Set();
+						for (const row of results || []) {
+							for (const attachment of parseJsonSafe(row.attachments, [])) {
+								const key = attachment?.id || attachment?.key;
+								if (typeof key === 'string' && key.startsWith('attachments/')) keys.add(key);
+							}
+						}
+						return json([...keys]);
+					}
 
 				if (method === 'POST' && pathname.match(/^\/users\/(\d+)\/account\/delete$/)) {
 					const userId = Number(pathname.split('/')[2]);

@@ -7,6 +7,10 @@ const {
 } = require('../../utils/nyaitterAddress');
 const { normalizeTarget } = require('../../utils/notification');
 const { normalizeBlockList } = require('../../utils/blockList');
+const {
+	createAttachmentReplacementMap,
+	rewriteAttachmentReferences,
+} = require('../../utils/attachmentKeys');
 
 class InMemoryAdapter extends DatabaseAdapter {
 	constructor() {
@@ -2368,6 +2372,20 @@ class InMemoryAdapter extends DatabaseAdapter {
 			}
 		}
 		return [...keys];
+	}
+
+	async rewriteAccountAttachmentKeys(userId, replacements) {
+		const replacementMap = createAttachmentReplacementMap(replacements);
+		if (replacementMap.size === 0) return 0;
+		let updatedCount = 0;
+		for (const post of this.posts.values()) {
+			if (Number(post.userId) !== Number(userId)) continue;
+			const { attachments, changed } = rewriteAttachmentReferences(post.attachments, replacementMap);
+			if (!changed) continue;
+			post.attachments = attachments;
+			updatedCount += 1;
+		}
+		return updatedCount;
 	}
 
 	async deleteAccount(userId) {

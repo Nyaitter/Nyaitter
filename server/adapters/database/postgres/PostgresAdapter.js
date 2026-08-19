@@ -9,6 +9,10 @@ const appConfig = require('../../../config');
 const { normalizeTarget } = require('../../../utils/notification');
 const { normalizeBlockList } = require('../../../utils/blockList');
 const {
+	createAttachmentReplacementMap,
+	rewriteAttachmentReferences,
+} = require('../../../utils/attachmentKeys');
+const {
 	createSnapshot,
 	normalizeSnapshot,
 } = require('../../../services/DataMigrationService');
@@ -983,14 +987,25 @@ class PostgresAdapter extends DatabaseAdapter {
 					GROUP BY r.post_id
 				)${personalScoreCtes.length > 0 ? `, ${personalScoreCtes.join(', ')}` : ''}, scored AS (
 					SELECT c.id, c.created_at,
-						48.0 / (1.0 + GREATEST(0, EXTRACT(EPOCH FROM (NOW() - c.created_at)) / 3600.0) / 6.0)
-						+ LEAST(22.0,
-							COALESCE(l.count, 0) * 4.0 / (COALESCE(l.count, 0) + 4.0)
-							+ COALESCE(s.count, 0) * 8.0 / (COALESCE(s.count, 0) + 2.0)
-							+ COALESCE(r.count, 0) * 10.0 / (COALESCE(r.count, 0) + 2.0))
-						${normalizedViewerId != null ? `+ CASE WHEN df.user_id IS NOT NULL THEN 24.0 WHEN sdf.user_id IS NOT NULL THEN 10.0 ELSE 0.0 END
-						+ LEAST(20.0, COALESCE(vla.count, 0) * 4.0)
-						+ LEAST(32.0, COALESCE(vsa.count, 0) * 8.0)` : ''} AS score
+						48::DECIMAL / (
+							1::DECIMAL + GREATEST(
+								0::DECIMAL,
+								EXTRACT(EPOCH FROM (NOW() - c.created_at))::DECIMAL / 3600::DECIMAL
+							) / 6::DECIMAL
+						)
+						+ LEAST(
+							22::DECIMAL,
+							COALESCE(l.count, 0)::DECIMAL * 4::DECIMAL / (COALESCE(l.count, 0)::DECIMAL + 4::DECIMAL)
+							+ COALESCE(s.count, 0)::DECIMAL * 8::DECIMAL / (COALESCE(s.count, 0)::DECIMAL + 2::DECIMAL)
+							+ COALESCE(r.count, 0)::DECIMAL * 10::DECIMAL / (COALESCE(r.count, 0)::DECIMAL + 2::DECIMAL)
+						)
+						${normalizedViewerId != null ? `+ CASE
+							WHEN df.user_id IS NOT NULL THEN 24::DECIMAL
+							WHEN sdf.user_id IS NOT NULL THEN 10::DECIMAL
+							ELSE 0::DECIMAL
+						END
+						+ LEAST(20::DECIMAL, COALESCE(vla.count, 0)::DECIMAL * 4::DECIMAL)
+						+ LEAST(32::DECIMAL, COALESCE(vsa.count, 0)::DECIMAL * 8::DECIMAL)` : ''} AS score
 					FROM candidates c
 					LEFT JOIN like_counts l ON l.post_id = c.id
 					LEFT JOIN star_counts s ON s.post_id = c.id
@@ -1010,7 +1025,7 @@ class PostgresAdapter extends DatabaseAdapter {
 					(SELECT COUNT(*)::int FROM candidate_source) AS candidate_count
 				FROM scored s
 				CROSS JOIN score_stats stats
-				WHERE s.score >= stats.average_score * 0.75`,
+					WHERE s.score >= stats.average_score * 0.75::DECIMAL`,
 				values,
 			);
 			const ids = Array.isArray(rows[0]?.ids)
@@ -2245,42 +2260,55 @@ class PostgresAdapter extends DatabaseAdapter {
 			}
 			if (nextId == null) throw new Error('Could not allocate a unique Nyaitter ID');
 
-			await client.query(
-				`UPDATE users
-					 SET "block" = COALESCE((
-						SELECT jsonb_agg(CASE WHEN value = to_jsonb($1::int) THEN to_jsonb($2::int) ELSE value END)
-						FROM jsonb_array_elements(COALESCE("block", '[]'::jsonb)) AS value
-					 ), '[]'::jsonb)
-					 WHERE "block" @> jsonb_build_array(to_jsonb($1::int))`,
-				[previousId, nextId],
-			);
-			await client.query(
-				'UPDATE dm_channels SET participants = array_replace(participants, $1, $2) WHERE $1 = ANY(participants)',
-				[previousId, nextId],
-			);
-			await client.query(
-				`UPDATE group_dms
-				 SET member = array_replace(member, $1, $2),
-					 post = COALESCE((
+				await client.query(
+					`UPDATE users
+						 SET "block" = COALESCE((
 						SELECT jsonb_agg(CASE
-							WHEN message->>'userid' = $1::text THEN jsonb_set(message, '{userid}', to_jsonb($2::int), true)
+							WHEN value = (($1::integer)::text)::jsonb THEN (($2::integer)::text)::jsonb
+							ELSE value
+						END)
+						FROM jsonb_array_elements(COALESCE("block", '[]'::jsonb)) AS value
+						 ), '[]'::jsonb)
+						 WHERE "block" @> (('[' || $1::integer::text || ']')::jsonb)`,
+					[previousId, nextId],
+				);
+				await client.query(
+					`UPDATE dm_channels
+					 SET participants = ARRAY(
+						SELECT CASE WHEN participant = $1::integer THEN $2::integer ELSE participant END
+						FROM unnest(participants) AS participant
+					 )
+					 WHERE $1::integer = ANY(participants)`,
+					[previousId, nextId],
+				);
+				await client.query(
+					`UPDATE group_dms
+					 SET member = ARRAY(
+						SELECT CASE WHEN member_id = $1::integer THEN $2::integer ELSE member_id END
+						FROM unnest(member) AS member_id
+					 ),
+						 post = COALESCE((
+						SELECT jsonb_agg(CASE
+							WHEN message->>'userid' = $1::integer::text
+								THEN jsonb_set(message, '{userid}', (($2::integer)::text)::jsonb, true)
 							ELSE message
 						END)
 						FROM jsonb_array_elements(COALESCE(post, '[]'::jsonb)) AS message
-					 ), '[]'::jsonb),
-					 unread = CASE
-						WHEN unread ? $1::text THEN (unread - $1::text) || jsonb_build_object($2::text, unread -> $1::text)
+						 ), '[]'::jsonb),
+						 unread = CASE
+						WHEN unread ? $1::integer::text
+							THEN (unread - $1::integer::text) || jsonb_build_object($2::integer::text, unread -> $1::integer::text)
 						ELSE unread
-					 END
-				 WHERE $1 = ANY(member) OR host_id = $1 OR unread ? $1::text`,
-				[previousId, nextId],
-			);
-			await client.query(
-				`UPDATE notifications
-				 SET target = jsonb_set(target, '{id}', to_jsonb($2::int), false)
-				 WHERE target->>'kind' = 'user' AND target->>'id' = $1::text`,
-				[previousId, nextId],
-			);
+						 END
+					 WHERE $1::integer = ANY(member) OR host_id = $1::integer OR unread ? $1::integer::text`,
+					[previousId, nextId],
+				);
+				await client.query(
+					`UPDATE notifications
+					 SET target = jsonb_set(target, '{id}', (($2::integer)::text)::jsonb, false)
+					 WHERE target->>'kind' = 'user' AND target->>'id' = $1::integer::text`,
+					[previousId, nextId],
+				);
 			const { rows: reportRows } = await client.query(
 				'SELECT id, target_kind, target_id, target_snapshot, excluded_admin_ids FROM moderation_reports FOR UPDATE',
 			);
@@ -2329,6 +2357,28 @@ class PostgresAdapter extends DatabaseAdapter {
 			}
 		}
 		return [...keys];
+	}
+
+	async rewriteAccountAttachmentKeys(userId, replacements) {
+		const replacementMap = createAttachmentReplacementMap(replacements);
+		if (replacementMap.size === 0) return 0;
+		return this._withTransaction(async (client) => {
+			const { rows } = await client.query(
+				'SELECT id, attachments FROM posts WHERE user_id = $1 FOR UPDATE',
+				[userId],
+			);
+			let updatedCount = 0;
+			for (const row of rows) {
+				const { attachments, changed } = rewriteAttachmentReferences(row.attachments, replacementMap);
+				if (!changed) continue;
+				await client.query(
+					'UPDATE posts SET attachments = $2::jsonb WHERE id = $1',
+					[row.id, JSON.stringify(attachments)],
+				);
+				updatedCount += 1;
+			}
+			return updatedCount;
+		});
 	}
 
 	async deleteAccount(userId) {

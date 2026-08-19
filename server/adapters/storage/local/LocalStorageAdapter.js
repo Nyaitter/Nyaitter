@@ -96,6 +96,18 @@ class LocalStorageAdapter extends StorageAdapter {
     };
   }
 
+  async copy(sourceFileId, destinationFileId) {
+    const { resolvedPath: sourcePath } = this._resolveStorageKey(sourceFileId);
+    const { normalizedKey: destinationKey, resolvedPath: destinationPath } = this._resolveStorageKey(destinationFileId);
+    await this._ensureDir(path.dirname(destinationPath));
+    await fs.copyFile(sourcePath, destinationPath, fs.constants.COPYFILE_EXCL);
+    return {
+      id: destinationKey,
+      key: destinationKey,
+      url: this._getPublicUrl(destinationKey),
+    };
+  }
+
   async deleteMany(fileIds) {
     await Promise.all(fileIds.map((id) => this.delete(id)));
   }

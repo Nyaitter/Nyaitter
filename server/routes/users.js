@@ -13,6 +13,7 @@ const {
 } = require('../utils/serialize');
 const { getPublicUrl, getUserNyaitterId } = require('../utils/nyaitterAddress');
 const { filterViewablePosts } = require('../utils/postVisibility');
+const { isOwnedAttachmentKey, normalizeStorageKey } = require('../adapters/storage/safeStoragePath');
 const { ScratchIconService } = require('../services/ScratchIconService');
 const {
 	createNotificationIfAllowed,
@@ -50,6 +51,54 @@ async function deleteStoredAccountAttachments(storage, keys) {
 	} catch (error) {
 		console.warn('[users] account attachment deletion failed:', error.message);
 	}
+}
+
+function buildReassignedAttachmentKey(sourceKey, previousUserId, nextUserId) {
+	if (!isOwnedAttachmentKey(sourceKey, previousUserId)) return null;
+	const sourcePrefix = `attachments/${Number(previousUserId)}/`;
+	if (!sourceKey.startsWith(sourcePrefix)) return null;
+	return normalizeStorageKey(`attachments/${Number(nextUserId)}/${sourceKey.slice(sourcePrefix.length)}`);
+}
+
+async function migrateReassignedAccountAttachments(db, storage, previousUserId, nextUserId) {
+	if (!db || typeof db.getAccountAttachmentKeys !== 'function' || typeof db.rewriteAccountAttachmentKeys !== 'function') {
+		throw new Error('Database adapter does not support attachment key rewrite');
+	}
+
+	const plannedCopies = [];
+	for (const sourceKey of await db.getAccountAttachmentKeys(nextUserId)) {
+		let destinationKey;
+		try {
+			destinationKey = buildReassignedAttachmentKey(sourceKey, previousUserId, nextUserId);
+		} catch (_) {
+			continue;
+		}
+		if (destinationKey) plannedCopies.push({ sourceKey, destinationKey });
+	}
+	if (plannedCopies.length === 0) return 0;
+	if (!storage || typeof storage.copy !== 'function') {
+		throw new Error('Storage adapter does not support attachment copy');
+	}
+
+	const replacements = [];
+	for (const { sourceKey, destinationKey } of plannedCopies) {
+		const copied = await storage.copy(sourceKey, destinationKey);
+		replacements.push({
+			sourceKey,
+			destinationKey,
+			url: copied?.url ?? null,
+		});
+	}
+	await db.rewriteAccountAttachmentKeys(nextUserId, replacements);
+	try {
+		const sourceKeys = replacements.map((replacement) => replacement.sourceKey);
+		if (typeof storage.deleteMany === 'function') await storage.deleteMany(sourceKeys);
+		else if (typeof storage.delete === 'function') await Promise.all(sourceKeys.map((sourceKey) => storage.delete(sourceKey)));
+	} catch (error) {
+		// 参照更新後の旧キー削除に失敗しても、新しい参照と複製済みファイルは維持する。
+		console.warn('[users] reassigned account attachment cleanup failed:', error.message);
+	}
+	return replacements.length;
 }
 
 function getDbAdapter(req) {
@@ -698,6 +747,12 @@ router.post('/me/nyaitter-id/reassign', requireAuthAllowFrozen, requireInteracti
 			if (!updated) throw new Error('Nyaitter ID reassignment did not complete');
 			const reassignedUserId = Number(updated.id);
 			operationUserId = reassignedUserId;
+			await migrateReassignedAccountAttachments(
+				db,
+				getStorageAdapter(req),
+				userId,
+				reassignedUserId,
+			);
 			const completedUser = await db.finishAccountOperation(reassignedUserId, 'reassigning') || updated;
 			const notification = await db.createNotification({
 				userId: reassignedUserId,

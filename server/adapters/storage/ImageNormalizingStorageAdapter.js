@@ -83,6 +83,10 @@ class ImageNormalizingStorageAdapter extends StorageAdapter {
     return this.storageAdapter.read(fileId);
   }
 
+  async copy(sourceFileId, destinationFileId) {
+    return this.storageAdapter.copy(sourceFileId, destinationFileId);
+  }
+
   async getUsage(folder) {
     return this.storageAdapter.getUsage(folder);
   }

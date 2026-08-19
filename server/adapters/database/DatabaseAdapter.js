@@ -102,6 +102,9 @@ class DatabaseAdapter {
 	async getAccountAttachmentKeys(userId) {
 		throw new Error('getAccountAttachmentKeys() must be implemented');
 	}
+	async rewriteAccountAttachmentKeys(userId, replacements) {
+		throw new Error('rewriteAccountAttachmentKeys() must be implemented');
+	}
 
 	// 全アダプター間のデータ移行に使う中立スナップショット。
 	async exportDataSnapshot() {

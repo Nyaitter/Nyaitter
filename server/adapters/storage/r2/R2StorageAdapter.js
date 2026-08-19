@@ -200,6 +200,24 @@ class R2StorageAdapter extends StorageAdapter {
     };
   }
 
+  async copy(sourceFileId, destinationFileId) {
+    const sourceKey = normalizeStorageKey(sourceFileId);
+    const destinationKey = normalizeStorageKey(destinationFileId);
+    const source = await this.read(sourceKey);
+    await this._send(new PutObjectCommand({
+      Bucket: this.bucket,
+      Key: destinationKey,
+      Body: source.buffer,
+      ContentType: source.contentType || 'application/octet-stream',
+      CacheControl: this.cacheControl || undefined,
+    }));
+    return {
+      id: destinationKey,
+      key: destinationKey,
+      url: this._getPublicUrlForKey(destinationKey),
+    };
+  }
+
   async deleteMany(fileIds) {
     const keys = [...new Set((fileIds || []).map((fileId) => normalizeStorageKey(fileId)))];
     if (keys.length === 0) return;
