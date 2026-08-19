@@ -412,11 +412,9 @@ router.post('/login-approvals/:approvalId/poll', async (req, res) => {
 
 router.get('/me', requireAuthAllowFrozen, async (req, res) => {
   const db = getDbAdapter(req);
-  const user = await db.getUserById(req.user.id);
-
-  if (!user) {
-    return res.status(404).json({ error: 'User not found' });
-  }
+  // requireAuthAllowFrozenはセッション・Bot認証時に完全なユーザー行を設定済み。
+  // auth/meで同じユーザーを再取得せず、リモートPostgreSQLへの往復を1回省く。
+  const user = req.user;
 
   res.json({
     user: await serializeUser(db, user, req.user.id, getPublicUrl(req)),

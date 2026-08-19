@@ -635,12 +635,43 @@ class PostgresAdapter extends DatabaseAdapter {
 		return this._normalizePost(row);
 	}
 
-	async getPostsByIds(postIds) {
+		async getPostsByIds(postIds) {
 		const ids = [...new Set((postIds || []).map(Number).filter(Number.isInteger))];
 		if (ids.length === 0) return [];
 		const { rows } = await this.pool.query(
 			'SELECT * FROM posts WHERE id = ANY($1::int[])',
 			[ids],
+		);
+		return rows.map((row) => this._normalizePost(row));
+	}
+
+	async getPostReferencesByIds(postIds, maxDepth = 2) {
+		const ids = [...new Set((postIds || []).map(Number)
+			.filter((id) => Number.isSafeInteger(id) && id > 0))];
+		const normalizedMaxDepth = Math.min(4, Math.max(0, Number(maxDepth) || 0));
+		if (ids.length === 0) return [];
+		const { rows } = await this.pool.query(
+			`WITH RECURSIVE post_references AS (
+				SELECT p.id, 0 AS depth, ARRAY[p.id] AS path
+				FROM posts p WHERE p.id = ANY($1::int[])
+				UNION ALL
+				SELECT target.id, refs.depth + 1, refs.path || target.id
+				FROM post_references refs
+				JOIN LATERAL (
+					SELECT reply_to, repost_to FROM posts WHERE id = refs.id LIMIT 1
+				) source ON TRUE
+				CROSS JOIN LATERAL (VALUES (source.reply_to), (source.repost_to)) AS target(id)
+				WHERE refs.depth < $2
+					AND target.id IS NOT NULL
+					AND NOT target.id = ANY(refs.path)
+			), nearest_references AS (
+				SELECT DISTINCT ON (id) id, depth
+				FROM post_references
+				ORDER BY id, depth ASC
+			)
+			SELECT p.* FROM nearest_references refs
+			JOIN LATERAL (SELECT * FROM posts WHERE id = refs.id LIMIT 1) p ON TRUE`,
+			[ids, normalizedMaxDepth],
 		);
 		return rows.map((row) => this._normalizePost(row));
 	}
@@ -1221,6 +1252,110 @@ class PostgresAdapter extends DatabaseAdapter {
 			[userId, postId]
 		);
 		return rows.length > 0;
+	}
+
+	async getUserAccountState(userId) {
+		const { rows } = await this.pool.query(
+			`SELECT
+				COALESCE((
+					SELECT array_agg(following_id ORDER BY created_at DESC, following_id ASC)
+					FROM follows WHERE follower_id = $1
+				), ARRAY[]::INTEGER[]) AS follow_ids,
+				COALESCE((
+					SELECT array_agg(post_id ORDER BY created_at DESC)
+					FROM likes WHERE user_id = $1
+				), ARRAY[]::INTEGER[]) AS like_ids,
+				COALESCE((
+					SELECT array_agg(post_id ORDER BY created_at DESC)
+					FROM stars WHERE user_id = $1
+				), ARRAY[]::INTEGER[]) AS star_ids,
+				(
+					SELECT post_id FROM pinned_posts WHERE user_id = $1
+					ORDER BY created_at DESC LIMIT 1
+				) AS pinned_post_id`,
+			[userId],
+		);
+		const normalizeIds = (values) => (Array.isArray(values) ? values : [])
+			.map(Number)
+			.filter((id) => Number.isSafeInteger(id) && id > 0);
+		const state = rows[0] || {};
+		return {
+			follow: normalizeIds(state.follow_ids),
+			like: normalizeIds(state.like_ids),
+			star: normalizeIds(state.star_ids),
+			pin: state.pinned_post_id != null && Number.isSafeInteger(Number(state.pinned_post_id))
+				? Number(state.pinned_post_id)
+				: null,
+		};
+	}
+
+	async getUserBootstrapData(userId, notificationLimit = 200) {
+		const normalizedLimit = Math.min(Math.max(Number(notificationLimit) || 200, 1), 200);
+		const { rows } = await this.pool.query(
+			`WITH notification_rows AS MATERIALIZED (
+				SELECT * FROM notifications
+				WHERE user_id = $1
+				ORDER BY created_at DESC
+				LIMIT $2
+			), notification_users AS MATERIALIZED (
+				SELECT DISTINCT u.id, u.account_operation, u.name, u.scid, u.icon_data,
+					u.handle, u.nyaitter_address, u.auth_provider, u.provider_domain,
+					u.external_id, u.settings, u."block", u.bio, u.header_image,
+					u.verify, u.admin, u."freeze", u.shadow, u.uuid, u.created_at
+				FROM users u
+				JOIN notification_rows n ON n.from_user_id = u.id
+			), notification_posts AS MATERIALIZED (
+				SELECT DISTINCT p.id, p.content
+				FROM posts p
+				JOIN notification_rows n ON n.post_id = p.id
+			)
+			SELECT
+				COALESCE((
+					SELECT array_agg(following_id ORDER BY created_at DESC, following_id ASC)
+					FROM follows WHERE follower_id = $1
+				), ARRAY[]::INTEGER[]) AS follow_ids,
+				COALESCE((
+					SELECT array_agg(post_id ORDER BY created_at DESC)
+					FROM likes WHERE user_id = $1
+				), ARRAY[]::INTEGER[]) AS like_ids,
+				COALESCE((
+					SELECT array_agg(post_id ORDER BY created_at DESC)
+					FROM stars WHERE user_id = $1
+				), ARRAY[]::INTEGER[]) AS star_ids,
+				(
+					SELECT post_id FROM pinned_posts WHERE user_id = $1
+					ORDER BY created_at DESC LIMIT 1
+				) AS pinned_post_id,
+				(SELECT COUNT(*)::int FROM notifications WHERE user_id = $1 AND read = false)
+					AS unread_notification_count,
+				COALESCE((SELECT jsonb_agg(to_jsonb(n) ORDER BY n.created_at DESC) FROM notification_rows n), '[]'::jsonb)
+					AS notifications,
+				COALESCE((SELECT jsonb_agg(to_jsonb(u)) FROM notification_users u), '[]'::jsonb)
+					AS notification_users,
+				COALESCE((SELECT jsonb_agg(to_jsonb(p)) FROM notification_posts p), '[]'::jsonb)
+					AS notification_posts`,
+			[userId, normalizedLimit],
+		);
+		const normalizeIds = (values) => (Array.isArray(values) ? values : [])
+			.map(Number)
+			.filter((id) => Number.isSafeInteger(id) && id > 0);
+		const result = rows[0] || {};
+		return {
+			follow: normalizeIds(result.follow_ids),
+			like: normalizeIds(result.like_ids),
+			star: normalizeIds(result.star_ids),
+			pin: result.pinned_post_id != null && Number.isSafeInteger(Number(result.pinned_post_id))
+				? Number(result.pinned_post_id)
+				: null,
+			unreadCount: Math.max(0, Number(result.unread_notification_count) || 0),
+			notifications: Array.isArray(result.notifications) ? result.notifications : [],
+			notificationUsers: Array.isArray(result.notification_users)
+				? result.notification_users.map((user) => this._normalizeUserBlockList(user)).filter(Boolean)
+				: [],
+			notificationPosts: Array.isArray(result.notification_posts)
+				? result.notification_posts.filter(Boolean)
+				: [],
+		};
 	}
 
 	async getLikeIds(userId) {

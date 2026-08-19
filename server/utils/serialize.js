@@ -36,7 +36,7 @@ function getAddressForPublicUrl(user, publicUrl) {
 	return `${formatNyaitterId(user.id)}@${new URL(publicUrl).host}`;
 }
 
-async function serializeNotifications(db, notifications, publicUrl = null) {
+async function serializeNotifications(db, notifications, publicUrl = null, options = {}) {
 	const normalizedNotifications = (notifications || [])
 		.map(normalizeNotificationRecord)
 		.filter(Boolean);
@@ -51,8 +51,12 @@ async function serializeNotifications(db, notifications, publicUrl = null) {
 		))
 		.filter((postId) => Number.isInteger(postId) && postId > 0))];
 	const [fromUsers, targetPosts] = await Promise.all([
-		fetchNotificationUsersByIds(db, fromUserIds),
-		targetPostIds.length > 0 ? db.getPostsByIds(targetPostIds) : [],
+		Array.isArray(options.fromUsers)
+			? options.fromUsers
+			: fetchNotificationUsersByIds(db, fromUserIds),
+		Array.isArray(options.targetPosts)
+			? options.targetPosts
+			: (targetPostIds.length > 0 ? db.getPostsByIds(targetPostIds) : []),
 	]);
 	const fromUsersById = new Map(fromUsers.map((user) => [Number(user.id), user]));
 	const targetPostsById = new Map((targetPosts || []).map((post) => [Number(post.id), post]));
@@ -89,17 +93,48 @@ async function serializeUser(db, user, viewerId = null, publicUrl = null) {
 	if (!user) return null;
 	const id = user.id;
 	const isSelf = viewerId != null && Number(viewerId) === Number(id);
-	const [follow, like, star, pin, notifications, unreadCount, dmUnreadCount] = await Promise.all([
-		db.getFollowIds ? db.getFollowIds(id) : [],
-		db.getLikeIds ? db.getLikeIds(id) : [],
-		db.getStarIds ? db.getStarIds(id) : [],
-		db.getPinnedPostId ? db.getPinnedPostId(id) : null,
-		isSelf && db.getNotifications ? db.getNotifications(id, 200) : [],
-		isSelf && db.getUnreadNotificationCount ? db.getUnreadNotificationCount(id) : 0,
-		isSelf ? getVisibleDmUnreadCount(db, id, { viewer: user }) : 0,
-	]);
+	let accountState;
+	let notifications;
+	let unreadCount;
+	let notificationUsers = null;
+	let notificationPosts = null;
+	let dmUnreadCount;
+	if (isSelf && typeof db.getUserBootstrapData === 'function') {
+		const [bootstrap, dmUnread] = await Promise.all([
+			db.getUserBootstrapData(id, 200),
+			getVisibleDmUnreadCount(db, id, { viewer: user }),
+		]);
+		accountState = bootstrap || {};
+		notifications = accountState.notifications || [];
+		unreadCount = accountState.unreadCount || 0;
+		notificationUsers = accountState.notificationUsers || [];
+		notificationPosts = accountState.notificationPosts || [];
+		dmUnreadCount = dmUnread;
+	} else {
+		const accountStatePromise = typeof db.getUserAccountState === 'function'
+			? db.getUserAccountState(id)
+			: Promise.all([
+				db.getFollowIds ? db.getFollowIds(id) : [],
+				db.getLikeIds ? db.getLikeIds(id) : [],
+				db.getStarIds ? db.getStarIds(id) : [],
+				db.getPinnedPostId ? db.getPinnedPostId(id) : null,
+			]).then(([follow, like, star, pin]) => ({ follow, like, star, pin }));
+		[accountState, notifications, unreadCount, dmUnreadCount] = await Promise.all([
+			accountStatePromise,
+			isSelf && db.getNotifications ? db.getNotifications(id, 200) : [],
+			isSelf && db.getUnreadNotificationCount ? db.getUnreadNotificationCount(id) : 0,
+			isSelf ? getVisibleDmUnreadCount(db, id, { viewer: user }) : 0,
+		]);
+	}
+	const follow = accountState?.follow || [];
+	const like = accountState?.like || [];
+	const star = accountState?.star || [];
+	const pin = accountState?.pin || null;
 	const structuredNotifications = isSelf
-		? await serializeNotifications(db, notifications, publicUrl)
+		? await serializeNotifications(db, notifications, publicUrl, {
+			fromUsers: notificationUsers,
+			targetPosts: notificationPosts,
+		})
 		: [];
 
 	return {
@@ -264,17 +299,35 @@ async function serializePostsBatch(db, rootPosts, currentUserId = null, publicUr
 	if (initialPosts.length === 0) return [];
 
 	const postsById = new Map(initialPosts.map((post) => [Number(post.id), post]));
-	let frontier = initialPosts;
-	for (let depth = 0; depth < 2; depth += 1) {
-		const relationIds = [];
-		for (const post of frontier) {
-			if (post.replyTo != null && !postsById.has(Number(post.replyTo))) relationIds.push(post.replyTo);
-			if (post.repostTo != null && !postsById.has(Number(post.repostTo))) relationIds.push(post.repostTo);
+	let loadedReferences = false;
+	if (typeof db.getPostReferencesByIds === 'function') {
+		try {
+			const references = await db.getPostReferencesByIds(
+				initialPosts.map((post) => post.id),
+				2,
+			);
+			if (Array.isArray(references)) {
+				for (const post of references) postsById.set(Number(post.id), post);
+				loadedReferences = true;
+			}
+		} catch (error) {
+			// D1 Workerなど段階デプロイ時の未対応実装は、従来の安全な取得へ後退する。
+			console.warn('[serialize] batch post reference fallback:', error.message);
 		}
-		const related = await fetchPostsByIds(db, relationIds);
-		for (const post of related) postsById.set(Number(post.id), post);
-		frontier = related;
-		if (frontier.length === 0) break;
+	}
+	if (!loadedReferences) {
+		let frontier = initialPosts;
+		for (let depth = 0; depth < 2; depth += 1) {
+			const relationIds = [];
+			for (const post of frontier) {
+				if (post.replyTo != null && !postsById.has(Number(post.replyTo))) relationIds.push(post.replyTo);
+				if (post.repostTo != null && !postsById.has(Number(post.repostTo))) relationIds.push(post.repostTo);
+			}
+			const related = await fetchPostsByIds(db, relationIds);
+			for (const post of related) postsById.set(Number(post.id), post);
+			frontier = related;
+			if (frontier.length === 0) break;
+		}
 	}
 
 	const allPosts = [...postsById.values()];
