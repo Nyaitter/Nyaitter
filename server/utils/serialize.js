@@ -305,6 +305,25 @@ async function serializePostsBatch(db, rootPosts, currentUserId = null, publicUr
 		return briefUsersById.get(authorId);
 	}
 
+	function createUnknownPostReference(postId) {
+		const normalizedPostId = Number(postId);
+		return {
+			id: Number.isSafeInteger(normalizedPostId) && normalizedPostId > 0
+				? normalizedPostId
+				: null,
+			unknown: true,
+		};
+	}
+
+	function composeReference(postId, depth) {
+		const referencedPost = postsById.get(Number(postId));
+		// 非公開・ブロック中の投稿は従来どおり参照を返さず、存在を秘匿する。
+		// DB上から失われた投稿だけを「不明なポスト」として明示する。
+		return referencedPost
+			? compose(referencedPost, depth + 1)
+			: createUnknownPostReference(postId);
+	}
+
 	function compose(post, depth = 0) {
 		const postId = Number(post?.id);
 		if (!post || !visibleByPostId.get(postId) || visitingPostIds.has(postId)) return null;
@@ -314,10 +333,10 @@ async function serializePostsBatch(db, rootPosts, currentUserId = null, publicUr
 		const metric = metricsByPostId.get(postId) || {};
 		const author = usersById.get(Number(post.userId)) || null;
 		const replyToPost = depth < 2 && post.replyTo != null
-			? compose(postsById.get(Number(post.replyTo)), depth + 1)
+			? composeReference(post.replyTo, depth)
 			: null;
 		const repostedPost = depth < 2 && post.repostTo != null
-			? compose(postsById.get(Number(post.repostTo)), depth + 1)
+			? composeReference(post.repostTo, depth)
 			: null;
 		const brief = getBriefUser(author);
 
