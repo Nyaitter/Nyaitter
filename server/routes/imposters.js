@@ -205,13 +205,20 @@ router.delete('/:imposterId', requireAuthAllowFrozen, requireInteractiveSession,
   const imposterId = normalizeUserId(req.params.imposterId);
   if (!imposterId) return res.status(400).json({ error: 'インポスターIDが正しくありません。' });
 
+  const db = getDbAdapter(req);
+  let started = false;
   try {
-    const db = getDbAdapter(req);
     const imposter = await db.getUserById(imposterId);
     const metadata = getImposterMetadata(imposter);
-    if (!imposter || !metadata || metadata.parent_id !== req.user.id) {
+    if (!imposter || !metadata || metadata.parent_id !== normalizeUserId(req.user.id)) {
       return res.status(403).json({ error: 'インポスターを削除する権限がありません。' });
     }
+
+    started = await db.beginAccountOperation(imposter.id, 'deleting');
+    if (!started) {
+      return res.status(409).json({ error: 'インポスターの削除を開始できません。' });
+    }
+    req.app.locals.realtime?.closeUser?.(imposter.id, 1012, 'Imposter deletion');
     const attachmentKeys = await db.getAccountAttachmentKeys(imposter.id);
     await db.invalidateAllSessions(imposter.id);
     const deleted = await db.deleteAccount(imposter.id);
@@ -220,6 +227,7 @@ router.delete('/:imposterId', requireAuthAllowFrozen, requireInteractiveSession,
     res.json({ success: true });
   } catch (error) {
     console.error('[imposters] delete error:', error);
+    if (started) await db.finishAccountOperation(imposterId, 'deleting').catch(() => {});
     res.status(500).json({ error: 'インポスターの削除に失敗しました。' });
   }
 });
