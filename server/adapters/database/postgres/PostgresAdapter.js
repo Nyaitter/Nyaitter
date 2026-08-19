@@ -1260,29 +1260,29 @@ class PostgresAdapter extends DatabaseAdapter {
 	}
 
 	async toggleLike(userId, postId) {
-		const { rows } = await this.pool.query(
-			`WITH deleted AS (
-				DELETE FROM likes WHERE user_id = $1 AND post_id = $2 RETURNING 1
-			), inserted AS (
-				INSERT INTO likes (user_id, post_id, created_at)
-				SELECT $1, $2, NOW() WHERE NOT EXISTS (SELECT 1 FROM deleted)
-				ON CONFLICT (user_id, post_id) DO NOTHING
-				RETURNING 1
-			)
-			SELECT
-				CASE
-					WHEN EXISTS (SELECT 1 FROM deleted) THEN false
-					ELSE true
-				END AS liked,
-				(SELECT COUNT(*)::int FROM likes WHERE post_id = $2)
-					- (SELECT COUNT(*)::int FROM deleted)
-					+ (SELECT COUNT(*)::int FROM inserted) AS count`,
-			[userId, postId],
-		);
-		return {
-			liked: !!rows[0]?.liked,
-			count: Math.max(0, Number(rows[0]?.count) || 0),
-		};
+		return this._withTransaction(async (client) => {
+			const deleted = await client.query(
+				'DELETE FROM likes WHERE user_id = $1 AND post_id = $2 RETURNING 1',
+				[userId, postId],
+			);
+			const liked = deleted.rowCount === 0;
+			if (liked) {
+				await client.query(
+					`INSERT INTO likes (user_id, post_id, created_at)
+					 VALUES ($1, $2, NOW())
+					 ON CONFLICT (user_id, post_id) DO NOTHING`,
+					[userId, postId],
+				);
+			}
+			const { rows } = await client.query(
+				'SELECT COUNT(*)::int AS count FROM likes WHERE post_id = $1',
+				[postId],
+			);
+			return {
+				liked,
+				count: Math.max(0, Number(rows[0]?.count) || 0),
+			};
+		});
 	}
 
 	async getLikeCount(postId) {
@@ -1302,29 +1302,29 @@ class PostgresAdapter extends DatabaseAdapter {
 	}
 
 	async toggleStar(userId, postId) {
-		const { rows } = await this.pool.query(
-			`WITH deleted AS (
-				DELETE FROM stars WHERE user_id = $1 AND post_id = $2 RETURNING 1
-			), inserted AS (
-				INSERT INTO stars (user_id, post_id, created_at)
-				SELECT $1, $2, NOW() WHERE NOT EXISTS (SELECT 1 FROM deleted)
-				ON CONFLICT (user_id, post_id) DO NOTHING
-				RETURNING 1
-			)
-			SELECT
-				CASE
-					WHEN EXISTS (SELECT 1 FROM deleted) THEN false
-					ELSE true
-				END AS starred,
-				(SELECT COUNT(*)::int FROM stars WHERE post_id = $2)
-					- (SELECT COUNT(*)::int FROM deleted)
-					+ (SELECT COUNT(*)::int FROM inserted) AS count`,
-			[userId, postId],
-		);
-		return {
-			starred: !!rows[0]?.starred,
-			count: Math.max(0, Number(rows[0]?.count) || 0),
-		};
+		return this._withTransaction(async (client) => {
+			const deleted = await client.query(
+				'DELETE FROM stars WHERE user_id = $1 AND post_id = $2 RETURNING 1',
+				[userId, postId],
+			);
+			const starred = deleted.rowCount === 0;
+			if (starred) {
+				await client.query(
+					`INSERT INTO stars (user_id, post_id, created_at)
+					 VALUES ($1, $2, NOW())
+					 ON CONFLICT (user_id, post_id) DO NOTHING`,
+					[userId, postId],
+				);
+			}
+			const { rows } = await client.query(
+				'SELECT COUNT(*)::int AS count FROM stars WHERE post_id = $1',
+				[postId],
+			);
+			return {
+				starred,
+				count: Math.max(0, Number(rows[0]?.count) || 0),
+			};
+		});
 	}
 
 	async getStarCount(postId) {
