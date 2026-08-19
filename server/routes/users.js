@@ -12,7 +12,10 @@ const {
 	serializeNotification,
 } = require('../utils/serialize');
 const { getPublicUrl, getUserNyaitterId } = require('../utils/nyaitterAddress');
-const { filterViewablePosts } = require('../utils/postVisibility');
+const {
+	createPostVisibilityContext,
+	filterViewablePosts,
+} = require('../utils/postVisibility');
 const { isOwnedAttachmentKey, normalizeStorageKey } = require('../adapters/storage/safeStoragePath');
 const { ScratchIconService } = require('../services/ScratchIconService');
 const {
@@ -247,9 +250,15 @@ function sendPrivateProfileSection(res, section) {
 
 async function getScratchUserIconUrl(scid) {
 	if (!scid) return 'https://uploads.scratch.mit.edu/get_image/user/0_60x60.png';
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(), 5000);
 	try {
 		const res = await fetch(
 			`https://api.scratch.mit.edu/users/${encodeURIComponent(scid)}`,
+			{
+				headers: { Accept: 'application/json' },
+				signal: controller.signal,
+			},
 		);
 		if (res.ok) {
 			const data = await res.json();
@@ -264,6 +273,8 @@ async function getScratchUserIconUrl(scid) {
 		}
 	} catch (err) {
 		console.warn(`[users/icon] Scratch API fetch error for ${scid}:`, err.message);
+	} finally {
+		clearTimeout(timeout);
 	}
 	return `https://uploads.scratch.mit.edu/get_image/user/${encodeURIComponent(scid)}_60x60.png`;
 }
@@ -427,7 +438,7 @@ router.get('/:userId', optionalAuth, async (req, res) => {
 					user,
 					viewerId,
 					getPublicUrl(req),
-					req.user || null,
+					req.user?.visibilityUser || null,
 				),
 			});
 	} catch (err) {
@@ -628,7 +639,13 @@ router.get('/:userId/:section(likes|stars)', optionalAuth, async (req, res) => {
 			: await db.getStarIds(userId);
 		const orderedIds = [...(ids || [])].reverse();
 		const pageIds = orderedIds.slice(offset, offset + limit);
-		const posts = await serializePostsByIds(db, pageIds, req.user?.id ?? null, getPublicUrl(req));
+			const posts = await serializePostsByIds(
+				db,
+				pageIds,
+				req.user?.id ?? null,
+				getPublicUrl(req),
+				req.user?.visibilityUser || null,
+			);
 		res.json({
 			posts,
 			has_more: orderedIds.length > offset + limit,
@@ -708,8 +725,16 @@ router.get('/:userId/posts', optionalAuth, async (req, res) => {
 			offset + limit + 1,
 			req.user ? req.user.id : null,
 		);
-		const currentUserId = req.user ? req.user.id : null;
-		let filtered = await filterViewablePosts(db, all, currentUserId);
+			const currentUserId = req.user ? req.user.id : null;
+			const knownViewer = req.user?.visibilityUser || null;
+			const visibilityContext = await createPostVisibilityContext(
+				db,
+				all,
+				currentUserId,
+				null,
+				knownViewer,
+			);
+			let filtered = await filterViewablePosts(db, all, currentUserId, visibilityContext);
 		if (mode === 'posts') {
 			filtered = filtered.filter((p) => !p.replyTo);
 		} else if (mode === 'replies') {
@@ -718,7 +743,14 @@ router.get('/:userId/posts', optionalAuth, async (req, res) => {
 		const slice = filtered.slice(offset, offset + limit);
 		const has_more = filtered.length > offset + limit;
 		res.json({
-			posts: await serializePostsBatch(db, slice, currentUserId, getPublicUrl(req)),
+				posts: await serializePostsBatch(
+					db,
+					slice,
+					currentUserId,
+					getPublicUrl(req),
+					knownViewer,
+					visibilityContext,
+				),
 			has_more,
 		});
 	} catch (err) {

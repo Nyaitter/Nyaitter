@@ -243,7 +243,14 @@ function canViewPostWithContext(post, context) {
  * 非公開投稿は投稿者本人、または投稿者と相互フォローであるログイン済みユーザーだけが閲覧できる。
  * 未許可時は投稿の存在自体を明かさないため false を返す。
  */
-async function canViewPost(db, post, viewerId = null, author = null, visibilityContext = null) {
+async function canViewPost(
+	db,
+	post,
+	viewerId = null,
+	author = null,
+	visibilityContext = null,
+	knownViewer = null,
+) {
 	if (!post) return false;
 	const authorId = getPostAuthorId(post);
 	if (authorId == null) return false;
@@ -251,7 +258,13 @@ async function canViewPost(db, post, viewerId = null, author = null, visibilityC
 
 	const authorsById = new Map();
 	if (author) authorsById.set(authorId, author);
-	const context = await createPostVisibilityContext(db, [post], viewerId, authorsById);
+	const context = await createPostVisibilityContext(
+		db,
+		[post],
+		viewerId,
+		authorsById,
+		knownViewer,
+	);
 	return canViewPostWithContext(post, context);
 }
 

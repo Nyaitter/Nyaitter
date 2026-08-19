@@ -321,7 +321,7 @@ router.post('/', requireAuth, postWriteLimiter, async (req, res) => {
 	try {
 		for (const targetId of [reply_to, repost_to].filter(Boolean)) {
 			const target = await db.getPostById(Number(targetId));
-			if (!target || !(await canViewPost(db, target, userId))) {
+			if (!target || !(await canViewPost(db, target, userId, null, null, req.user?.visibilityUser || null))) {
 				return res.status(404).json({ error: 'Post not found' });
 			}
 		}
@@ -916,7 +916,7 @@ router.post('/:id/like', requireAuth, postWriteLimiter, async (req, res) => {
 
 	try {
 		const post = await db.getPostById(postId);
-		if (!post || !(await canViewPost(db, post, userId))) {
+		if (!post || !(await canViewPost(db, post, userId, null, null, req.user?.visibilityUser || null))) {
 			return res.status(404).json({ error: 'Post not found' });
 		}
 		const result = await postService.toggleLike(userId, postId);
@@ -961,7 +961,7 @@ router.post('/:id/star', requireAuth, postWriteLimiter, async (req, res) => {
 
 	try {
 		const post = await db.getPostById(postId);
-		if (!post || !(await canViewPost(db, post, userId))) {
+		if (!post || !(await canViewPost(db, post, userId, null, null, req.user?.visibilityUser || null))) {
 			return res.status(404).json({ error: 'Post not found' });
 		}
 		const result = await postService.toggleStar(userId, postId);
@@ -1053,7 +1053,7 @@ router.get('/:id/reposts', optionalAuth, async (req, res) => {
 	try {
 		const post = await db.getPostById(postId);
 		const currentUserId = req.user ? req.user.id : null;
-		if (!post || !(await canViewPost(db, post, currentUserId))) {
+		if (!post || !(await canViewPost(db, post, currentUserId, null, null, req.user?.visibilityUser || null))) {
 			return res.status(404).json({ error: 'Post not found' });
 		}
 		const reposts = await db.getRepostsOfPost(postId, limit);
@@ -1075,7 +1075,7 @@ router.post('/:id/repost', requireAuth, postWriteLimiter, async (req, res) => {
 
 	try {
 		const original = await db.getPostById(postId);
-		if (!original || !(await canViewPost(db, original, userId))) {
+		if (!original || !(await canViewPost(db, original, userId, null, null, req.user?.visibilityUser || null))) {
 			return res.status(404).json({ error: 'Post not found' });
 		}
 		const repost = await db.repostPost(userId, postId);
