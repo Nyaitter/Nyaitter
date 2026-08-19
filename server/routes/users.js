@@ -18,6 +18,7 @@ const {
 } = require('../utils/postVisibility');
 const { isOwnedAttachmentKey, normalizeStorageKey } = require('../adapters/storage/safeStoragePath');
 const { ScratchIconService } = require('../services/ScratchIconService');
+const { listOwnedImposters } = require('../services/ImposterService');
 const {
 	createNotificationIfAllowed,
 } = require('../services/NotificationDeliveryService');
@@ -53,6 +54,18 @@ async function deleteStoredAccountAttachments(storage, keys) {
 		else if (typeof storage.delete === 'function') await Promise.all(keys.map((key) => storage.delete(key)));
 	} catch (error) {
 		console.warn('[users] account attachment deletion failed:', error.message);
+	}
+}
+
+async function deleteOwnedImposterAccounts(req, db, storage, parentId) {
+	const imposters = await listOwnedImposters(db, parentId);
+	for (const imposter of imposters) {
+		req.app.locals.realtime?.closeUser?.(imposter.id, 1012, 'Parent account deletion');
+		const attachmentKeys = await db.getAccountAttachmentKeys(imposter.id);
+		await db.invalidateAllSessions(imposter.id);
+		const deleted = await db.deleteAccount(imposter.id);
+		if (!deleted) throw new Error(`Imposter account deletion did not complete: ${imposter.id}`);
+		await deleteStoredAccountAttachments(storage, attachmentKeys);
 	}
 }
 
@@ -841,6 +854,7 @@ router.delete('/me/account', requireAuthAllowFrozen, requireInteractiveSession, 
 		started = await db.beginAccountOperation(req.user.id, 'deleting');
 		if (!started) return res.status(409).json({ error: 'アカウント削除を開始できません。' });
 		req.app.locals.realtime?.closeUser?.(req.user.id, 1012, 'Account deletion');
+		await deleteOwnedImposterAccounts(req, db, storage, req.user.id);
 		const attachmentKeys = await db.getAccountAttachmentKeys(req.user.id);
 		await db.invalidateAllSessions(req.user.id);
 		const deleted = await db.deleteAccount(req.user.id);

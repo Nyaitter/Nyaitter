@@ -257,6 +257,7 @@ const restRoutes = [
     ['ui', require('./routes/ui')],
     ['dm', require('./routes/dm')],
     ['users', require('./routes/users')],
+    ['imposters', require('./routes/imposters')],
     ['notifications', require('./routes/notifications')],
     ['reports', require('./routes/reports')],
     ['appeals', require('./routes/appeals')],

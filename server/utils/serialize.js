@@ -25,6 +25,7 @@ function serializeUserBrief(user, publicUrl = null) {
 		icon_data: user.icon_data || null,
 		admin: !!user.admin,
 		verify: !!user.verify,
+		is_imposter: !!user.settings?.imposter?.parent_id,
 	};
 }
 
@@ -157,6 +158,7 @@ async function serializeUser(db, user, viewerId = null, publicUrl = null) {
 		dm_unread_count: isSelf ? dmUnreadCount : 0,
 		admin: !!user.admin,
 		verify: !!user.verify,
+		is_imposter: !!user.settings?.imposter?.parent_id,
 		freeze: user.freeze || null,
 		shadow: !!user.shadow,
 		lock: !!(user.settings && user.settings.lock),
@@ -227,6 +229,7 @@ async function serializePublicProfile(
 		account_state: user.freeze ? 'frozen' : 'active',
 		admin: !!user.admin,
 		verify: !!user.verify,
+		is_imposter: !!user.settings?.imposter?.parent_id,
 		visibility,
 		...(viewerId != null ? { relationship: { viewer_blocks_profile: viewerBlocksProfile, profile_blocks_viewer: profileBlocksViewer } } : {}),
 		...(visibility.scid === 'public' && user.scid ? { scid: user.scid } : {}),

@@ -295,6 +295,13 @@ const config = {
       30,
       1,
     ),
+    impostersPerParent: exactIntegerSetting(
+      'imposters per parent',
+      ['NYAITTER_LIMIT_IMPOSTERS_PER_PARENT'],
+      ['limits.impostersPerParent'],
+      5,
+      0,
+    ),
     userSearchPageSize: rangeSetting(
       'user search page size',
       ['NYAITTER_LIMIT_USER_SEARCH_PAGE_SIZE'],

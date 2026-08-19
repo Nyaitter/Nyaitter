@@ -18,6 +18,11 @@ const config = require('../config');
 const { isWithinRange } = require('../utils/settingFormats');
 const { serializeUser, serializeNotification } = require('../utils/serialize');
 const {
+  getImposterRole,
+  canOperateImposter,
+  listAccessibleImposters,
+} = require('../services/ImposterService');
+const {
   formatNyaitterId,
   getPublicUrl,
   getUserNyaitterAddress,
@@ -88,12 +93,14 @@ function serializeLoginUser(user, req) {
     id: user.id,
     nyaitter_id: getUserNyaitterId(user),
     name: user.name,
+    icon_data: user.icon_data || null,
     scid: user.scid || null,
     handle: getUserNyaitterId(user),
     nyaitter_address: getUserNyaitterAddress(user, req),
     auth_provider: user.auth_provider,
     provider_domain: user.provider_domain || null,
     external_profile: user.external_profile || null,
+    is_imposter: !!user.settings?.imposter?.parent_id,
   };
 }
 
@@ -621,12 +628,41 @@ router.get('/accounts', async (req, res) => {
   try {
     const accounts = await getValidRememberedAccounts(req, db);
     setRememberedAccountsCookie(res, accounts);
-    res.json({
-      accounts: accounts.map((account) => ({
-        ...serializeLoginUser(account.user, req),
-        active: getCookieValue(req, 'nyaitter_session') === account.token,
-      })),
-    });
+    const activeToken = getCookieValue(req, 'nyaitter_session');
+    const accessibleGroups = await Promise.all(
+      accounts.map((account) => listAccessibleImposters(db, account.userId)),
+    );
+    const automaticallyAccessible = new Map();
+    for (let index = 0; index < accounts.length; index += 1) {
+      const account = accounts[index];
+      for (const imposter of accessibleGroups[index]) {
+        if (!automaticallyAccessible.has(imposter.id)) {
+          automaticallyAccessible.set(imposter.id, {
+            user: imposter,
+            role: getImposterRole(imposter, account.userId),
+          });
+        }
+      }
+    }
+
+    const directAccounts = accounts.map((account) => ({
+      ...serializeLoginUser(account.user, req),
+      imposter_role: account.user.settings?.imposter?.parent_id
+        ? getImposterRole(account.user, account.user.settings.imposter.parent_id)
+        : null,
+      active: activeToken === account.token,
+    }));
+    const directIds = new Set(accounts.map((account) => account.userId));
+    const imposterAccounts = [...automaticallyAccessible.values()]
+      .filter(({ user }) => !directIds.has(user.id))
+      .map(({ user, role }) => ({
+        ...serializeLoginUser(user, req),
+        imposter_role: role,
+        active: false,
+        automatic_imposter: true,
+      }));
+
+    res.json({ accounts: [...directAccounts, ...imposterAccounts] });
   } catch (error) {
     console.error('[auth] account list error:', error);
     res.status(500).json({ error: 'アカウント一覧の取得に失敗しました' });
@@ -662,6 +698,34 @@ router.post('/accounts/switch', async (req, res) => {
   } catch (error) {
     console.error('[auth] account switch error:', error);
     res.status(500).json({ error: 'アカウントの切替に失敗しました' });
+  }
+});
+
+router.post('/imposters/:imposterId/switch', requireAuth, requireInteractiveSession, async (req, res) => {
+  const imposterId = Number(req.params.imposterId);
+  if (!Number.isInteger(imposterId) || imposterId <= 0) {
+    return res.status(400).json({ error: 'インポスターIDが正しくありません。' });
+  }
+
+  const db = getDbAdapter(req);
+  try {
+    const imposter = await db.getUserById(imposterId);
+    const rememberedAccounts = await getValidRememberedAccounts(req, db);
+    const authorizedAccount = rememberedAccounts.find((account) => (
+      canOperateImposter(imposter, account.userId)
+    ));
+    if (!imposter || !authorizedAccount) {
+      return res.status(403).json({ error: 'このインポスターへの切替権限がありません。' });
+    }
+    const session = await createAuthenticatedSession(req, res, imposter, getRequestLoginMetadata(req));
+    return res.json({
+      success: true,
+      expires_at: session.expiresAt,
+      user: serializeLoginUser(imposter, req),
+    });
+  } catch (error) {
+    console.error('[auth] imposter switch error:', error);
+    return res.status(500).json({ error: 'インポスターへの切替に失敗しました' });
   }
 });
 
