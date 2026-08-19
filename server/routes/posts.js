@@ -683,10 +683,6 @@ router.get('/:id/thread', optionalAuth, async (req, res) => {
 		const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 100);
 		const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
 		const root = await db.getPostById(postId);
-		if (!root) {
-			return res.status(404).json({ error: 'Post not found' });
-		}
-
 		const replyPage = await getThreadReplyPostIds(db, postId, limit, offset);
 		const replyPostsById = new Map(
 			(await db.getPostsByIds(replyPage.ids)).filter(Boolean).map((post) => [Number(post.id), post]),
@@ -694,6 +690,33 @@ router.get('/:id/thread', optionalAuth, async (req, res) => {
 		const orderedReplyPosts = replyPage.ids
 			.map((id) => replyPostsById.get(Number(id)))
 			.filter(Boolean);
+
+		if (!root) {
+			// 削除済みの親投稿は返信が存在する場合だけ仮想的に表示する。
+			// 参照先を完全に欠くIDや、閲覧者に見えない返信しかないIDを列挙できないようにする。
+			const replies = await serializePostsBatch(
+				db,
+				orderedReplyPosts,
+				currentUserId,
+				getPublicUrl(req),
+			);
+			if (replies.length === 0) {
+				return res.status(404).json({ error: 'Post not found' });
+			}
+			return res.json({
+				post: {
+					id: postId,
+					unknown: true,
+					user: { id: null, name: 'UnknownPost', scid: 'unknown', nyaitter_id: '@unknown' },
+					author: { id: null, name: 'UnknownPost', scid: 'unknown', nyaitter_id: '@unknown' },
+				},
+				replies,
+				has_more: replyPage.has_more,
+				offset,
+				limit,
+			});
+		}
+
 		const serializedPosts = await serializePostsBatch(
 			db,
 			[root, ...orderedReplyPosts],
