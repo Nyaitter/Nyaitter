@@ -452,6 +452,7 @@ const config = {
       poolSize: Math.min(100, Math.max(1, Math.floor(Number(process.env.POSTGRES_POOL_SIZE || get('database.postgres.poolSize', 10)) || 10))),
       poolMin: Math.min(20, Math.max(1, Math.floor(Number(process.env.POSTGRES_POOL_MIN || get('database.postgres.poolMin', 2)) || 2))),
       poolIdleTimeoutMs: Math.min(86400000, Math.max(1000, Math.floor(Number(process.env.POSTGRES_POOL_IDLE_TIMEOUT_MS || get('database.postgres.poolIdleTimeoutMs', 300000)) || 300000))),
+      poolMaxLifetimeSeconds: Math.min(86400, Math.max(60, Math.floor(Number(process.env.POSTGRES_POOL_MAX_LIFETIME_SECONDS || get('database.postgres.poolMaxLifetimeSeconds', 1800)) || 1800))),
       connectionTimeoutMs: Math.min(60000, Math.max(1000, Math.floor(Number(process.env.POSTGRES_CONNECTION_TIMEOUT_MS || get('database.postgres.connectionTimeoutMs', 15000)) || 15000))),
       transactionRetries: Math.min(10, Math.max(0, Math.floor(Number(process.env.POSTGRES_TRANSACTION_RETRIES || get('database.postgres.transactionRetries', 5)) || 0))),
       retryBaseDelayMs: Math.min(5000, Math.max(10, Math.floor(Number(process.env.POSTGRES_RETRY_BASE_DELAY_MS || get('database.postgres.retryBaseDelayMs', 50)) || 10))),

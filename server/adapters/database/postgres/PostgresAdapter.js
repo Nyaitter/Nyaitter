@@ -65,12 +65,15 @@ class PostgresAdapter extends DatabaseAdapter {
 			throw new Error('Invalid PostgreSQL sslmode. Use disable, allow, prefer, require, verify-ca, verify-full, or no-verify.');
 		}
 
+		const poolMax = Math.max(1, Number(this.config.poolSize) || 10);
+		const poolMin = Math.min(poolMax, Math.max(1, Number(this.config.poolMin) || 2));
 		const poolOptions = {
 			connectionString,
-			max: this.config.poolSize || 10,
-			min: Math.min(this.config.poolSize || 10, this.config.poolMin || 2),
+			max: poolMax,
+			min: poolMin,
 			idleTimeoutMillis: this.config.poolIdleTimeoutMs || 300000,
 			connectionTimeoutMillis: this.config.connectionTimeoutMs || 15000,
+			maxLifetimeSeconds: this.config.poolMaxLifetimeSeconds || 1800,
 			keepAlive: true,
 			keepAliveInitialDelayMillis: 10000,
 		};
@@ -82,9 +85,20 @@ class PostgresAdapter extends DatabaseAdapter {
 		this.pool = new Pool(poolOptions);
 
 		let client;
+		const warmupClients = [];
 		try {
 			client = await this.pool.connect();
 			await client.query('SELECT 1');
+			client.release();
+			client = null;
+
+			// pg-poolのminはアイドル接続を即時生成しないため、最初の並行API要求で
+			// 接続確立待ちが発生しないよう、起動時に必要最小数まで接続を確立する。
+			await Promise.all(Array.from({ length: poolMin }, async () => {
+				const warmupClient = await this.pool.connect();
+				warmupClients.push(warmupClient);
+			}));
+			for (const warmupClient of warmupClients.splice(0)) warmupClient.release();
 		} catch (error) {
 			await this.pool.end();
 			this.pool = null;
@@ -94,9 +108,10 @@ class PostgresAdapter extends DatabaseAdapter {
 			throw error;
 		} finally {
 			client?.release();
+			for (const warmupClient of warmupClients.splice(0)) warmupClient.release();
 		}
 
-		console.log('[PostgresAdapter] Connected to PostgreSQL');
+		console.log(`[PostgresAdapter] Connected to PostgreSQL (pool ${poolMin}-${poolMax})`);
 	}
 
 	async disconnect() {
@@ -641,57 +656,46 @@ class PostgresAdapter extends DatabaseAdapter {
 		const viewerId = Number.isSafeInteger(parsedViewerId) && parsedViewerId > 0
 			? parsedViewerId
 			: null;
-		const [likeResult, starResult, repostResult, replyResult, myLikesResult, myStarsResult] = await Promise.all([
-			this.pool.query(
-				`SELECT post_id, COUNT(*)::int AS count FROM likes
-				 WHERE post_id = ANY($1::int[])
-				 GROUP BY post_id`,
-				[ids],
-			),
-			this.pool.query(
-				`SELECT post_id, COUNT(*)::int AS count FROM stars
-				 WHERE post_id = ANY($1::int[])
-				 GROUP BY post_id`,
-				[ids],
-			),
-			this.pool.query(
-				`SELECT post_id, COUNT(*)::int AS count FROM reposts
-				 WHERE post_id = ANY($1::int[])
-				 GROUP BY post_id`,
-				[ids],
-			),
-			this.pool.query(
-				`SELECT reply_to AS post_id, COUNT(*)::int AS count FROM posts
-				 WHERE reply_to = ANY($1::int[])
-				 GROUP BY reply_to`,
-				[ids],
-			),
-			viewerId == null
-				? Promise.resolve({ rows: [] })
-				: this.pool.query(
-					`SELECT post_id FROM likes
-					 WHERE user_id = $1 AND post_id = ANY($2::int[])`,
-					[viewerId, ids],
-				),
-			viewerId == null
-				? Promise.resolve({ rows: [] })
-				: this.pool.query(
-					`SELECT post_id FROM stars
-					 WHERE user_id = $1 AND post_id = ANY($2::int[])`,
-					[viewerId, ids],
-				),
-		]);
-
-		const countMap = (rows) => new Map((rows || []).map((row) => [
-			Number(row.post_id),
-			Math.max(0, Number(row.count) || 0),
-		]));
-		const likeMap = countMap(likeResult.rows);
-		const starMap = countMap(starResult.rows);
-		const repostMap = countMap(repostResult.rows);
-		const replyMap = countMap(replyResult.rows);
-		const myLikesSet = new Set((myLikesResult.rows || []).map((row) => Number(row.post_id)));
-		const myStarsSet = new Set((myStarsResult.rows || []).map((row) => Number(row.post_id)));
+		// PostgreSQLへの往復を1回に集約する。従来は同じ投稿ページに対して
+		// 最大6本のクエリを並行送信しており、接続プール待機時に待機時間が増幅していた。
+		const metricQueries = [
+			`SELECT 'like_count'::text AS kind, post_id, COUNT(*)::int AS value
+			 FROM likes WHERE post_id = ANY($1::int[]) GROUP BY post_id`,
+			`SELECT 'star_count'::text AS kind, post_id, COUNT(*)::int AS value
+			 FROM stars WHERE post_id = ANY($1::int[]) GROUP BY post_id`,
+			`SELECT 'repost_count'::text AS kind, post_id, COUNT(*)::int AS value
+			 FROM reposts WHERE post_id = ANY($1::int[]) GROUP BY post_id`,
+			`SELECT 'reply_count'::text AS kind, reply_to AS post_id, COUNT(*)::int AS value
+			 FROM posts WHERE reply_to = ANY($1::int[]) GROUP BY reply_to`,
+		];
+		if (viewerId != null) {
+			metricQueries.push(
+				`SELECT 'liked_by_me'::text AS kind, post_id, 1::int AS value
+				 FROM likes WHERE user_id = $2 AND post_id = ANY($1::int[])`,
+				`SELECT 'starred_by_me'::text AS kind, post_id, 1::int AS value
+				 FROM stars WHERE user_id = $2 AND post_id = ANY($1::int[])`,
+			);
+		}
+		const { rows } = await this.pool.query(
+			metricQueries.join('\nUNION ALL\n'),
+			viewerId == null ? [ids] : [ids, viewerId],
+		);
+		const likeMap = new Map();
+		const starMap = new Map();
+		const repostMap = new Map();
+		const replyMap = new Map();
+		const myLikesSet = new Set();
+		const myStarsSet = new Set();
+		for (const row of rows || []) {
+			const postId = Number(row.post_id);
+			if (!Number.isSafeInteger(postId) || postId <= 0) continue;
+			if (row.kind === 'like_count') likeMap.set(postId, Math.max(0, Number(row.value) || 0));
+			if (row.kind === 'star_count') starMap.set(postId, Math.max(0, Number(row.value) || 0));
+			if (row.kind === 'repost_count') repostMap.set(postId, Math.max(0, Number(row.value) || 0));
+			if (row.kind === 'reply_count') replyMap.set(postId, Math.max(0, Number(row.value) || 0));
+			if (row.kind === 'liked_by_me') myLikesSet.add(postId);
+			if (row.kind === 'starred_by_me') myStarsSet.add(postId);
+		}
 
 		return ids.map((id) => ({
 			post_id: id,
@@ -1136,35 +1140,29 @@ class PostgresAdapter extends DatabaseAdapter {
 	}
 
 	async toggleLike(userId, postId) {
-		return this._withTransaction(async (client) => {
-			const deleted = await client.query(
-				'DELETE FROM likes WHERE user_id = $1 AND post_id = $2 RETURNING 1',
-				[userId, postId],
-			);
-			let liked = false;
-			if (deleted.rowCount === 0) {
-				const inserted = await client.query(
-					`INSERT INTO likes (user_id, post_id, created_at)
-					 VALUES ($1, $2, NOW())
-					 ON CONFLICT (user_id, post_id) DO NOTHING
-					 RETURNING 1`,
-					[userId, postId],
-				);
-				liked = inserted.rowCount > 0;
-				if (!liked) {
-					const existing = await client.query(
-						'SELECT 1 FROM likes WHERE user_id = $1 AND post_id = $2',
-						[userId, postId],
-					);
-					liked = existing.rowCount > 0;
-				}
-			}
-			const countResult = await client.query(
-				'SELECT COUNT(*)::int AS count FROM likes WHERE post_id = $1',
-				[postId],
-			);
-			return { liked, count: Number(countResult.rows[0]?.count || 0) };
-		});
+		const { rows } = await this.pool.query(
+			`WITH deleted AS (
+				DELETE FROM likes WHERE user_id = $1 AND post_id = $2 RETURNING 1
+			), inserted AS (
+				INSERT INTO likes (user_id, post_id, created_at)
+				SELECT $1, $2, NOW() WHERE NOT EXISTS (SELECT 1 FROM deleted)
+				ON CONFLICT (user_id, post_id) DO NOTHING
+				RETURNING 1
+			)
+			SELECT
+				CASE
+					WHEN EXISTS (SELECT 1 FROM deleted) THEN false
+					ELSE true
+				END AS liked,
+				(SELECT COUNT(*)::int FROM likes WHERE post_id = $2)
+					- (SELECT COUNT(*)::int FROM deleted)
+					+ (SELECT COUNT(*)::int FROM inserted) AS count`,
+			[userId, postId],
+		);
+		return {
+			liked: !!rows[0]?.liked,
+			count: Math.max(0, Number(rows[0]?.count) || 0),
+		};
 	}
 
 	async getLikeCount(postId) {
@@ -1184,35 +1182,29 @@ class PostgresAdapter extends DatabaseAdapter {
 	}
 
 	async toggleStar(userId, postId) {
-		return this._withTransaction(async (client) => {
-			const deleted = await client.query(
-				'DELETE FROM stars WHERE user_id = $1 AND post_id = $2 RETURNING 1',
-				[userId, postId],
-			);
-			let starred = false;
-			if (deleted.rowCount === 0) {
-				const inserted = await client.query(
-					`INSERT INTO stars (user_id, post_id, created_at)
-					 VALUES ($1, $2, NOW())
-					 ON CONFLICT (user_id, post_id) DO NOTHING
-					 RETURNING 1`,
-					[userId, postId],
-				);
-				starred = inserted.rowCount > 0;
-				if (!starred) {
-					const existing = await client.query(
-						'SELECT 1 FROM stars WHERE user_id = $1 AND post_id = $2',
-						[userId, postId],
-					);
-					starred = existing.rowCount > 0;
-				}
-			}
-			const countResult = await client.query(
-				'SELECT COUNT(*)::int AS count FROM stars WHERE post_id = $1',
-				[postId],
-			);
-			return { starred, count: Number(countResult.rows[0]?.count || 0) };
-		});
+		const { rows } = await this.pool.query(
+			`WITH deleted AS (
+				DELETE FROM stars WHERE user_id = $1 AND post_id = $2 RETURNING 1
+			), inserted AS (
+				INSERT INTO stars (user_id, post_id, created_at)
+				SELECT $1, $2, NOW() WHERE NOT EXISTS (SELECT 1 FROM deleted)
+				ON CONFLICT (user_id, post_id) DO NOTHING
+				RETURNING 1
+			)
+			SELECT
+				CASE
+					WHEN EXISTS (SELECT 1 FROM deleted) THEN false
+					ELSE true
+				END AS starred,
+				(SELECT COUNT(*)::int FROM stars WHERE post_id = $2)
+					- (SELECT COUNT(*)::int FROM deleted)
+					+ (SELECT COUNT(*)::int FROM inserted) AS count`,
+			[userId, postId],
+		);
+		return {
+			starred: !!rows[0]?.starred,
+			count: Math.max(0, Number(rows[0]?.count) || 0),
+		};
 	}
 
 	async getStarCount(postId) {
