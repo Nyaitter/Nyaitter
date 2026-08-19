@@ -67,6 +67,7 @@ R2などの公開ドメインを直接使う場合は、Clientの`userFileEndpoi
 | ファイル | `STORAGE_ADAPTER`、`STORAGE_USER_QUOTA_MB`、`R2_*` |
 | Push | `VAPID_SUBJECT`、`VAPID_PUBLIC_KEY`、`VAPID_PRIVATE_KEY` |
 | 自動モデレーション | `GEMINI_API_KEY`、`GEMINI_MODEL`、`GEMINI_MOD_PROMPT` |
+| Turnstile | `TURNSTILE_SECRET_KEY`（クライアントのサイトキーは `page/config.js` の `turnstileSiteKey`） |
 
 別オリジンのClientでCookieを使う場合は、ClientのオリジンとCookie利用を設定します。
 

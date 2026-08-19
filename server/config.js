@@ -187,6 +187,8 @@ function corsAllowedOriginsSetting() {
   return get('cors.allowedOrigins', defaultCorsAllowedOrigins);
 }
 
+const turnstileSecretKey = process.env.TURNSTILE_SECRET_KEY || get('turnstile.secret', '');
+
 const config = {
   server: {
     port: parseInt(process.env.PORT, 10) || get('server.port', 3000),
@@ -596,6 +598,15 @@ const config = {
     trusted_servers: get('federation.trusted_servers', []),
   },
 
+  turnstile: {
+    // Cloudflare Turnstile. secret は /server/auth/scratch/generate を保護するための
+    // サーバー側の鍵です。siteKey はクライアントが widget を描画する際に使えますが、
+    // 通常は page/config.js の turnstileSiteKey をクライアント側で指定します。
+    secret: turnstileSecretKey,
+    siteKey: process.env.TURNSTILE_SITE_KEY || get('turnstile.siteKey', ''),
+    enabled: Boolean(turnstileSecretKey),
+  },
+
   raw: rawConfig,
 };
 
@@ -604,7 +615,7 @@ function validateConfig() {
   const isProd = isProduction;
 
   if (isProd) {
-    if (!process.env.TURNSTILE_SECRET_KEY && !config.raw?.turnstile?.secret) {
+    if (!config.turnstile?.secret) {
       console.warn('[config] WARNING: TURNSTILE_SECRET_KEY is not set in production');
     }
 

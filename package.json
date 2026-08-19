@@ -5,6 +5,7 @@
   "description": "Nyaitter Server",
   "scripts": {
     "start": "node server/index.js",
+    "dev": "DEV_BYPASS_AUTH=true TRUST_PROXY=true npm run start",
     "check:config": "node server/check-config.js",
     "sync:client": "node server/sync-client.js",
     "migrate": "node server/migrations/migrate.js",

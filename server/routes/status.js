@@ -99,6 +99,9 @@ router.get('/status', async (req, res) => {
 				domain: server.domain,
 			})),
 		},
+		turnstile: {
+			enabled: Boolean(config.turnstile?.enabled),
+		},
 		client_limits: getPublicClientLimits(),
 	});
 });

@@ -4,20 +4,36 @@ const SessionManager = require('../services/auth/SessionManager');
 const BotTokenManager = require('../services/auth/BotTokenManager');
 const config = require('../config');
 
-const DEFAULT_CSP = [
-  "default-src 'self'",
-  "base-uri 'self'",
-  "object-src 'none'",
-  "frame-ancestors 'none'",
-  "form-action 'self'",
-  "script-src 'self' https://cdn.jsdelivr.net",
-  "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com",
-  "img-src 'self' data: https:",
-  "font-src 'self' data: https://fonts.gstatic.com",
-  "connect-src 'self' https: wss:",
-  "worker-src 'self'",
-  "manifest-src 'self'",
-].join('; ');
+function buildContentSecurityPolicy() {
+  const csp = [
+    "default-src 'self'",
+    "base-uri 'self'",
+    "object-src 'none'",
+    "frame-ancestors 'none'",
+    "form-action 'self'",
+    "script-src 'self' https://cdn.jsdelivr.net",
+    "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com",
+    "img-src 'self' data: https:",
+    "font-src 'self' data: https://fonts.gstatic.com",
+    "connect-src 'self' https: wss:",
+    "worker-src 'self'",
+    "manifest-src 'self'",
+  ];
+
+  // Cloudflare Turnstileチャレンジを有効にした場合だけ、widgetのスクリプトと
+  // iframeの読み込み元をCSPに追加する。
+  if (config.turnstile?.enabled) {
+    const scriptIndex = csp.findIndex((directive) => directive.startsWith('script-src '));
+    if (scriptIndex !== -1) {
+      csp[scriptIndex] = `${csp[scriptIndex]} https://challenges.cloudflare.com`;
+    }
+    csp.push('frame-src https://challenges.cloudflare.com');
+  }
+
+  return csp.join('; ');
+}
+
+const DEFAULT_CSP = buildContentSecurityPolicy();
 
 const PERMISSIONS_POLICY = 'camera=(), microphone=(), geolocation=(), payment=(), usb=()';
 
@@ -200,11 +216,25 @@ function csrfProtection(req, res, next) {
   }
   const cookies = parseCookies(req);
   const hasBrowserSession = Boolean(cookies.nyaitter_session || cookies.nyaitter_accounts);
+  if (!hasBrowserSession) return next();
+
   const fetchSite = String(req.headers['sec-fetch-site'] || '').toLowerCase();
-  if (hasBrowserSession && (!isSameOriginRequest(req) || fetchSite === 'cross-site')) {
+
+  // Originを伴わない要求はブラウザのクロスサイトPOSTでは通常発生しない。
+  // Sec-Fetch-Site が cross-site / same-site の場合は、Originが欠落していても
+  // CSRFとして拒否する。
+  if (!req.headers.origin && (fetchSite === 'cross-site' || fetchSite === 'same-site')) {
     return res.status(403).json({ error: 'Cross-origin state-changing requests are not allowed' });
   }
-  return next();
+
+  // 同一オリジン、またはCORSで明示的に許可したオリジン（資格情報付きCORSが有効な
+  // allowedOrigins）からのCookie付き状態変更要求は許可する。
+  // 許可したオリジンからのブラウザ要求は Sec-Fetch-Site: cross-site になるため、
+  // 信頼判定を先に行う。
+  if (isSameOriginRequest(req)) return next();
+
+  // 信頼できないオリジンからCookieが同送される状態変更要求はCSRFとして拒否する。
+  return res.status(403).json({ error: 'Cross-origin state-changing requests are not allowed' });
 }
 
 function flexibleCors(req, res, next) {

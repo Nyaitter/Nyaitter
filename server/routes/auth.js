@@ -54,6 +54,35 @@ function requireInteractiveSession(req, res, next) {
   return next();
 }
 
+async function verifyTurnstileToken(token) {
+  const secret = config.turnstile?.secret;
+  if (!secret) return { success: false, code: 'not_configured' };
+  if (!token || typeof token !== 'string') {
+    return { success: false, code: 'token_required' };
+  }
+
+  try {
+    const formData = new URLSearchParams();
+    formData.append('secret', secret);
+    formData.append('response', token);
+
+    const verifyRes = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+      method: 'POST',
+      body: formData,
+    });
+
+    const data = await verifyRes.json();
+    if (data?.success) return { success: true };
+    return {
+      success: false,
+      code: 'invalid',
+      errorCodes: Array.isArray(data?.['error-codes']) ? data['error-codes'] : null,
+    };
+  } catch (error) {
+    return { success: false, code: 'error', error };
+  }
+}
+
 function serializeLoginUser(user, req) {
   return {
     id: user.id,
@@ -285,13 +314,23 @@ function sendLoginResult(req, res, user, result, { external = false } = {}) {
 	});
 }
 
-router.post('/scratch/generate', (req, res) => {
-  const { username } = req.body;
+router.post('/scratch/generate', async (req, res) => {
+  const { username, turnstile_token: turnstileToken } = req.body;
   if (!username || typeof username !== 'string') {
     return res.status(400).json({ error: 'username is required' });
   }
   if (!isValidScratchUsername(username)) {
     return res.status(400).json({ error: 'Invalid Scratch username format' });
+  }
+
+  if (config.turnstile?.enabled) {
+    const turnstileResult = await verifyTurnstileToken(turnstileToken);
+    if (turnstileResult.success !== true) {
+      return res.status(403).json({
+        error: 'Turnstileチャレンジを完了してください。',
+        code: 'turnstile_required',
+      });
+    }
   }
 
   const { ipHash } = getRequestLoginMetadata(req);
@@ -683,34 +722,18 @@ router.post('/logout', optionalAuth, async (req, res) => {
 
 router.post('/turnstile/verify', async (req, res) => {
   const { token } = req.body;
-  const secret = process.env.TURNSTILE_SECRET_KEY;
-
-  if (!secret) {
+  if (!config.turnstile?.secret) {
     return res.status(500).json({ error: 'Turnstileがサーバー側で設定されていません' });
   }
-  if (!token) {
+
+  const result = await verifyTurnstileToken(token);
+  if (result.code === 'token_required') {
     return res.status(400).json({ error: 'token is required' });
   }
-
-  try {
-    const formData = new URLSearchParams();
-    formData.append('secret', secret);
-    formData.append('response', token);
-
-    const verifyRes = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
-      method: 'POST',
-      body: formData,
-    });
-
-    const data = await verifyRes.json();
-
-    if (data.success) {
-      res.json({ success: true });
-    } else {
-      res.status(400).json({ success: false, error: data['error-codes'] || '検証に失敗しました' });
-    }
-  } catch (e) {
-    res.status(500).json({ error: 'Turnstile検証中にエラーが発生しました' });
+  if (result.success) {
+    res.json({ success: true });
+  } else {
+    res.status(400).json({ success: false, error: result.errorCodes || '検証に失敗しました' });
   }
 });
 
