@@ -51,15 +51,20 @@ async function getUsersByIdsForDmVisibility(db, ids) {
  * ブロック関係を含む会話は、相手メッセージと存在を推測できる未読数の双方を除外する。
  * 会話をまたいでメンバーを一括取得するため、会話数や参加者数に比例してDB/Worker往復しない。
  */
-async function getVisibleDmUnreadCount(db, userId) {
-	if (typeof db?.getGroupDmsForUser !== 'function') {
+async function getVisibleDmUnreadCount(db, userId, { viewer: knownViewer = null } = {}) {
+	const getVisibilityDms = typeof db?.getGroupDmVisibilityDataForUser === 'function'
+		? db.getGroupDmVisibilityDataForUser.bind(db)
+		: typeof db?.getGroupDmsForUser === 'function'
+			? db.getGroupDmsForUser.bind(db)
+			: null;
+	if (!getVisibilityDms) {
 		return db?.getGroupDmUnreadTotal
 			? db.getGroupDmUnreadTotal(userId)
 			: 0;
 	}
 
 	const normalizedUserId = Number(userId);
-	const dms = await db.getGroupDmsForUser(normalizedUserId);
+	const dms = await getVisibilityDms(normalizedUserId);
 	if (!Array.isArray(dms) || dms.length === 0) return 0;
 
 	const memberIds = new Set();
@@ -73,7 +78,7 @@ async function getVisibleDmUnreadCount(db, userId) {
 	}
 
 	const [viewer, membersById] = await Promise.all([
-		typeof db.getUserById === 'function' ? db.getUserById(normalizedUserId) : null,
+		knownViewer || (typeof db.getUserById === 'function' ? db.getUserById(normalizedUserId) : null),
 		getUsersByIdsForDmVisibility(db, [...memberIds]),
 	]);
 

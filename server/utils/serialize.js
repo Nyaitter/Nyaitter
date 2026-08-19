@@ -96,7 +96,7 @@ async function serializeUser(db, user, viewerId = null, publicUrl = null) {
 		db.getPinnedPostId ? db.getPinnedPostId(id) : null,
 		isSelf && db.getNotifications ? db.getNotifications(id, 200) : [],
 		isSelf && db.getUnreadNotificationCount ? db.getUnreadNotificationCount(id) : 0,
-		isSelf ? getVisibleDmUnreadCount(db, id) : 0,
+		isSelf ? getVisibleDmUnreadCount(db, id, { viewer: user }) : 0,
 	]);
 	const structuredNotifications = isSelf
 		? await serializeNotifications(db, notifications, publicUrl)

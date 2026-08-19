@@ -1342,6 +1342,20 @@ class PostgresAdapter extends DatabaseAdapter {
 		return rows.map((row) => this._serializeGroupDmRow(row, userId));
 	}
 
+	async getGroupDmVisibilityDataForUser(userId) {
+		// DM未読数の可視性判定では member と unread だけを使用する。
+		// 投稿履歴JSONを転送しないことで、/auth/me とUIサマリの読み取り量を抑える。
+		const { rows } = await this.pool.query(
+			`SELECT id, member, unread FROM group_dms WHERE $1::INTEGER = ANY(member)`,
+			[userId],
+		);
+		return rows.map((row) => ({
+			id: row.id,
+			member: (row.member || []).map(Number),
+			unread: row.unread || {},
+		}));
+	}
+
 	async getGroupDm(dmId) {
 		const { rows } = await this.pool.query(
 			'SELECT * FROM group_dms WHERE id = $1 LIMIT 1',
@@ -1661,22 +1675,14 @@ class PostgresAdapter extends DatabaseAdapter {
 	}
 
 	async deletePost(postId, userId) {
-		return this._withTransaction(async (client) => {
-			const { rows: postRows } = await client.query(
-				'SELECT user_id FROM posts WHERE id = $1',
-				[postId]
-			);
-			if (postRows.length === 0 || Number(postRows[0].user_id) !== Number(userId)) {
-				return false;
-			}
-
-			await client.query('DELETE FROM likes WHERE post_id = $1', [postId]);
-			await client.query('DELETE FROM stars WHERE post_id = $1', [postId]);
-			await client.query('DELETE FROM reposts WHERE post_id = $1', [postId]);
-			await client.query('DELETE FROM pinned_posts WHERE post_id = $1', [postId]);
-			await client.query('DELETE FROM posts WHERE id = $1', [postId]);
-			return true;
-		});
+		// likes / stars / reposts / pinned_posts はすべて posts.id に
+		// ON DELETE CASCADE で参照している。明示的な子テーブル削除を重ねず、
+		// 所有者条件を含む単一DELETEに集約する。
+		const { rowCount } = await this.pool.query(
+			'DELETE FROM posts WHERE id = $1 AND user_id = $2',
+			[postId, userId],
+		);
+		return rowCount > 0;
 	}
 
 	async togglePin(userId, postId) {
@@ -1792,14 +1798,11 @@ class PostgresAdapter extends DatabaseAdapter {
 	}
 
 	async adminDeletePost(postId) {
-		return this._withTransaction(async (client) => {
-			await client.query('DELETE FROM likes WHERE post_id = $1', [postId]);
-			await client.query('DELETE FROM stars WHERE post_id = $1', [postId]);
-			await client.query('DELETE FROM reposts WHERE post_id = $1', [postId]);
-			await client.query('DELETE FROM pinned_posts WHERE post_id = $1', [postId]);
-			await client.query('DELETE FROM posts WHERE id = $1', [postId]);
-			return true;
-		});
+		const { rowCount } = await this.pool.query(
+			'DELETE FROM posts WHERE id = $1',
+			[postId],
+		);
+		return rowCount > 0;
 	}
 
 	async createNotification(notificationData) {

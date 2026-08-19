@@ -682,18 +682,36 @@ router.get('/:id/thread', optionalAuth, async (req, res) => {
 		const currentUserId = req.user ? req.user.id : null;
 		const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 100);
 		const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
-					const root = await db.getPostById(postId);
-			if (!root || !(await canViewPost(db, root, currentUserId))) {
-				return res.status(404).json({ error: 'Post not found' });
-			}
-			const replyPage = await getThreadReplyPostIds(db, postId, limit, offset);
-			const viewableReplyIds = await getViewablePostIds(db, replyPage.ids, currentUserId);
-			const [mainPost, replies] = await Promise.all([
-				serializePost(db, root, currentUserId, 0, getPublicUrl(req)),
-				serializePostsByIds(db, viewableReplyIds, currentUserId, getPublicUrl(req)),
-			]);
+		const root = await db.getPostById(postId);
+		if (!root) {
+			return res.status(404).json({ error: 'Post not found' });
+		}
 
-		res.json({ post: mainPost, replies, has_more: replyPage.has_more, offset, limit });
+		const replyPage = await getThreadReplyPostIds(db, postId, limit, offset);
+		const replyPostsById = new Map(
+			(await db.getPostsByIds(replyPage.ids)).filter(Boolean).map((post) => [Number(post.id), post]),
+		);
+		const orderedReplyPosts = replyPage.ids
+			.map((id) => replyPostsById.get(Number(id)))
+			.filter(Boolean);
+		const serializedPosts = await serializePostsBatch(
+			db,
+			[root, ...orderedReplyPosts],
+			currentUserId,
+			getPublicUrl(req),
+		);
+		const mainPost = serializedPosts[0] || null;
+		if (!mainPost) {
+			return res.status(404).json({ error: 'Post not found' });
+		}
+
+		res.json({
+			post: mainPost,
+			replies: serializedPosts.slice(1),
+			has_more: replyPage.has_more,
+			offset,
+			limit,
+		});
 	} catch (err) {
 		console.error('[posts] thread error:', err);
 		res.status(500).json({ error: '投稿スレッドの取得に失敗しました' });
@@ -711,10 +729,14 @@ router.get('/:id', optionalAuth, async (req, res) => {
 
 	try {
 		const post = await db.getPostById(postId);
-					if (!post || !(await canViewPost(db, post, currentUserId))) {
-				return res.status(404).json({ error: 'Post not found' });
-			}
-			res.json({ post: await serializePost(db, post, currentUserId, 0, getPublicUrl(req)) });
+		if (!post) {
+			return res.status(404).json({ error: 'Post not found' });
+		}
+		const serializedPost = await serializePost(db, post, currentUserId, 0, getPublicUrl(req));
+		if (!serializedPost) {
+			return res.status(404).json({ error: 'Post not found' });
+		}
+		res.json({ post: serializedPost });
 
 	} catch (err) {
 		console.error('[posts] detail error:', err);
@@ -733,15 +755,28 @@ router.get('/:id/replies', optionalAuth, async (req, res) => {
 
 	try {
 		const root = await db.getPostById(postId);
-		if (!root || !(await canViewPost(db, root, currentUserId))) {
+		if (!root) {
 			return res.status(404).json({ error: 'Post not found' });
 		}
 		const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 100);
 		const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
 		const page = await db.getReplyPostIds(postId, limit, offset);
-		const viewableReplyIds = await getViewablePostIds(db, page.ids, currentUserId);
-		const replies = await serializePostsByIds(db, viewableReplyIds, currentUserId, getPublicUrl(req));
-		res.json({ replies, has_more: page.has_more, offset, limit });
+		const replyPostsById = new Map(
+			(await db.getPostsByIds(page.ids)).filter(Boolean).map((post) => [Number(post.id), post]),
+		);
+		const orderedReplyPosts = page.ids
+			.map((id) => replyPostsById.get(Number(id)))
+			.filter(Boolean);
+		const serializedPosts = await serializePostsBatch(
+			db,
+			[root, ...orderedReplyPosts],
+			currentUserId,
+			getPublicUrl(req),
+		);
+		if (!serializedPosts[0]) {
+			return res.status(404).json({ error: 'Post not found' });
+		}
+		res.json({ replies: serializedPosts.slice(1), has_more: page.has_more, offset, limit });
 	} catch (err) {
 		console.error('[posts] replies error:', err);
 		res.status(500).json({ error: 'リプライの取得に失敗しました' });

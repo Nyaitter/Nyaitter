@@ -116,14 +116,15 @@ async function createPostVisibilityContext(db, posts, viewerId = null, authorsBy
 	const values = (posts || []).filter(Boolean);
 	const normalizedViewerId = normalizeUserId(viewerId);
 	const resolvedAuthorsById = authorsById || await getAuthorsById(db, values);
-	let viewer = null;
-	if (normalizedViewerId != null && typeof db.getUserById === 'function') {
-		viewer = await db.getUserById(normalizedViewerId);
-	}
 	const authorIds = [...new Set(values
 		.map(getPostAuthorId)
 		.filter((id) => id != null))];
-	const followSnapshot = await getFollowRelationshipSnapshot(db, normalizedViewerId, authorIds);
+	const [viewer, followSnapshot] = await Promise.all([
+		normalizedViewerId != null && typeof db.getUserById === 'function'
+			? db.getUserById(normalizedViewerId)
+			: null,
+		getFollowRelationshipSnapshot(db, normalizedViewerId, authorIds),
+	]);
 
 	return {
 		viewerId: normalizedViewerId,
