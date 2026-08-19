@@ -1,36 +1,33 @@
+'use strict';
+
 const config = require('../config');
 
 function createRateLimiter(options = {}) {
-  const windowMs = options.windowMs || config.rateLimit.general?.windowMs || 60000;
-  const max = options.max || config.rateLimit.general?.max || 1000;
+  const windowMs = options.windowMs || config.rateLimit?.general?.windowMs || 60000;
+  const max = options.max || config.rateLimit?.general?.max || 1000;
   const keyGenerator = options.keyGenerator || ((req) => {
-    if (req.user?.id) {
-      return `user:${req.user.id}`;
-    }
+    if (req.user?.id) return `user:${req.user.id}`;
     return req.ip || 'unknown';
   });
 
-  // リミッターごとに状態を分離する。認証系と一般APIの使用量を混在させず、
-  // IPが増えた場合も期限切れエントリーを定期的に回収する。
   const store = new Map(); // key -> { count, resetTime }
-  let lastPrunedAt = 0;
 
-  function pruneExpiredEntries(now) {
-    if (now - lastPrunedAt < windowMs) return;
-    lastPrunedAt = now;
+  // Background pruning on unref interval prevents O(N) map traversal on request hot path
+  const timer = setInterval(() => {
+    const now = Date.now();
     for (const [key, entry] of store) {
       if (!entry || entry.resetTime <= now) store.delete(key);
     }
-  }
+  }, Math.max(10000, windowMs));
+  timer.unref();
 
   return function rateLimitMiddleware(req, res, next) {
-    if (!config.rateLimit.enabled) {
+    if (!config.rateLimit?.enabled) {
       return next();
     }
 
     const key = keyGenerator(req);
     const now = Date.now();
-    pruneExpiredEntries(now);
     let entry = store.get(key);
 
     if (!entry || now >= entry.resetTime) {
@@ -38,7 +35,7 @@ function createRateLimiter(options = {}) {
       store.set(key, entry);
     }
 
-    entry.count++;
+    entry.count += 1;
 
     if (entry.count > max) {
       res.setHeader('Retry-After', Math.max(1, Math.ceil((entry.resetTime - now) / 1000)));
@@ -58,8 +55,8 @@ function createRateLimiter(options = {}) {
 
 const generalLimiter = createRateLimiter();
 const authLimiter = createRateLimiter({
-  windowMs: config.rateLimit.auth?.windowMs,
-  max: config.rateLimit.auth?.max || 20,
+  windowMs: config.rateLimit?.auth?.windowMs,
+  max: config.rateLimit?.auth?.max || 20,
 });
 
 module.exports = {

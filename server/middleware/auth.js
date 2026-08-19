@@ -1,36 +1,57 @@
+'use strict';
+
 const SessionManager = require('../services/auth/SessionManager');
 const BotTokenManager = require('../services/auth/BotTokenManager');
 const config = require('../config');
 
+const DEFAULT_CSP = [
+  "default-src 'self'",
+  "base-uri 'self'",
+  "object-src 'none'",
+  "frame-ancestors 'none'",
+  "form-action 'self'",
+  "script-src 'self' https://cdn.jsdelivr.net",
+  "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com",
+  "img-src 'self' data: https:",
+  "font-src 'self' data: https://fonts.gstatic.com",
+  "connect-src 'self' https: wss:",
+  "worker-src 'self'",
+  "manifest-src 'self'",
+].join('; ');
+
+const PERMISSIONS_POLICY = 'camera=(), microphone=(), geolocation=(), payment=(), usb=()';
+
 function parseCookies(req) {
-  const cookies = {};
   const rawCookie = req.headers.cookie;
-  if (!rawCookie) return cookies;
+  if (!rawCookie) return {};
 
-  rawCookie.split(';').forEach((cookie) => {
-    const parts = cookie.split('=');
-    const name = parts.shift()?.trim();
-    if (!name) return;
-
+  const cookies = {};
+  const pairs = rawCookie.split(';');
+  for (let i = 0; i < pairs.length; i += 1) {
+    const pair = pairs[i];
+    const eqIdx = pair.indexOf('=');
+    if (eqIdx === -1) continue;
+    const name = pair.slice(0, eqIdx).trim();
+    if (!name) continue;
+    const val = pair.slice(eqIdx + 1).trim();
     try {
-      cookies[name] = decodeURIComponent(parts.join('='));
+      cookies[name] = decodeURIComponent(val);
     } catch (_) {
-      // Malformed cookies must not turn an authentication attempt into a 500 error.
+      cookies[name] = val;
     }
-  });
+  }
   return cookies;
 }
 
 function extractToken(req) {
   const authHeader = req.headers.authorization;
   if (authHeader && authHeader.startsWith('Bearer ')) {
-    return authHeader.slice('Bearer '.length).trim() || null;
+    return authHeader.slice(7).trim() || null;
   }
   if (req.headers['x-api-key']) {
     return String(req.headers['x-api-key']).trim() || null;
   }
-  // URLクエリのトークンはアクセスログ・Referer・プロキシログに残るため受け付けない。
-  // スクリプト利用時は Authorization: Bearer または X-API-Key を使用する。
+  // URLクエリのトークンはアクセスログ・Referer等に残るため受け付けない。
   const cookies = parseCookies(req);
   return cookies.nyaitter_session || cookies.session || null;
 }
@@ -40,8 +61,6 @@ async function getSessionPrincipal(req, token) {
   const tokenHash = SessionManager.hashToken(token);
   let user = null;
 
-  // PostgreSQLではセッションと利用者を結合して一度に取得する。
-  // 他のアダプターは既存のセッション照合と利用者取得を維持する。
   if (typeof db.getUserBySessionToken === 'function') {
     user = await db.getUserBySessionToken(tokenHash);
   } else {
@@ -55,7 +74,6 @@ async function getSessionPrincipal(req, token) {
   const principal = {
     id: user.id,
     tokenType: 'session',
-    // Push購読と同じハッシュを使い、WebSocket接続中の同一セッションを判定する。
     sessionTokenHash: tokenHash,
     isBot: false,
     admin: user.admin === true,
@@ -79,9 +97,6 @@ async function getAuthenticatedPrincipal(req) {
     });
     const botInfo = await botManager.validateBotToken(token);
     if (botInfo) {
-      // Bot tokens can act as their owner for regular APIs but never obtain
-      // administrative privileges, even if the owner is an administrator.
-      // 所有者が凍結済みの場合、Botトークン経由で制限を回避させない。
       const owner = await req.app.locals.dbAdapter.getUserById(botInfo.userId);
       if (!owner) return null;
       const principal = {
@@ -176,17 +191,13 @@ function isSameOriginRequest(req) {
     }
   }
 
-  // Cookieを伴うクロスオリジン要求は、資格情報付きCORSを明示的に有効化し、
-  // allowedOriginsへ登録したClientだけを信頼する。
-  return config.cors.credentials === true && (config.cors.allowedOrigins || []).includes(origin);
+  return config.cors?.credentials === true && (config.cors?.allowedOrigins || []).includes(origin);
 }
 
-/**
- * SameSite Cookieだけに依存せず、Cookieが同送される状態変更要求は同一オリジンに限定する。
- * Bearer / Botトークンのみのサーバー間リクエストはCookieを伴わないため影響を受けない。
- */
 function csrfProtection(req, res, next) {
-  if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
+  if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') {
+    return next();
+  }
   const cookies = parseCookies(req);
   const hasBrowserSession = Boolean(cookies.nyaitter_session || cookies.nyaitter_accounts);
   const fetchSite = String(req.headers['sec-fetch-site'] || '').toLowerCase();
@@ -198,8 +209,8 @@ function csrfProtection(req, res, next) {
 
 function flexibleCors(req, res, next) {
   const origin = req.headers.origin;
-  const allowedOrigins = config.cors.allowedOrigins || [];
-  const defaultPortOrigin = `http://localhost:${config.server.port}`;
+  const allowedOrigins = config.cors?.allowedOrigins || [];
+  const defaultPortOrigin = `http://localhost:${config.server?.port || 3000}`;
   const originAllowed = Boolean(
     origin && (allowedOrigins.includes(origin) || origin === defaultPortOrigin),
   );
@@ -207,7 +218,7 @@ function flexibleCors(req, res, next) {
   if (originAllowed) {
     res.header('Access-Control-Allow-Origin', origin);
     res.header('Vary', 'Origin');
-    if (config.cors.credentials === true) {
+    if (config.cors?.credentials === true) {
       res.header('Access-Control-Allow-Credentials', 'true');
     }
   }
@@ -220,7 +231,7 @@ function flexibleCors(req, res, next) {
     'Access-Control-Allow-Methods',
     'GET, POST, PUT, DELETE, OPTIONS',
   );
-  res.header('Access-Control-Max-Age', String(config.cors.preflightMaxAge || 600));
+  res.header('Access-Control-Max-Age', String(config.cors?.preflightMaxAge || 600));
 
   if (req.method === 'OPTIONS') {
     return res.sendStatus(204);
@@ -231,7 +242,6 @@ function flexibleCors(req, res, next) {
 
 function securityHeaders(req, res, next) {
   const sec = config.security || {};
-  const isDev = (process.env.NODE_ENV || 'development') === 'development';
 
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -243,28 +253,12 @@ function securityHeaders(req, res, next) {
     res.setHeader('Strict-Transport-Security', hsts);
   }
 
-	if (!res.getHeader('Content-Security-Policy')) {
-		// クライアントはインラインscript・イベント属性を使わない。style属性は既存UIの
-		// 互換性のため維持するが、script-srcからunsafe-inlineを除外してDOM XSSを抑止する。
-		const csp = [
-			"default-src 'self'",
-			"base-uri 'self'",
-			"object-src 'none'",
-			"frame-ancestors 'none'",
-			"form-action 'self'",
-			"script-src 'self' https://cdn.jsdelivr.net",
-			"style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com",
-			"img-src 'self' data: https:",
-			"font-src 'self' data: https://fonts.gstatic.com",
-			"connect-src 'self' https: wss:",
-			"worker-src 'self'",
-			"manifest-src 'self'",
-		].join('; ');
-		res.setHeader('Content-Security-Policy', csp);
-	}
+  if (!res.getHeader('Content-Security-Policy')) {
+    res.setHeader('Content-Security-Policy', DEFAULT_CSP);
+  }
 
-	res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=(), usb=()');
-	res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+  res.setHeader('Permissions-Policy', PERMISSIONS_POLICY);
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
 
   return next();
 }
