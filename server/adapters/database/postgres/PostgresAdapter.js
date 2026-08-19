@@ -1783,22 +1783,24 @@ class PostgresAdapter extends DatabaseAdapter {
 			throw new Error('Cannot follow yourself');
 		}
 
-		const { rows } = await this.pool.query(
-			`WITH deleted AS (
-				DELETE FROM follows
-				WHERE follower_id = $1 AND following_id = $2
-				RETURNING 1
-			), inserted AS (
-				INSERT INTO follows (follower_id, following_id, created_at)
-				SELECT $1, $2, NOW()
-				WHERE NOT EXISTS (SELECT 1 FROM deleted)
-				ON CONFLICT (follower_id, following_id) DO NOTHING
-				RETURNING 1
-			)
-			SELECT EXISTS (SELECT 1 FROM inserted) AS following`,
-			[followerId, followingId],
-		);
-		return { following: !!rows[0]?.following };
+		return this._withTransaction(async (client) => {
+			const deleted = await client.query(
+				`DELETE FROM follows
+				 WHERE follower_id = $1 AND following_id = $2
+				 RETURNING 1`,
+				[followerId, followingId],
+			);
+			const following = deleted.rowCount === 0;
+			if (following) {
+				await client.query(
+					`INSERT INTO follows (follower_id, following_id, created_at)
+					 VALUES ($1, $2, NOW())
+					 ON CONFLICT (follower_id, following_id) DO NOTHING`,
+					[followerId, followingId],
+				);
+			}
+			return { following };
+		});
 	}
 
 	async isFollowing(followerId, followingId) {
@@ -1897,28 +1899,30 @@ class PostgresAdapter extends DatabaseAdapter {
 	}
 
 	async togglePin(userId, postId) {
-		const { rows } = await this.pool.query(
-			`WITH owned AS (
-				SELECT 1 FROM posts WHERE id = $2 AND user_id = $1
-			), deleted AS (
-				DELETE FROM pinned_posts
-				WHERE user_id = $1 AND post_id = $2
-					AND EXISTS (SELECT 1 FROM owned)
-				RETURNING 1
-			), inserted AS (
-				INSERT INTO pinned_posts (user_id, post_id, created_at)
-				SELECT $1, $2, NOW()
-				WHERE EXISTS (SELECT 1 FROM owned)
-					AND NOT EXISTS (SELECT 1 FROM deleted)
-				ON CONFLICT (user_id, post_id) DO NOTHING
-				RETURNING 1
-			)
-			SELECT EXISTS (SELECT 1 FROM owned) AS owned,
-				EXISTS (SELECT 1 FROM inserted) AS pinned`,
-			[userId, postId],
-		);
-		if (!rows[0]?.owned) throw new Error('Cannot pin a post you do not own');
-		return { pinned: !!rows[0].pinned };
+		return this._withTransaction(async (client) => {
+			const owned = await client.query(
+				'SELECT 1 FROM posts WHERE id = $1 AND user_id = $2',
+				[postId, userId],
+			);
+			if (owned.rowCount === 0) {
+				throw new Error('Cannot pin a post you do not own');
+			}
+
+			const deleted = await client.query(
+				'DELETE FROM pinned_posts WHERE user_id = $1 AND post_id = $2 RETURNING 1',
+				[userId, postId],
+			);
+			const pinned = deleted.rowCount === 0;
+			if (pinned) {
+				await client.query(
+					`INSERT INTO pinned_posts (user_id, post_id, created_at)
+					 VALUES ($1, $2, NOW())
+					 ON CONFLICT (user_id, post_id) DO NOTHING`,
+					[userId, postId],
+				);
+			}
+			return { pinned };
+		});
 	}
 
 	async getPinnedPosts(userId) {
