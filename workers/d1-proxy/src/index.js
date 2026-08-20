@@ -389,7 +389,7 @@ export default {
 				status: 204,
 				headers: {
 					'Access-Control-Allow-Origin': '*',
-					'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+					'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
 					'Access-Control-Allow-Headers': 'Content-Type, Authorization',
 				},
 			});
@@ -1315,6 +1315,16 @@ export default {
 				return row ? json(normalizeGroupRow(row)) : notFound('Group not found');
 			}
 
+			if (method === 'PATCH' && pathname.match(/^\/groups\/[^/]+\/owner$/)) {
+				const groupId = decodeURIComponent(pathname.split('/')[2]);
+				const body = await request.json();
+				const newOwnerId = Number(body.newOwnerId ?? body.new_owner_id);
+				if (!Number.isInteger(newOwnerId) || newOwnerId < 0) return badRequest('Invalid new owner');
+				await db.prepare('UPDATE groups SET owner_id = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL').bind(newOwnerId, new Date().toISOString(), groupId).run();
+				const row = await db.prepare(`SELECT g.*, (SELECT COUNT(*) FROM group_memberships gm WHERE gm.group_id = g.id AND gm.status = 'active') AS member_count FROM groups g WHERE g.id = ? AND g.deleted_at IS NULL`).bind(groupId).first();
+				return row ? json(normalizeGroupRow(row)) : notFound('Group not found');
+			}
+
 			if (method === 'PATCH' && pathname.match(/^\/groups\/[^/]+$/)) {
 				const groupId = decodeURIComponent(pathname.split('/')[2]);
 				const body = await request.json();
@@ -1459,8 +1469,8 @@ export default {
 			}
 
 			if (method === 'GET' && pathname.match(/^\/groups\/[^/]+\/(posts|announcements)$/)) {
-				const groupId = decodeURIComponent(pathname.split('/')[2]); const onlyAnnouncements = pathname.endsWith('/announcements'); const limit = Math.max(1, Math.min(Number(url.searchParams.get('limit') || 30), 100)); const offset = Math.max(0, Number(url.searchParams.get('offset') || 0)); const beforeId = Number(url.searchParams.get('beforeId')) || null;
-				const clauses = ['group_id = ?']; const values = [groupId]; if (onlyAnnouncements) clauses.push('group_announcement = 1'); if (beforeId) { clauses.push('id < ?'); values.push(beforeId); }
+				const groupId = decodeURIComponent(pathname.split('/')[2]); const onlyAnnouncements = pathname.endsWith('/announcements'); const limit = Math.max(1, Math.min(Number(url.searchParams.get('limit') || 30), 100)); const offset = Math.max(0, Number(url.searchParams.get('offset') || 0)); const beforeId = Number(url.searchParams.get('beforeId')) || null; const authorId = Number.isInteger(Number(url.searchParams.get('authorId'))) && Number(url.searchParams.get('authorId')) >= 0 ? Number(url.searchParams.get('authorId')) : null;
+				const clauses = ['group_id = ?']; const values = [groupId]; if (onlyAnnouncements) clauses.push('group_announcement = 1'); if (authorId != null) { clauses.push('user_id = ?'); values.push(authorId); } if (beforeId) { clauses.push('id < ?'); values.push(beforeId); }
 				values.push(limit + 1); let offsetSql = ''; if (!beforeId) { values.push(offset); offsetSql = ' OFFSET ?'; }
 				const { results } = await db.prepare(`SELECT id FROM posts WHERE ${clauses.join(' AND ')} ORDER BY created_at DESC, id DESC LIMIT ?${offsetSql}`).bind(...values).all(); const rows = results || []; const ids = rows.slice(0, limit).map((row) => Number(row.id)); return json({ ids, has_more: rows.length > limit, next_cursor: rows.length > limit ? ids.at(-1) || null : null });
 			}
@@ -1600,14 +1610,14 @@ export default {
 
 			if (method === 'GET' && pathname === '/posts/recent') {
 				const limit = Math.min(Number(url.searchParams.get('limit') || 30), 100);
-				const { results } = await db.prepare('SELECT * FROM posts WHERE reply_to IS NULL ORDER BY created_at DESC, id DESC LIMIT ?').bind(limit).all();
+				const { results } = await db.prepare('SELECT * FROM posts WHERE group_id IS NULL AND reply_to IS NULL ORDER BY created_at DESC, id DESC LIMIT ?').bind(limit).all();
 				return json((results || []).map(normalizePostRow));
 			}
 
 			if (method === 'GET' && pathname.match(/^\/users\/(\d+)\/posts$/)) {
 				const userId = Number(pathname.split('/')[2]);
 				const limit = Math.min(Number(url.searchParams.get('limit') || 50), 100);
-				const { results } = await db.prepare('SELECT * FROM posts WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT ?').bind(userId, limit).all();
+				const { results } = await db.prepare('SELECT * FROM posts WHERE user_id = ? AND group_id IS NULL ORDER BY created_at DESC, id DESC LIMIT ?').bind(userId, limit).all();
 				return json((results || []).map(normalizePostRow));
 			}
 
@@ -1627,28 +1637,28 @@ export default {
 					const placeholders = followIds.map(() => '?').join(', ');
 					const queryRes = beforeId != null
 						? await db.prepare(
-							`SELECT id FROM posts WHERE user_id IN (${placeholders}) AND reply_to IS NULL AND id < ? ORDER BY created_at DESC, id DESC LIMIT ?`
+							`SELECT id FROM posts WHERE user_id IN (${placeholders}) AND group_id IS NULL AND reply_to IS NULL AND id < ? ORDER BY created_at DESC, id DESC LIMIT ?`
 						).bind(...followIds, beforeId, limit + 1).all()
 						: await db.prepare(
-							`SELECT id FROM posts WHERE user_id IN (${placeholders}) AND reply_to IS NULL ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`
+							`SELECT id FROM posts WHERE user_id IN (${placeholders}) AND group_id IS NULL AND reply_to IS NULL ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`
 						).bind(...followIds, limit + 1, offset).all();
 					results = queryRes.results || [];
 				} else if (tab === 'announce') {
 					const queryRes = beforeId != null
 						? await db.prepare(
-							`SELECT id FROM posts WHERE announcement = 1 AND reply_to IS NULL AND id < ? ORDER BY created_at DESC, id DESC LIMIT ?`
+							`SELECT id FROM posts WHERE group_id IS NULL AND announcement = 1 AND reply_to IS NULL AND id < ? ORDER BY created_at DESC, id DESC LIMIT ?`
 						).bind(beforeId, limit + 1).all()
 						: await db.prepare(
-							`SELECT id FROM posts WHERE announcement = 1 AND reply_to IS NULL ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`
+							`SELECT id FROM posts WHERE group_id IS NULL AND announcement = 1 AND reply_to IS NULL ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`
 						).bind(limit + 1, offset).all();
 					results = queryRes.results || [];
 				} else {
 					const queryRes = beforeId != null
 						? await db.prepare(
-							`SELECT id FROM posts WHERE reply_to IS NULL AND id < ? ORDER BY created_at DESC, id DESC LIMIT ?`
+							`SELECT id FROM posts WHERE group_id IS NULL AND reply_to IS NULL AND id < ? ORDER BY created_at DESC, id DESC LIMIT ?`
 						).bind(beforeId, limit + 1).all()
 						: await db.prepare(
-							`SELECT id FROM posts WHERE reply_to IS NULL ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`
+							`SELECT id FROM posts WHERE group_id IS NULL AND reply_to IS NULL ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`
 						).bind(limit + 1, offset).all();
 					results = queryRes.results || [];
 				}
@@ -1673,7 +1683,7 @@ export default {
 						: null;
 											const scoringBlockSize = Math.max(240, limit * 8);
 						const candidateLimit = scoringBlockSize + 1;
-						const candidateWhere = beforeId != null ? 'p.reply_to IS NULL AND p.id < ?' : 'p.reply_to IS NULL';
+						const candidateWhere = beforeId != null ? 'p.group_id IS NULL AND p.reply_to IS NULL AND p.id < ?' : 'p.group_id IS NULL AND p.reply_to IS NULL';
 						const candidateBindings = beforeId != null
 							? [beforeId, candidateLimit, offset, scoringBlockSize]
 							: [candidateLimit, offset, scoringBlockSize];
@@ -1820,7 +1830,7 @@ export default {
 					: null;
 				const offset = beforeId == null ? Number(url.searchParams.get('offset') || 0) : 0;
 
-				let sql = 'SELECT id FROM posts WHERE user_id = ?';
+				let sql = 'SELECT id FROM posts WHERE user_id = ? AND group_id IS NULL';
 				const bindings = [userId];
 				if (subType === 'posts_only') sql += ' AND reply_to IS NULL';
 				if (subType === 'replies_only') sql += ' AND reply_to IS NOT NULL';
@@ -1855,10 +1865,10 @@ export default {
 
 				const { results } = beforeId != null
 					? await db.prepare(
-						'SELECT id FROM posts WHERE LOWER(content) LIKE ? AND id < ? ORDER BY created_at DESC, id DESC LIMIT ?'
+						'SELECT id FROM posts WHERE group_id IS NULL AND LOWER(content) LIKE ? AND id < ? ORDER BY created_at DESC, id DESC LIMIT ?'
 					).bind(`%${q.toLowerCase()}%`, beforeId, limit + 1).all()
 					: await db.prepare(
-						'SELECT id FROM posts WHERE LOWER(content) LIKE ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?'
+						'SELECT id FROM posts WHERE group_id IS NULL AND LOWER(content) LIKE ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?'
 					).bind(`%${q.toLowerCase()}%`, limit + 1, offset).all();
 
 				const rows = results || [];
@@ -1874,7 +1884,7 @@ export default {
 				const q = url.searchParams.get('q') || '';
 				const limit = Math.min(Number(url.searchParams.get('limit') || 20), 100);
 				const { results } = await db.prepare(
-					'SELECT * FROM posts WHERE LOWER(content) LIKE ? ORDER BY created_at DESC, id DESC LIMIT ?'
+					'SELECT * FROM posts WHERE group_id IS NULL AND LOWER(content) LIKE ? ORDER BY created_at DESC, id DESC LIMIT ?'
 				).bind(`%${q.toLowerCase()}%`, limit).all();
 				return json((results || []).map(normalizePostRow));
 			}
@@ -1984,7 +1994,7 @@ export default {
 
 			if (method === 'GET' && pathname === '/posts/trending-hashtags') {
 				const limit = Math.min(Number(url.searchParams.get('limit') || 10), 50);
-				const { results } = await db.prepare('SELECT content, tags FROM posts ORDER BY created_at DESC LIMIT 500').all();
+				const { results } = await db.prepare('SELECT content, tags FROM posts WHERE group_id IS NULL ORDER BY created_at DESC LIMIT 500').all();
 				const counts = new Map();
 				for (const row of results || []) {
 					const matches = (row.content || '').match(/#([^<>/@#\s]+)/g) || [];

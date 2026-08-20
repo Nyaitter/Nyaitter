@@ -19,6 +19,11 @@ const {
   resolvePostingUser,
   assertPostingUserWritable,
 } = require('./auth/PostAsUserService');
+const {
+  normalizeGroupId,
+  requireGroupPermission,
+  listActiveGroupMemberIds,
+} = require('./GroupService');
 
 function decodeBase64File(value) {
   if (typeof value !== 'string' || value.length === 0 || value.length % 4 !== 0) {
@@ -137,7 +142,7 @@ async function notifyPostAction(context, { userId, type, fromUserId, postId }) {
 }
 
 async function publishNewTimelinePost(context, post) {
-  if (!post || post.replyTo != null || post.reply_to != null) return;
+  if (!post || post.groupId || post.group_id || post.replyTo != null || post.reply_to != null) return;
   if (!context.realtime?.publishPostToFollowers) return;
   try {
     await context.realtime.publishPostToFollowers(post.userId, context.db, post);
@@ -148,7 +153,7 @@ async function publishNewTimelinePost(context, post) {
 
 function enqueueGeminiModeration(context, post) {
   const service = context.autoModerationService;
-  if (!service?.enabled || !post) return;
+  if (!service?.enabled || !post || post.groupId || post.group_id) return;
   try {
     service.enqueue(post);
   } catch (error) {
@@ -161,6 +166,20 @@ function normalizeTargetPostId(value) {
   return Number.isInteger(postId) && postId > 0 ? postId : null;
 }
 
+async function notifyGroupAnnouncement(context, group, post) {
+  const memberIds = await listActiveGroupMemberIds(context.db, group.id);
+  for (const memberId of memberIds) {
+    const notification = await createNotificationIfAllowed(context.db, {
+      userId: memberId,
+      type: 'group_announcement',
+      fromUserId: post.userId,
+      target: { kind: 'post', id: Number(post.id) },
+      message: `「${group.name}」のグループアナウンスが投稿されました。`,
+    });
+    if (notification) await publishNewNotification(context, memberId, notification);
+  }
+}
+
 async function processCreatePostAction(context, payload) {
   const postingUser = assertPostingUserWritable(
     await resolvePostingUser(context.authRequest, context.db, payload.postAsUserId),
@@ -171,6 +190,9 @@ async function processCreatePostAction(context, payload) {
   const replyTo = normalizeTargetPostId(payload.replyTo);
   const repostTo = normalizeTargetPostId(payload.repostTo);
   const isAnnouncement = payload.announcement === true;
+  let groupId = normalizeGroupId(payload.groupId ?? payload.group_id);
+  let groupAnnouncement = payload.groupAnnouncement === true || payload.group_announcement === true;
+  let group = null;
   const isSimpleRepost = content.length === 0 && repostTo != null;
 
   if (!content && attachments.length === 0 && !isSimpleRepost) {
@@ -182,6 +204,10 @@ async function processCreatePostAction(context, payload) {
   if (isAnnouncement && (replyTo || repostTo)) {
     throw new Error('Announcements cannot be replies or reposts');
   }
+  if (isAnnouncement && groupId) throw new Error('Global announcements cannot be group posts');
+  if (groupAnnouncement && !groupId) throw new Error('Group announcements require a group');
+  if (groupId && repostTo) throw new Error('Group posts cannot quote or repost another post');
+  if (groupAnnouncement && (replyTo || repostTo)) throw new Error('Group announcements cannot be replies or reposts');
 
   validateAttachmentReferences(attachments, userId);
   const relatedPosts = new Map();
@@ -198,6 +224,23 @@ async function processCreatePostAction(context, payload) {
       throw new Error('Post not found');
     }
     relatedPosts.set(targetId, target);
+  }
+
+  const replyTargetForGroup = replyTo ? relatedPosts.get(replyTo) : null;
+  const replyTargetGroupId = normalizeGroupId(replyTargetForGroup?.groupId ?? replyTargetForGroup?.group_id);
+  if (replyTargetGroupId) {
+    if (groupId && groupId !== replyTargetGroupId) throw new Error('Replies must remain in the same group');
+    groupId = replyTargetGroupId;
+    groupAnnouncement = false;
+  } else if (groupId && replyTo) {
+    throw new Error('Group posts cannot reply to a non-group post');
+  }
+
+  if (groupId) {
+    group = await context.db.getGroupById(groupId);
+    if (!group) throw new Error('Group not found');
+    await requireGroupPermission(context.db, group, userId, 'post');
+    if (groupAnnouncement) await requireGroupPermission(context.db, group, userId, 'announce');
   }
 
   const processedAttachments = attachments.map((attachment) => {
@@ -225,6 +268,8 @@ async function processCreatePostAction(context, payload) {
     mask: Boolean(payload.mask),
     lock: Boolean(payload.lock),
     announcement: isAnnouncement,
+    groupId,
+    groupAnnouncement,
     replyTo,
     repostTo,
   });
@@ -266,6 +311,7 @@ async function processCreatePostAction(context, payload) {
     });
   }
 
+  if (groupAnnouncement && group) await notifyGroupAnnouncement(context, group, post);
   await publishNewTimelinePost(context, post);
   enqueueGeminiModeration(context, post);
   return post;

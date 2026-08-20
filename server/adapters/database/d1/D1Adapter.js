@@ -697,6 +697,14 @@ class D1Adapter extends DatabaseAdapter {
 		return normalizeGroup(await this._write(`/groups/${this._groupPath(groupId)}`, undefined, 'DELETE'));
 	}
 
+	async transferGroupOwnership(groupId, newOwnerId) {
+		return normalizeGroup(await this._write(
+			`/groups/${this._groupPath(groupId)}/owner`,
+			{ newOwnerId: requireId(newOwnerId, 'newOwnerId') },
+			'PATCH',
+		));
+	}
+
 	async getGroupsByVisibility({ query = '', visibility = ['open', 'open_invite'], limit = 20, offset = 0 } = {}) {
 		const groups = await this._read(this._query('/groups', { query, visibility: Array.isArray(visibility) ? visibility.join(',') : visibility,
 			limit: this._limit(limit, 20, 100), offset: Math.max(0, Number(offset) || 0) }), { cacheSeconds: 0 });
@@ -784,9 +792,10 @@ class D1Adapter extends DatabaseAdapter {
 		return normalizeGroupJoinRequest(await this._write(`/group-join-requests/${this._groupPath(requestId)}`, fields, 'PATCH'));
 	}
 
-	async getGroupPostIds(groupId, { limit = 30, offset = 0, beforeId = null } = {}) {
+	async getGroupPostIds(groupId, { limit = 30, offset = 0, beforeId = null, authorId = null } = {}) {
 		return this._read(this._query(`/groups/${this._groupPath(groupId)}/posts`, {
 			limit: this._limit(limit, 30, 100), offset: Math.max(0, Number(offset) || 0), beforeId: beforeId ?? undefined,
+			authorId: Number.isInteger(Number(authorId)) && Number(authorId) >= 0 ? Number(authorId) : undefined,
 		}), { cacheSeconds: 0 });
 	}
 

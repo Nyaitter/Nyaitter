@@ -126,6 +126,7 @@ class DatabaseAdapter {
 	async getGroupById(groupId) { throw new Error('getGroupById() must be implemented'); }
 	async updateGroup(groupId, fields) { throw new Error('updateGroup() must be implemented'); }
 	async deleteGroup(groupId) { throw new Error('deleteGroup() must be implemented'); }
+	async transferGroupOwnership(groupId, newOwnerId) { throw new Error('transferGroupOwnership() must be implemented'); }
 	async getGroupsByVisibility(params = {}) { throw new Error('getGroupsByVisibility() must be implemented'); }
 	async getUserGroups(userId, params = {}) { throw new Error('getUserGroups() must be implemented'); }
 	async createGroupRole(roleData) { throw new Error('createGroupRole() must be implemented'); }

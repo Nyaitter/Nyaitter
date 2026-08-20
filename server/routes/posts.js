@@ -261,6 +261,8 @@ router.post('/', requireAuth, postWriteLimiter, (req, res) => {
 		mask,
 		lock,
 		announcement,
+		group_id,
+		group_announcement,
 		reply_to,
 		repost_to,
 		post_as_user_id,
@@ -291,8 +293,10 @@ router.post('/', requireAuth, postWriteLimiter, (req, res) => {
 			attachments,
 			mask,
 			lock,
-			announcement: announcement === true,
-			replyTo: reply_to,
+				announcement: announcement === true,
+				groupId: group_id,
+				groupAnnouncement: group_announcement === true,
+				replyTo: reply_to,
 			repostTo: repost_to,
 			postAsUserId: post_as_user_id,
 		}));
@@ -423,10 +427,23 @@ router.get('/search', optionalAuth, async (req, res) => {
 				getPublicUrl(req),
 				knownViewer,
 				visibilityContext,
-			);
-				res.json({ posts, has_next: has_more, next_cursor });
-	} catch (err) {
-		console.error('[posts] search error:', err);
+				);
+				const groupPage = currentUserId != null && typeof db.searchGroupPostIds === 'function'
+					? await db.searchGroupPostIds(currentUserId, q, { limit, offset, beforeId })
+					: { ids: [], has_more: false, next_cursor: null };
+				const groupPosts = await serializePostsByIds(
+					db,
+					groupPage.ids || [],
+					currentUserId,
+					getPublicUrl(req),
+					knownViewer,
+				);
+				const mergedPosts = [...posts, ...groupPosts]
+					.sort((left, right) => new Date(right.created_at || 0).getTime() - new Date(left.created_at || 0).getTime())
+					.slice(0, limit);
+				res.json({ posts: mergedPosts, has_next: has_more || Boolean(groupPage.has_more), next_cursor: next_cursor || groupPage.next_cursor || null });
+		} catch (err) {
+			console.error('[posts] search error:', err);
 		res.status(500).json({ error: '検索に失敗しました' });
 	}
 });

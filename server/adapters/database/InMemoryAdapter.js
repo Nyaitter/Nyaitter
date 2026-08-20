@@ -981,6 +981,14 @@ class InMemoryAdapter extends DatabaseAdapter {
 		return this._cloneGroup(group);
 	}
 
+	async transferGroupOwnership(groupId, newOwnerId) {
+		const group = this.groups.get(String(groupId));
+		if (!group || group.deletedAt) return null;
+		group.ownerId = Number(newOwnerId);
+		group.updatedAt = new Date().toISOString();
+		return this._cloneGroup(group);
+	}
+
 	async getGroupsByVisibility({ query = '', visibility = ['open', 'open_invite'], limit = 20, offset = 0 } = {}) {
 		const allowed = new Set((Array.isArray(visibility) ? visibility : [visibility]).map(String));
 		const q = String(query || '').trim().toLowerCase();
@@ -1143,8 +1151,9 @@ class InMemoryAdapter extends DatabaseAdapter {
 		return { ids, has_more: visible.length > safeLimit, next_cursor: visible.length > safeLimit ? ids.at(-1) || null : null };
 	}
 
-	async getGroupPostIds(groupId, { limit = 30, offset = 0, beforeId = null } = {}) {
-		return this._groupPostResult([...this.posts.values()].filter((post) => post.groupId === String(groupId)), limit, offset, beforeId);
+	async getGroupPostIds(groupId, { limit = 30, offset = 0, beforeId = null, authorId = null } = {}) {
+		const normalizedAuthorId = Number.isInteger(Number(authorId)) && Number(authorId) >= 0 ? Number(authorId) : null;
+		return this._groupPostResult([...this.posts.values()].filter((post) => post.groupId === String(groupId) && (normalizedAuthorId == null || Number(post.userId) === normalizedAuthorId)), limit, offset, beforeId);
 	}
 
 	async getGroupAnnouncementPostIds(groupId, { limit = 30, offset = 0, beforeId = null } = {}) {
@@ -1284,7 +1293,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 		const posts = [];
 		for (const id of this.postIdsNewest) {
 			const post = this.posts.get(id);
-			if (!post || post.replyTo != null) continue;
+			if (!post || post.groupId || post.group_id || post.replyTo != null) continue;
 			posts.push(post);
 			if (posts.length >= normalizedLimit) break;
 		}
@@ -1295,9 +1304,9 @@ class InMemoryAdapter extends DatabaseAdapter {
 		async getPostsByUserId(userId, limit = config.limits.timelinePageSize, _currentUserId = null) {
 			const ids = this.postIdsByUser.get(Number(userId)) || [];
 			return ids
-				.slice(0, Math.max(0, Number(limit) || 0))
 				.map((id) => this.posts.get(id))
-				.filter(Boolean);
+				.filter((post) => post && !post.groupId && !post.group_id)
+				.slice(0, Math.max(0, Number(limit) || 0));
 		}
 
 	async toggleLike(userId, postId) {
@@ -2170,7 +2179,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 		const top = [];
 			for (const postId of this.postIdsNewest) {
 				const post = this.posts.get(postId);
-				if (!post || post.replyTo != null) continue;
+				if (!post || post.groupId || post.group_id || post.replyTo != null) continue;
 				const score = (this.likeCountByPost.get(postId) || 0)
 				+ (this.starCountByPost.get(postId) || 0) * 2
 				+ (this.repostCountByPost.get(postId) || 0) * 3;
@@ -2389,7 +2398,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 			const sourceIds = this.postIdsByUser.get(Number(userId)) || [];
 			const matched = sourceIds.filter((id) => {
 				const post = this.posts.get(id);
-				if (!post || (normalizedBeforeId != null && Number(id) >= normalizedBeforeId)) return false;
+				if (!post || post.groupId || post.group_id || (normalizedBeforeId != null && Number(id) >= normalizedBeforeId)) return false;
 				return subType === 'all' || (subType === 'posts_only' ? post.replyTo == null : post.replyTo != null);
 			});
 			const window = matched.slice(normalizedOffset, normalizedOffset + normalizedLimit + 1);
@@ -2411,7 +2420,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 			const matched = [];
 			for (const id of this.postIdsNewest) {
 				const post = this.posts.get(id);
-				if (!post || post.replyTo != null || (normalizedBeforeId != null && Number(id) >= normalizedBeforeId)) continue;
+				if (!post || post.groupId || post.group_id || post.replyTo != null || (normalizedBeforeId != null && Number(id) >= normalizedBeforeId)) continue;
 				const matches = tab === 'following'
 					? followSet.has(Number(post.userId))
 					: tab === 'announce'
@@ -2470,7 +2479,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 			const candidateSource = [];
 			for (const id of this.postIdsNewest) {
 				const post = this.posts.get(id);
-				if (!post || post.replyTo != null || (normalizedBeforeId != null && Number(id) >= normalizedBeforeId)) continue;
+				if (!post || post.groupId || post.group_id || post.replyTo != null || (normalizedBeforeId != null && Number(id) >= normalizedBeforeId)) continue;
 				candidateSource.push(post);
 				if (candidateSource.length >= normalizedOffset + scoringBlockSize + 1) break;
 			}
@@ -2561,7 +2570,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 			const matched = [];
 			for (const id of this.postIdsNewest) {
 				const post = this.posts.get(id);
-				if (!post || (normalizedBeforeId != null && Number(id) >= normalizedBeforeId)) continue;
+				if (!post || post.groupId || post.group_id || (normalizedBeforeId != null && Number(id) >= normalizedBeforeId)) continue;
 				if (!(post.content || '').toLowerCase().includes(q)) continue;
 				matched.push(id);
 				if (matched.length >= normalizedOffset + normalizedLimit + 1) break;

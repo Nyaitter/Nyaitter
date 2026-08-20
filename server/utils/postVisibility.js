@@ -14,6 +14,11 @@ function getReplyToPostId(post) {
 	return Number.isInteger(id) && id > 0 ? id : null;
 }
 
+function getPostGroupId(post) {
+	const groupId = post?.groupId ?? post?.group_id ?? null;
+	return typeof groupId === 'string' && groupId.trim() ? groupId.trim() : null;
+}
+
 function normalizeUserId(value) {
 	const id = Number(value);
 	return Number.isInteger(id) ? id : null;
@@ -142,7 +147,7 @@ async function createPostVisibilityContext(
 	const existingPostsById = new Map(values.map((p) => [Number(p.id), p]));
 	const missingParentIds = replyToPostIds.filter((id) => !existingPostsById.has(id));
 
-	const [viewer, followSnapshot, fetchedParents] = await Promise.all([
+	const [viewer, followSnapshot, fetchedParents, activeGroupIds] = await Promise.all([
 		canReuseKnownViewer
 			? knownViewer
 			: normalizedViewerId != null && typeof db.getUserById === 'function'
@@ -155,6 +160,14 @@ async function createPostVisibilityContext(
 				return [];
 			})
 			: [],
+		normalizedViewerId != null && typeof db.getUserGroups === 'function'
+			? db.getUserGroups(normalizedViewerId, { status: 'active', limit: 200, offset: 0 })
+				.then((groups) => new Set((groups || []).map((group) => String(group.id))))
+				.catch((err) => {
+					console.warn('[postVisibility] group membership fallback:', err.message);
+					return new Set();
+				})
+			: new Set(),
 	]);
 
 	const replyToAuthorIdsByReplyId = new Map();
@@ -180,6 +193,7 @@ async function createPostVisibilityContext(
 		followerIds: followSnapshot.followerIds,
 		relationshipAuthorIds: new Set(authorIds.filter((id) => id !== normalizedViewerId)),
 		replyToAuthorIdsByReplyId,
+		activeGroupIds,
 	};
 }
 
@@ -279,6 +293,7 @@ async function extendPostVisibilityContext(
 		]),
 		relationshipAuthorIds: knownRelationshipAuthorIds,
 		replyToAuthorIdsByReplyId: mergedReplyToAuthorIds,
+		activeGroupIds: new Set(visibilityContext.activeGroupIds || []),
 	};
 }
 
@@ -294,7 +309,11 @@ function canViewPostWithContext(post, context) {
 	const authorId = getPostAuthorId(post);
 	if (authorId == null) return false;
 	const author = context.authorsById?.get(authorId) || null;
+	const groupId = getPostGroupId(post);
 
+	// グループ投稿は投稿者自身を含め、現在も参加状態がactiveのメンバーだけが閲覧できる。
+	// 退出後は過去投稿も閲覧できないというグループ境界を最初に適用する。
+	if (groupId && (context.viewerId == null || !context.activeGroupIds?.has(groupId))) return false;
 	if (hasBlockRelationshipInContext(context, authorId)) return false;
 	if (!isPrivatePost(post, author)) return true;
 	if (context.viewerId == null) return false;
@@ -358,6 +377,8 @@ async function filterDiscoverablePosts(db, posts, viewerId = null, visibilityCon
 	const values = (posts || []).filter(Boolean);
 	const context = visibilityContext || await createPostVisibilityContext(db, values, viewerId);
 	return values.filter((post) => {
+		// グループ投稿はグループ専用画面・タブでのみ公開する。
+		if (getPostGroupId(post)) return false;
 		const authorId = getPostAuthorId(post);
 		const author = context.authorsById?.get(authorId) || null;
 		if (!author?.shadow) return true;
@@ -377,6 +398,7 @@ module.exports = {
 	getFollowRelationshipSnapshot,
 	getPostAuthorId,
 	getReplyToPostId,
+	getPostGroupId,
 	getAuthorsById,
 	isPrivatePost,
 };

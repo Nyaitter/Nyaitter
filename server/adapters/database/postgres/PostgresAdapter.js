@@ -1387,6 +1387,15 @@ class PostgresAdapter extends DatabaseAdapter {
 		return normalizeGroupRow(rows[0] || null);
 	}
 
+	async transferGroupOwnership(groupId, newOwnerId) {
+		const { rows } = await this.pool.query(
+			`UPDATE groups SET owner_id = $1, updated_at = NOW()
+			 WHERE id = $2 AND deleted_at IS NULL RETURNING *`,
+			[Number(newOwnerId), String(groupId)],
+		);
+		return normalizeGroupRow(rows[0] || null);
+	}
+
 	async getGroupsByVisibility({ query = '', visibility = ['open', 'open_invite'], limit = 20, offset = 0 } = {}) {
 		const safeLimit = Math.max(1, Math.min(Number(limit) || 20, 100));
 		const safeOffset = Math.max(0, Number(offset) || 0);
@@ -1640,10 +1649,13 @@ class PostgresAdapter extends DatabaseAdapter {
 		return normalizeGroupJoinRequestRow(rows[0] || null);
 	}
 
-	async getGroupPostIds(groupId, { limit = 30, offset = 0, beforeId = null } = {}) {
+	async getGroupPostIds(groupId, { limit = 30, offset = 0, beforeId = null, authorId = null } = {}) {
 		const safeLimit = Math.max(1, Math.min(Number(limit) || 30, 100));
 		const values = [String(groupId)];
 		const clauses = ['group_id = $1'];
+		if (Number.isInteger(Number(authorId)) && Number(authorId) >= 0) {
+			values.push(Number(authorId)); clauses.push(`user_id = $${values.length}`);
+		}
 		if (Number.isInteger(Number(beforeId)) && Number(beforeId) > 0) {
 			values.push(Number(beforeId)); clauses.push(`id < $${values.length}`);
 		}
@@ -1930,7 +1942,7 @@ class PostgresAdapter extends DatabaseAdapter {
 	async getRecentPosts(limit = 30) {
 		const safeLimit = Math.min(Math.max(Number(limit) || 30, 1), 100);
 		const { rows } = await this.pool.query(
-			`SELECT * FROM posts WHERE reply_to IS NULL ORDER BY created_at DESC, id DESC LIMIT $1`,
+			`SELECT * FROM posts WHERE group_id IS NULL AND reply_to IS NULL ORDER BY created_at DESC, id DESC LIMIT $1`,
 			[safeLimit],
 		);
 		return rows.map(normalizePostRow);
@@ -1939,7 +1951,7 @@ class PostgresAdapter extends DatabaseAdapter {
 	async getPostsByUserId(userId, limit = 50, _currentUserId = null) {
 		const safeLimit = Math.min(Math.max(Number(limit) || 50, 1), 100);
 		const { rows } = await this.pool.query(
-			`SELECT * FROM posts WHERE user_id = $1 ORDER BY created_at DESC, id DESC LIMIT $2`,
+			`SELECT * FROM posts WHERE user_id = $1 AND group_id IS NULL ORDER BY created_at DESC, id DESC LIMIT $2`,
 			[Number(userId), safeLimit],
 		);
 		return rows.map(normalizePostRow);
@@ -1964,29 +1976,29 @@ class PostgresAdapter extends DatabaseAdapter {
 			const ids = [...new Set((followIds || []).map(Number).filter(Number.isSafeInteger))];
 			if (ids.length === 0) return { ids: [], has_more: false, next_cursor: null };
 			if (normalizedBeforeId != null) {
-				query = `SELECT id FROM posts WHERE user_id = ANY($1::int[]) AND reply_to IS NULL AND id < $2
+				query = `SELECT id FROM posts WHERE user_id = ANY($1::int[]) AND group_id IS NULL AND reply_to IS NULL AND id < $2
 					ORDER BY created_at DESC, id DESC LIMIT $3`;
 				values = [ids, normalizedBeforeId, normalizedLimit + 1];
 			} else {
-				query = `SELECT id FROM posts WHERE user_id = ANY($1::int[]) AND reply_to IS NULL
+				query = `SELECT id FROM posts WHERE user_id = ANY($1::int[]) AND group_id IS NULL AND reply_to IS NULL
 					ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3`;
 				values = [ids, normalizedLimit + 1, normalizedOffset];
 			}
 		} else if (tab === 'announce') {
 			if (normalizedBeforeId != null) {
-				query = `SELECT id FROM posts WHERE announcement = TRUE AND reply_to IS NULL
+				query = `SELECT id FROM posts WHERE group_id IS NULL AND announcement = TRUE AND reply_to IS NULL
 					AND id < $1 ORDER BY created_at DESC, id DESC LIMIT $2`;
 				values = [normalizedBeforeId, normalizedLimit + 1];
 			} else {
-				query = `SELECT id FROM posts WHERE announcement = TRUE AND reply_to IS NULL
+				query = `SELECT id FROM posts WHERE group_id IS NULL AND announcement = TRUE AND reply_to IS NULL
 					ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2`;
 				values = [normalizedLimit + 1, normalizedOffset];
 			}
 		} else if (normalizedBeforeId != null) {
-			query = `SELECT id FROM posts WHERE reply_to IS NULL AND id < $1 ORDER BY created_at DESC, id DESC LIMIT $2`;
+			query = `SELECT id FROM posts WHERE group_id IS NULL AND reply_to IS NULL AND id < $1 ORDER BY created_at DESC, id DESC LIMIT $2`;
 			values = [normalizedBeforeId, normalizedLimit + 1];
 		} else {
-			query = `SELECT id FROM posts WHERE reply_to IS NULL ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2`;
+			query = `SELECT id FROM posts WHERE group_id IS NULL AND reply_to IS NULL ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2`;
 			values = [normalizedLimit + 1, normalizedOffset];
 		}
 		const { rows } = await this.pool.query(query, values);
@@ -2008,7 +2020,7 @@ class PostgresAdapter extends DatabaseAdapter {
 		const scoringBlockSize = Math.max(240, normalizedLimit * 8);
 		const candidateLimit = scoringBlockSize + 1;
 		const values = [];
-		const candidateClauses = ['p.reply_to IS NULL'];
+			const candidateClauses = ['p.group_id IS NULL', 'p.reply_to IS NULL'];
 		if (normalizedBeforeId != null) {
 			values.push(normalizedBeforeId);
 			candidateClauses.push(`p.id < $${values.length}`);
@@ -2152,7 +2164,7 @@ class PostgresAdapter extends DatabaseAdapter {
 			? Number(beforeId)
 			: null;
 		const values = [Number(userId)];
-		const clauses = ['user_id = $1'];
+		const clauses = ['user_id = $1', 'group_id IS NULL'];
 		if (subType === 'posts_only') clauses.push('reply_to IS NULL');
 		if (subType === 'replies_only') clauses.push('reply_to IS NOT NULL');
 		if (normalizedBeforeId != null) {
@@ -2190,13 +2202,13 @@ class PostgresAdapter extends DatabaseAdapter {
 		const pattern = `%${q.toLowerCase()}%`;
 		const { rows } = normalizedBeforeId != null
 			? await this.pool.query(
-				`SELECT id FROM posts WHERE LOWER(content) LIKE $1 AND id < $2
-				 ORDER BY created_at DESC, id DESC LIMIT $3`,
+				`SELECT id FROM posts WHERE group_id IS NULL AND LOWER(content) LIKE $1 AND id < $2
+					 ORDER BY created_at DESC, id DESC LIMIT $3`,
 				[pattern, normalizedBeforeId, normalizedLimit + 1],
 			)
 			: await this.pool.query(
-				`SELECT id FROM posts WHERE LOWER(content) LIKE $1
-				 ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3`,
+				`SELECT id FROM posts WHERE group_id IS NULL AND LOWER(content) LIKE $1
+					 ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3`,
 				[pattern, normalizedLimit + 1, normalizedOffset],
 			);
 		const ids = rows.slice(0, normalizedLimit).map((row) => Number(row.id));
@@ -2212,8 +2224,8 @@ class PostgresAdapter extends DatabaseAdapter {
 		if (!q) return [];
 		const safeLimit = Math.min(Math.max(Number(limit) || 20, 1), 100);
 		const { rows } = await this.pool.query(
-			`SELECT * FROM posts 
-			 WHERE LOWER(content) LIKE $1 
+`SELECT * FROM posts 
+				 WHERE group_id IS NULL AND LOWER(content) LIKE $1
 			 ORDER BY created_at DESC, id DESC
 			 LIMIT $2`,
 			[`%${q.toLowerCase()}%`, safeLimit],
@@ -2330,7 +2342,7 @@ class PostgresAdapter extends DatabaseAdapter {
 	async getTrendingHashtags(limit = 10) {
 		const normalizedLimit = Math.max(1, Math.min(Number(limit) || 10, 50));
 		const { rows } = await this.pool.query(
-			'SELECT content, tags FROM posts ORDER BY created_at DESC LIMIT 500',
+			'SELECT content, tags FROM posts WHERE group_id IS NULL ORDER BY created_at DESC LIMIT 500',
 		);
 		const counts = new Map();
 		for (const row of rows) {

@@ -1,0 +1,592 @@
+'use strict';
+
+const crypto = require('crypto');
+const express = require('express');
+const config = require('../config');
+const { requireAuth, optionalAuth } = require('../middleware/auth');
+const { serializePostsByIds, serializeNotification } = require('../utils/serialize');
+const { getPublicUrl } = require('../utils/nyaitterAddress');
+const { createNotificationIfAllowed } = require('../services/NotificationDeliveryService');
+const {
+  GROUP_VISIBILITIES,
+  normalizeGroupId,
+  normalizeVisibility,
+  normalizePermissionList,
+  normalizeUserId,
+  normalizeLimit,
+  normalizeOffset,
+  normalizePostId,
+  hasPermission,
+  isOwner,
+  isAdmin,
+  resolveGroupMembership,
+  requireGroupPermission,
+  requireActiveMembership,
+  countCreatedGroups,
+  createGroupWithDefaultRoles,
+  getDefaultMemberRole,
+} = require('../services/GroupService');
+
+const router = express.Router();
+
+function getDb(req) {
+  return req.app.locals.dbAdapter;
+}
+
+function groupPayload(group, { roles = null, membership = null, owner = null } = {}) {
+  return {
+    id: String(group.id),
+    owner_id: Number(group.ownerId ?? group.owner_id),
+    name: group.name || '',
+    description: group.description || '',
+    icon_data: group.iconData ?? group.icon_data ?? null,
+    header_image: group.headerImage ?? group.header_image ?? null,
+    visibility: group.visibility || 'open',
+    member_count: Math.max(0, Number(group.memberCount ?? group.member_count) || 0),
+    created_at: group.createdAt ?? group.created_at ?? null,
+    updated_at: group.updatedAt ?? group.updated_at ?? null,
+    ...(owner ? { owner } : {}),
+    ...(membership ? { membership } : {}),
+    ...(roles ? { roles } : {}),
+  };
+}
+
+function rolePayload(role) {
+  return {
+    id: String(role.id),
+    group_id: String(role.groupId ?? role.group_id),
+    name: role.name || '',
+    permissions: Array.isArray(role.permissions) ? role.permissions : [],
+    is_system: Boolean(role.isSystem ?? role.is_system),
+    sort_order: Number(role.sortOrder ?? role.sort_order) || 0,
+  };
+}
+
+function membershipPayload(membership) {
+  if (!membership) return null;
+  return {
+    group_id: String(membership.groupId ?? membership.group_id),
+    user_id: Number(membership.userId ?? membership.user_id),
+    role_id: membership.roleId ?? membership.role_id ?? null,
+    status: membership.status || 'active',
+    joined_at: membership.joinedAt ?? membership.joined_at ?? null,
+  };
+}
+
+async function getGroupOr404(req, res) {
+  const groupId = normalizeGroupId(req.params.groupId);
+  if (!groupId) {
+    res.status(400).json({ error: 'グループIDが正しくありません。' });
+    return null;
+  }
+  const group = await getDb(req).getGroupById(groupId);
+  if (!group) {
+    res.status(404).json({ error: 'グループが見つかりません。' });
+    return null;
+  }
+  return group;
+}
+
+async function publishNotification(req, userId, notification) {
+  if (!notification) return;
+  const structured = await serializeNotification(getDb(req), notification, getPublicUrl(req));
+  if (!structured) return;
+  try {
+    await req.app.locals.realtime?.publishNewNotification?.(userId, structured, getDb(req));
+  } catch (error) {
+    console.warn('[groups] realtime notification delivery failed:', error.message);
+  }
+  if (req.app.locals.pushNotificationService?.enabled) {
+    void req.app.locals.pushNotificationService.sendNotificationToUser(userId, structured, {
+      publicUrl: getPublicUrl(req),
+    }).catch((error) => console.warn('[groups] push notification delivery failed:', error.message));
+  }
+}
+
+async function getDefaultMemberRoleOrThrow(db, groupId) {
+  const roles = await db.getGroupRoles(groupId);
+  const memberRole = getDefaultMemberRole(roles);
+  if (!memberRole) throw new Error('グループの標準ロールが見つかりません。');
+  return memberRole;
+}
+
+async function assertMembershipCapacity(req, group, userId) {
+  const groupMaximum = Number(config.limits.groupMaxMembersPerGroup) || 0;
+  if (groupMaximum > 0 && Number(group.memberCount ?? group.member_count) >= groupMaximum) {
+    const error = new Error('このグループは参加者数の上限に達しています。');
+    error.statusCode = 409;
+    throw error;
+  }
+  const userMaximum = Number(config.limits.groupMaxMembershipsPerUser) || 0;
+  if (userMaximum > 0) {
+    const groups = await getDb(req).getUserGroups(userId, { status: 'active', limit: userMaximum + 1 });
+    if (groups.length >= userMaximum) {
+      const error = new Error('参加グループ数の上限に達しています。');
+      error.statusCode = 409;
+      throw error;
+    }
+  }
+}
+
+function errorResponse(res, error, label) {
+  if (error?.statusCode) return res.status(error.statusCode).json({ error: error.message });
+  console.error(`[groups] ${label}:`, error);
+  return res.status(500).json({ error: 'グループ操作に失敗しました。' });
+}
+
+router.get('/', optionalAuth, async (req, res) => {
+  try {
+    const db = getDb(req);
+    const limit = normalizeLimit(req.query.limit, 20, 100);
+    const offset = normalizeOffset(req.query.offset);
+    const groups = await db.getGroupsByVisibility({
+      query: String(req.query.q || ''),
+      visibility: ['open', 'open_invite'],
+      limit,
+      offset,
+    });
+    res.json({ groups: groups.map((group) => groupPayload(group)) });
+  } catch (error) {
+    errorResponse(res, error, 'list error');
+  }
+});
+
+router.post('/', requireAuth, async (req, res) => {
+  const db = getDb(req);
+  const name = String(req.body?.name || '').trim();
+  const description = String(req.body?.description || '');
+  const visibility = normalizeVisibility(req.body?.visibility, 'open');
+  if (!name || name.length > 100 || description.length > 2000 || !visibility) {
+    return res.status(400).json({ error: 'グループ名、説明、または公開レベルが正しくありません。' });
+  }
+  try {
+    const maximum = Number(config.limits.groupMaxCreatedPerUser) || 0;
+    if (maximum > 0 && await countCreatedGroups(db, req.user.id) >= maximum) {
+      return res.status(409).json({ error: 'グループ作成数の上限に達しています。' });
+    }
+    const group = await createGroupWithDefaultRoles(db, {
+      ownerId: req.user.id,
+      name,
+      description,
+      iconData: req.body?.icon_data ?? null,
+      headerImage: req.body?.header_image ?? null,
+      visibility,
+    });
+    const membershipState = await resolveGroupMembership(db, group, req.user.id);
+    res.status(201).json({
+      group: groupPayload(group, {
+        roles: membershipState.roles.map(rolePayload),
+        membership: membershipPayload(membershipState.membership),
+      }),
+    });
+  } catch (error) {
+    errorResponse(res, error, 'create error');
+  }
+});
+
+router.get('/mine', requireAuth, async (req, res) => {
+  try {
+    const groups = await getDb(req).getUserGroups(req.user.id, {
+      status: 'active',
+      limit: normalizeLimit(req.query.limit, 100, 200),
+      offset: normalizeOffset(req.query.offset),
+    });
+    const homeTabMaximum = Number(config.limits.groupMaxHomeTabs) || 0;
+    res.json({
+      groups: groups.map((group) => groupPayload(group, { membership: membershipPayload(group.membership) })),
+      home_tab_limit: homeTabMaximum,
+    });
+  } catch (error) {
+    errorResponse(res, error, 'mine list error');
+  }
+});
+
+router.get('/invites/mine', requireAuth, async (req, res) => {
+  try {
+    const invites = await getDb(req).getGroupInvites({ inviteeId: req.user.id, status: 'pending', limit: 100 });
+    const groups = await Promise.all(invites.map((invite) => getDb(req).getGroupById(invite.groupId ?? invite.group_id)));
+    res.json({ invites: invites.map((invite, index) => ({ ...invite, group: groups[index] ? groupPayload(groups[index]) : null })) });
+  } catch (error) {
+    errorResponse(res, error, 'invite list error');
+  }
+});
+
+router.post('/invites/:inviteId/respond', requireAuth, async (req, res) => {
+  const decision = String(req.body?.decision || '').toLowerCase();
+  if (!['accept', 'decline'].includes(decision)) return res.status(400).json({ error: '招待への応答が正しくありません。' });
+  try {
+    const db = getDb(req);
+    const invite = await db.getGroupInvite(req.params.inviteId);
+    if (!invite || Number(invite.inviteeId ?? invite.invitee_id) !== Number(req.user.id) || invite.status !== 'pending') {
+      return res.status(404).json({ error: '保留中の招待が見つかりません。' });
+    }
+    const group = await db.getGroupById(invite.groupId ?? invite.group_id);
+    if (!group) return res.status(404).json({ error: 'グループが見つかりません。' });
+    if (decision === 'decline') {
+      const updated = await db.updateGroupInvite(invite.id, { status: 'declined' });
+      return res.json({ invite: updated });
+    }
+    await assertMembershipCapacity(req, group, req.user.id);
+    const memberRole = await getDefaultMemberRoleOrThrow(db, group.id);
+    const existing = await db.getGroupMembership(group.id, req.user.id);
+    if (existing?.status === 'banned') return res.status(403).json({ error: 'このグループへの参加は禁止されています。' });
+    await db.createGroupMembership({ groupId: group.id, userId: req.user.id, roleId: memberRole.id, status: 'active', joinedAt: new Date().toISOString() });
+    const updated = await db.updateGroupInvite(invite.id, { status: 'accepted' });
+    res.json({ invite: updated, membership: membershipPayload(await db.getGroupMembership(group.id, req.user.id)) });
+  } catch (error) {
+    errorResponse(res, error, 'invite response error');
+  }
+});
+
+router.get('/:groupId', optionalAuth, async (req, res) => {
+  try {
+    const group = await getGroupOr404(req, res);
+    if (!group) return;
+    const db = getDb(req);
+    const owner = await db.getUserById(group.ownerId ?? group.owner_id);
+    let membershipState = { membership: null, roles: [] };
+    if (req.user) membershipState = await resolveGroupMembership(db, group, req.user.id);
+    res.json({ group: groupPayload(group, {
+      owner: owner ? { id: owner.id, name: owner.name || '', nyaitter_id: owner.handle || null, icon_data: owner.icon_data || null } : null,
+      membership: membershipPayload(membershipState.membership),
+      roles: membershipState.membership?.status === 'active' ? membershipState.roles.map(rolePayload) : undefined,
+    }) });
+  } catch (error) {
+    errorResponse(res, error, 'detail error');
+  }
+});
+
+router.patch('/:groupId', requireAuth, async (req, res) => {
+  try {
+    const group = await getGroupOr404(req, res);
+    if (!group) return;
+    await requireGroupPermission(getDb(req), group, req.user.id, 'profile');
+    const fields = {};
+    if (req.body?.name !== undefined) fields.name = String(req.body.name).trim();
+    if (req.body?.description !== undefined) fields.description = String(req.body.description);
+    if (req.body?.icon_data !== undefined) fields.iconData = req.body.icon_data;
+    if (req.body?.header_image !== undefined) fields.headerImage = req.body.header_image;
+    if (req.body?.visibility !== undefined) fields.visibility = normalizeVisibility(req.body.visibility);
+    if ((fields.name !== undefined && (!fields.name || fields.name.length > 100)) || (fields.description !== undefined && fields.description.length > 2000) || fields.visibility === null) {
+      return res.status(400).json({ error: '更新内容が正しくありません。' });
+    }
+    const updated = await getDb(req).updateGroup(group.id, fields);
+    res.json({ group: groupPayload(updated) });
+  } catch (error) {
+    errorResponse(res, error, 'update error');
+  }
+});
+
+router.post('/:groupId/transfer-owner', requireAuth, async (req, res) => {
+  const newOwnerId = normalizeUserId(req.body?.user_id);
+  if (newOwnerId == null) return res.status(400).json({ error: '新しいオーナーのユーザーIDが正しくありません。' });
+  try {
+    const group = await getGroupOr404(req, res);
+    if (!group) return;
+    if (!isOwner(group, req.user.id)) return res.status(403).json({ error: 'オーナー権限を移譲できるのは現在のオーナーのみです。' });
+    if (newOwnerId === Number(req.user.id)) return res.status(400).json({ error: '自分自身へオーナー権限を移譲することはできません。' });
+    const db = getDb(req);
+    const newOwnerMembership = await db.getGroupMembership(group.id, newOwnerId);
+    if (!newOwnerMembership || newOwnerMembership.status !== 'active') return res.status(409).json({ error: '新しいオーナーは参加中のメンバーである必要があります。' });
+    const roles = await db.getGroupRoles(group.id);
+    const ownerRole = roles.find((role) => (role.isSystem ?? role.is_system) && role.name === 'owner');
+    const adminRole = roles.find((role) => (role.isSystem ?? role.is_system) && role.name === 'admin');
+    if (!ownerRole || !adminRole) throw new Error('グループのシステムロールが見つかりません。');
+    const changed = await db.transferGroupOwnership(group.id, newOwnerId);
+    if (!changed) return res.status(404).json({ error: 'グループが見つかりません。' });
+    await db.updateGroupMembership(group.id, newOwnerId, { roleId: ownerRole.id });
+    await db.updateGroupMembership(group.id, req.user.id, { roleId: adminRole.id });
+    res.json({ group: groupPayload(changed) });
+  } catch (error) {
+    errorResponse(res, error, 'transfer owner error');
+  }
+});
+
+router.delete('/:groupId', requireAuth, async (req, res) => {
+  try {
+    const group = await getGroupOr404(req, res);
+    if (!group) return;
+    if (!isOwner(group, req.user.id)) return res.status(403).json({ error: 'グループを削除できるのはオーナーのみです。' });
+    const deleted = await getDb(req).deleteGroup(group.id);
+    res.json({ success: Boolean(deleted) });
+  } catch (error) {
+    errorResponse(res, error, 'delete error');
+  }
+});
+
+router.post('/:groupId/join', requireAuth, async (req, res) => {
+  try {
+    const group = await getGroupOr404(req, res);
+    if (!group) return;
+    const db = getDb(req);
+    const existing = await db.getGroupMembership(group.id, req.user.id);
+    if (existing?.status === 'banned') return res.status(403).json({ error: 'このグループへの参加は禁止されています。' });
+    if (existing?.status === 'active') return res.json({ membership: membershipPayload(existing), joined: true });
+    if (group.visibility === 'invite' || group.visibility === 'open_invite') {
+      const requests = await db.getGroupJoinRequests({ groupId: group.id, userId: req.user.id, status: 'pending', limit: 1 });
+      if (requests.length > 0) return res.status(409).json({ error: '参加申請はすでに送信されています。' });
+      const request = await db.createGroupJoinRequest({ id: crypto.randomUUID(), groupId: group.id, userId: req.user.id, status: 'pending' });
+      return res.status(202).json({ join_request: request, pending: true });
+    }
+    await assertMembershipCapacity(req, group, req.user.id);
+    const memberRole = await getDefaultMemberRoleOrThrow(db, group.id);
+    const membership = await db.createGroupMembership({ groupId: group.id, userId: req.user.id, roleId: memberRole.id, status: 'active', joinedAt: new Date().toISOString() });
+    res.status(201).json({ membership: membershipPayload(membership), joined: true });
+  } catch (error) {
+    errorResponse(res, error, 'join error');
+  }
+});
+
+router.post('/:groupId/leave', requireAuth, async (req, res) => {
+  try {
+    const group = await getGroupOr404(req, res);
+    if (!group) return;
+    if (isOwner(group, req.user.id)) return res.status(409).json({ error: 'オーナーはオーナー権限を移譲してから退出してください。' });
+    const membership = await getDb(req).getGroupMembership(group.id, req.user.id);
+    if (!membership || membership.status !== 'active') return res.status(404).json({ error: '参加状態が見つかりません。' });
+    const updated = await getDb(req).updateGroupMembership(group.id, req.user.id, { status: 'pending', roleId: null, joinedAt: null });
+    res.json({ success: true, membership: membershipPayload(updated) });
+  } catch (error) {
+    errorResponse(res, error, 'leave error');
+  }
+});
+
+router.post('/:groupId/invites', requireAuth, async (req, res) => {
+  const inviteeId = normalizeUserId(req.body?.user_id);
+  if (inviteeId == null) return res.status(400).json({ error: '招待するユーザーIDが正しくありません。' });
+  try {
+    const group = await getGroupOr404(req, res);
+    if (!group) return;
+    const db = getDb(req);
+    await requireGroupPermission(db, group, req.user.id, 'invite');
+    if (inviteeId === Number(req.user.id)) return res.status(400).json({ error: '自分自身を招待することはできません。' });
+    if (!await db.getUserById(inviteeId)) return res.status(404).json({ error: 'ユーザーが見つかりません。' });
+    const membership = await db.getGroupMembership(group.id, inviteeId);
+    if (membership?.status === 'banned') return res.status(403).json({ error: 'このユーザーはグループへの参加を禁止されています。' });
+    if (membership?.status === 'active') return res.status(409).json({ error: 'このユーザーはすでに参加しています。' });
+    const existing = await db.getGroupInvites({ groupId: group.id, inviteeId, status: 'pending', limit: 1 });
+    if (existing.length > 0) return res.status(409).json({ error: '保留中の招待がすでにあります。' });
+    const invite = await db.createGroupInvite({ id: crypto.randomUUID(), groupId: group.id, inviterId: req.user.id, inviteeId, status: 'pending' });
+    const notification = await createNotificationIfAllowed(db, {
+      userId: inviteeId,
+      type: 'group_invite',
+      fromUserId: req.user.id,
+      target: { kind: 'route', value: '#groups' },
+      message: `「${group.name}」へのグループ招待が届いています。`,
+    });
+    await publishNotification(req, inviteeId, notification);
+    res.status(201).json({ invite });
+  } catch (error) {
+    errorResponse(res, error, 'invite create error');
+  }
+});
+
+router.get('/:groupId/join-requests', requireAuth, async (req, res) => {
+  try {
+    const group = await getGroupOr404(req, res);
+    if (!group) return;
+    await requireGroupPermission(getDb(req), group, req.user.id, 'invite');
+    const requests = await getDb(req).getGroupJoinRequests({ groupId: group.id, status: String(req.query.status || 'pending'), limit: 100 });
+    res.json({ join_requests: requests });
+  } catch (error) {
+    errorResponse(res, error, 'join request list error');
+  }
+});
+
+router.post('/:groupId/join-requests/:requestId/respond', requireAuth, async (req, res) => {
+  const decision = String(req.body?.decision || '').toLowerCase();
+  if (!['approve', 'decline'].includes(decision)) return res.status(400).json({ error: '参加申請への応答が正しくありません。' });
+  try {
+    const group = await getGroupOr404(req, res);
+    if (!group) return;
+    const db = getDb(req);
+    await requireGroupPermission(db, group, req.user.id, 'invite');
+    const request = await db.getGroupJoinRequest(req.params.requestId);
+    if (!request || String(request.groupId ?? request.group_id) !== group.id || request.status !== 'pending') return res.status(404).json({ error: '保留中の参加申請が見つかりません。' });
+    if (decision === 'approve') {
+      await assertMembershipCapacity(req, group, request.userId ?? request.user_id);
+      const memberRole = await getDefaultMemberRoleOrThrow(db, group.id);
+      await db.createGroupMembership({ groupId: group.id, userId: request.userId ?? request.user_id, roleId: memberRole.id, status: 'active', joinedAt: new Date().toISOString() });
+    }
+    const updated = await db.updateGroupJoinRequest(request.id, { status: decision === 'approve' ? 'approved' : 'declined', reviewedBy: req.user.id });
+    res.json({ join_request: updated });
+  } catch (error) {
+    errorResponse(res, error, 'join request response error');
+  }
+});
+
+router.get('/:groupId/roles', requireAuth, async (req, res) => {
+  try {
+    const group = await getGroupOr404(req, res);
+    if (!group) return;
+    await requireActiveMembership(getDb(req), group, req.user.id);
+    res.json({ roles: (await getDb(req).getGroupRoles(group.id)).map(rolePayload) });
+  } catch (error) {
+    errorResponse(res, error, 'role list error');
+  }
+});
+
+router.post('/:groupId/roles', requireAuth, async (req, res) => {
+  const name = String(req.body?.name || '').trim();
+  const permissions = normalizePermissionList(req.body?.permissions);
+  if (!name || name.length > 50 || !permissions) return res.status(400).json({ error: 'ロール名または権限が正しくありません。' });
+  try {
+    const group = await getGroupOr404(req, res);
+    if (!group) return;
+    const state = await requireActiveMembership(getDb(req), group, req.user.id);
+    if (!isAdmin(group, state.membership, state.role)) return res.status(403).json({ error: 'ロールを管理する権限がありません。' });
+    const roles = await getDb(req).getGroupRoles(group.id);
+    if (roles.some((role) => role.name.toLowerCase() === name.toLowerCase())) return res.status(409).json({ error: '同名のロールがすでにあります。' });
+    const role = await getDb(req).createGroupRole({ id: crypto.randomUUID(), groupId: group.id, name, permissions, isSystem: false, sortOrder: Number(req.body?.sort_order) || roles.length + 10 });
+    res.status(201).json({ role: rolePayload(role) });
+  } catch (error) {
+    errorResponse(res, error, 'role create error');
+  }
+});
+
+router.patch('/:groupId/roles/:roleId', requireAuth, async (req, res) => {
+  try {
+    const group = await getGroupOr404(req, res);
+    if (!group) return;
+    const db = getDb(req);
+    const state = await requireActiveMembership(db, group, req.user.id);
+    if (!isAdmin(group, state.membership, state.role)) return res.status(403).json({ error: 'ロールを管理する権限がありません。' });
+    const role = (await db.getGroupRoles(group.id)).find((candidate) => String(candidate.id) === String(req.params.roleId));
+    if (!role) return res.status(404).json({ error: 'ロールが見つかりません。' });
+    if (role.isSystem ?? role.is_system) return res.status(403).json({ error: 'システムロールは変更できません。' });
+    const fields = {};
+    if (req.body?.name !== undefined) fields.name = String(req.body.name).trim();
+    if (req.body?.permissions !== undefined) fields.permissions = normalizePermissionList(req.body.permissions);
+    if (req.body?.sort_order !== undefined) fields.sortOrder = Number(req.body.sort_order) || 0;
+    if (!fields.name && fields.name !== undefined || fields.permissions === null) return res.status(400).json({ error: 'ロール更新内容が正しくありません。' });
+    const updated = await db.updateGroupRole(role.id, fields);
+    res.json({ role: rolePayload(updated) });
+  } catch (error) {
+    errorResponse(res, error, 'role update error');
+  }
+});
+
+router.delete('/:groupId/roles/:roleId', requireAuth, async (req, res) => {
+  try {
+    const group = await getGroupOr404(req, res);
+    if (!group) return;
+    const db = getDb(req);
+    const state = await requireActiveMembership(db, group, req.user.id);
+    if (!isAdmin(group, state.membership, state.role)) return res.status(403).json({ error: 'ロールを管理する権限がありません。' });
+    const role = (await db.getGroupRoles(group.id)).find((candidate) => String(candidate.id) === String(req.params.roleId));
+    if (!role) return res.status(404).json({ error: 'ロールが見つかりません。' });
+    if (role.isSystem ?? role.is_system) return res.status(403).json({ error: 'システムロールは削除できません。' });
+    await db.deleteGroupRole(role.id);
+    res.json({ success: true });
+  } catch (error) {
+    errorResponse(res, error, 'role delete error');
+  }
+});
+
+router.get('/:groupId/members', requireAuth, async (req, res) => {
+  try {
+    const group = await getGroupOr404(req, res);
+    if (!group) return;
+    await requireActiveMembership(getDb(req), group, req.user.id);
+    const memberships = await getDb(req).getGroupMemberships(group.id, { status: req.query.status || 'active', limit: 200, offset: normalizeOffset(req.query.offset) });
+    const users = await getDb(req).getUsersByIds(memberships.map((membership) => membership.userId ?? membership.user_id));
+    const usersById = new Map(users.map((user) => [Number(user.id), user]));
+    res.json({ members: memberships.map((membership) => ({ membership: membershipPayload(membership), user: usersById.get(Number(membership.userId ?? membership.user_id)) || null })) });
+  } catch (error) {
+    errorResponse(res, error, 'member list error');
+  }
+});
+
+router.patch('/:groupId/members/:userId', requireAuth, async (req, res) => {
+  const memberId = normalizeUserId(req.params.userId);
+  if (memberId == null) return res.status(400).json({ error: 'ユーザーIDが正しくありません。' });
+  try {
+    const group = await getGroupOr404(req, res);
+    if (!group) return;
+    const db = getDb(req);
+    const state = await requireActiveMembership(db, group, req.user.id);
+    if (!isAdmin(group, state.membership, state.role)) return res.status(403).json({ error: 'メンバーを管理する権限がありません。' });
+    if (isOwner(group, memberId)) return res.status(403).json({ error: 'オーナーのロールは変更できません。' });
+    const roleId = String(req.body?.role_id || '').trim();
+    const role = (await db.getGroupRoles(group.id)).find((candidate) => String(candidate.id) === roleId);
+    if (!role) return res.status(400).json({ error: 'ロールが正しくありません。' });
+    const updated = await db.updateGroupMembership(group.id, memberId, { roleId: role.id });
+    if (!updated) return res.status(404).json({ error: 'メンバーが見つかりません。' });
+    res.json({ membership: membershipPayload(updated) });
+  } catch (error) {
+    errorResponse(res, error, 'member update error');
+  }
+});
+
+router.post('/:groupId/members/:userId/ban', requireAuth, async (req, res) => {
+  const memberId = normalizeUserId(req.params.userId);
+  if (memberId == null) return res.status(400).json({ error: 'ユーザーIDが正しくありません。' });
+  try {
+    const group = await getGroupOr404(req, res);
+    if (!group) return;
+    const db = getDb(req);
+    await requireGroupPermission(db, group, req.user.id, 'ban');
+    if (isOwner(group, memberId)) return res.status(403).json({ error: 'オーナーを追放することはできません。' });
+    const current = await db.getGroupMembership(group.id, memberId);
+    const updated = current
+      ? await db.updateGroupMembership(group.id, memberId, { status: 'banned', roleId: null, joinedAt: null })
+      : await db.createGroupMembership({ groupId: group.id, userId: memberId, roleId: null, status: 'banned', joinedAt: null });
+    res.json({ membership: membershipPayload(updated) });
+  } catch (error) {
+    errorResponse(res, error, 'member ban error');
+  }
+});
+
+router.post('/:groupId/members/:userId/unban', requireAuth, async (req, res) => {
+  const memberId = normalizeUserId(req.params.userId);
+  if (memberId == null) return res.status(400).json({ error: 'ユーザーIDが正しくありません。' });
+  try {
+    const group = await getGroupOr404(req, res);
+    if (!group) return;
+    const db = getDb(req);
+    await requireGroupPermission(db, group, req.user.id, 'ban');
+    const membership = await db.getGroupMembership(group.id, memberId);
+    if (!membership || membership.status !== 'banned') return res.status(404).json({ error: '禁止状態のメンバーが見つかりません。' });
+    const updated = await db.updateGroupMembership(group.id, memberId, { status: 'pending', roleId: null, joinedAt: null });
+    res.json({ membership: membershipPayload(updated) });
+  } catch (error) {
+    errorResponse(res, error, 'member unban error');
+  }
+});
+
+router.get('/:groupId/posts', requireAuth, async (req, res) => {
+  try {
+    const group = await getGroupOr404(req, res);
+    if (!group) return;
+    await requireActiveMembership(getDb(req), group, req.user.id);
+    const limit = normalizeLimit(req.query.limit, 30, 100);
+    const beforeId = normalizePostId(req.query.before_id);
+    const offset = beforeId == null ? normalizeOffset(req.query.offset) : 0;
+    const authorId = req.query.author_id === undefined ? null : normalizeUserId(req.query.author_id);
+    if (req.query.author_id !== undefined && authorId == null) return res.status(400).json({ error: '投稿者IDが正しくありません。' });
+    const mode = String(req.query.mode || 'all');
+    let page;
+    if (mode === 'announcements') {
+      page = await getDb(req).getGroupAnnouncementPostIds(group.id, { limit, offset, beforeId });
+    } else if (mode === 'recommended') {
+      const candidatePage = await getDb(req).getGroupPostIds(group.id, { limit: Math.min(limit * 4, 100), offset, beforeId, authorId });
+      const metrics = await getDb(req).getPostMetricsBatch(candidatePage.ids || [], req.user.id);
+      const metricsByPostId = new Map(metrics.map((metric) => [Number(metric.post_id ?? metric.postId), metric]));
+      const rankedIds = [...(candidatePage.ids || [])].sort((left, right) => {
+        const leftMetrics = metricsByPostId.get(Number(left)) || {};
+        const rightMetrics = metricsByPostId.get(Number(right)) || {};
+        const score = (metric) => Number(metric.like_count || 0) + Number(metric.star_count || 0) * 2 + Number(metric.repost_count || 0) * 3;
+        return score(rightMetrics) - score(leftMetrics) || Number(right) - Number(left);
+      });
+      page = { ...candidatePage, ids: rankedIds.slice(0, limit) };
+    } else {
+      page = await getDb(req).getGroupPostIds(group.id, { limit, offset, beforeId, authorId });
+    }
+    const posts = await serializePostsByIds(getDb(req), page.ids || [], req.user.id, getPublicUrl(req), req.user.visibilityUser || null);
+    res.json({ posts, has_next: Boolean(page.has_more), next_cursor: page.next_cursor || null });
+  } catch (error) {
+    errorResponse(res, error, 'post list error');
+  }
+});
+
+module.exports = router;
