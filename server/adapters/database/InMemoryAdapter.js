@@ -2150,6 +2150,18 @@ class InMemoryAdapter extends DatabaseAdapter {
 				const keywordAffinities = normalizedViewerId == null
 					? new Map()
 					: (this.userKeywordAffinityByUser.get(normalizedViewerId) || new Map());
+				const keywordAffinityEntries = [...keywordAffinities.entries()]
+					.sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0], 'ja'))
+					.slice(0, 80);
+				const keywordSimilarity = (postKeyword, profileKeyword) => {
+					const left = String(postKeyword || '').toLowerCase();
+					const right = String(profileKeyword || '').toLowerCase();
+					if (!left || !right) return 0;
+					if (left === right) return 1;
+					if (left.length < 3 || right.length < 3) return 0;
+					if (!left.includes(right) && !right.includes(left)) return 0;
+					return Math.min(left.length, right.length) / Math.max(left.length, right.length);
+				};
 				const scored = candidates.map((post) => {
 				const authorId = Number(post.userId);
 				const ageHours = Math.max(0, (now - new Date(post.createdAt || post.created_at).getTime()) / 3600000);
@@ -2166,7 +2178,12 @@ class InMemoryAdapter extends DatabaseAdapter {
 					const keywordScore = Math.min(
 						30,
 						(Array.isArray(post.tags) ? post.tags : []).reduce(
-							(total, keyword) => total + (keywordAffinities.get(String(keyword).toLowerCase()) || 0) * 2,
+							(total, keyword) => total + keywordAffinityEntries.reduce(
+								(matchScore, [profileKeyword, profileScore]) => (
+									matchScore + Number(profileScore || 0) * keywordSimilarity(keyword, profileKeyword)
+								),
+								0,
+							) * 2,
 							0,
 						),
 					);

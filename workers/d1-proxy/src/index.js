@@ -1462,11 +1462,28 @@ export default {
 								WHERE s.score >= stats.average_score * 0.75
 								ORDER BY s.score DESC, s.created_at DESC, s.id DESC
 							)`
-						: `${commonCtes}, viewer_keyword_affinity AS (
-							SELECT c.id AS post_id, SUM(uka.score) AS score
+						: `${commonCtes}, viewer_keyword_profile AS (
+							SELECT keyword, score
+							FROM user_keyword_affinities
+							WHERE user_id = ?
+							ORDER BY score DESC, keyword ASC
+							LIMIT 80
+						), viewer_keyword_affinity AS (
+							SELECT c.id AS post_id,
+								SUM(profile.score * CASE
+									WHEN profile.keyword = post_tag.value THEN 1.0
+									ELSE MIN(LENGTH(profile.keyword), LENGTH(post_tag.value)) * 1.0
+										/ MAX(LENGTH(profile.keyword), LENGTH(post_tag.value))
+								END) AS score
 							FROM candidates c
 								CROSS JOIN json_each(COALESCE(c.tags, '[]')) AS post_tag
-							JOIN user_keyword_affinities uka ON uka.keyword = post_tag.value AND uka.user_id = ?
+							CROSS JOIN viewer_keyword_profile profile
+							WHERE profile.keyword = post_tag.value
+								OR (
+									LENGTH(profile.keyword) >= 3
+									AND LENGTH(post_tag.value) >= 3
+									AND (instr(post_tag.value, profile.keyword) > 0 OR instr(profile.keyword, post_tag.value) > 0)
+								)
 							GROUP BY c.id
 							), /* Temporarily disabled: simple author affinity from likes and stars.
 							viewer_like_affinity AS (

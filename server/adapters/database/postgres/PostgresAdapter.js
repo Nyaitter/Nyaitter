@@ -1519,12 +1519,31 @@ class PostgresAdapter extends DatabaseAdapter {
 				values.push(normalizedViewerId);
 				const secondDegreeExcludeParam = values.length;
 				personalScoreCtes.push(
-					`viewer_keyword_affinity AS (
-						SELECT c.id AS post_id, SUM(uka.score)::numeric AS score
+					`viewer_keyword_profile AS (
+						SELECT keyword, score
+						FROM user_keyword_affinities
+						WHERE user_id = $${keywordViewerParam}
+						ORDER BY score DESC, keyword ASC
+						LIMIT 80
+					), viewer_keyword_affinity AS (
+						SELECT c.id AS post_id,
+							SUM(profile.score * CASE
+								WHEN profile.keyword = post_tag.keyword THEN 1::numeric
+								ELSE LEAST(char_length(profile.keyword), char_length(post_tag.keyword))::numeric
+									/ GREATEST(char_length(profile.keyword), char_length(post_tag.keyword))::numeric
+							END)::numeric AS score
 						FROM candidates c
 						CROSS JOIN LATERAL jsonb_array_elements_text(COALESCE(c.tags, '[]'::jsonb)) AS post_tag(keyword)
-						JOIN user_keyword_affinities uka
-							ON uka.keyword = post_tag.keyword AND uka.user_id = $${keywordViewerParam}
+						CROSS JOIN viewer_keyword_profile profile
+						WHERE profile.keyword = post_tag.keyword
+							OR (
+								char_length(profile.keyword) >= 3
+								AND char_length(post_tag.keyword) >= 3
+								AND (
+									position(profile.keyword in post_tag.keyword) > 0
+									OR position(post_tag.keyword in profile.keyword) > 0
+								)
+							)
 						GROUP BY c.id
 					), direct_follows AS (
 						SELECT following_id AS user_id FROM follows WHERE follower_id = $${directViewerParam}
