@@ -6,7 +6,7 @@
 		"apiEndpoint": "/server"
 	},
 	"userFiles": {
-		"endpoint": "",
+		"endpoint": "/uploads",
 		"port": null
 	},
 	"static": {
