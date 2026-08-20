@@ -68,6 +68,10 @@ function normalizePost(post) {
 	post.mask = !!post.mask;
 	post.lock = !!post.lock;
 	post.announcement = !!post.announcement;
+	post.groupId = post.groupId ?? post.group_id ?? null;
+	post.group_id = post.groupId;
+	post.groupAnnouncement = !!(post.groupAnnouncement ?? post.group_announcement);
+	post.group_announcement = post.groupAnnouncement;
 	if (post.tags && typeof post.tags === 'string') {
 		try {
 			post.tags = JSON.parse(post.tags);
@@ -83,6 +87,68 @@ function normalizePost(post) {
 		post.attachments = post.attachments ? [post.attachments] : [];
 	}
 	return post;
+}
+
+function normalizeGroup(group) {
+	if (!group) return null;
+	const ownerId = Number(group.ownerId ?? group.owner_id);
+	const iconData = group.iconData ?? group.icon_data ?? null;
+	const headerImage = group.headerImage ?? group.header_image ?? null;
+	const createdAt = group.createdAt ?? group.created_at ?? null;
+	const updatedAt = group.updatedAt ?? group.updated_at ?? null;
+	const deletedAt = group.deletedAt ?? group.deleted_at ?? null;
+	return {
+		...group, id: String(group.id), ownerId, owner_id: ownerId, iconData, icon_data: iconData,
+		headerImage, header_image: headerImage, memberCount: Number(group.memberCount ?? group.member_count) || 0,
+		member_count: Number(group.memberCount ?? group.member_count) || 0, createdAt, created_at: createdAt,
+		updatedAt, updated_at: updatedAt, deletedAt, deleted_at: deletedAt,
+	};
+}
+
+function normalizeGroupRole(role) {
+	if (!role) return null;
+	let permissions = role.permissions;
+	if (typeof permissions === 'string') { try { permissions = JSON.parse(permissions); } catch (_) { permissions = []; } }
+	const groupId = String(role.groupId ?? role.group_id);
+	const createdAt = role.createdAt ?? role.created_at ?? null;
+	const updatedAt = role.updatedAt ?? role.updated_at ?? null;
+	return { ...role, id: String(role.id), groupId, group_id: groupId, permissions: Array.isArray(permissions) ? permissions.map(String) : [],
+		isSystem: Boolean(role.isSystem ?? role.is_system), is_system: Boolean(role.isSystem ?? role.is_system),
+		sortOrder: Number(role.sortOrder ?? role.sort_order) || 0, sort_order: Number(role.sortOrder ?? role.sort_order) || 0,
+		createdAt, created_at: createdAt, updatedAt, updated_at: updatedAt };
+}
+
+function normalizeGroupMembership(membership) {
+	if (!membership) return null;
+	const groupId = String(membership.groupId ?? membership.group_id);
+	const userId = Number(membership.userId ?? membership.user_id);
+	const roleId = membership.roleId ?? membership.role_id ?? null;
+	const joinedAt = membership.joinedAt ?? membership.joined_at ?? null;
+	const updatedAt = membership.updatedAt ?? membership.updated_at ?? null;
+	return { ...membership, groupId, group_id: groupId, userId, user_id: userId, roleId, role_id: roleId,
+		joinedAt, joined_at: joinedAt, updatedAt, updated_at: updatedAt };
+}
+
+function normalizeGroupInvite(invite) {
+	if (!invite) return null;
+	const groupId = String(invite.groupId ?? invite.group_id);
+	const inviterId = Number(invite.inviterId ?? invite.inviter_id);
+	const inviteeId = Number(invite.inviteeId ?? invite.invitee_id);
+	const createdAt = invite.createdAt ?? invite.created_at ?? null;
+	const respondedAt = invite.respondedAt ?? invite.responded_at ?? null;
+	return { ...invite, id: String(invite.id), groupId, group_id: groupId, inviterId, inviter_id: inviterId, inviteeId, invitee_id: inviteeId,
+		createdAt, created_at: createdAt, respondedAt, responded_at: respondedAt };
+}
+
+function normalizeGroupJoinRequest(request) {
+	if (!request) return null;
+	const groupId = String(request.groupId ?? request.group_id);
+	const userId = Number(request.userId ?? request.user_id);
+	const reviewedBy = request.reviewedBy ?? request.reviewed_by ?? null;
+	const createdAt = request.createdAt ?? request.created_at ?? null;
+	const reviewedAt = request.reviewedAt ?? request.reviewed_at ?? null;
+	return { ...request, id: String(request.id), groupId, group_id: groupId, userId, user_id: userId,
+		reviewedBy, reviewed_by: reviewedBy, createdAt, created_at: createdAt, reviewedAt, reviewed_at: reviewedAt };
 }
 
 function serializeGroupDm(row, userId = null) {
@@ -300,9 +366,9 @@ class D1Adapter extends DatabaseAdapter {
 		});
 	}
 
-	async _write(path, body = null) {
+	async _write(path, body = null, method = 'POST') {
 		const result = await this._request(path, {
-			method: 'POST',
+			method,
 			body,
 			retry: false,
 		});
@@ -605,6 +671,135 @@ class D1Adapter extends DatabaseAdapter {
 				? (result.follower_ids ?? result.followerIds).map(Number).filter(Number.isInteger)
 				: [],
 		};
+	}
+
+	// ==================== Groups ====================
+
+	_groupPath(groupId) {
+		const id = String(groupId || '').trim();
+		if (!id) throw new TypeError('groupId is required');
+		return encodeURIComponent(id);
+	}
+
+	async createGroup(groupData) {
+		return normalizeGroup(await this._write('/groups', groupData));
+	}
+
+	async getGroupById(groupId) {
+		return normalizeGroup(await this._read(`/groups/${this._groupPath(groupId)}`, { cacheSeconds: 0 }));
+	}
+
+	async updateGroup(groupId, fields) {
+		return normalizeGroup(await this._write(`/groups/${this._groupPath(groupId)}`, fields, 'PATCH'));
+	}
+
+	async deleteGroup(groupId) {
+		return normalizeGroup(await this._write(`/groups/${this._groupPath(groupId)}`, undefined, 'DELETE'));
+	}
+
+	async getGroupsByVisibility({ query = '', visibility = ['open', 'open_invite'], limit = 20, offset = 0 } = {}) {
+		const groups = await this._read(this._query('/groups', { query, visibility: Array.isArray(visibility) ? visibility.join(',') : visibility,
+			limit: this._limit(limit, 20, 100), offset: Math.max(0, Number(offset) || 0) }), { cacheSeconds: 0 });
+		return Array.isArray(groups) ? groups.map(normalizeGroup) : [];
+	}
+
+	async getUserGroups(userId, { status = 'active', limit = 100, offset = 0 } = {}) {
+		const groups = await this._read(this._query(`/users/${requireId(userId, 'userId')}/groups`, {
+			status, limit: this._limit(limit, 100, 200), offset: Math.max(0, Number(offset) || 0),
+		}), { cacheSeconds: 0 });
+		return Array.isArray(groups) ? groups.map((group) => ({ ...normalizeGroup(group), membership: normalizeGroupMembership(group.membership) })) : [];
+	}
+
+	async createGroupRole(roleData) {
+		return normalizeGroupRole(await this._write(`/groups/${this._groupPath(roleData.groupId)}/roles`, roleData));
+	}
+
+	async getGroupRoles(groupId) {
+		const roles = await this._read(`/groups/${this._groupPath(groupId)}/roles`, { cacheSeconds: 0 });
+		return Array.isArray(roles) ? roles.map(normalizeGroupRole) : [];
+	}
+
+	async updateGroupRole(roleId, fields) {
+		return normalizeGroupRole(await this._write(`/group-roles/${this._groupPath(roleId)}`, fields, 'PATCH'));
+	}
+
+	async deleteGroupRole(roleId) {
+		return normalizeGroupRole(await this._write(`/group-roles/${this._groupPath(roleId)}`, undefined, 'DELETE'));
+	}
+
+	async getGroupMembership(groupId, userId) {
+		return normalizeGroupMembership(await this._read(`/groups/${this._groupPath(groupId)}/members/${requireId(userId, 'userId')}`, { cacheSeconds: 0 }));
+	}
+
+	async getGroupMemberships(groupId, { status = null, limit = 100, offset = 0 } = {}) {
+		const memberships = await this._read(this._query(`/groups/${this._groupPath(groupId)}/members`, {
+			status: status || undefined, limit: this._limit(limit, 100, 200), offset: Math.max(0, Number(offset) || 0),
+		}), { cacheSeconds: 0 });
+		return Array.isArray(memberships) ? memberships.map(normalizeGroupMembership) : [];
+	}
+
+	async createGroupMembership(membershipData) {
+		return normalizeGroupMembership(await this._write(`/groups/${this._groupPath(membershipData.groupId)}/members`, membershipData));
+	}
+
+	async updateGroupMembership(groupId, userId, fields) {
+		return normalizeGroupMembership(await this._write(
+			`/groups/${this._groupPath(groupId)}/members/${requireId(userId, 'userId')}`, fields, 'PATCH',
+		));
+	}
+
+	async createGroupInvite(inviteData) {
+		return normalizeGroupInvite(await this._write(`/groups/${this._groupPath(inviteData.groupId)}/invites`, inviteData));
+	}
+
+	async getGroupInvite(inviteId) {
+		return normalizeGroupInvite(await this._read(`/group-invites/${this._groupPath(inviteId)}`, { cacheSeconds: 0 }));
+	}
+
+	async getGroupInvites({ groupId = null, inviteeId = null, status = null, limit = 100, offset = 0 } = {}) {
+		const invites = await this._read(this._query('/group-invites', { groupId: groupId || undefined, inviteeId: inviteeId ?? undefined,
+			status: status || undefined, limit: this._limit(limit, 100, 200), offset: Math.max(0, Number(offset) || 0) }), { cacheSeconds: 0 });
+		return Array.isArray(invites) ? invites.map(normalizeGroupInvite) : [];
+	}
+
+	async updateGroupInvite(inviteId, fields) {
+		return normalizeGroupInvite(await this._write(`/group-invites/${this._groupPath(inviteId)}`, fields, 'PATCH'));
+	}
+
+	async createGroupJoinRequest(requestData) {
+		return normalizeGroupJoinRequest(await this._write(`/groups/${this._groupPath(requestData.groupId)}/join-requests`, requestData));
+	}
+
+	async getGroupJoinRequest(requestId) {
+		return normalizeGroupJoinRequest(await this._read(`/group-join-requests/${this._groupPath(requestId)}`, { cacheSeconds: 0 }));
+	}
+
+	async getGroupJoinRequests({ groupId = null, userId = null, status = null, limit = 100, offset = 0 } = {}) {
+		const requests = await this._read(this._query('/group-join-requests', { groupId: groupId || undefined, userId: userId ?? undefined,
+			status: status || undefined, limit: this._limit(limit, 100, 200), offset: Math.max(0, Number(offset) || 0) }), { cacheSeconds: 0 });
+		return Array.isArray(requests) ? requests.map(normalizeGroupJoinRequest) : [];
+	}
+
+	async updateGroupJoinRequest(requestId, fields) {
+		return normalizeGroupJoinRequest(await this._write(`/group-join-requests/${this._groupPath(requestId)}`, fields, 'PATCH'));
+	}
+
+	async getGroupPostIds(groupId, { limit = 30, offset = 0, beforeId = null } = {}) {
+		return this._read(this._query(`/groups/${this._groupPath(groupId)}/posts`, {
+			limit: this._limit(limit, 30, 100), offset: Math.max(0, Number(offset) || 0), beforeId: beforeId ?? undefined,
+		}), { cacheSeconds: 0 });
+	}
+
+	async getGroupAnnouncementPostIds(groupId, { limit = 30, offset = 0, beforeId = null } = {}) {
+		return this._read(this._query(`/groups/${this._groupPath(groupId)}/announcements`, {
+			limit: this._limit(limit, 30, 100), offset: Math.max(0, Number(offset) || 0), beforeId: beforeId ?? undefined,
+		}), { cacheSeconds: 0 });
+	}
+
+	async searchGroupPostIds(userId, query, { limit = 30, offset = 0, beforeId = null } = {}) {
+		return this._read(this._query('/group-posts/search', { userId: requireId(userId, 'userId'), query: String(query || ''),
+			limit: this._limit(limit, 30, 100), offset: Math.max(0, Number(offset) || 0), beforeId: beforeId ?? undefined,
+		}), { cacheSeconds: 0 });
 	}
 
 	async createPost(postData) {

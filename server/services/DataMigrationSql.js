@@ -12,7 +12,7 @@ const TABLE_COLUMNS = Object.freeze({
   trusted_login_ips: ['user_id', 'ip_hash', 'ip_masked', 'created_at', 'last_used_at'],
   login_approvals: ['id', 'user_id', 'ip_hash', 'ip_masked', 'user_agent', 'poll_token_hash', 'status', 'created_at', 'expires_at', 'decided_at', 'consumed_at'],
   bot_tokens: ['token_id', 'token_hash', 'user_id', 'name', 'created_at', 'last_used_at'],
-  posts: ['id', 'user_id', 'content', 'attachments', 'mask', 'lock', 'announcement', 'reply_to', 'repost_to', 'tags', 'tags_generated_at', 'created_at'],
+  posts: ['id', 'user_id', 'content', 'attachments', 'mask', 'lock', 'announcement', 'reply_to', 'repost_to', 'tags', 'tags_generated_at', 'group_id', 'group_announcement', 'created_at'],
   likes: ['user_id', 'post_id', 'created_at'],
   stars: ['user_id', 'post_id', 'created_at'],
   reposts: ['user_id', 'post_id', 'created_at'],
@@ -26,21 +26,31 @@ const TABLE_COLUMNS = Object.freeze({
   push_subscriptions: ['user_id', 'endpoint', 'expiration_time', 'p256dh', 'auth', 'session_token', 'created_at', 'updated_at'],
   moderation_reports: ['id', 'reporter_user_id', 'target_kind', 'target_id', 'description', 'target_snapshot', 'assignment_type', 'status', 'assigned_admin_id', 'assigned_at', 'excluded_admin_ids', 'resolution', 'created_at', 'resolved_at'],
   logs: ['id', 'scratch_id', 'nyaitter_id', 'masked_ip_uuid', 'log_time'],
+  groups: ['id', 'owner_id', 'name', 'description', 'icon_data', 'header_image', 'visibility', 'deleted_at', 'created_at', 'updated_at'],
+  group_roles: ['id', 'group_id', 'name', 'permissions', 'is_system', 'sort_order', 'created_at', 'updated_at'],
+  group_memberships: ['group_id', 'user_id', 'role_id', 'status', 'joined_at', 'updated_at'],
+  group_invites: ['id', 'group_id', 'inviter_id', 'invitee_id', 'status', 'created_at', 'responded_at'],
+  group_join_requests: ['id', 'group_id', 'user_id', 'status', 'reviewed_by', 'created_at', 'reviewed_at'],
   user_keyword_affinities: ['user_id', 'keyword', 'score', 'updated_at'],
 });
 
 const JSON_COLUMNS = new Set([
   'external_profile', 'settings', 'block', 'attachments', 'tags', 'post', 'unread', 'target',
-  'target_snapshot', 'excluded_admin_ids', 'resolution',
+  'target_snapshot', 'excluded_admin_ids', 'resolution', 'permissions',
 ]);
 const ARRAY_COLUMNS = new Set(['participants', 'member']);
 const DATE_COLUMNS = new Set([
   'created_at', 'updated_at', 'tags_generated_at', 'expires_at', 'last_used_at', 'decided_at', 'consumed_at',
-  'sent_at', 'read_at', 'time', 'assigned_at', 'resolved_at', 'log_time',
+  'sent_at', 'read_at', 'time', 'assigned_at', 'resolved_at', 'log_time', 'deleted_at', 'joined_at', 'responded_at', 'reviewed_at',
 ]);
 
 const INSERT_ORDER = Object.freeze([
   'users',
+  'groups',
+  'group_roles',
+  'group_memberships',
+  'group_invites',
+  'group_join_requests',
   'posts',
   'dm_channels',
   'group_dms',

@@ -118,8 +118,9 @@ function rewriteAttachmentReferences(attachments, replacementMap) {
 const MIGRATION_TABLES = [
 	'users', 'sessions', 'trusted_login_ips', 'login_approvals', 'bot_tokens', 'posts',
 	'likes', 'stars', 'reposts', 'pinned_posts', 'follows', 'dm_channels', 'dm_messages',
-	'group_dms', 'dm_e2e_keys', 'notifications', 'push_subscriptions', 'moderation_reports', 'logs',
-	'user_keyword_affinities',
+		'group_dms', 'dm_e2e_keys', 'notifications', 'push_subscriptions', 'moderation_reports', 'logs',
+		'groups', 'group_roles', 'group_memberships', 'group_invites', 'group_join_requests',
+		'user_keyword_affinities',
 ];
 const MIGRATION_COLUMNS = {
 	users: ['id', 'scid', 'name', 'handle', 'nyaitter_address', 'auth_provider', 'provider_domain', 'external_id', 'external_profile', 'uuid', 'settings', 'bio', 'header_image', 'icon_data', 'verify', 'freeze', 'admin', 'shadow', 'block', 'account_operation', 'created_at'],
@@ -127,7 +128,7 @@ const MIGRATION_COLUMNS = {
 	trusted_login_ips: ['user_id', 'ip_hash', 'ip_masked', 'created_at', 'last_used_at'],
 	login_approvals: ['id', 'user_id', 'ip_hash', 'ip_masked', 'user_agent', 'poll_token_hash', 'status', 'created_at', 'expires_at', 'decided_at', 'consumed_at'],
 	bot_tokens: ['token_id', 'token_hash', 'user_id', 'name', 'created_at', 'last_used_at'],
-	posts: ['id', 'user_id', 'content', 'attachments', 'mask', 'lock', 'announcement', 'reply_to', 'repost_to', 'tags', 'tags_generated_at', 'created_at'],
+	posts: ['id', 'user_id', 'content', 'attachments', 'mask', 'lock', 'announcement', 'reply_to', 'repost_to', 'tags', 'tags_generated_at', 'group_id', 'group_announcement', 'created_at'],
 	likes: ['user_id', 'post_id', 'created_at'],
 	stars: ['user_id', 'post_id', 'created_at'],
 	reposts: ['user_id', 'post_id', 'created_at'],
@@ -141,11 +142,16 @@ const MIGRATION_COLUMNS = {
 	push_subscriptions: ['user_id', 'endpoint', 'expiration_time', 'p256dh', 'auth', 'session_token', 'created_at', 'updated_at'],
 	moderation_reports: ['id', 'reporter_user_id', 'target_kind', 'target_id', 'description', 'target_snapshot', 'assignment_type', 'status', 'assigned_admin_id', 'assigned_at', 'excluded_admin_ids', 'resolution', 'created_at', 'resolved_at'],
 	logs: ['id', 'scratch_id', 'nyaitter_id', 'masked_ip_uuid', 'log_time'],
+	groups: ['id', 'owner_id', 'name', 'description', 'icon_data', 'header_image', 'visibility', 'deleted_at', 'created_at', 'updated_at'],
+	group_roles: ['id', 'group_id', 'name', 'permissions', 'is_system', 'sort_order', 'created_at', 'updated_at'],
+	group_memberships: ['group_id', 'user_id', 'role_id', 'status', 'joined_at', 'updated_at'],
+	group_invites: ['id', 'group_id', 'inviter_id', 'invitee_id', 'status', 'created_at', 'responded_at'],
+	group_join_requests: ['id', 'group_id', 'user_id', 'status', 'reviewed_by', 'created_at', 'reviewed_at'],
 	user_keyword_affinities: ['user_id', 'keyword', 'score', 'updated_at'],
 };
-const MIGRATION_JSON_COLUMNS = new Set(['external_profile', 'settings', 'block', 'attachments', 'tags', 'participants', 'member', 'post', 'unread', 'target', 'target_snapshot', 'excluded_admin_ids', 'resolution']);
-const MIGRATION_BOOLEAN_COLUMNS = new Set(['verify', 'admin', 'shadow', 'mask', 'lock', 'announcement', 'read', 'clicked']);
-const MIGRATION_INSERT_ORDER = ['users', 'posts', 'dm_channels', 'group_dms', 'dm_e2e_keys', 'sessions', 'trusted_login_ips', 'login_approvals', 'bot_tokens', 'follows', 'likes', 'stars', 'reposts', 'pinned_posts', 'user_keyword_affinities', 'dm_messages', 'notifications', 'push_subscriptions', 'moderation_reports', 'logs'];
+const MIGRATION_JSON_COLUMNS = new Set(['external_profile', 'settings', 'block', 'attachments', 'tags', 'participants', 'member', 'post', 'unread', 'target', 'target_snapshot', 'excluded_admin_ids', 'resolution', 'permissions']);
+const MIGRATION_BOOLEAN_COLUMNS = new Set(['verify', 'admin', 'shadow', 'mask', 'lock', 'announcement', 'group_announcement', 'is_system', 'read', 'clicked']);
+const MIGRATION_INSERT_ORDER = ['users', 'groups', 'group_roles', 'group_memberships', 'group_invites', 'group_join_requests', 'posts', 'dm_channels', 'group_dms', 'dm_e2e_keys', 'sessions', 'trusted_login_ips', 'login_approvals', 'bot_tokens', 'follows', 'likes', 'stars', 'reposts', 'pinned_posts', 'user_keyword_affinities', 'dm_messages', 'notifications', 'push_subscriptions', 'moderation_reports', 'logs'];
 
 function migrationValue(column, value) {
 	if (value == null) return null;
@@ -241,6 +247,49 @@ function normalizeUserRow(row) {
 	};
 }
 
+function normalizeGroupRow(row) {
+	if (!row) return null;
+	const ownerId = Number(row.owner_id);
+	return {
+		id: String(row.id), ownerId, owner_id: ownerId, name: row.name || '', description: row.description || '',
+		iconData: row.icon_data ?? null, icon_data: row.icon_data ?? null, headerImage: row.header_image ?? null,
+		header_image: row.header_image ?? null, visibility: row.visibility || 'open',
+		memberCount: Number(row.member_count) || 0, member_count: Number(row.member_count) || 0,
+		deletedAt: row.deleted_at ?? null, deleted_at: row.deleted_at ?? null, createdAt: row.created_at ?? null,
+		created_at: row.created_at ?? null, updatedAt: row.updated_at ?? null, updated_at: row.updated_at ?? null,
+	};
+}
+
+function normalizeGroupRoleRow(row) {
+	if (!row) return null;
+	const permissions = parseJsonSafe(row.permissions, []);
+	return { id: String(row.id), groupId: String(row.group_id), group_id: String(row.group_id), name: row.name || '',
+		permissions: Array.isArray(permissions) ? permissions.map(String) : [], isSystem: Boolean(row.is_system), is_system: Boolean(row.is_system),
+		sortOrder: Number(row.sort_order) || 0, sort_order: Number(row.sort_order) || 0,
+		createdAt: row.created_at ?? null, created_at: row.created_at ?? null, updatedAt: row.updated_at ?? null, updated_at: row.updated_at ?? null };
+}
+
+function normalizeGroupMembershipRow(row) {
+	if (!row) return null;
+	return { groupId: String(row.group_id), group_id: String(row.group_id), userId: Number(row.user_id), user_id: Number(row.user_id),
+		roleId: row.role_id ?? null, role_id: row.role_id ?? null, status: row.status || 'active',
+		joinedAt: row.joined_at ?? null, joined_at: row.joined_at ?? null, updatedAt: row.updated_at ?? null, updated_at: row.updated_at ?? null };
+}
+
+function normalizeGroupInviteRow(row) {
+	if (!row) return null;
+	return { id: String(row.id), groupId: String(row.group_id), group_id: String(row.group_id), inviterId: Number(row.inviter_id), inviter_id: Number(row.inviter_id),
+		inviteeId: Number(row.invitee_id), invitee_id: Number(row.invitee_id), status: row.status || 'pending',
+		createdAt: row.created_at ?? null, created_at: row.created_at ?? null, respondedAt: row.responded_at ?? null, responded_at: row.responded_at ?? null };
+}
+
+function normalizeGroupJoinRequestRow(row) {
+	if (!row) return null;
+	return { id: String(row.id), groupId: String(row.group_id), group_id: String(row.group_id), userId: Number(row.user_id), user_id: Number(row.user_id),
+		status: row.status || 'pending', reviewedBy: row.reviewed_by ?? null, reviewed_by: row.reviewed_by ?? null,
+		createdAt: row.created_at ?? null, created_at: row.created_at ?? null, reviewedAt: row.reviewed_at ?? null, reviewed_at: row.reviewed_at ?? null };
+}
+
 function normalizePostRow(row) {
 	if (!row) return null;
 	return {
@@ -255,6 +304,10 @@ function normalizePostRow(row) {
 		mask: Boolean(row.mask),
 		lock: Boolean(row.lock),
 		announcement: Boolean(row.announcement),
+		groupId: row.group_id ?? null,
+		group_id: row.group_id ?? null,
+		groupAnnouncement: Boolean(row.group_announcement),
+		group_announcement: Boolean(row.group_announcement),
 		replyTo: row.reply_to || null,
 		reply_to: row.reply_to || null,
 		repostTo: row.repost_to || null,
@@ -1222,6 +1275,202 @@ export default {
 				return json((results || []).map((r) => r.following_id));
 			}
 
+			// ==================== Groups ====================
+			if (method === 'GET' && pathname === '/groups') {
+				const rawVisibility = String(url.searchParams.get('visibility') || 'open,open_invite');
+				const visibility = rawVisibility.split(',').map((value) => value.trim()).filter(Boolean);
+				if (visibility.length === 0) return json([]);
+				const query = String(url.searchParams.get('query') || '').trim().toLowerCase();
+				const limit = Math.max(1, Math.min(Number(url.searchParams.get('limit') || 20), 100));
+				const offset = Math.max(0, Number(url.searchParams.get('offset') || 0));
+				const placeholders = visibility.map(() => '?').join(', ');
+				const parameters = [...visibility];
+				let sql = `SELECT g.*, (SELECT COUNT(*) FROM group_memberships gm WHERE gm.group_id = g.id AND gm.status = 'active') AS member_count FROM groups g WHERE g.deleted_at IS NULL AND g.visibility IN (${placeholders})`;
+				if (query) { sql += ' AND (LOWER(g.name) LIKE ? OR LOWER(g.description) LIKE ?)'; parameters.push(`%${query}%`, `%${query}%`); }
+				sql += ' ORDER BY g.created_at DESC, g.id DESC LIMIT ? OFFSET ?';
+				parameters.push(limit, offset);
+				const { results } = await db.prepare(sql).bind(...parameters).all();
+				return json((results || []).map(normalizeGroupRow));
+			}
+
+			if (method === 'POST' && pathname === '/groups') {
+				const body = await request.json();
+				const id = String(body.id || '').trim();
+				const ownerId = Number(body.ownerId ?? body.owner_id);
+				const name = String(body.name || '').trim();
+				const visibility = String(body.visibility || 'open');
+				if (!id || !Number.isInteger(ownerId) || ownerId < 0 || !name || name.length > 100 || !['open', 'private', 'invite', 'open_invite'].includes(visibility)) return badRequest('Invalid group');
+				const description = String(body.description || '');
+				if (description.length > 2000) return badRequest('Invalid description');
+				const now = body.createdAt || new Date().toISOString();
+				await db.prepare(`INSERT INTO groups (id, owner_id, name, description, icon_data, header_image, visibility, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+					.bind(id, ownerId, name, description, body.iconData ?? body.icon_data ?? null, body.headerImage ?? body.header_image ?? null, visibility, now, now).run();
+				const row = await db.prepare(`SELECT g.*, 0 AS member_count FROM groups g WHERE g.id = ?`).bind(id).first();
+				return json(normalizeGroupRow(row));
+			}
+
+			if (method === 'GET' && pathname.match(/^\/groups\/[^/]+$/)) {
+				const groupId = decodeURIComponent(pathname.split('/')[2]);
+				const row = await db.prepare(`SELECT g.*, (SELECT COUNT(*) FROM group_memberships gm WHERE gm.group_id = g.id AND gm.status = 'active') AS member_count FROM groups g WHERE g.id = ? AND g.deleted_at IS NULL`).bind(groupId).first();
+				return row ? json(normalizeGroupRow(row)) : notFound('Group not found');
+			}
+
+			if (method === 'PATCH' && pathname.match(/^\/groups\/[^/]+$/)) {
+				const groupId = decodeURIComponent(pathname.split('/')[2]);
+				const body = await request.json();
+				const fields = [['name', 'name'], ['description', 'description'], ['iconData', 'icon_data'], ['icon_data', 'icon_data'], ['headerImage', 'header_image'], ['header_image', 'header_image'], ['visibility', 'visibility']];
+				const sets = []; const values = []; const assigned = new Set();
+				for (const [key, column] of fields) {
+					if (body[key] === undefined || assigned.has(column)) continue;
+					assigned.add(column);
+					const value = body[key] == null && ['icon_data', 'header_image'].includes(column) ? null : String(body[key]);
+					if (column === 'name' && (!value || value.length > 100)) return badRequest('Invalid group name');
+					if (column === 'description' && value.length > 2000) return badRequest('Invalid description');
+					if (column === 'visibility' && !['open', 'private', 'invite', 'open_invite'].includes(value)) return badRequest('Invalid visibility');
+					sets.push(`${column} = ?`); values.push(value);
+				}
+				if (sets.length === 0) return badRequest('No editable fields');
+				sets.push('updated_at = ?'); values.push(new Date().toISOString(), groupId);
+				await db.prepare(`UPDATE groups SET ${sets.join(', ')} WHERE id = ? AND deleted_at IS NULL`).bind(...values).run();
+				const row = await db.prepare(`SELECT g.*, (SELECT COUNT(*) FROM group_memberships gm WHERE gm.group_id = g.id AND gm.status = 'active') AS member_count FROM groups g WHERE g.id = ? AND g.deleted_at IS NULL`).bind(groupId).first();
+				return row ? json(normalizeGroupRow(row)) : notFound('Group not found');
+			}
+
+			if (method === 'DELETE' && pathname.match(/^\/groups\/[^/]+$/)) {
+				const groupId = decodeURIComponent(pathname.split('/')[2]);
+				const now = new Date().toISOString();
+				await db.prepare('UPDATE groups SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL').bind(now, now, groupId).run();
+				const row = await db.prepare('SELECT * FROM groups WHERE id = ?').bind(groupId).first();
+				return row ? json(normalizeGroupRow(row)) : notFound('Group not found');
+			}
+
+			if (method === 'GET' && pathname.match(/^\/users\/(\d+)\/groups$/)) {
+				const userId = Number(pathname.split('/')[2]);
+				const status = String(url.searchParams.get('status') || 'active');
+				const limit = Math.max(1, Math.min(Number(url.searchParams.get('limit') || 100), 200));
+				const offset = Math.max(0, Number(url.searchParams.get('offset') || 0));
+				const { results } = await db.prepare(`SELECT g.*, gm.role_id AS membership_role_id, gm.status AS membership_status, gm.joined_at AS membership_joined_at,
+					(SELECT COUNT(*) FROM group_memberships count_gm WHERE count_gm.group_id = g.id AND count_gm.status = 'active') AS member_count
+					FROM group_memberships gm JOIN groups g ON g.id = gm.group_id WHERE gm.user_id = ? AND gm.status = ? AND g.deleted_at IS NULL
+					ORDER BY gm.joined_at DESC, g.created_at DESC LIMIT ? OFFSET ?`).bind(userId, status, limit, offset).all();
+				return json((results || []).map((row) => ({ ...normalizeGroupRow(row), membership: normalizeGroupMembershipRow({ group_id: row.id, user_id: userId, role_id: row.membership_role_id, status: row.membership_status, joined_at: row.membership_joined_at }) })));
+			}
+
+			if (method === 'GET' && pathname.match(/^\/groups\/[^/]+\/roles$/)) {
+				const groupId = decodeURIComponent(pathname.split('/')[2]);
+				const { results } = await db.prepare('SELECT * FROM group_roles WHERE group_id = ? ORDER BY sort_order ASC, name ASC, id ASC').bind(groupId).all();
+				return json((results || []).map(normalizeGroupRoleRow));
+			}
+
+			if (method === 'POST' && pathname.match(/^\/groups\/[^/]+\/roles$/)) {
+				const groupId = decodeURIComponent(pathname.split('/')[2]); const body = await request.json(); const id = String(body.id || '').trim(); const name = String(body.name || '').trim();
+				if (!id || !name || name.length > 50 || !Array.isArray(body.permissions)) return badRequest('Invalid role');
+				const now = body.createdAt || new Date().toISOString();
+				await db.prepare('INSERT INTO group_roles (id, group_id, name, permissions, is_system, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+					.bind(id, groupId, name, JSON.stringify(body.permissions.map(String)), body.isSystem ? 1 : 0, Number(body.sortOrder) || 0, now, now).run();
+				return json(normalizeGroupRoleRow(await db.prepare('SELECT * FROM group_roles WHERE id = ?').bind(id).first()));
+			}
+
+			if (method === 'PATCH' && pathname.match(/^\/group-roles\/[^/]+$/)) {
+				const roleId = decodeURIComponent(pathname.split('/')[2]); const body = await request.json(); const sets = []; const values = [];
+				if (body.name !== undefined) { const name = String(body.name).trim(); if (!name || name.length > 50) return badRequest('Invalid role name'); sets.push('name = ?'); values.push(name); }
+				if (body.permissions !== undefined) { if (!Array.isArray(body.permissions)) return badRequest('Invalid permissions'); sets.push('permissions = ?'); values.push(JSON.stringify(body.permissions.map(String))); }
+				if (body.sortOrder !== undefined || body.sort_order !== undefined) { sets.push('sort_order = ?'); values.push(Number(body.sortOrder ?? body.sort_order) || 0); }
+				if (sets.length === 0) return badRequest('No editable fields');
+				sets.push('updated_at = ?'); values.push(new Date().toISOString(), roleId);
+				await db.prepare(`UPDATE group_roles SET ${sets.join(', ')} WHERE id = ?`).bind(...values).run();
+				const row = await db.prepare('SELECT * FROM group_roles WHERE id = ?').bind(roleId).first(); return row ? json(normalizeGroupRoleRow(row)) : notFound('Group role not found');
+			}
+
+			if (method === 'DELETE' && pathname.match(/^\/group-roles\/[^/]+$/)) {
+				const roleId = decodeURIComponent(pathname.split('/')[2]); const row = await db.prepare('SELECT * FROM group_roles WHERE id = ?').bind(roleId).first();
+				if (!row) return notFound('Group role not found'); await db.prepare('DELETE FROM group_roles WHERE id = ?').bind(roleId).run(); return json(normalizeGroupRoleRow(row));
+			}
+
+			if (method === 'GET' && pathname.match(/^\/groups\/[^/]+\/members\/\d+$/)) {
+				const [, , encodedGroupId, , rawUserId] = pathname.split('/'); const row = await db.prepare('SELECT * FROM group_memberships WHERE group_id = ? AND user_id = ?').bind(decodeURIComponent(encodedGroupId), Number(rawUserId)).first();
+				return row ? json(normalizeGroupMembershipRow(row)) : notFound('Group membership not found');
+			}
+
+			if (method === 'GET' && pathname.match(/^\/groups\/[^/]+\/members$/)) {
+				const groupId = decodeURIComponent(pathname.split('/')[2]); const status = url.searchParams.get('status'); const limit = Math.max(1, Math.min(Number(url.searchParams.get('limit') || 100), 200)); const offset = Math.max(0, Number(url.searchParams.get('offset') || 0));
+				const stmt = status ? db.prepare('SELECT * FROM group_memberships WHERE group_id = ? AND status = ? ORDER BY joined_at ASC, user_id ASC LIMIT ? OFFSET ?').bind(groupId, status, limit, offset) : db.prepare('SELECT * FROM group_memberships WHERE group_id = ? ORDER BY joined_at ASC, user_id ASC LIMIT ? OFFSET ?').bind(groupId, limit, offset);
+				const { results } = await stmt.all(); return json((results || []).map(normalizeGroupMembershipRow));
+			}
+
+			if (method === 'POST' && pathname.match(/^\/groups\/[^/]+\/members$/)) {
+				const groupId = decodeURIComponent(pathname.split('/')[2]); const body = await request.json(); const userId = Number(body.userId ?? body.user_id);
+				if (!Number.isInteger(userId) || userId < 0) return badRequest('Invalid user'); const now = body.updatedAt || new Date().toISOString();
+				await db.prepare(`INSERT INTO group_memberships (group_id, user_id, role_id, status, joined_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)
+					ON CONFLICT(group_id, user_id) DO UPDATE SET role_id=excluded.role_id, status=excluded.status, joined_at=excluded.joined_at, updated_at=excluded.updated_at`)
+					.bind(groupId, userId, body.roleId ?? body.role_id ?? null, String(body.status || 'active'), body.joinedAt ?? body.joined_at ?? null, now).run();
+				return json(normalizeGroupMembershipRow(await db.prepare('SELECT * FROM group_memberships WHERE group_id = ? AND user_id = ?').bind(groupId, userId).first()));
+			}
+
+			if (method === 'PATCH' && pathname.match(/^\/groups\/[^/]+\/members\/\d+$/)) {
+				const [, , encodedGroupId, , rawUserId] = pathname.split('/'); const groupId = decodeURIComponent(encodedGroupId); const userId = Number(rawUserId); const body = await request.json(); const sets = []; const values = [];
+				if (body.roleId !== undefined || body.role_id !== undefined) { sets.push('role_id = ?'); values.push(body.roleId ?? body.role_id ?? null); }
+				if (body.status !== undefined) { sets.push('status = ?'); values.push(String(body.status)); }
+				if (body.joinedAt !== undefined || body.joined_at !== undefined) { sets.push('joined_at = ?'); values.push(body.joinedAt ?? body.joined_at ?? null); }
+				if (sets.length === 0) return badRequest('No editable fields'); sets.push('updated_at = ?'); values.push(new Date().toISOString(), groupId, userId);
+				await db.prepare(`UPDATE group_memberships SET ${sets.join(', ')} WHERE group_id = ? AND user_id = ?`).bind(...values).run(); const row = await db.prepare('SELECT * FROM group_memberships WHERE group_id = ? AND user_id = ?').bind(groupId, userId).first(); return row ? json(normalizeGroupMembershipRow(row)) : notFound('Group membership not found');
+			}
+
+			if (method === 'POST' && pathname.match(/^\/groups\/[^/]+\/invites$/)) {
+				const groupId = decodeURIComponent(pathname.split('/')[2]); const body = await request.json(); const id = String(body.id || '').trim(); const inviterId = Number(body.inviterId ?? body.inviter_id); const inviteeId = Number(body.inviteeId ?? body.invitee_id);
+				if (!id || !Number.isInteger(inviterId) || !Number.isInteger(inviteeId)) return badRequest('Invalid invite'); const now = body.createdAt || new Date().toISOString();
+				await db.prepare('INSERT INTO group_invites (id, group_id, inviter_id, invitee_id, status, created_at) VALUES (?, ?, ?, ?, ?, ?)').bind(id, groupId, inviterId, inviteeId, String(body.status || 'pending'), now).run(); return json(normalizeGroupInviteRow(await db.prepare('SELECT * FROM group_invites WHERE id = ?').bind(id).first()));
+			}
+
+			if (method === 'GET' && pathname === '/group-invites') {
+				const groupId = url.searchParams.get('groupId'); const inviteeId = url.searchParams.get('inviteeId'); const status = url.searchParams.get('status'); const clauses = []; const values = [];
+				if (groupId) { clauses.push('group_id = ?'); values.push(groupId); } if (inviteeId != null) { clauses.push('invitee_id = ?'); values.push(Number(inviteeId)); } if (status) { clauses.push('status = ?'); values.push(status); }
+				if (!clauses.length) return json([]); values.push(Math.max(1, Math.min(Number(url.searchParams.get('limit') || 100), 200)), Math.max(0, Number(url.searchParams.get('offset') || 0)));
+				const { results } = await db.prepare(`SELECT * FROM group_invites WHERE ${clauses.join(' AND ')} ORDER BY created_at DESC LIMIT ? OFFSET ?`).bind(...values).all(); return json((results || []).map(normalizeGroupInviteRow));
+			}
+
+			if (method === 'GET' && pathname.match(/^\/group-invites\/[^/]+$/)) {
+				const row = await db.prepare('SELECT * FROM group_invites WHERE id = ?').bind(decodeURIComponent(pathname.split('/')[2])).first(); return row ? json(normalizeGroupInviteRow(row)) : notFound('Group invite not found');
+			}
+
+			if (method === 'PATCH' && pathname.match(/^\/group-invites\/[^/]+$/)) {
+				const inviteId = decodeURIComponent(pathname.split('/')[2]); const body = await request.json(); const sets = []; const values = [];
+				if (body.status !== undefined) { sets.push('status = ?'); values.push(String(body.status)); } if (body.respondedAt !== undefined || body.responded_at !== undefined) { sets.push('responded_at = ?'); values.push(body.respondedAt ?? body.responded_at ?? null); } else if (body.status && body.status !== 'pending') sets.push(`responded_at = '${new Date().toISOString()}'`);
+				if (!sets.length) return badRequest('No editable fields'); values.push(inviteId); await db.prepare(`UPDATE group_invites SET ${sets.join(', ')} WHERE id = ?`).bind(...values).run(); const row = await db.prepare('SELECT * FROM group_invites WHERE id = ?').bind(inviteId).first(); return row ? json(normalizeGroupInviteRow(row)) : notFound('Group invite not found');
+			}
+
+			if (method === 'POST' && pathname.match(/^\/groups\/[^/]+\/join-requests$/)) {
+				const groupId = decodeURIComponent(pathname.split('/')[2]); const body = await request.json(); const id = String(body.id || '').trim(); const userId = Number(body.userId ?? body.user_id); if (!id || !Number.isInteger(userId)) return badRequest('Invalid join request'); const now = body.createdAt || new Date().toISOString();
+				await db.prepare('INSERT INTO group_join_requests (id, group_id, user_id, status, created_at) VALUES (?, ?, ?, ?, ?)').bind(id, groupId, userId, String(body.status || 'pending'), now).run(); return json(normalizeGroupJoinRequestRow(await db.prepare('SELECT * FROM group_join_requests WHERE id = ?').bind(id).first()));
+			}
+
+			if (method === 'GET' && pathname === '/group-join-requests') {
+				const groupId = url.searchParams.get('groupId'); const userId = url.searchParams.get('userId'); const status = url.searchParams.get('status'); const clauses = []; const values = [];
+				if (groupId) { clauses.push('group_id = ?'); values.push(groupId); } if (userId != null) { clauses.push('user_id = ?'); values.push(Number(userId)); } if (status) { clauses.push('status = ?'); values.push(status); } if (!clauses.length) return json([]);
+				values.push(Math.max(1, Math.min(Number(url.searchParams.get('limit') || 100), 200)), Math.max(0, Number(url.searchParams.get('offset') || 0))); const { results } = await db.prepare(`SELECT * FROM group_join_requests WHERE ${clauses.join(' AND ')} ORDER BY created_at DESC LIMIT ? OFFSET ?`).bind(...values).all(); return json((results || []).map(normalizeGroupJoinRequestRow));
+			}
+
+			if (method === 'GET' && pathname.match(/^\/group-join-requests\/[^/]+$/)) { const row = await db.prepare('SELECT * FROM group_join_requests WHERE id = ?').bind(decodeURIComponent(pathname.split('/')[2])).first(); return row ? json(normalizeGroupJoinRequestRow(row)) : notFound('Group join request not found'); }
+
+			if (method === 'PATCH' && pathname.match(/^\/group-join-requests\/[^/]+$/)) {
+				const requestId = decodeURIComponent(pathname.split('/')[2]); const body = await request.json(); const sets = []; const values = [];
+				if (body.status !== undefined) { sets.push('status = ?'); values.push(String(body.status)); } if (body.reviewedBy !== undefined || body.reviewed_by !== undefined) { sets.push('reviewed_by = ?'); values.push(body.reviewedBy ?? body.reviewed_by ?? null); } if (body.reviewedAt !== undefined || body.reviewed_at !== undefined) { sets.push('reviewed_at = ?'); values.push(body.reviewedAt ?? body.reviewed_at ?? null); } else if (body.status && body.status !== 'pending') sets.push(`reviewed_at = '${new Date().toISOString()}'`);
+				if (!sets.length) return badRequest('No editable fields'); values.push(requestId); await db.prepare(`UPDATE group_join_requests SET ${sets.join(', ')} WHERE id = ?`).bind(...values).run(); const row = await db.prepare('SELECT * FROM group_join_requests WHERE id = ?').bind(requestId).first(); return row ? json(normalizeGroupJoinRequestRow(row)) : notFound('Group join request not found');
+			}
+
+			if (method === 'GET' && pathname.match(/^\/groups\/[^/]+\/(posts|announcements)$/)) {
+				const groupId = decodeURIComponent(pathname.split('/')[2]); const onlyAnnouncements = pathname.endsWith('/announcements'); const limit = Math.max(1, Math.min(Number(url.searchParams.get('limit') || 30), 100)); const offset = Math.max(0, Number(url.searchParams.get('offset') || 0)); const beforeId = Number(url.searchParams.get('beforeId')) || null;
+				const clauses = ['group_id = ?']; const values = [groupId]; if (onlyAnnouncements) clauses.push('group_announcement = 1'); if (beforeId) { clauses.push('id < ?'); values.push(beforeId); }
+				values.push(limit + 1); let offsetSql = ''; if (!beforeId) { values.push(offset); offsetSql = ' OFFSET ?'; }
+				const { results } = await db.prepare(`SELECT id FROM posts WHERE ${clauses.join(' AND ')} ORDER BY created_at DESC, id DESC LIMIT ?${offsetSql}`).bind(...values).all(); const rows = results || []; const ids = rows.slice(0, limit).map((row) => Number(row.id)); return json({ ids, has_more: rows.length > limit, next_cursor: rows.length > limit ? ids.at(-1) || null : null });
+			}
+
+			if (method === 'GET' && pathname === '/group-posts/search') {
+				const userId = Number(url.searchParams.get('userId')); const query = String(url.searchParams.get('query') || '').trim().toLowerCase(); if (!Number.isInteger(userId) || !query) return json({ ids: [], has_more: false, next_cursor: null }); const limit = Math.max(1, Math.min(Number(url.searchParams.get('limit') || 30), 100)); const offset = Math.max(0, Number(url.searchParams.get('offset') || 0)); const beforeId = Number(url.searchParams.get('beforeId')) || null;
+				const clauses = ["gm.user_id = ?", "gm.status = 'active'", 'LOWER(p.content) LIKE ?']; const values = [userId, `%${query}%`]; if (beforeId) { clauses.push('p.id < ?'); values.push(beforeId); } values.push(limit + 1); let offsetSql = ''; if (!beforeId) { values.push(offset); offsetSql = ' OFFSET ?'; }
+				const { results } = await db.prepare(`SELECT p.id FROM posts p JOIN group_memberships gm ON gm.group_id = p.group_id WHERE ${clauses.join(' AND ')} ORDER BY p.created_at DESC, p.id DESC LIMIT ?${offsetSql}`).bind(...values).all(); const rows = results || []; const ids = rows.slice(0, limit).map((row) => Number(row.id)); return json({ ids, has_more: rows.length > limit, next_cursor: rows.length > limit ? ids.at(-1) || null : null });
+			}
+
 			if (method === 'POST' && pathname === '/posts') {
 				const postData = await request.json();
 				const userId = Number(postData.userId);
@@ -1234,13 +1483,15 @@ export default {
 					const repostTo = postData.repostTo ? Number(postData.repostTo) : null;
 					const normalizedTags = normalizePostTags(postData.tags);
 					const tags = JSON.stringify(normalizedTags);
-					const tagsGeneratedAt = postData.tagsGeneratedAt || null;
-					const now = new Date().toISOString();
+						const tagsGeneratedAt = postData.tagsGeneratedAt || null;
+						const groupId = postData.groupId ?? postData.group_id ?? null;
+						const groupAnnouncement = postData.groupAnnouncement ?? postData.group_announcement ? 1 : 0;
+						const now = new Date().toISOString();
 
-				const res = await db.prepare(
-`INSERT INTO posts (user_id, content, attachments, mask, lock, announcement, reply_to, repost_to, tags, tags_generated_at, created_at)
-								 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-					).bind(userId, content, attachments, mask, lock, announcement, replyTo, repostTo, tags, tagsGeneratedAt, now).run();
+					const res = await db.prepare(
+	`INSERT INTO posts (user_id, content, attachments, mask, lock, announcement, reply_to, repost_to, tags, tags_generated_at, group_id, group_announcement, created_at)
+									 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+						).bind(userId, content, attachments, mask, lock, announcement, replyTo, repostTo, tags, tagsGeneratedAt, groupId, groupAnnouncement, now).run();
 
 				const created = await db.prepare('SELECT * FROM posts WHERE id = ?').bind(res.meta.last_row_id).first();
 				await adjustUserKeywordAffinitiesForTags(db, userId, normalizedTags, 1);
