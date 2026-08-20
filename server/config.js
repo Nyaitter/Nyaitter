@@ -156,6 +156,11 @@ function normalizeCorsAllowedOrigins(value) {
   for (const value of candidates) {
     const candidate = String(value || '').trim();
     if (!candidate) continue;
+    // `*` はCORSの全オリジン許可を明示する設定値として扱う。
+    if (candidate === '*') {
+      origins.add('*');
+      continue;
+    }
 
     try {
       const url = new URL(candidate);
@@ -226,7 +231,7 @@ const config = {
 
   cors: {
     // NYAITTER_CORS_ALLOWED_ORIGINS takes a comma-separated list of origins.
-    // config.json uses an array at cors.allowedOrigins.
+    // `*` を含めると全オリジンを許可する。config.json uses an array at cors.allowedOrigins.
     allowedOrigins: normalizeCorsAllowedOrigins(corsAllowedOriginsSetting()),
     credentials: envBoolean(
       'NYAITTER_CORS_CREDENTIALS',
