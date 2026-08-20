@@ -7,6 +7,29 @@ const PROJECT_OWNER_USERNAME = process.env.SCRATCH_PROJECT_OWNER || 'NyaitterTea
 // メモリ上に保存する一時的なコード
 // (username -> { code, expiresAt, issuedIpHash })
 const pendingCodes = new Map();
+const MAX_PENDING_CODES = Math.max(
+  1,
+  Number(config.auth?.maxPendingVerificationCodes) || 1000,
+);
+
+function discardExpiredCodes(now = Date.now()) {
+  for (const [username, value] of pendingCodes) {
+    if (!value || value.expiresAt <= now) pendingCodes.delete(username);
+  }
+}
+
+function makeRoomForPendingCode() {
+  discardExpiredCodes();
+  while (pendingCodes.size >= MAX_PENDING_CODES) {
+    const oldestUsername = pendingCodes.keys().next().value;
+    if (oldestUsername === undefined) break;
+    pendingCodes.delete(oldestUsername);
+  }
+}
+
+// Clear expired entries even when no later verification request arrives.
+const pendingCodeCleanupTimer = setInterval(discardExpiredCodes, 60 * 1000);
+pendingCodeCleanupTimer.unref();
 
 function matchesSecret(expectedValue, actualValue) {
   const expected = Buffer.from(String(expectedValue || ''), 'utf8');
@@ -26,17 +49,14 @@ function generateVerificationCode(username, issuedIpHash) {
   const expiryMins = config.auth?.verificationCodeExpiryMinutes || 10;
   const expiresAt = Date.now() + msPerMinute * expiryMins;
 
-  pendingCodes.set(username.toLowerCase(), {
+  const normalizedUsername = username.toLowerCase();
+  if (pendingCodes.has(normalizedUsername)) discardExpiredCodes();
+  else makeRoomForPendingCode();
+  pendingCodes.set(normalizedUsername, {
     code,
     expiresAt,
     issuedIpHash: String(issuedIpHash || ''),
   });
-
-  for (const [key, value] of pendingCodes.entries()) {
-    if (value.expiresAt < Date.now()) {
-      pendingCodes.delete(key);
-    }
-  }
 
   return { code, expiresAt };
 }

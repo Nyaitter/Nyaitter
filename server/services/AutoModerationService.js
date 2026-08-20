@@ -79,7 +79,10 @@ class AutoModerationService {
     this.storage = storageAdapter;
     this.publishNotification = publishNotification;
     this.config = moderationConfig;
+    this.maxPendingJobs = Math.max(1, Number(moderationConfig.maxPendingJobs) || 500);
     this.queue = [];
+    // Map keeps at most one queued job per post and lets edits replace stale input.
+    this.pendingJobsByPostId = new Map();
     this.processing = false;
     this.stopped = false;
   }
@@ -94,13 +97,30 @@ class AutoModerationService {
   }
 
   enqueue(post) {
-    if (!this.enabled || !post?.id) return false;
+    if (!this.enabled || !post?.id || this.stopped) return false;
 
-    this.queue.push({
-      postId: Number(post.id),
+    const postId = Number(post.id);
+    if (!Number.isSafeInteger(postId) || postId <= 0) return false;
+
+    const existingJob = this.pendingJobsByPostId.get(postId);
+    if (existingJob) {
+      // Keep the pending job current without retaining an additional post body.
+      existingJob.content = String(post.content || '');
+      existingJob.attachmentsSignature = attachmentSignature(post.attachments);
+      return true;
+    }
+    if (this.queue.length >= this.maxPendingJobs) {
+      console.warn(`[gemini-moderation] queue is full; skipping post=${postId}`);
+      return false;
+    }
+
+    const job = {
+      postId,
       content: String(post.content || ''),
       attachmentsSignature: attachmentSignature(post.attachments),
-    });
+    };
+    this.pendingJobsByPostId.set(postId, job);
+    this.queue.push(job);
     this._startProcessing();
     return true;
   }
@@ -108,6 +128,7 @@ class AutoModerationService {
   stop() {
     this.stopped = true;
     this.queue.length = 0;
+    this.pendingJobsByPostId.clear();
   }
 
   _startProcessing() {
@@ -124,16 +145,25 @@ class AutoModerationService {
   async _processQueue() {
     while (!this.stopped && this.queue.length > 0) {
       const job = this.queue.shift();
+      this.pendingJobsByPostId.delete(job.postId);
       try {
         await this._moderate(job);
       } catch (error) {
         const waitMs = Number(error?.statusCode) === 429
           ? RATE_LIMIT_BACKOFF_MS
           : ERROR_BACKOFF_MS;
+        if (this.pendingJobsByPostId.has(job.postId)) {
+          console.warn(
+            `[gemini-moderation] post=${job.postId} failed; a newer job is already queued.`,
+            error.message,
+          );
+          continue;
+        }
         console.warn(
           `[gemini-moderation] post=${job.postId} failed; retrying after ${waitMs}ms:`,
           error.message,
         );
+        this.pendingJobsByPostId.set(job.postId, job);
         this.queue.unshift(job);
         await delay(waitMs);
       }

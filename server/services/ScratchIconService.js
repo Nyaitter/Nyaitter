@@ -6,6 +6,7 @@ const crypto = require('crypto');
 
 const DEFAULT_MAX_SOURCE_BYTES = 2 * 1024 * 1024;
 const DEFAULT_FAILURE_CACHE_MS = 60 * 1000;
+const DEFAULT_MAX_FAILURE_CACHE_ENTRIES = 500;
 const ALLOWED_SCRATCH_IMAGE_HOSTS = new Set([
   'uploads.scratch.mit.edu',
   'cdn2.scratch.mit.edu',
@@ -51,7 +52,22 @@ class ScratchIconService {
       1000,
       Number(options.failureCacheMs || DEFAULT_FAILURE_CACHE_MS),
     );
+    this.maxFailureCacheEntries = Math.max(
+      1,
+      Number(options.maxFailureCacheEntries || DEFAULT_MAX_FAILURE_CACHE_ENTRIES),
+    );
     this.failureCache = new Map();
+  }
+
+  _pruneFailureCache(now = Date.now()) {
+    for (const [scid, retryAt] of this.failureCache) {
+      if (!retryAt || retryAt <= now) this.failureCache.delete(scid);
+    }
+    while (this.failureCache.size >= this.maxFailureCacheEntries) {
+      const oldestScid = this.failureCache.keys().next().value;
+      if (oldestScid === undefined) break;
+      this.failureCache.delete(oldestScid);
+    }
   }
 
   async _fetchSourceImage(url) {
@@ -99,9 +115,9 @@ class ScratchIconService {
     if (!normalizedScid) return null;
 
     const now = Date.now();
+    this._pruneFailureCache(now);
     const retryAt = this.failureCache.get(normalizedScid);
     if (retryAt && retryAt > now) return null;
-    if (retryAt) this.failureCache.delete(normalizedScid);
 
     try {
       const sourceUrl = await resolveSourceUrl(normalizedScid);
@@ -116,6 +132,7 @@ class ScratchIconService {
         etag: `"scratch-icon-${crypto.createHash('sha256').update(source.buffer).digest('hex')}"`,
       };
     } catch (error) {
+      this._pruneFailureCache(now);
       this.failureCache.set(normalizedScid, now + this.failureCacheMs);
       throw error;
     }

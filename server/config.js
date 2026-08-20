@@ -387,8 +387,15 @@ const config = {
 	    botTokenPrefix: get('auth.botTokenPrefix', 'bot_'),
 	    sessionTokenBytes: get('auth.sessionTokenBytes', 32),
 	    botTokenIdBytes: get('auth.botTokenIdBytes', 16),
-	    verificationCodeBytes: get('auth.verificationCodeBytes', 4),
-	    scratchVerification: {
+		    verificationCodeBytes: get('auth.verificationCodeBytes', 4),
+		    maxPendingVerificationCodes: exactIntegerSetting(
+		      'maximum pending Scratch verification codes',
+		      ['NYAITTER_AUTH_MAX_PENDING_VERIFICATION_CODES'],
+		      ['auth.maxPendingVerificationCodes'],
+		      1000,
+		      1,
+		    ),
+		    scratchVerification: {
 	      ipRestrictionEnabled: envBoolean(
 	        'SCRATCH_IP_RESTRICTION_ENABLED',
 	        get('auth.scratchVerification.ipRestrictionEnabled', true),
@@ -434,6 +441,13 @@ const config = {
 		        ['geminiModeration.maxImages', 'GEMINI_MOD_MAX_IMAGES'],
 		        0,
 		        0,
+		      ),
+		      maxPendingJobs: exactIntegerSetting(
+		        'Gemini moderation max pending jobs',
+		        ['GEMINI_MOD_MAX_PENDING_JOBS'],
+		        ['geminiModeration.maxPendingJobs', 'GEMINI_MOD_MAX_PENDING_JOBS'],
+		        500,
+		        1,
 		      ),
 		      enabled: Boolean(apiKey && model && prompt),
 		    };
@@ -504,6 +518,13 @@ const config = {
 
   rateLimit: {
     enabled: envBoolean('NYAITTER_RATE_LIMIT_ENABLED', get('rateLimit.enabled', true)),
+    maxTrackedKeys: exactIntegerSetting(
+      'rate limit max tracked keys',
+      ['NYAITTER_RATE_LIMIT_MAX_TRACKED_KEYS'],
+      ['rateLimit.maxTrackedKeys'],
+      10000,
+      100,
+    ),
     general: rateLimitSetting({
       label: 'general rate limit',
       envPrefix: 'NYAITTER_RATE_LIMIT_GENERAL',

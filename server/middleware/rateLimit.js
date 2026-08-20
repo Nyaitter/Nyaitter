@@ -11,13 +11,31 @@ function createRateLimiter(options = {}) {
   });
 
   const store = new Map(); // key -> { count, resetTime }
+  const maxTrackedKeys = Math.max(
+    100,
+    Number(options.maxTrackedKeys ?? config.rateLimit?.maxTrackedKeys) || 10000,
+  );
 
-  // Background pruning on unref interval prevents O(N) map traversal on request hot path
-  const timer = setInterval(() => {
-    const now = Date.now();
+  const pruneExpiredEntries = (now = Date.now()) => {
     for (const [key, entry] of store) {
       if (!entry || entry.resetTime <= now) store.delete(key);
     }
+  };
+
+  const trimStore = (now = Date.now()) => {
+    pruneExpiredEntries(now);
+    // Map iteration is insertion-ordered, so evict the oldest active keys only
+    // under unusually high cardinality to bound memory use.
+    while (store.size >= maxTrackedKeys) {
+      const oldestKey = store.keys().next().value;
+      if (oldestKey === undefined) break;
+      store.delete(oldestKey);
+    }
+  };
+
+  // Background pruning on an unref interval keeps expired keys from accumulating.
+  const timer = setInterval(() => {
+    pruneExpiredEntries();
   }, Math.max(10000, windowMs));
   timer.unref();
 
@@ -31,6 +49,7 @@ function createRateLimiter(options = {}) {
     let entry = store.get(key);
 
     if (!entry || now >= entry.resetTime) {
+      if (!entry) trimStore(now);
       entry = { count: 0, resetTime: now + windowMs };
       store.set(key, entry);
     }
