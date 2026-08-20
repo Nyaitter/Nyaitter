@@ -33,7 +33,10 @@ class InMemoryAdapter extends DatabaseAdapter {
 					this.likes = new Map(); // `${userId}:${postId}` -> true
 			this.stars = new Map();
 			this.likedPostIdsByUser = new Map(); // userId -> Set(postId)
-			this.starredPostIdsByUser = new Map(); // userId -> Set(postId)
+						this.starredPostIdsByUser = new Map(); // userId -> Set(postId)
+			this.userKeywordAffinityByUser = new Map(); // userId -> Map(keyword -> score)
+
+
 
 		this.dmChannels = new Map(); // channelId -> { id, participants, messages, ... }
 		this.groupDms = new Map(); // dmId -> { id, title, member, host_id, time, post, unread }
@@ -114,8 +117,16 @@ class InMemoryAdapter extends DatabaseAdapter {
 			push_subscriptions: [...this.pushSubscriptions.entries()].flatMap(([user_id, subscriptions]) => (
 				[...subscriptions.values()].map((subscription) => ({ user_id, ...subscription }))
 			)),
-			moderation_reports: [...this.moderationReports.values()],
-			logs: this.logs,
+				moderation_reports: [...this.moderationReports.values()],
+				logs: this.logs,
+				user_keyword_affinities: [...this.userKeywordAffinityByUser.entries()].flatMap(([user_id, affinities]) => (
+					[...affinities.entries()].map(([keyword, score]) => ({
+						user_id,
+						keyword,
+						score,
+						updated_at: new Date().toISOString(),
+					}))
+				)),
 		};
 		return createSnapshot('memory', rows);
 	}
@@ -173,7 +184,8 @@ class InMemoryAdapter extends DatabaseAdapter {
 		}
 		for (const row of [...data.tables.posts].sort((left, right) => String(left.created_at).localeCompare(String(right.created_at)))) {
 			const post = {
-				id: row.id, userId: row.user_id, content: row.content, attachments: row.attachments,
+				id: row.id, userId: row.user_id, content: row.content,
+				tags: Array.isArray(row.tags) ? row.tags : [], attachments: row.attachments,
 				mask: row.mask, lock: row.lock, announcement: row.announcement,
 				replyTo: row.reply_to, repostTo: row.repost_to, createdAt: row.created_at,
 			};
@@ -200,8 +212,16 @@ class InMemoryAdapter extends DatabaseAdapter {
 				this._updateUserReactionIndex(userIndex, row.user_id, row.post_id, true);
 			}
 		}
-		for (const [table, target, countMap] of [
-			['reposts', this.reposts, this.repostCountByPost],
+			for (const row of data.tables.user_keyword_affinities || []) {
+				const userId = Number(row.user_id);
+				const keyword = String(row.keyword || '').trim().toLowerCase();
+				const score = Math.max(0, Number(row.score) || 0);
+				if (!keyword || score <= 0) continue;
+				if (!this.userKeywordAffinityByUser.has(userId)) this.userKeywordAffinityByUser.set(userId, new Map());
+				this.userKeywordAffinityByUser.get(userId).set(keyword, score);
+			}
+			for (const [table, target, countMap] of [
+				['reposts', this.reposts, this.repostCountByPost],
 			['pinned_posts', this.pinnedPosts, null],
 		]) {
 			for (const row of data.tables[table]) {
@@ -367,7 +387,26 @@ class InMemoryAdapter extends DatabaseAdapter {
 			if (postIds.size === 0) index.delete(normalizedUserId);
 		}
 
-		_updateFollowIndexes(followerId, followingId, following) {
+			_adjustUserKeywordAffinities(userId, postId, delta) {
+				const post = this.posts.get(Number(postId));
+				const keywords = Array.isArray(post?.tags) ? post.tags : [];
+				if (!Number.isFinite(Number(delta)) || keywords.length === 0) return;
+				const normalizedUserId = Number(userId);
+				if (!this.userKeywordAffinityByUser.has(normalizedUserId)) {
+					this.userKeywordAffinityByUser.set(normalizedUserId, new Map());
+				}
+				const affinities = this.userKeywordAffinityByUser.get(normalizedUserId);
+				for (const keyword of keywords) {
+					const normalizedKeyword = String(keyword || '').trim().toLowerCase();
+					if (!normalizedKeyword) continue;
+					const nextScore = Math.max(0, (affinities.get(normalizedKeyword) || 0) + Number(delta));
+					if (nextScore === 0) affinities.delete(normalizedKeyword);
+					else affinities.set(normalizedKeyword, nextScore);
+				}
+				if (affinities.size === 0) this.userKeywordAffinityByUser.delete(normalizedUserId);
+			}
+
+			_updateFollowIndexes(followerId, followingId, following) {
 
 		const follower = Number(followerId);
 		const followingUser = Number(followingId);
@@ -802,8 +841,9 @@ class InMemoryAdapter extends DatabaseAdapter {
 		const post = {
 			id,
 			userId: postData.userId,
-			content: postData.content,
-			attachments: postData.attachments || null,
+				content: postData.content,
+				tags: Array.isArray(postData.tags) ? [...new Set(postData.tags.map((tag) => String(tag || '').trim().toLowerCase()).filter(Boolean))].slice(0, 4) : [],
+				attachments: postData.attachments || null,
 			mask: !!postData.mask,
 			lock: !!postData.lock,
 			announcement: !!postData.announcement,
@@ -844,8 +884,9 @@ class InMemoryAdapter extends DatabaseAdapter {
 
 		const post = this.posts.get(postId);
 		if (!post) return null;
-		if (fields.content !== undefined) post.content = fields.content;
-		if (fields.attachments !== undefined) post.attachments = fields.attachments;
+			if (fields.content !== undefined) post.content = fields.content;
+			if (fields.tags !== undefined) post.tags = Array.isArray(fields.tags) ? [...new Set(fields.tags.map((tag) => String(tag || '').trim().toLowerCase()).filter(Boolean))].slice(0, 4) : [];
+			if (fields.attachments !== undefined) post.attachments = fields.attachments;
 					if (fields.mask !== undefined) post.mask = !!fields.mask;
 			if (fields.lock !== undefined) post.lock = !!fields.lock;
 			return post;
@@ -932,12 +973,14 @@ class InMemoryAdapter extends DatabaseAdapter {
 				this.likes.delete(key);
 				this._updateUserReactionIndex(this.likedPostIdsByUser, userId, postId, false);
 				this.likeCountByPost.set(postId, Math.max(0, currentCount - 1));
-						} else {
+				this._adjustUserKeywordAffinities(userId, postId, -1);
+							} else {
 					this.likes.set(key, new Date().toISOString());
 					this._updateUserReactionIndex(this.likedPostIdsByUser, userId, postId, true);
 
-				this.likeCountByPost.set(postId, currentCount + 1);
-			}
+					this.likeCountByPost.set(postId, currentCount + 1);
+					this._adjustUserKeywordAffinities(userId, postId, 1);
+				}
 
 		const count = this.likeCountByPost.get(postId) || 0;
 
@@ -968,12 +1011,14 @@ class InMemoryAdapter extends DatabaseAdapter {
 				this.stars.delete(key);
 				this._updateUserReactionIndex(this.starredPostIdsByUser, userId, postId, false);
 				this.starCountByPost.set(postId, Math.max(0, currentCount - 1));
-						} else {
+				this._adjustUserKeywordAffinities(userId, postId, -3);
+							} else {
 					this.stars.set(key, new Date().toISOString());
 					this._updateUserReactionIndex(this.starredPostIdsByUser, userId, postId, true);
 
-				this.starCountByPost.set(postId, currentCount + 1);
-			}
+					this.starCountByPost.set(postId, currentCount + 1);
+					this._adjustUserKeywordAffinities(userId, postId, 3);
+				}
 
 		const count = this.starCountByPost.get(postId) || 0;
 
@@ -2068,21 +2113,23 @@ class InMemoryAdapter extends DatabaseAdapter {
 					}
 				}
 			}
-			const affinityByAuthor = new Map();
-			const addAffinity = (postIds, field) => {
-				for (const postId of postIds) {
-					const reactedPost = this.posts.get(postId);
-					if (!reactedPost) continue;
-					const authorId = Number(reactedPost.userId);
-					const affinity = affinityByAuthor.get(authorId) || { likes: 0, stars: 0 };
-					affinity[field] += 1;
-					affinityByAuthor.set(authorId, affinity);
+				const affinityByAuthor = new Map();
+				/* Temporarily disabled: simple author affinity from likes and stars.
+				const addAffinity = (postIds, field) => {
+					for (const postId of postIds) {
+						const reactedPost = this.posts.get(postId);
+						if (!reactedPost) continue;
+						const authorId = Number(reactedPost.userId);
+						const affinity = affinityByAuthor.get(authorId) || { likes: 0, stars: 0 };
+						affinity[field] += 1;
+						affinityByAuthor.set(authorId, affinity);
+					}
+				};
+				if (normalizedViewerId != null) {
+					addAffinity(this.likedPostIdsByUser.get(normalizedViewerId) || [], 'likes');
+					addAffinity(this.starredPostIdsByUser.get(normalizedViewerId) || [], 'stars');
 				}
-			};
-			if (normalizedViewerId != null) {
-				addAffinity(this.likedPostIdsByUser.get(normalizedViewerId) || [], 'likes');
-				addAffinity(this.starredPostIdsByUser.get(normalizedViewerId) || [], 'stars');
-			}
+				*/
 
 			const candidateSource = [];
 			for (const id of this.postIdsNewest) {
@@ -2096,25 +2143,39 @@ class InMemoryAdapter extends DatabaseAdapter {
 				normalizedOffset + scoringBlockSize + 1,
 			);
 			const candidates = blockWithSentinel.slice(0, scoringBlockSize);
-			const now = Date.now();
-			const scored = candidates.map((post) => {
+				const now = Date.now();
+				const keywordAffinities = normalizedViewerId == null
+					? new Map()
+					: (this.userKeywordAffinityByUser.get(normalizedViewerId) || new Map());
+				const scored = candidates.map((post) => {
 				const authorId = Number(post.userId);
 				const ageHours = Math.max(0, (now - new Date(post.createdAt || post.created_at).getTime()) / 3600000);
 				const recencyScore = 48 / (1 + ageHours / 6);
-				const affinity = affinityByAuthor.get(authorId) || { likes: 0, stars: 0 };
-				const affinityScore = Math.min(20, affinity.likes * 4) + Math.min(32, affinity.stars * 8);
+					// Temporarily disabled: simple author affinity from likes and stars.
+					// const affinity = affinityByAuthor.get(authorId) || { likes: 0, stars: 0 };
+					// const affinityScore = Math.min(20, affinity.likes * 4) + Math.min(32, affinity.stars * 8);
+					const affinityScore = 0;
 				const graphScore = directFollowIds.has(authorId)
 					? 24
 					: secondDegreeFollowIds.has(authorId)
 						? 10
 						: 0;
-				const engagementScore = Math.min(
-					22,
-					Math.log1p(this.likeCountByPost.get(Number(post.id)) || 0) * 2
-						+ Math.log1p(this.starCountByPost.get(Number(post.id)) || 0) * 4
-						+ Math.log1p(this.repostCountByPost.get(Number(post.id)) || 0) * 5,
-				);
-				return { post, score: recencyScore + graphScore + affinityScore + engagementScore };
+					const keywordScore = Math.min(
+						30,
+						(Array.isArray(post.tags) ? post.tags : []).reduce(
+							(total, keyword) => total + (keywordAffinities.get(String(keyword).toLowerCase()) || 0) * 2,
+							0,
+						),
+					);
+					const engagementScore = Math.min(
+						22,
+						/* Temporarily disabled: simple like score.
+						Math.log1p(this.likeCountByPost.get(Number(post.id)) || 0) * 2
+							+ simple star score.
+							Math.log1p(this.starCountByPost.get(Number(post.id)) || 0) * 4
+							+ */ Math.log1p(this.repostCountByPost.get(Number(post.id)) || 0) * 5,
+					);
+					return { post, score: recencyScore + graphScore + affinityScore + keywordScore + engagementScore };
 			});
 			const averageScore = scored.reduce((total, entry) => total + entry.score, 0) / scored.length;
 			const ids = scored

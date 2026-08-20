@@ -442,6 +442,7 @@ async function serializePostsBatch(
 			id: post.id,
 			userid: post.userId,
 			content: post.content,
+			tags: Array.isArray(post.tags) ? post.tags : [],
 			mask: !!post.mask,
 			lock: !!post.lock,
 			announcement: !!post.announcement,
@@ -496,10 +497,11 @@ async function serializeReply(db, post, currentUserId = null, publicUrl = null) 
 	const replyToUser = parent && db.getUserById ? await db.getUserById(parent.userId) : null;
 
 	return {
-		id: post.id,
-		userid: post.userId,
-			content: post.content,
-			mask: !!post.mask,
+			id: post.id,
+			userid: post.userId,
+				content: post.content,
+				tags: Array.isArray(post.tags) ? post.tags : [],
+				mask: !!post.mask,
 			lock: !!post.lock,
 			announcement: !!post.announcement,
 			private: isPrivatePost(post, author),

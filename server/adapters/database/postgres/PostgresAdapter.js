@@ -70,6 +70,15 @@ function normalizeUserRow(row) {
 	};
 }
 
+function normalizePostTags(value) {
+	const rawTags = parseJsonSafe(value, Array.isArray(value) ? value : []);
+	if (!Array.isArray(rawTags)) return [];
+	return [...new Set(rawTags
+		.map((tag) => String(tag || '').trim().toLocaleLowerCase('ja-JP'))
+		.filter((tag) => tag.length > 0 && tag.length <= 48))]
+		.slice(0, 4);
+}
+
 function normalizePostRow(row) {
 	if (!row) return null;
 	const id = Number(row.id);
@@ -81,12 +90,14 @@ function normalizePostRow(row) {
 	const attachments = Array.isArray(rawAttachments)
 		? rawAttachments
 		: (rawAttachments ? [rawAttachments] : []);
+	const tags = normalizePostTags(row.tags);
 
 	return {
 		id,
 		userId,
 		user_id: userId,
 		content: row.content || '',
+		tags,
 		attachments,
 		mask: Boolean(row.mask),
 		lock: Boolean(row.lock),
@@ -1215,11 +1226,12 @@ class PostgresAdapter extends DatabaseAdapter {
 			Boolean(postData.announcement),
 			postData.replyTo ? Number(postData.replyTo) : null,
 			postData.repostTo ? Number(postData.repostTo) : null,
+			JSON.stringify(normalizePostTags(postData.tags)),
 			now,
 		];
 		const { rows } = await this.pool.query(
-			`INSERT INTO posts (user_id, content, attachments, mask, lock, announcement, reply_to, repost_to, created_at)
-			 VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7, $8, $9)
+`INSERT INTO posts (user_id, content, attachments, mask, lock, announcement, reply_to, repost_to, tags, created_at)
+				 VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7, $8, $9::jsonb, $10)
 			 RETURNING *`,
 			values,
 		);
@@ -1343,7 +1355,11 @@ class PostgresAdapter extends DatabaseAdapter {
 			values.push(fields.content);
 			sets.push(`content = $${values.length}`);
 		}
-		if (fields.attachments !== undefined) {
+			if (fields.tags !== undefined) {
+				values.push(JSON.stringify(normalizePostTags(fields.tags)));
+				sets.push(`tags = $${values.length}::jsonb`);
+			}
+			if (fields.attachments !== undefined) {
 			values.push(fields.attachments ? JSON.stringify(fields.attachments) : null);
 			sets.push(`attachments = $${values.length}::jsonb`);
 		}
@@ -1485,48 +1501,43 @@ class PostgresAdapter extends DatabaseAdapter {
 		values.push(scoringBlockSize);
 		const scoringBlockSizeParam = values.length;
 		const personalScoreCtes = [];
-		if (normalizedViewerId != null) {
-			values.push(normalizedViewerId);
-			const likeViewerParam = values.length;
-			values.push(normalizedViewerId);
-			const starViewerParam = values.length;
-			values.push(normalizedViewerId);
-			const directViewerParam = values.length;
-			values.push(normalizedViewerId);
-			const secondDegreeViewerParam = values.length;
-			values.push(normalizedViewerId);
-			const secondDegreeExcludeParam = values.length;
-			personalScoreCtes.push(
-				`viewer_like_affinity AS (
-					SELECT p.user_id, COUNT(*)::int AS count
-					FROM likes l JOIN posts p ON p.id = l.post_id
-					WHERE l.user_id = $${likeViewerParam}
-					GROUP BY p.user_id
-				), viewer_star_affinity AS (
-					SELECT p.user_id, COUNT(*)::int AS count
-					FROM stars s JOIN posts p ON p.id = s.post_id
-					WHERE s.user_id = $${starViewerParam}
-					GROUP BY p.user_id
-				), direct_follows AS (
-					SELECT following_id AS user_id FROM follows WHERE follower_id = $${directViewerParam}
-				), second_degree_follows AS (
-					SELECT DISTINCT f2.following_id AS user_id
-					FROM follows f1 JOIN follows f2 ON f2.follower_id = f1.following_id
-					WHERE f1.follower_id = $${secondDegreeViewerParam}
-						AND f2.following_id <> $${secondDegreeExcludeParam}
-				)`,
-			);
-		}
+			if (normalizedViewerId != null) {
+				values.push(normalizedViewerId);
+				const keywordViewerParam = values.length;
+				values.push(normalizedViewerId);
+				const directViewerParam = values.length;
+				values.push(normalizedViewerId);
+				const secondDegreeViewerParam = values.length;
+				values.push(normalizedViewerId);
+				const secondDegreeExcludeParam = values.length;
+				personalScoreCtes.push(
+					`viewer_keyword_affinity AS (
+						SELECT c.id AS post_id, SUM(uka.score)::numeric AS score
+						FROM candidates c
+						CROSS JOIN LATERAL jsonb_array_elements_text(COALESCE(c.tags, '[]'::jsonb)) AS post_tag(keyword)
+						JOIN user_keyword_affinities uka
+							ON uka.keyword = post_tag.keyword AND uka.user_id = $${keywordViewerParam}
+						GROUP BY c.id
+					), direct_follows AS (
+						SELECT following_id AS user_id FROM follows WHERE follower_id = $${directViewerParam}
+					), second_degree_follows AS (
+						SELECT DISTINCT f2.following_id AS user_id
+						FROM follows f1 JOIN follows f2 ON f2.follower_id = f1.following_id
+						WHERE f1.follower_id = $${secondDegreeViewerParam}
+							AND f2.following_id <> $${secondDegreeExcludeParam}
+					)`,
+				);
+			}
 		const { rows } = await this.pool.query(
 			`WITH candidate_source AS (
-				SELECT p.id, p.user_id, p.created_at
-				FROM posts p
+					SELECT p.id, p.user_id, p.created_at, p.tags
+					FROM posts p
 				WHERE ${candidateClauses.join(' AND ')}
 				ORDER BY p.created_at DESC, p.id DESC
 				LIMIT $${candidateLimitParam} OFFSET $${candidateOffsetParam}
 			), candidates AS (
-				SELECT id, user_id, created_at
-				FROM candidate_source
+					SELECT id, user_id, created_at, tags
+					FROM candidate_source
 				ORDER BY created_at DESC, id DESC
 				LIMIT $${scoringBlockSizeParam}
 			), like_counts AS (
@@ -1551,24 +1562,24 @@ class PostgresAdapter extends DatabaseAdapter {
 					)
 					+ LEAST(
 						22::DECIMAL,
-						COALESCE(l.count, 0)::DECIMAL * 4::DECIMAL / (COALESCE(l.count, 0)::DECIMAL + 4::DECIMAL)
-						+ COALESCE(s.count, 0)::DECIMAL * 8::DECIMAL / (COALESCE(s.count, 0)::DECIMAL + 2::DECIMAL)
-						+ COALESCE(r.count, 0)::DECIMAL * 10::DECIMAL / (COALESCE(r.count, 0)::DECIMAL + 2::DECIMAL)
+							/* Temporarily disabled: simple like score.
+							COALESCE(l.count, 0)::DECIMAL * 4::DECIMAL / (COALESCE(l.count, 0)::DECIMAL + 4::DECIMAL)
+							+ simple star score.
+							COALESCE(s.count, 0)::DECIMAL * 8::DECIMAL / (COALESCE(s.count, 0)::DECIMAL + 2::DECIMAL)
+							+ */ COALESCE(r.count, 0)::DECIMAL * 10::DECIMAL / (COALESCE(r.count, 0)::DECIMAL + 2::DECIMAL)
 					)
 					${normalizedViewerId != null ? `+ CASE
 						WHEN df.user_id IS NOT NULL THEN 24::DECIMAL
 						WHEN sdf.user_id IS NOT NULL THEN 10::DECIMAL
 						ELSE 0::DECIMAL
-					END
-					+ LEAST(20::DECIMAL, COALESCE(vla.count, 0)::DECIMAL * 4::DECIMAL)
-					+ LEAST(32::DECIMAL, COALESCE(vsa.count, 0)::DECIMAL * 8::DECIMAL)` : ''} AS score
+						END
+						+ LEAST(30::DECIMAL, COALESCE(vka.score, 0)::DECIMAL * 2::DECIMAL)` : ''} AS score
 				FROM candidates c
 				LEFT JOIN like_counts l ON l.post_id = c.id
 				LEFT JOIN star_counts s ON s.post_id = c.id
 				LEFT JOIN repost_counts r ON r.post_id = c.id
-				${normalizedViewerId != null ? `LEFT JOIN viewer_like_affinity vla ON vla.user_id = c.user_id
-				LEFT JOIN viewer_star_affinity vsa ON vsa.user_id = c.user_id
-				LEFT JOIN direct_follows df ON df.user_id = c.user_id
+					${normalizedViewerId != null ? `LEFT JOIN viewer_keyword_affinity vka ON vka.post_id = c.id
+					LEFT JOIN direct_follows df ON df.user_id = c.user_id
 				LEFT JOIN second_degree_follows sdf ON sdf.user_id = c.user_id` : ''}
 			), score_stats AS (
 				SELECT AVG(score) AS average_score FROM scored
@@ -1843,24 +1854,49 @@ class PostgresAdapter extends DatabaseAdapter {
 
 	// ==================== Reactions ====================
 
+	async _adjustUserKeywordAffinities(client, userId, postId, delta) {
+		const normalizedDelta = Number(delta);
+		if (!Number.isFinite(normalizedDelta) || normalizedDelta === 0) return;
+		const { rows } = await client.query(
+			'SELECT tags FROM posts WHERE id = $1 LIMIT 1',
+			[Number(postId)],
+		);
+		const tags = normalizePostTags(rows[0]?.tags);
+		if (tags.length === 0) return;
+		await client.query(
+			`INSERT INTO user_keyword_affinities (user_id, keyword, score, updated_at)
+			 SELECT $1, keyword, $3::numeric, NOW() FROM unnest($2::text[]) AS keyword
+			 ON CONFLICT (user_id, keyword) DO UPDATE
+			 SET score = GREATEST(0, user_keyword_affinities.score + EXCLUDED.score),
+				 updated_at = NOW()`,
+			[Number(userId), tags, normalizedDelta],
+		);
+		await client.query(
+			'DELETE FROM user_keyword_affinities WHERE user_id = $1 AND score <= 0',
+			[Number(userId)],
+		);
+	}
+
 	async toggleLike(userId, postId) {
 		return this._withTransaction(async (client) => {
 			const existing = await client.query(
 				'SELECT 1 FROM likes WHERE user_id = $1 AND post_id = $2',
 				[Number(userId), Number(postId)],
 			);
-			if (existing.rows.length > 0) {
-				await client.query(
-					'DELETE FROM likes WHERE user_id = $1 AND post_id = $2',
-					[Number(userId), Number(postId)],
-				);
-			} else {
+				if (existing.rows.length > 0) {
+					await client.query(
+						'DELETE FROM likes WHERE user_id = $1 AND post_id = $2',
+						[Number(userId), Number(postId)],
+					);
+					await this._adjustUserKeywordAffinities(client, userId, postId, -1);
+				} else {
 				const now = new Date().toISOString();
-				await client.query(
-					'INSERT INTO likes (user_id, post_id, created_at) VALUES ($1, $2, $3)',
-					[Number(userId), Number(postId), now],
-				);
-			}
+					await client.query(
+						'INSERT INTO likes (user_id, post_id, created_at) VALUES ($1, $2, $3)',
+						[Number(userId), Number(postId), now],
+					);
+					await this._adjustUserKeywordAffinities(client, userId, postId, 1);
+				}
 			const countResult = await client.query(
 				'SELECT COUNT(*)::int AS count FROM likes WHERE post_id = $1',
 				[Number(postId)],
@@ -1902,18 +1938,20 @@ class PostgresAdapter extends DatabaseAdapter {
 				'SELECT 1 FROM stars WHERE user_id = $1 AND post_id = $2',
 				[Number(userId), Number(postId)],
 			);
-			if (existing.rows.length > 0) {
-				await client.query(
-					'DELETE FROM stars WHERE user_id = $1 AND post_id = $2',
-					[Number(userId), Number(postId)],
-				);
-			} else {
+				if (existing.rows.length > 0) {
+					await client.query(
+						'DELETE FROM stars WHERE user_id = $1 AND post_id = $2',
+						[Number(userId), Number(postId)],
+					);
+					await this._adjustUserKeywordAffinities(client, userId, postId, -3);
+				} else {
 				const now = new Date().toISOString();
-				await client.query(
-					'INSERT INTO stars (user_id, post_id, created_at) VALUES ($1, $2, $3)',
-					[Number(userId), Number(postId), now],
-				);
-			}
+					await client.query(
+						'INSERT INTO stars (user_id, post_id, created_at) VALUES ($1, $2, $3)',
+						[Number(userId), Number(postId), now],
+					);
+					await this._adjustUserKeywordAffinities(client, userId, postId, 3);
+				}
 			const countResult = await client.query(
 				'SELECT COUNT(*)::int AS count FROM stars WHERE post_id = $1',
 				[Number(postId)],

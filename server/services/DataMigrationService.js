@@ -25,6 +25,7 @@ const TABLES = Object.freeze([
   'push_subscriptions',
   'moderation_reports',
   'logs',
+  'user_keyword_affinities',
 ]);
 
 const ADAPTER_NAMES = new Set(['memory', 'postgres', 'd1']);
@@ -127,6 +128,7 @@ function normalizeRow(table, input) {
       announcement: normalizeBoolean(value.announcement),
       reply_to: normalizeInteger(value.reply_to ?? value.replyTo),
       repost_to: normalizeInteger(value.repost_to ?? value.repostTo),
+      tags: parseJson(value.tags, []).map((tag) => String(tag || '').trim().toLocaleLowerCase('ja-JP')).filter((tag) => tag.length > 0 && tag.length <= 48).slice(0, 4),
       created_at: normalizeDate(value.created_at ?? value.createdAt),
     };
   }
@@ -178,6 +180,15 @@ function normalizeRow(table, input) {
       name: String(value.name || ''),
       created_at: normalizeDate(value.created_at ?? value.createdAt),
       last_used_at: normalizeDate(value.last_used_at ?? value.lastUsedAt),
+    };
+  }
+
+  if (table === 'user_keyword_affinities') {
+    return {
+      user_id: normalizeInteger(value.user_id ?? value.userId),
+      keyword: String(value.keyword || '').trim().toLocaleLowerCase('ja-JP').slice(0, 48),
+      score: Math.max(0, Number(value.score) || 0),
+      updated_at: normalizeDate(value.updated_at ?? value.updatedAt),
     };
   }
 

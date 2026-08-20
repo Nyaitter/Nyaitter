@@ -73,6 +73,15 @@ function parseJsonSafe(value, fallback = null) {
 	}
 }
 
+function normalizePostTags(value) {
+	const rawTags = parseJsonSafe(value, Array.isArray(value) ? value : []);
+	if (!Array.isArray(rawTags)) return [];
+	return [...new Set(rawTags
+		.map((tag) => String(tag || '').trim().toLocaleLowerCase('ja-JP'))
+		.filter((tag) => tag.length > 0 && tag.length <= 48))]
+		.slice(0, 4);
+}
+
 function createAttachmentReplacementMap(replacements) {
 	const replacementMap = new Map();
 	for (const replacement of Array.isArray(replacements) ? replacements : []) {
@@ -110,6 +119,7 @@ const MIGRATION_TABLES = [
 	'users', 'sessions', 'trusted_login_ips', 'login_approvals', 'bot_tokens', 'posts',
 	'likes', 'stars', 'reposts', 'pinned_posts', 'follows', 'dm_channels', 'dm_messages',
 	'group_dms', 'dm_e2e_keys', 'notifications', 'push_subscriptions', 'moderation_reports', 'logs',
+	'user_keyword_affinities',
 ];
 const MIGRATION_COLUMNS = {
 	users: ['id', 'scid', 'name', 'handle', 'nyaitter_address', 'auth_provider', 'provider_domain', 'external_id', 'external_profile', 'uuid', 'settings', 'bio', 'header_image', 'icon_data', 'verify', 'freeze', 'admin', 'shadow', 'block', 'account_operation', 'created_at'],
@@ -117,7 +127,7 @@ const MIGRATION_COLUMNS = {
 	trusted_login_ips: ['user_id', 'ip_hash', 'ip_masked', 'created_at', 'last_used_at'],
 	login_approvals: ['id', 'user_id', 'ip_hash', 'ip_masked', 'user_agent', 'poll_token_hash', 'status', 'created_at', 'expires_at', 'decided_at', 'consumed_at'],
 	bot_tokens: ['token_id', 'token_hash', 'user_id', 'name', 'created_at', 'last_used_at'],
-	posts: ['id', 'user_id', 'content', 'attachments', 'mask', 'lock', 'announcement', 'reply_to', 'repost_to', 'created_at'],
+	posts: ['id', 'user_id', 'content', 'attachments', 'mask', 'lock', 'announcement', 'reply_to', 'repost_to', 'tags', 'created_at'],
 	likes: ['user_id', 'post_id', 'created_at'],
 	stars: ['user_id', 'post_id', 'created_at'],
 	reposts: ['user_id', 'post_id', 'created_at'],
@@ -131,10 +141,11 @@ const MIGRATION_COLUMNS = {
 	push_subscriptions: ['user_id', 'endpoint', 'expiration_time', 'p256dh', 'auth', 'session_token', 'created_at', 'updated_at'],
 	moderation_reports: ['id', 'reporter_user_id', 'target_kind', 'target_id', 'description', 'target_snapshot', 'assignment_type', 'status', 'assigned_admin_id', 'assigned_at', 'excluded_admin_ids', 'resolution', 'created_at', 'resolved_at'],
 	logs: ['id', 'scratch_id', 'nyaitter_id', 'masked_ip_uuid', 'log_time'],
+	user_keyword_affinities: ['user_id', 'keyword', 'score', 'updated_at'],
 };
-const MIGRATION_JSON_COLUMNS = new Set(['external_profile', 'settings', 'block', 'attachments', 'participants', 'member', 'post', 'unread', 'target', 'target_snapshot', 'excluded_admin_ids', 'resolution']);
+const MIGRATION_JSON_COLUMNS = new Set(['external_profile', 'settings', 'block', 'attachments', 'tags', 'participants', 'member', 'post', 'unread', 'target', 'target_snapshot', 'excluded_admin_ids', 'resolution']);
 const MIGRATION_BOOLEAN_COLUMNS = new Set(['verify', 'admin', 'shadow', 'mask', 'lock', 'announcement', 'read', 'clicked']);
-const MIGRATION_INSERT_ORDER = ['users', 'posts', 'dm_channels', 'group_dms', 'dm_e2e_keys', 'sessions', 'trusted_login_ips', 'login_approvals', 'bot_tokens', 'follows', 'likes', 'stars', 'reposts', 'pinned_posts', 'dm_messages', 'notifications', 'push_subscriptions', 'moderation_reports', 'logs'];
+const MIGRATION_INSERT_ORDER = ['users', 'posts', 'dm_channels', 'group_dms', 'dm_e2e_keys', 'sessions', 'trusted_login_ips', 'login_approvals', 'bot_tokens', 'follows', 'likes', 'stars', 'reposts', 'pinned_posts', 'user_keyword_affinities', 'dm_messages', 'notifications', 'push_subscriptions', 'moderation_reports', 'logs'];
 
 function migrationValue(column, value) {
 	if (value == null) return null;
@@ -237,6 +248,7 @@ function normalizePostRow(row) {
 		userId: row.user_id,
 		user_id: row.user_id,
 		content: row.content || '',
+		tags: normalizePostTags(row.tags),
 		attachments: parseJsonSafe(row.attachments, []),
 		mask: Boolean(row.mask),
 		lock: Boolean(row.lock),
@@ -248,6 +260,25 @@ function normalizePostRow(row) {
 		createdAt: row.created_at,
 		created_at: row.created_at,
 	};
+}
+
+async function adjustUserKeywordAffinities(db, userId, postId, delta) {
+	const normalizedDelta = Number(delta);
+	if (!Number.isFinite(normalizedDelta) || normalizedDelta === 0) return;
+	const post = await db.prepare('SELECT tags FROM posts WHERE id = ?').bind(Number(postId)).first();
+	const tags = normalizePostTags(post?.tags);
+	if (tags.length === 0) return;
+	const now = new Date().toISOString();
+	const statements = tags.map((keyword) => db.prepare(
+		`INSERT INTO user_keyword_affinities (user_id, keyword, score, updated_at)
+		 VALUES (?, ?, ?, ?)
+		 ON CONFLICT(user_id, keyword) DO UPDATE SET
+		 score = MAX(0, user_keyword_affinities.score + excluded.score),
+		 updated_at = excluded.updated_at`,
+	).bind(Number(userId), keyword, normalizedDelta, now));
+	if (statements.length > 0) await db.batch(statements);
+	await db.prepare('DELETE FROM user_keyword_affinities WHERE user_id = ? AND score <= 0')
+		.bind(Number(userId)).run();
 }
 
 function normalizeGroupDmRow(row, viewerId = null) {
@@ -1195,13 +1226,14 @@ export default {
 					const lock = postData.lock ? 1 : 0;
 					const announcement = postData.announcement ? 1 : 0;
 					const replyTo = postData.replyTo ? Number(postData.replyTo) : null;
-				const repostTo = postData.repostTo ? Number(postData.repostTo) : null;
-				const now = new Date().toISOString();
+					const repostTo = postData.repostTo ? Number(postData.repostTo) : null;
+					const tags = JSON.stringify(normalizePostTags(postData.tags));
+					const now = new Date().toISOString();
 
 				const res = await db.prepare(
-						`INSERT INTO posts (user_id, content, attachments, mask, lock, announcement, reply_to, repost_to, created_at)
-						 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-					).bind(userId, content, attachments, mask, lock, announcement, replyTo, repostTo, now).run();
+`INSERT INTO posts (user_id, content, attachments, mask, lock, announcement, reply_to, repost_to, tags, created_at)
+							 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+					).bind(userId, content, attachments, mask, lock, announcement, replyTo, repostTo, tags, now).run();
 
 				const created = await db.prepare('SELECT * FROM posts WHERE id = ?').bind(res.meta.last_row_id).first();
 				return json(normalizePostRow(created));
@@ -1258,8 +1290,9 @@ export default {
 				const sets = [];
 				const values = [];
 
-				if (fields.content !== undefined) { sets.push('content = ?'); values.push(fields.content); }
-				if (fields.attachments !== undefined) { sets.push('attachments = ?'); values.push(fields.attachments ? JSON.stringify(fields.attachments) : null); }
+									if (fields.content !== undefined) { sets.push('content = ?'); values.push(fields.content); }
+					if (fields.tags !== undefined) { sets.push('tags = ?'); values.push(JSON.stringify(normalizePostTags(fields.tags))); }
+					if (fields.attachments !== undefined) { sets.push('attachments = ?'); values.push(fields.attachments ? JSON.stringify(fields.attachments) : null); }
 				if (fields.mask !== undefined) { sets.push('mask = ?'); values.push(fields.mask ? 1 : 0); }
 				if (fields.lock !== undefined) { sets.push('lock = ?'); values.push(fields.lock ? 1 : 0); }
 
@@ -1378,13 +1411,13 @@ export default {
 							? [beforeId, candidateLimit, offset, scoringBlockSize]
 							: [candidateLimit, offset, scoringBlockSize];
 						const commonCtes = `WITH candidate_source AS (
-							SELECT p.id, p.user_id, p.created_at
+							SELECT p.id, p.user_id, p.created_at, p.tags
 							FROM posts p
 							WHERE ${candidateWhere}
 							ORDER BY p.created_at DESC, p.id DESC
 							LIMIT ? OFFSET ?
 						), candidates AS (
-							SELECT id, user_id, created_at
+							SELECT id, user_id, created_at, tags
 							FROM candidate_source
 							ORDER BY created_at DESC, id DESC
 							LIMIT ?
@@ -1402,10 +1435,12 @@ export default {
 						FROM reposts r JOIN candidates c ON c.id = r.post_id
 						GROUP BY r.post_id
 					)`;
-					const engagementScore = `MIN(22.0,
-						COALESCE(l.count, 0) * 4.0 / (COALESCE(l.count, 0) + 4.0)
-						+ COALESCE(s.count, 0) * 8.0 / (COALESCE(s.count, 0) + 2.0)
-						+ COALESCE(r.count, 0) * 10.0 / (COALESCE(r.count, 0) + 2.0))`;
+						const engagementScore = `MIN(22.0,
+							/* Temporarily disabled: simple like score.
+							COALESCE(l.count, 0) * 4.0 / (COALESCE(l.count, 0) + 4.0)
+							+ simple star score.
+							COALESCE(s.count, 0) * 8.0 / (COALESCE(s.count, 0) + 2.0)
+							+ */ COALESCE(r.count, 0) * 10.0 / (COALESCE(r.count, 0) + 2.0))`;
 					const recencyScore = `48.0 / (1.0 + MAX(0.0, (julianday('now') - julianday(c.created_at)) * 24.0) / 6.0)`;
 					const query = viewerId == null
 						? `${commonCtes}, scored AS (
@@ -1423,17 +1458,24 @@ export default {
 								WHERE s.score >= stats.average_score * 0.75
 								ORDER BY s.score DESC, s.created_at DESC, s.id DESC
 							)`
-						: `${commonCtes}, viewer_like_affinity AS (
-							SELECT p.user_id, COUNT(*) AS count
-							FROM likes l JOIN posts p ON p.id = l.post_id
-							WHERE l.user_id = ?
-							GROUP BY p.user_id
-						), viewer_star_affinity AS (
-							SELECT p.user_id, COUNT(*) AS count
-							FROM stars s JOIN posts p ON p.id = s.post_id
-							WHERE s.user_id = ?
-							GROUP BY p.user_id
-						), direct_follows AS (
+						: `${commonCtes}, viewer_keyword_affinity AS (
+							SELECT c.id AS post_id, SUM(uka.score) AS score
+							FROM candidates c
+								CROSS JOIN json_each(COALESCE(c.tags, '[]')) AS post_tag
+							JOIN user_keyword_affinities uka ON uka.keyword = post_tag.value AND uka.user_id = ?
+							GROUP BY c.id
+							), /* Temporarily disabled: simple author affinity from likes and stars.
+							viewer_like_affinity AS (
+								SELECT p.user_id, COUNT(*) AS count
+								FROM likes l JOIN posts p ON p.id = l.post_id
+								WHERE l.user_id = ?
+								GROUP BY p.user_id
+							), viewer_star_affinity AS (
+								SELECT p.user_id, COUNT(*) AS count
+								FROM stars s JOIN posts p ON p.id = s.post_id
+								WHERE s.user_id = ?
+								GROUP BY p.user_id
+							), */ direct_follows AS (
 							SELECT following_id AS user_id FROM follows WHERE follower_id = ?
 						), second_degree_follows AS (
 							SELECT DISTINCT f2.following_id AS user_id
@@ -1442,16 +1484,19 @@ export default {
 						), scored AS (
 							SELECT c.id, c.created_at,
 								${recencyScore} + ${engagementScore}
-								+ CASE WHEN df.user_id IS NOT NULL THEN 24.0 WHEN sdf.user_id IS NOT NULL THEN 10.0 ELSE 0.0 END
-								+ MIN(20.0, COALESCE(vla.count, 0) * 4.0)
-								+ MIN(32.0, COALESCE(vsa.count, 0) * 8.0) AS score
+									+ CASE WHEN df.user_id IS NOT NULL THEN 24.0 WHEN sdf.user_id IS NOT NULL THEN 10.0 ELSE 0.0 END
+										/* Temporarily disabled: simple author affinity from likes and stars.
+										+ MIN(20.0, COALESCE(vla.count, 0) * 4.0)
+										+ MIN(32.0, COALESCE(vsa.count, 0) * 8.0)
+										*/ + MIN(30.0, COALESCE(vka.score, 0) * 2.0) AS score
 							FROM candidates c
 							LEFT JOIN like_counts l ON l.post_id = c.id
 							LEFT JOIN star_counts s ON s.post_id = c.id
 							LEFT JOIN repost_counts r ON r.post_id = c.id
-							LEFT JOIN viewer_like_affinity vla ON vla.user_id = c.user_id
-							LEFT JOIN viewer_star_affinity vsa ON vsa.user_id = c.user_id
-							LEFT JOIN direct_follows df ON df.user_id = c.user_id
+								LEFT JOIN viewer_keyword_affinity vka ON vka.post_id = c.id
+								/* Temporarily disabled: LEFT JOIN viewer_like_affinity vla ON vla.user_id = c.user_id
+								LEFT JOIN viewer_star_affinity vsa ON vsa.user_id = c.user_id */
+								LEFT JOIN direct_follows df ON df.user_id = c.user_id
 							LEFT JOIN second_degree_follows sdf ON sdf.user_id = c.user_id
 						)
 						SELECT COALESCE(json_group_array(id), '[]') AS ids,
@@ -1464,7 +1509,7 @@ export default {
 							)`;
 					const bindings = viewerId == null
 						? candidateBindings
-						: [...candidateBindings, viewerId, viewerId, viewerId, viewerId, viewerId];
+							: [...candidateBindings, viewerId, viewerId, viewerId, viewerId];
 					const { results } = await db.prepare(query).bind(...bindings).all();
 					const row = (results || [])[0] || {};
 					let ids = [];
@@ -1737,9 +1782,11 @@ export default {
 				const existing = await db.prepare('SELECT 1 FROM likes WHERE user_id = ? AND post_id = ?').bind(userId, postId).first();
 				if (existing) {
 					await db.prepare('DELETE FROM likes WHERE user_id = ? AND post_id = ?').bind(userId, postId).run();
+					await adjustUserKeywordAffinities(db, userId, postId, -1);
 				} else {
 					const now = new Date().toISOString();
 					await db.prepare('INSERT INTO likes (user_id, post_id, created_at) VALUES (?, ?, ?)').bind(userId, postId, now).run();
+					await adjustUserKeywordAffinities(db, userId, postId, 1);
 				}
 				const countRow = await db.prepare('SELECT COUNT(*) as count FROM likes WHERE post_id = ?').bind(postId).first();
 				return json({ liked: !existing, count: Number(countRow?.count || 0) });
@@ -1772,9 +1819,11 @@ export default {
 				const existing = await db.prepare('SELECT 1 FROM stars WHERE user_id = ? AND post_id = ?').bind(userId, postId).first();
 				if (existing) {
 					await db.prepare('DELETE FROM stars WHERE user_id = ? AND post_id = ?').bind(userId, postId).run();
+					await adjustUserKeywordAffinities(db, userId, postId, -3);
 				} else {
 					const now = new Date().toISOString();
 					await db.prepare('INSERT INTO stars (user_id, post_id, created_at) VALUES (?, ?, ?)').bind(userId, postId, now).run();
+					await adjustUserKeywordAffinities(db, userId, postId, 3);
 				}
 				const countRow = await db.prepare('SELECT COUNT(*) as count FROM stars WHERE post_id = ?').bind(postId).first();
 				return json({ starred: !existing, count: Number(countRow?.count || 0) });

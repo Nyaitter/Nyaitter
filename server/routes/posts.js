@@ -1,5 +1,6 @@
 const express = require('express');
 const PostService = require('../services/PostService');
+const { extractPostKeywords } = require('../services/PostKeywordService');
 const { requireAuth, optionalAuth } = require('../middleware/auth');
 const config = require('../config');
 const { isWithinRange, describeIntegerRange } = require('../utils/settingFormats');
@@ -1060,8 +1061,10 @@ router.put('/:id', requireAuth, postWriteLimiter, async (req, res) => {
 			return res.status(403).json({ error: 'You can only edit your own posts' });
 		}
 
+				const normalizedContent = content.trim();
 				const updated = await db.updatePost(postId, {
-			content: content.trim(),
+				content: normalizedContent,
+				tags: await extractPostKeywords(normalizedContent),
 			attachments:
 				Array.isArray(attachments) && attachments.length > 0
 					? attachments

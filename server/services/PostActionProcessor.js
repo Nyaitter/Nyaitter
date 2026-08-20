@@ -1,6 +1,7 @@
 'use strict';
 
 const PostService = require('./PostService');
+const { extractPostKeywords } = require('./PostKeywordService');
 const {
   serializeNotification,
 } = require('../utils/serialize');
@@ -210,6 +211,7 @@ async function processCreatePostAction(context, payload) {
     return attachment;
   });
 
+  const tags = isSimpleRepost ? [] : await extractPostKeywords(content);
   const postService = new PostService({
     dbAdapter: context.db,
     storageAdapter: context.storage,
@@ -217,6 +219,7 @@ async function processCreatePostAction(context, payload) {
   const post = await postService.createPost({
     userId,
     content,
+    tags,
     attachments: processedAttachments,
     mask: Boolean(payload.mask),
     lock: Boolean(payload.lock),

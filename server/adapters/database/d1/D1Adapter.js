@@ -66,6 +66,12 @@ function normalizePost(post) {
 	post.mask = !!post.mask;
 	post.lock = !!post.lock;
 	post.announcement = !!post.announcement;
+	if (post.tags && typeof post.tags === 'string') {
+		try {
+			post.tags = JSON.parse(post.tags);
+		} catch (_) {}
+	}
+	if (!Array.isArray(post.tags)) post.tags = [];
 	if (post.attachments && typeof post.attachments === 'string') {
 		try {
 			post.attachments = JSON.parse(post.attachments);
