@@ -120,7 +120,35 @@ class DatabaseAdapter {
 	async revokeBotToken(userId, tokenId) { throw new Error('revokeBotToken() must be implemented'); }
 	async updateBotTokenLastUsed(tokenId) { throw new Error('updateBotTokenLastUsed() must be implemented'); }
 
-	
+
+	// ==================== Groups ====================
+	async createGroup(groupData) { throw new Error('createGroup() must be implemented'); }
+	async getGroupById(groupId) { throw new Error('getGroupById() must be implemented'); }
+	async updateGroup(groupId, fields) { throw new Error('updateGroup() must be implemented'); }
+	async deleteGroup(groupId) { throw new Error('deleteGroup() must be implemented'); }
+	async transferGroupOwnership(groupId, newOwnerId) { throw new Error('transferGroupOwnership() must be implemented'); }
+	async getGroupsByVisibility(params = {}) { throw new Error('getGroupsByVisibility() must be implemented'); }
+	async getUserGroups(userId, params = {}) { throw new Error('getUserGroups() must be implemented'); }
+	async createGroupRole(roleData) { throw new Error('createGroupRole() must be implemented'); }
+	async getGroupRoles(groupId) { throw new Error('getGroupRoles() must be implemented'); }
+	async updateGroupRole(roleId, fields) { throw new Error('updateGroupRole() must be implemented'); }
+	async deleteGroupRole(roleId) { throw new Error('deleteGroupRole() must be implemented'); }
+	async getGroupMembership(groupId, userId) { throw new Error('getGroupMembership() must be implemented'); }
+	async getGroupMemberships(groupId, params = {}) { throw new Error('getGroupMemberships() must be implemented'); }
+	async createGroupMembership(membershipData) { throw new Error('createGroupMembership() must be implemented'); }
+	async updateGroupMembership(groupId, userId, fields) { throw new Error('updateGroupMembership() must be implemented'); }
+	async createGroupInvite(inviteData) { throw new Error('createGroupInvite() must be implemented'); }
+	async getGroupInvite(inviteId) { throw new Error('getGroupInvite() must be implemented'); }
+	async getGroupInvites(params = {}) { throw new Error('getGroupInvites() must be implemented'); }
+	async updateGroupInvite(inviteId, fields) { throw new Error('updateGroupInvite() must be implemented'); }
+	async createGroupJoinRequest(requestData) { throw new Error('createGroupJoinRequest() must be implemented'); }
+	async getGroupJoinRequest(requestId) { throw new Error('getGroupJoinRequest() must be implemented'); }
+	async getGroupJoinRequests(params = {}) { throw new Error('getGroupJoinRequests() must be implemented'); }
+	async updateGroupJoinRequest(requestId, fields) { throw new Error('updateGroupJoinRequest() must be implemented'); }
+	async getGroupPostIds(groupId, params = {}) { throw new Error('getGroupPostIds() must be implemented'); }
+	async getGroupAnnouncementPostIds(groupId, params = {}) { throw new Error('getGroupAnnouncementPostIds() must be implemented'); }
+	async searchGroupPostIds(userId, query, params = {}) { throw new Error('searchGroupPostIds() must be implemented'); }
+
 	async createPost(postData) {
 		throw new Error('createPost() must be implemented');
 	}

@@ -156,6 +156,11 @@ function normalizeCorsAllowedOrigins(value) {
   for (const value of candidates) {
     const candidate = String(value || '').trim();
     if (!candidate) continue;
+    // `*` はCORSの全オリジン許可を明示する設定値として扱う。
+    if (candidate === '*') {
+      origins.add('*');
+      continue;
+    }
 
     try {
       const url = new URL(candidate);
@@ -189,28 +194,38 @@ function corsAllowedOriginsSetting() {
 
 const turnstileSecretKey = process.env.TURNSTILE_SECRET_KEY || get('turnstile.secret', '');
 
+const apiEndpoint = normalizeApiEndpoint(
+  process.env.NYAITTER_API_ENDPOINT || get('server.apiEndpoint', '/server'),
+);
+const configuredUserFilesPort = optionalPort(
+  'NYAITTER_USER_FILES_PORT',
+  process.env.NYAITTER_USER_FILES_PORT !== undefined
+    ? process.env.NYAITTER_USER_FILES_PORT
+    : get('userFiles.port', null),
+);
+const defaultUserFilesEndpoint = configuredUserFilesPort
+  ? '/uploads'
+  : (`${apiEndpoint === '/' ? '' : apiEndpoint}/uploads` || '/uploads');
+const configuredUserFilesEndpoint = process.env.NYAITTER_USER_FILES_ENDPOINT !== undefined
+  ? process.env.NYAITTER_USER_FILES_ENDPOINT
+  : get('userFiles.endpoint', undefined);
+
 const config = {
   server: {
     port: parseInt(process.env.PORT, 10) || get('server.port', 3000),
     jsonBodyLimit: process.env.JSON_BODY_LIMIT || get('server.jsonBodyLimit', '2mb'),
     trustProxy: process.env.TRUST_PROXY === 'true' || get('server.trustProxy', false),
-    apiEndpoint: normalizeApiEndpoint(
-      process.env.NYAITTER_API_ENDPOINT || get('server.apiEndpoint', '/server'),
-    ),
+    apiEndpoint,
   },
 
   userFiles: {
+    // 未指定時はAPIエンドポイント配下で配信する。空文字の明示指定だけが配信無効化を表す。
     endpoint: normalizeUserFilesEndpoint(
-      process.env.NYAITTER_USER_FILES_ENDPOINT !== undefined
-        ? process.env.NYAITTER_USER_FILES_ENDPOINT
-        : get('userFiles.endpoint', ''),
+      configuredUserFilesEndpoint === undefined
+        ? defaultUserFilesEndpoint
+        : configuredUserFilesEndpoint,
     ),
-    port: optionalPort(
-      'NYAITTER_USER_FILES_PORT',
-      process.env.NYAITTER_USER_FILES_PORT !== undefined
-        ? process.env.NYAITTER_USER_FILES_PORT
-        : get('userFiles.port', null),
-    ),
+    port: configuredUserFilesPort,
   },
 
   static: {
@@ -226,7 +241,7 @@ const config = {
 
   cors: {
     // NYAITTER_CORS_ALLOWED_ORIGINS takes a comma-separated list of origins.
-    // config.json uses an array at cors.allowedOrigins.
+    // `*` を含めると全オリジンを許可する。config.json uses an array at cors.allowedOrigins.
     allowedOrigins: normalizeCorsAllowedOrigins(corsAllowedOriginsSetting()),
     credentials: envBoolean(
       'NYAITTER_CORS_CREDENTIALS',
@@ -300,6 +315,34 @@ const config = {
       ['NYAITTER_LIMIT_IMPOSTERS_PER_PARENT'],
       ['limits.impostersPerParent'],
       5,
+      0,
+    ),
+    groupMaxCreatedPerUser: exactIntegerSetting(
+      'groups created per user',
+      ['NYAITTER_GROUP_MAX_CREATED_PER_USER'],
+      ['limits.groupMaxCreatedPerUser'],
+      0,
+      0,
+    ),
+    groupMaxMembershipsPerUser: exactIntegerSetting(
+      'group memberships per user',
+      ['NYAITTER_GROUP_MAX_MEMBERSHIPS_PER_USER'],
+      ['limits.groupMaxMembershipsPerUser'],
+      0,
+      0,
+    ),
+    groupMaxHomeTabs: exactIntegerSetting(
+      'group home tabs',
+      ['NYAITTER_GROUP_MAX_HOME_TABS'],
+      ['limits.groupMaxHomeTabs'],
+      0,
+      0,
+    ),
+    groupMaxMembersPerGroup: exactIntegerSetting(
+      'group members per group',
+      ['NYAITTER_GROUP_MAX_MEMBERS_PER_GROUP'],
+      ['limits.groupMaxMembersPerGroup'],
+      0,
       0,
     ),
     userSearchPageSize: rangeSetting(

@@ -20,6 +20,11 @@ const TABLES = Object.freeze([
   'dm_channels',
   'dm_messages',
   'group_dms',
+  'groups',
+  'group_roles',
+  'group_memberships',
+  'group_invites',
+  'group_join_requests',
   'dm_e2e_keys',
   'notifications',
   'push_subscriptions',
@@ -130,7 +135,72 @@ function normalizeRow(table, input) {
       repost_to: normalizeInteger(value.repost_to ?? value.repostTo),
       tags: parseJson(value.tags, []).map((tag) => String(tag || '').trim().toLocaleLowerCase('ja-JP')).filter((tag) => tag.length > 0 && tag.length <= 48).slice(0, 4),
       tags_generated_at: normalizeDate(value.tags_generated_at ?? value.tagsGeneratedAt),
+      group_id: value.group_id ?? value.groupId ?? null,
+      group_announcement: normalizeBoolean(value.group_announcement ?? value.groupAnnouncement),
       created_at: normalizeDate(value.created_at ?? value.createdAt),
+    };
+  }
+
+  if (table === 'groups') {
+    return {
+      id: value.id == null ? null : String(value.id),
+      owner_id: normalizeInteger(value.owner_id ?? value.ownerId),
+      name: String(value.name || ''),
+      description: String(value.description || ''),
+      icon_data: value.icon_data ?? value.iconData ?? null,
+      header_image: value.header_image ?? value.headerImage ?? null,
+      visibility: ['open', 'private', 'invite', 'open_invite'].includes(String(value.visibility)) ? String(value.visibility) : 'open',
+      deleted_at: normalizeDate(value.deleted_at ?? value.deletedAt),
+      created_at: normalizeDate(value.created_at ?? value.createdAt),
+      updated_at: normalizeDate(value.updated_at ?? value.updatedAt),
+    };
+  }
+
+  if (table === 'group_roles') {
+    return {
+      id: value.id == null ? null : String(value.id),
+      group_id: value.group_id ?? value.groupId ?? null,
+      name: String(value.name || ''),
+      permissions: parseJson(value.permissions, []).map((permission) => String(permission || '').trim()).filter(Boolean),
+      is_system: normalizeBoolean(value.is_system ?? value.isSystem),
+      sort_order: normalizeInteger(value.sort_order ?? value.sortOrder, 0),
+      created_at: normalizeDate(value.created_at ?? value.createdAt),
+      updated_at: normalizeDate(value.updated_at ?? value.updatedAt),
+    };
+  }
+
+  if (table === 'group_memberships') {
+    return {
+      group_id: value.group_id ?? value.groupId ?? null,
+      user_id: normalizeInteger(value.user_id ?? value.userId),
+      role_id: value.role_id ?? value.roleId ?? null,
+      status: ['active', 'pending', 'invited', 'banned'].includes(String(value.status)) ? String(value.status) : 'active',
+      joined_at: normalizeDate(value.joined_at ?? value.joinedAt),
+      updated_at: normalizeDate(value.updated_at ?? value.updatedAt),
+    };
+  }
+
+  if (table === 'group_invites') {
+    return {
+      id: value.id == null ? null : String(value.id),
+      group_id: value.group_id ?? value.groupId ?? null,
+      inviter_id: normalizeInteger(value.inviter_id ?? value.inviterId),
+      invitee_id: normalizeInteger(value.invitee_id ?? value.inviteeId),
+      status: ['pending', 'accepted', 'declined', 'cancelled'].includes(String(value.status)) ? String(value.status) : 'pending',
+      created_at: normalizeDate(value.created_at ?? value.createdAt),
+      responded_at: normalizeDate(value.responded_at ?? value.respondedAt),
+    };
+  }
+
+  if (table === 'group_join_requests') {
+    return {
+      id: value.id == null ? null : String(value.id),
+      group_id: value.group_id ?? value.groupId ?? null,
+      user_id: normalizeInteger(value.user_id ?? value.userId),
+      status: ['pending', 'approved', 'declined', 'cancelled'].includes(String(value.status)) ? String(value.status) : 'pending',
+      reviewed_by: normalizeInteger(value.reviewed_by ?? value.reviewedBy),
+      created_at: normalizeDate(value.created_at ?? value.createdAt),
+      reviewed_at: normalizeDate(value.reviewed_at ?? value.reviewedAt),
     };
   }
 

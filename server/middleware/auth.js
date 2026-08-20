@@ -191,6 +191,22 @@ async function optionalAuth(req, res, next) {
   return next();
 }
 
+function isDevelopmentCorsMode() {
+  // npm run dev は DEV_BYPASS_AUTH=true を設定するため、開発用途では
+  // 一時公開先を含む任意のオリジンから利用できるようにする。
+  return process.env.DEV_BYPASS_AUTH === 'true';
+}
+
+function isCorsOriginAllowed(origin) {
+  if (!origin) return false;
+  const allowedOrigins = config.cors?.allowedOrigins || [];
+  return (
+    isDevelopmentCorsMode() ||
+    allowedOrigins.includes('*') ||
+    allowedOrigins.includes(origin)
+  );
+}
+
 function isSameOriginRequest(req) {
   const origin = req.headers.origin;
   if (!origin) return true;
@@ -207,7 +223,10 @@ function isSameOriginRequest(req) {
     }
   }
 
-  return config.cors?.credentials === true && (config.cors?.allowedOrigins || []).includes(origin);
+  // npm run devでは開発用認証バイパスと全オリジンCORSを同時に有効化するため、
+  // Cookie付きの状態変更要求もオリジンで拒否しない。
+  if (isDevelopmentCorsMode()) return true;
+  return config.cors?.credentials === true && isCorsOriginAllowed(origin);
 }
 
 function csrfProtection(req, res, next) {
@@ -239,10 +258,9 @@ function csrfProtection(req, res, next) {
 
 function flexibleCors(req, res, next) {
   const origin = req.headers.origin;
-  const allowedOrigins = config.cors?.allowedOrigins || [];
   const defaultPortOrigin = `http://localhost:${config.server?.port || 3000}`;
   const originAllowed = Boolean(
-    origin && (allowedOrigins.includes(origin) || origin === defaultPortOrigin),
+    origin && (isCorsOriginAllowed(origin) || origin === defaultPortOrigin),
   );
 
   if (originAllowed) {
@@ -303,4 +321,5 @@ module.exports = {
   getAuthenticatedPrincipal,
   extractToken,
   isSameOriginRequest,
+  isCorsOriginAllowed,
 };

@@ -22,6 +22,14 @@ class InMemoryAdapter extends DatabaseAdapter {
 			this.loginApprovals = new Map(); // approvalId -> pending login approval
 			this.botTokens = new Map(); // tokenId -> { userId, tokenHash, name, ... }
 		this.posts = new Map();
+		this.groups = new Map(); // groupId -> group
+		this.groupRoles = new Map(); // roleId -> role
+		this.groupRoleIdsByGroup = new Map(); // groupId -> Set(roleId)
+		this.groupMemberships = new Map(); // `${groupId}:${userId}` -> membership
+		this.groupMemberIdsByGroup = new Map(); // groupId -> Set(userId)
+		this.groupIdsByUser = new Map(); // userId -> Set(groupId)
+		this.groupInvites = new Map(); // inviteId -> invite
+		this.groupJoinRequests = new Map(); // requestId -> request
 		// 投稿読み取りを投稿総数に比例させないための補助インデックス。
 		this.postIdsNewest = []; // newest -> oldest
 		this.postIdsByUser = new Map(); // userId -> newest -> oldest post IDs
@@ -71,7 +79,13 @@ class InMemoryAdapter extends DatabaseAdapter {
 			trusted_login_ips: [...this.trustedLoginIps.values()],
 			login_approvals: [...this.loginApprovals.values()],
 			bot_tokens: [...this.botTokens.values()],
-			posts: [...this.posts.values()],
+							posts: [...this.posts.values()],
+				groups: [...this.groups.values()],
+				group_roles: [...this.groupRoles.values()],
+				group_memberships: [...this.groupMemberships.values()],
+				group_invites: [...this.groupInvites.values()],
+				group_join_requests: [...this.groupJoinRequests.values()],
+
 			likes: [...this.likes.entries()].map(([key, created_at]) => {
 				const [user_id, post_id] = key.split(':').map(Number);
 				return { user_id, post_id, created_at };
@@ -187,14 +201,50 @@ class InMemoryAdapter extends DatabaseAdapter {
 				id: row.id, userId: row.user_id, content: row.content,
 				tags: Array.isArray(row.tags) ? row.tags : [],
 				tagsGeneratedAt: row.tags_generated_at ?? row.tagsGeneratedAt ?? null, attachments: row.attachments,
-				mask: row.mask, lock: row.lock, announcement: row.announcement,
-				replyTo: row.reply_to, repostTo: row.repost_to, createdAt: row.created_at,
+									mask: row.mask, lock: row.lock, announcement: row.announcement,
+					groupId: row.group_id ?? row.groupId ?? null,
+					groupAnnouncement: Boolean(row.group_announcement ?? row.groupAnnouncement),
+					replyTo: row.reply_to, repostTo: row.repost_to, createdAt: row.created_at,
+
 			};
 			this.posts.set(post.id, post);
 			this._addPostIndexes(post);
 			this.nextPostId = Math.max(this.nextPostId, Number(post.id) + 1);
 		}
-		for (const row of data.tables.follows) {
+			for (const row of data.tables.groups || []) {
+				this.groups.set(String(row.id), {
+					id: String(row.id), ownerId: Number(row.owner_id), name: row.name || '', description: row.description || '',
+					iconData: row.icon_data ?? null, headerImage: row.header_image ?? null, visibility: row.visibility || 'open',
+					deletedAt: row.deleted_at ?? null, createdAt: row.created_at ?? new Date().toISOString(), updatedAt: row.updated_at ?? new Date().toISOString(),
+				});
+			}
+			for (const row of data.tables.group_roles || []) {
+				const role = { id: String(row.id), groupId: String(row.group_id), name: row.name || '',
+					permissions: Array.isArray(row.permissions) ? row.permissions.map(String) : [], isSystem: Boolean(row.is_system),
+					sortOrder: Number(row.sort_order) || 0, createdAt: row.created_at ?? new Date().toISOString(), updatedAt: row.updated_at ?? new Date().toISOString() };
+				this.groupRoles.set(role.id, role);
+				if (!this.groupRoleIdsByGroup.has(role.groupId)) this.groupRoleIdsByGroup.set(role.groupId, new Set());
+				this.groupRoleIdsByGroup.get(role.groupId).add(role.id);
+			}
+			for (const row of data.tables.group_memberships || []) {
+				const membership = { groupId: String(row.group_id), userId: Number(row.user_id), roleId: row.role_id ?? null,
+					status: row.status || 'active', joinedAt: row.joined_at ?? null, updatedAt: row.updated_at ?? new Date().toISOString() };
+				const key = `${membership.groupId}:${membership.userId}`;
+				this.groupMemberships.set(key, membership);
+				if (!this.groupMemberIdsByGroup.has(membership.groupId)) this.groupMemberIdsByGroup.set(membership.groupId, new Set());
+				if (!this.groupIdsByUser.has(membership.userId)) this.groupIdsByUser.set(membership.userId, new Set());
+				this.groupMemberIdsByGroup.get(membership.groupId).add(membership.userId);
+				this.groupIdsByUser.get(membership.userId).add(membership.groupId);
+			}
+			for (const row of data.tables.group_invites || []) this.groupInvites.set(String(row.id), {
+				id: String(row.id), groupId: String(row.group_id), inviterId: Number(row.inviter_id), inviteeId: Number(row.invitee_id),
+				status: row.status || 'pending', createdAt: row.created_at ?? new Date().toISOString(), respondedAt: row.responded_at ?? null,
+			});
+			for (const row of data.tables.group_join_requests || []) this.groupJoinRequests.set(String(row.id), {
+				id: String(row.id), groupId: String(row.group_id), userId: Number(row.user_id), status: row.status || 'pending',
+				reviewedBy: row.reviewed_by ?? null, createdAt: row.created_at ?? new Date().toISOString(), reviewedAt: row.reviewed_at ?? null,
+			});
+			for (const row of data.tables.follows) {
 			const key = `${row.follower_id}:${row.following_id}`;
 			this.follows.set(key, row.created_at);
 			if (!this.followingIdsByUser.has(row.follower_id)) this.followingIdsByUser.set(row.follower_id, new Set());
@@ -841,6 +891,286 @@ class InMemoryAdapter extends DatabaseAdapter {
 		}
 	}
 
+	// ==================== Groups ====================
+
+	_groupMemberKey(groupId, userId) {
+		return `${String(groupId)}:${Number(userId)}`;
+	}
+
+	_groupMemberCount(groupId) {
+		const userIds = this.groupMemberIdsByGroup.get(String(groupId)) || new Set();
+		let count = 0;
+		for (const userId of userIds) {
+			if (this.groupMemberships.get(this._groupMemberKey(groupId, userId))?.status === 'active') count += 1;
+		}
+		return count;
+	}
+
+	_cloneGroup(group) {
+		if (!group) return null;
+		return {
+			id: group.id, ownerId: group.ownerId, owner_id: group.ownerId, name: group.name,
+			description: group.description, iconData: group.iconData, icon_data: group.iconData,
+			headerImage: group.headerImage, header_image: group.headerImage, visibility: group.visibility,
+			memberCount: this._groupMemberCount(group.id), member_count: this._groupMemberCount(group.id),
+			deletedAt: group.deletedAt, deleted_at: group.deletedAt, createdAt: group.createdAt, created_at: group.createdAt,
+			updatedAt: group.updatedAt, updated_at: group.updatedAt,
+		};
+	}
+
+	_cloneGroupRole(role) {
+		if (!role) return null;
+		return { id: role.id, groupId: role.groupId, group_id: role.groupId, name: role.name,
+			permissions: [...role.permissions], isSystem: role.isSystem, is_system: role.isSystem,
+			sortOrder: role.sortOrder, sort_order: role.sortOrder, createdAt: role.createdAt, created_at: role.createdAt,
+			updatedAt: role.updatedAt, updated_at: role.updatedAt };
+	}
+
+	_cloneGroupMembership(membership) {
+		if (!membership) return null;
+		return { groupId: membership.groupId, group_id: membership.groupId, userId: membership.userId, user_id: membership.userId,
+			roleId: membership.roleId, role_id: membership.roleId, status: membership.status,
+			joinedAt: membership.joinedAt, joined_at: membership.joinedAt, updatedAt: membership.updatedAt, updated_at: membership.updatedAt };
+	}
+
+	_cloneGroupInvite(invite) {
+		if (!invite) return null;
+		return { id: invite.id, groupId: invite.groupId, group_id: invite.groupId, inviterId: invite.inviterId, inviter_id: invite.inviterId,
+			inviteeId: invite.inviteeId, invitee_id: invite.inviteeId, status: invite.status,
+			createdAt: invite.createdAt, created_at: invite.createdAt, respondedAt: invite.respondedAt, responded_at: invite.respondedAt };
+	}
+
+	_cloneGroupJoinRequest(request) {
+		if (!request) return null;
+		return { id: request.id, groupId: request.groupId, group_id: request.groupId, userId: request.userId, user_id: request.userId,
+			status: request.status, reviewedBy: request.reviewedBy, reviewed_by: request.reviewedBy,
+			createdAt: request.createdAt, created_at: request.createdAt, reviewedAt: request.reviewedAt, reviewed_at: request.reviewedAt };
+	}
+
+	async createGroup(groupData) {
+		const now = groupData.createdAt || new Date().toISOString();
+		const group = { id: String(groupData.id), ownerId: Number(groupData.ownerId), name: String(groupData.name || ''),
+			description: String(groupData.description || ''), iconData: groupData.iconData ?? null, headerImage: groupData.headerImage ?? null,
+			visibility: String(groupData.visibility || 'open'), deletedAt: null, createdAt: now, updatedAt: now };
+		this.groups.set(group.id, group);
+		return this._cloneGroup(group);
+	}
+
+	async getGroupById(groupId) {
+		const group = this.groups.get(String(groupId));
+		return group && !group.deletedAt ? this._cloneGroup(group) : null;
+	}
+
+	async updateGroup(groupId, fields) {
+		const group = this.groups.get(String(groupId));
+		if (!group || group.deletedAt) return null;
+		if (fields.name !== undefined) group.name = String(fields.name);
+		if (fields.description !== undefined) group.description = String(fields.description);
+		if (fields.iconData !== undefined || fields.icon_data !== undefined) group.iconData = fields.iconData ?? fields.icon_data ?? null;
+		if (fields.headerImage !== undefined || fields.header_image !== undefined) group.headerImage = fields.headerImage ?? fields.header_image ?? null;
+		if (fields.visibility !== undefined) group.visibility = String(fields.visibility);
+		group.updatedAt = new Date().toISOString();
+		return this._cloneGroup(group);
+	}
+
+	async deleteGroup(groupId) {
+		const group = this.groups.get(String(groupId));
+		if (!group || group.deletedAt) return null;
+		group.deletedAt = new Date().toISOString();
+		group.updatedAt = group.deletedAt;
+		return this._cloneGroup(group);
+	}
+
+	async transferGroupOwnership(groupId, newOwnerId) {
+		const group = this.groups.get(String(groupId));
+		if (!group || group.deletedAt) return null;
+		group.ownerId = Number(newOwnerId);
+		group.updatedAt = new Date().toISOString();
+		return this._cloneGroup(group);
+	}
+
+	async getGroupsByVisibility({ query = '', visibility = ['open', 'open_invite'], limit = 20, offset = 0 } = {}) {
+		const allowed = new Set((Array.isArray(visibility) ? visibility : [visibility]).map(String));
+		const q = String(query || '').trim().toLowerCase();
+		return [...this.groups.values()]
+			.filter((group) => !group.deletedAt && allowed.has(group.visibility))
+			.filter((group) => !q || group.name.toLowerCase().includes(q) || group.description.toLowerCase().includes(q))
+			.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)) || b.id.localeCompare(a.id))
+			.slice(Math.max(0, Number(offset) || 0), Math.max(0, Number(offset) || 0) + Math.max(1, Math.min(Number(limit) || 20, 100)))
+			.map((group) => this._cloneGroup(group));
+	}
+
+	async getUserGroups(userId, { status = 'active', limit = 100, offset = 0 } = {}) {
+		const ids = this.groupIdsByUser.get(Number(userId)) || new Set();
+		const start = Math.max(0, Number(offset) || 0);
+		const end = start + Math.max(1, Math.min(Number(limit) || 100, 200));
+		return [...ids]
+			.map((id) => ({ group: this.groups.get(id), membership: this.groupMemberships.get(this._groupMemberKey(id, userId)) }))
+			.filter(({ group, membership }) => group && !group.deletedAt && membership?.status === status)
+			.sort((a, b) => String(b.membership.joinedAt || '').localeCompare(String(a.membership.joinedAt || '')))
+			.slice(start, end)
+			.map(({ group, membership }) => ({ ...this._cloneGroup(group), membership: this._cloneGroupMembership(membership) }));
+	}
+
+	async createGroupRole(roleData) {
+		const now = roleData.createdAt || new Date().toISOString();
+		const role = { id: String(roleData.id), groupId: String(roleData.groupId), name: String(roleData.name || ''),
+			permissions: Array.isArray(roleData.permissions) ? [...new Set(roleData.permissions.map(String))] : [],
+			isSystem: Boolean(roleData.isSystem), sortOrder: Number(roleData.sortOrder) || 0, createdAt: now, updatedAt: now };
+		this.groupRoles.set(role.id, role);
+		if (!this.groupRoleIdsByGroup.has(role.groupId)) this.groupRoleIdsByGroup.set(role.groupId, new Set());
+		this.groupRoleIdsByGroup.get(role.groupId).add(role.id);
+		return this._cloneGroupRole(role);
+	}
+
+	async getGroupRoles(groupId) {
+		return [...(this.groupRoleIdsByGroup.get(String(groupId)) || new Set())]
+			.map((id) => this.groupRoles.get(id)).filter(Boolean)
+			.sort((a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name) || a.id.localeCompare(b.id))
+			.map((role) => this._cloneGroupRole(role));
+	}
+
+	async updateGroupRole(roleId, fields) {
+		const role = this.groupRoles.get(String(roleId));
+		if (!role) return null;
+		if (fields.name !== undefined) role.name = String(fields.name);
+		if (fields.permissions !== undefined) role.permissions = Array.isArray(fields.permissions) ? [...new Set(fields.permissions.map(String))] : [];
+		if (fields.sortOrder !== undefined || fields.sort_order !== undefined) role.sortOrder = Number(fields.sortOrder ?? fields.sort_order) || 0;
+		role.updatedAt = new Date().toISOString();
+		return this._cloneGroupRole(role);
+	}
+
+	async deleteGroupRole(roleId) {
+		const role = this.groupRoles.get(String(roleId));
+		if (!role) return null;
+		this.groupRoles.delete(role.id);
+		this.groupRoleIdsByGroup.get(role.groupId)?.delete(role.id);
+		for (const membership of this.groupMemberships.values()) if (membership.roleId === role.id) membership.roleId = null;
+		return this._cloneGroupRole(role);
+	}
+
+	async getGroupMembership(groupId, userId) {
+		return this._cloneGroupMembership(this.groupMemberships.get(this._groupMemberKey(groupId, userId)) || null);
+	}
+
+	async getGroupMemberships(groupId, { status = null, limit = 100, offset = 0 } = {}) {
+		const userIds = this.groupMemberIdsByGroup.get(String(groupId)) || new Set();
+		const start = Math.max(0, Number(offset) || 0);
+		const end = start + Math.max(1, Math.min(Number(limit) || 100, 200));
+		return [...userIds].map((id) => this.groupMemberships.get(this._groupMemberKey(groupId, id))).filter(Boolean)
+			.filter((membership) => !status || membership.status === status)
+			.sort((a, b) => String(a.joinedAt || '').localeCompare(String(b.joinedAt || '')) || a.userId - b.userId)
+			.slice(start, end).map((membership) => this._cloneGroupMembership(membership));
+	}
+
+	async createGroupMembership(membershipData) {
+		const key = this._groupMemberKey(membershipData.groupId, membershipData.userId);
+		const membership = { groupId: String(membershipData.groupId), userId: Number(membershipData.userId), roleId: membershipData.roleId ?? null,
+			status: String(membershipData.status || 'active'), joinedAt: membershipData.joinedAt ?? null, updatedAt: membershipData.updatedAt || new Date().toISOString() };
+		this.groupMemberships.set(key, membership);
+		if (!this.groupMemberIdsByGroup.has(membership.groupId)) this.groupMemberIdsByGroup.set(membership.groupId, new Set());
+		if (!this.groupIdsByUser.has(membership.userId)) this.groupIdsByUser.set(membership.userId, new Set());
+		this.groupMemberIdsByGroup.get(membership.groupId).add(membership.userId);
+		this.groupIdsByUser.get(membership.userId).add(membership.groupId);
+		return this._cloneGroupMembership(membership);
+	}
+
+	async updateGroupMembership(groupId, userId, fields) {
+		const membership = this.groupMemberships.get(this._groupMemberKey(groupId, userId));
+		if (!membership) return null;
+		if (fields.roleId !== undefined || fields.role_id !== undefined) membership.roleId = fields.roleId ?? fields.role_id ?? null;
+		if (fields.status !== undefined) membership.status = String(fields.status);
+		if (fields.joinedAt !== undefined || fields.joined_at !== undefined) membership.joinedAt = fields.joinedAt ?? fields.joined_at ?? null;
+		membership.updatedAt = new Date().toISOString();
+		return this._cloneGroupMembership(membership);
+	}
+
+	async createGroupInvite(inviteData) {
+		const invite = { id: String(inviteData.id), groupId: String(inviteData.groupId), inviterId: Number(inviteData.inviterId),
+			inviteeId: Number(inviteData.inviteeId), status: String(inviteData.status || 'pending'),
+			createdAt: inviteData.createdAt || new Date().toISOString(), respondedAt: null };
+		this.groupInvites.set(invite.id, invite);
+		return this._cloneGroupInvite(invite);
+	}
+
+	async getGroupInvite(inviteId) { return this._cloneGroupInvite(this.groupInvites.get(String(inviteId)) || null); }
+
+	async getGroupInvites({ groupId = null, inviteeId = null, status = null, limit = 100, offset = 0 } = {}) {
+		if (groupId == null && inviteeId == null) return [];
+		const start = Math.max(0, Number(offset) || 0);
+		const end = start + Math.max(1, Math.min(Number(limit) || 100, 200));
+		return [...this.groupInvites.values()].filter((invite) =>
+			(groupId == null || invite.groupId === String(groupId)) && (inviteeId == null || invite.inviteeId === Number(inviteeId)) && (!status || invite.status === status)
+		).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt))).slice(start, end).map((invite) => this._cloneGroupInvite(invite));
+	}
+
+	async updateGroupInvite(inviteId, fields) {
+		const invite = this.groupInvites.get(String(inviteId));
+		if (!invite) return null;
+		if (fields.status !== undefined) invite.status = String(fields.status);
+		if (fields.respondedAt !== undefined || fields.responded_at !== undefined) invite.respondedAt = fields.respondedAt ?? fields.responded_at ?? null;
+		else if (fields.status && fields.status !== 'pending') invite.respondedAt = new Date().toISOString();
+		return this._cloneGroupInvite(invite);
+	}
+
+	async createGroupJoinRequest(requestData) {
+		const request = { id: String(requestData.id), groupId: String(requestData.groupId), userId: Number(requestData.userId),
+			status: String(requestData.status || 'pending'), reviewedBy: null, createdAt: requestData.createdAt || new Date().toISOString(), reviewedAt: null };
+		this.groupJoinRequests.set(request.id, request);
+		return this._cloneGroupJoinRequest(request);
+	}
+
+	async getGroupJoinRequest(requestId) { return this._cloneGroupJoinRequest(this.groupJoinRequests.get(String(requestId)) || null); }
+
+	async getGroupJoinRequests({ groupId = null, userId = null, status = null, limit = 100, offset = 0 } = {}) {
+		if (groupId == null && userId == null) return [];
+		const start = Math.max(0, Number(offset) || 0);
+		const end = start + Math.max(1, Math.min(Number(limit) || 100, 200));
+		return [...this.groupJoinRequests.values()].filter((request) =>
+			(groupId == null || request.groupId === String(groupId)) && (userId == null || request.userId === Number(userId)) && (!status || request.status === status)
+		).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt))).slice(start, end).map((request) => this._cloneGroupJoinRequest(request));
+	}
+
+	async updateGroupJoinRequest(requestId, fields) {
+		const request = this.groupJoinRequests.get(String(requestId));
+		if (!request) return null;
+		if (fields.status !== undefined) request.status = String(fields.status);
+		if (fields.reviewedBy !== undefined || fields.reviewed_by !== undefined) request.reviewedBy = fields.reviewedBy ?? fields.reviewed_by ?? null;
+		if (fields.reviewedAt !== undefined || fields.reviewed_at !== undefined) request.reviewedAt = fields.reviewedAt ?? fields.reviewed_at ?? null;
+		else if (fields.status && fields.status !== 'pending') request.reviewedAt = new Date().toISOString();
+		return this._cloneGroupJoinRequest(request);
+	}
+
+	_groupPostResult(posts, limit, offset, beforeId) {
+		const safeLimit = Math.max(1, Math.min(Number(limit) || 30, 100));
+		const filtered = posts.filter((post) => !beforeId || Number(post.id) < Number(beforeId))
+			.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime() || Number(b.id) - Number(a.id));
+		const useOffset = !beforeId;
+		const visible = useOffset ? filtered.slice(Math.max(0, Number(offset) || 0), Math.max(0, Number(offset) || 0) + safeLimit + 1) : filtered.slice(0, safeLimit + 1);
+		const ids = visible.slice(0, safeLimit).map((post) => Number(post.id));
+		return { ids, has_more: visible.length > safeLimit, next_cursor: visible.length > safeLimit ? ids.at(-1) || null : null };
+	}
+
+	async getGroupPostIds(groupId, { limit = 30, offset = 0, beforeId = null, authorId = null } = {}) {
+		const normalizedAuthorId = authorId == null || authorId === ''
+			? null
+			: (Number.isInteger(Number(authorId)) && Number(authorId) >= 0 ? Number(authorId) : null);
+		return this._groupPostResult([...this.posts.values()].filter((post) => post.groupId === String(groupId) && (normalizedAuthorId == null || Number(post.userId) === normalizedAuthorId)), limit, offset, beforeId);
+	}
+
+	async getGroupAnnouncementPostIds(groupId, { limit = 30, offset = 0, beforeId = null } = {}) {
+		return this._groupPostResult([...this.posts.values()].filter((post) => post.groupId === String(groupId) && post.groupAnnouncement), limit, offset, beforeId);
+	}
+
+	async searchGroupPostIds(userId, query, { limit = 30, offset = 0, beforeId = null } = {}) {
+		const q = String(query || '').trim().toLowerCase();
+		if (!q) return { ids: [], has_more: false, next_cursor: null };
+		const activeGroupIds = new Set((this.groupIdsByUser.get(Number(userId)) || new Set()).values());
+		const posts = [...this.posts.values()].filter((post) => post.groupId && activeGroupIds.has(post.groupId) &&
+			this.groupMemberships.get(this._groupMemberKey(post.groupId, userId))?.status === 'active' && String(post.content || '').toLowerCase().includes(q));
+		return this._groupPostResult(posts, limit, offset, beforeId);
+	}
+
 	async createPost(postData) {
 		const id = this.nextPostId++;
 		const post = {
@@ -853,6 +1183,10 @@ class InMemoryAdapter extends DatabaseAdapter {
 			mask: !!postData.mask,
 			lock: !!postData.lock,
 			announcement: !!postData.announcement,
+			groupId: postData.groupId ?? postData.group_id ?? null,
+			group_id: postData.groupId ?? postData.group_id ?? null,
+			groupAnnouncement: !!(postData.groupAnnouncement ?? postData.group_announcement),
+			group_announcement: !!(postData.groupAnnouncement ?? postData.group_announcement),
 			replyTo: postData.replyTo || null,
 			repostTo: postData.repostTo || null,
 			createdAt: new Date(),
@@ -961,7 +1295,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 		const posts = [];
 		for (const id of this.postIdsNewest) {
 			const post = this.posts.get(id);
-			if (!post || post.replyTo != null) continue;
+			if (!post || post.groupId || post.group_id || post.replyTo != null) continue;
 			posts.push(post);
 			if (posts.length >= normalizedLimit) break;
 		}
@@ -972,9 +1306,9 @@ class InMemoryAdapter extends DatabaseAdapter {
 		async getPostsByUserId(userId, limit = config.limits.timelinePageSize, _currentUserId = null) {
 			const ids = this.postIdsByUser.get(Number(userId)) || [];
 			return ids
-				.slice(0, Math.max(0, Number(limit) || 0))
 				.map((id) => this.posts.get(id))
-				.filter(Boolean);
+				.filter((post) => post && !post.groupId && !post.group_id)
+				.slice(0, Math.max(0, Number(limit) || 0));
 		}
 
 	async toggleLike(userId, postId) {
@@ -1847,7 +2181,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 		const top = [];
 			for (const postId of this.postIdsNewest) {
 				const post = this.posts.get(postId);
-				if (!post || post.replyTo != null) continue;
+				if (!post || post.groupId || post.group_id || post.replyTo != null) continue;
 				const score = (this.likeCountByPost.get(postId) || 0)
 				+ (this.starCountByPost.get(postId) || 0) * 2
 				+ (this.repostCountByPost.get(postId) || 0) * 3;
@@ -2066,7 +2400,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 			const sourceIds = this.postIdsByUser.get(Number(userId)) || [];
 			const matched = sourceIds.filter((id) => {
 				const post = this.posts.get(id);
-				if (!post || (normalizedBeforeId != null && Number(id) >= normalizedBeforeId)) return false;
+				if (!post || post.groupId || post.group_id || (normalizedBeforeId != null && Number(id) >= normalizedBeforeId)) return false;
 				return subType === 'all' || (subType === 'posts_only' ? post.replyTo == null : post.replyTo != null);
 			});
 			const window = matched.slice(normalizedOffset, normalizedOffset + normalizedLimit + 1);
@@ -2088,7 +2422,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 			const matched = [];
 			for (const id of this.postIdsNewest) {
 				const post = this.posts.get(id);
-				if (!post || post.replyTo != null || (normalizedBeforeId != null && Number(id) >= normalizedBeforeId)) continue;
+				if (!post || post.groupId || post.group_id || post.replyTo != null || (normalizedBeforeId != null && Number(id) >= normalizedBeforeId)) continue;
 				const matches = tab === 'following'
 					? followSet.has(Number(post.userId))
 					: tab === 'announce'
@@ -2147,7 +2481,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 			const candidateSource = [];
 			for (const id of this.postIdsNewest) {
 				const post = this.posts.get(id);
-				if (!post || post.replyTo != null || (normalizedBeforeId != null && Number(id) >= normalizedBeforeId)) continue;
+				if (!post || post.groupId || post.group_id || post.replyTo != null || (normalizedBeforeId != null && Number(id) >= normalizedBeforeId)) continue;
 				candidateSource.push(post);
 				if (candidateSource.length >= normalizedOffset + scoringBlockSize + 1) break;
 			}
@@ -2238,7 +2572,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 			const matched = [];
 			for (const id of this.postIdsNewest) {
 				const post = this.posts.get(id);
-				if (!post || (normalizedBeforeId != null && Number(id) >= normalizedBeforeId)) continue;
+				if (!post || post.groupId || post.group_id || (normalizedBeforeId != null && Number(id) >= normalizedBeforeId)) continue;
 				if (!(post.content || '').toLowerCase().includes(q)) continue;
 				matched.push(id);
 				if (matched.length >= normalizedOffset + normalizedLimit + 1) break;

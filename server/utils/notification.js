@@ -9,6 +9,9 @@ const NOTIFICATION_TYPES = new Set([
   'dm_invite',
   'dm_removed',
   'dm_host_transfer',
+  'group_invite',
+  'group_join_request',
+  'group_announcement',
   'admin_notice',
   'auto_moderation',
   'login_approval',
@@ -78,6 +81,9 @@ function getNotificationText(notification) {
     case 'dm_invite': return `${actor} さんがあなたをDMに招待しました。`;
     case 'dm_removed': return `${actor} さんによってDMから削除されました。`;
     case 'dm_host_transfer': return `${actor} さんからDMの管理者権限を受け取りました。`;
+    case 'group_invite': return `${actor} さんからグループ招待が届いています。`;
+    case 'group_join_request': return `${actor} さんからグループへの参加申請が届いています。`;
+    case 'group_announcement': return `${actor} さんがグループアナウンスを投稿しました。`;
     case 'admin_notice': return `${actor} さんからお知らせがあります。`;
     case 'auto_moderation': return '自動モデレーションによりポストの公開範囲が変更されました。';
     case 'login_approval': return '不明な場所からのログイン承認が必要です。';

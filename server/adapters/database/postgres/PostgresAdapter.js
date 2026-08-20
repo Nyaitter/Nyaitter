@@ -92,6 +92,8 @@ function normalizePostRow(row) {
 		? rawAttachments
 		: (rawAttachments ? [rawAttachments] : []);
 	const tags = normalizePostTags(row.tags);
+	const groupId = row.group_id ?? row.groupId ?? null;
+	const groupAnnouncement = Boolean(row.group_announcement ?? row.groupAnnouncement);
 
 	return {
 		id,
@@ -105,12 +107,120 @@ function normalizePostRow(row) {
 		mask: Boolean(row.mask),
 		lock: Boolean(row.lock),
 		announcement: Boolean(row.announcement),
+		groupId: groupId == null ? null : String(groupId),
+		group_id: groupId == null ? null : String(groupId),
+		groupAnnouncement,
+		group_announcement: groupAnnouncement,
 		replyTo: replyTo == null ? null : Number(replyTo),
 		reply_to: replyTo == null ? null : Number(replyTo),
 		repostTo: repostTo == null ? null : Number(repostTo),
 		repost_to: repostTo == null ? null : Number(repostTo),
 		createdAt,
 		created_at: createdAt,
+	};
+}
+
+function normalizeGroupRow(row) {
+	if (!row) return null;
+	const id = String(row.id);
+	const ownerId = Number(row.owner_id ?? row.ownerId);
+	const createdAt = toIsoString(row.created_at ?? row.createdAt);
+	const updatedAt = toIsoString(row.updated_at ?? row.updatedAt);
+	const deletedAt = toIsoString(row.deleted_at ?? row.deletedAt);
+	return {
+		id,
+		ownerId,
+		owner_id: ownerId,
+		name: row.name || '',
+		description: row.description || '',
+		iconData: row.icon_data ?? row.iconData ?? null,
+		icon_data: row.icon_data ?? row.iconData ?? null,
+		headerImage: row.header_image ?? row.headerImage ?? null,
+		header_image: row.header_image ?? row.headerImage ?? null,
+		visibility: row.visibility || 'open',
+		memberCount: Math.max(0, Number(row.member_count ?? row.memberCount) || 0),
+		member_count: Math.max(0, Number(row.member_count ?? row.memberCount) || 0),
+		createdAt,
+		created_at: createdAt,
+		updatedAt,
+		updated_at: updatedAt,
+		deletedAt,
+		deleted_at: deletedAt,
+	};
+}
+
+function normalizeGroupRoleRow(row) {
+	if (!row) return null;
+	const groupId = String(row.group_id ?? row.groupId);
+	const permissions = parseJsonSafe(row.permissions, []);
+	const createdAt = toIsoString(row.created_at ?? row.createdAt);
+	const updatedAt = toIsoString(row.updated_at ?? row.updatedAt);
+	return {
+		id: String(row.id),
+		groupId,
+		group_id: groupId,
+		name: row.name || '',
+		permissions: Array.isArray(permissions) ? permissions.map(String) : [],
+		isSystem: Boolean(row.is_system ?? row.isSystem),
+		is_system: Boolean(row.is_system ?? row.isSystem),
+		sortOrder: Number(row.sort_order ?? row.sortOrder) || 0,
+		sort_order: Number(row.sort_order ?? row.sortOrder) || 0,
+		createdAt,
+		created_at: createdAt,
+		updatedAt,
+		updated_at: updatedAt,
+	};
+}
+
+function normalizeGroupMembershipRow(row) {
+	if (!row) return null;
+	const groupId = String(row.group_id ?? row.groupId);
+	const userId = Number(row.user_id ?? row.userId);
+	const roleId = row.role_id ?? row.roleId ?? null;
+	const joinedAt = toIsoString(row.joined_at ?? row.joinedAt);
+	const updatedAt = toIsoString(row.updated_at ?? row.updatedAt);
+	return {
+		groupId,
+		group_id: groupId,
+		userId,
+		user_id: userId,
+		roleId: roleId == null ? null : String(roleId),
+		role_id: roleId == null ? null : String(roleId),
+		status: row.status || 'active',
+		joinedAt,
+		joined_at: joinedAt,
+		updatedAt,
+		updated_at: updatedAt,
+	};
+}
+
+function normalizeGroupInviteRow(row) {
+	if (!row) return null;
+	const groupId = String(row.group_id ?? row.groupId);
+	const inviterId = Number(row.inviter_id ?? row.inviterId);
+	const inviteeId = Number(row.invitee_id ?? row.inviteeId);
+	const createdAt = toIsoString(row.created_at ?? row.createdAt);
+	const respondedAt = toIsoString(row.responded_at ?? row.respondedAt);
+	return {
+		id: String(row.id), groupId, group_id: groupId, inviterId, inviter_id: inviterId,
+		inviteeId, invitee_id: inviteeId, status: row.status || 'pending',
+		createdAt, created_at: createdAt, respondedAt, responded_at: respondedAt,
+	};
+}
+
+function normalizeGroupJoinRequestRow(row) {
+	if (!row) return null;
+	const groupId = String(row.group_id ?? row.groupId);
+	const userId = Number(row.user_id ?? row.userId);
+	const reviewedBy = row.reviewed_by ?? row.reviewedBy ?? null;
+	const createdAt = toIsoString(row.created_at ?? row.createdAt);
+	const reviewedAt = toIsoString(row.reviewed_at ?? row.reviewedAt);
+	return {
+		id: String(row.id), groupId, group_id: groupId, userId, user_id: userId,
+		status: row.status || 'pending',
+		reviewedBy: reviewedBy == null ? null : Number(reviewedBy),
+		reviewed_by: reviewedBy == null ? null : Number(reviewedBy),
+		createdAt, created_at: createdAt, reviewedAt, reviewed_at: reviewedAt,
 	};
 }
 
@@ -1216,6 +1326,398 @@ class PostgresAdapter extends DatabaseAdapter {
 		);
 	}
 
+	// ==================== Groups ====================
+
+	async createGroup(groupData) {
+		const now = groupData.createdAt ? toIsoString(groupData.createdAt) : new Date().toISOString();
+		const { rows } = await this.pool.query(
+			`INSERT INTO groups (id, owner_id, name, description, icon_data, header_image, visibility, created_at, updated_at)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8) RETURNING *`,
+			[
+				String(groupData.id), Number(groupData.ownerId), String(groupData.name || ''),
+				String(groupData.description || ''), groupData.iconData ?? null, groupData.headerImage ?? null,
+				String(groupData.visibility || 'open'), now,
+			],
+		);
+		return normalizeGroupRow(rows[0] || null);
+	}
+
+	async getGroupById(groupId) {
+		const { rows } = await this.pool.query(
+			`SELECT g.*, (
+				SELECT COUNT(*)::int FROM group_memberships gm
+				WHERE gm.group_id = g.id AND gm.status = 'active'
+			) AS member_count
+			FROM groups g WHERE g.id = $1 AND g.deleted_at IS NULL LIMIT 1`,
+			[String(groupId)],
+		);
+		return normalizeGroupRow(rows[0] || null);
+	}
+
+	async updateGroup(groupId, fields) {
+		const fieldMap = {
+			name: 'name', description: 'description', iconData: 'icon_data', icon_data: 'icon_data',
+			headerImage: 'header_image', header_image: 'header_image', visibility: 'visibility',
+		};
+		const sets = [];
+		const values = [];
+		const assigned = new Set();
+		for (const [key, column] of Object.entries(fieldMap)) {
+			if (fields[key] === undefined || assigned.has(column)) continue;
+			assigned.add(column);
+			values.push(fields[key] == null && ['icon_data', 'header_image'].includes(column) ? null : String(fields[key]));
+			sets.push(`${column} = $${values.length}`);
+		}
+		if (sets.length === 0) return this.getGroupById(groupId);
+		sets.push(`updated_at = NOW()`);
+		values.push(String(groupId));
+		const { rows } = await this.pool.query(
+			`UPDATE groups SET ${sets.join(', ')} WHERE id = $${values.length} AND deleted_at IS NULL RETURNING *`,
+			values,
+		);
+		return normalizeGroupRow(rows[0] || null);
+	}
+
+	async deleteGroup(groupId) {
+		const { rows } = await this.pool.query(
+			`UPDATE groups SET deleted_at = NOW(), updated_at = NOW()
+			 WHERE id = $1 AND deleted_at IS NULL RETURNING *`,
+			[String(groupId)],
+		);
+		return normalizeGroupRow(rows[0] || null);
+	}
+
+	async transferGroupOwnership(groupId, newOwnerId) {
+		const { rows } = await this.pool.query(
+			`UPDATE groups SET owner_id = $1, updated_at = NOW()
+			 WHERE id = $2 AND deleted_at IS NULL RETURNING *`,
+			[Number(newOwnerId), String(groupId)],
+		);
+		return normalizeGroupRow(rows[0] || null);
+	}
+
+	async getGroupsByVisibility({ query = '', visibility = ['open', 'open_invite'], limit = 20, offset = 0 } = {}) {
+		const safeLimit = Math.max(1, Math.min(Number(limit) || 20, 100));
+		const safeOffset = Math.max(0, Number(offset) || 0);
+		const visibilities = (Array.isArray(visibility) ? visibility : [visibility])
+			.map((item) => String(item || '').trim())
+			.filter(Boolean);
+		if (visibilities.length === 0) return [];
+		const values = [visibilities];
+		const clauses = ['g.deleted_at IS NULL', 'g.visibility = ANY($1::text[])'];
+		const normalizedQuery = String(query || '').trim().toLowerCase();
+		if (normalizedQuery) {
+			values.push(`%${normalizedQuery}%`);
+			clauses.push(`(LOWER(g.name) LIKE $${values.length} OR LOWER(g.description) LIKE $${values.length})`);
+		}
+		values.push(safeLimit, safeOffset);
+		const { rows } = await this.pool.query(
+			`SELECT g.*, (
+				SELECT COUNT(*)::int FROM group_memberships gm
+				WHERE gm.group_id = g.id AND gm.status = 'active'
+			) AS member_count
+			FROM groups g WHERE ${clauses.join(' AND ')}
+			ORDER BY g.created_at DESC, g.id DESC LIMIT $${values.length - 1} OFFSET $${values.length}`,
+			values,
+		);
+		return rows.map(normalizeGroupRow);
+	}
+
+	async getUserGroups(userId, { status = 'active', limit = 100, offset = 0 } = {}) {
+		const safeLimit = Math.max(1, Math.min(Number(limit) || 100, 200));
+		const safeOffset = Math.max(0, Number(offset) || 0);
+		const { rows } = await this.pool.query(
+			`SELECT g.*, gm.role_id AS membership_role_id, gm.status AS membership_status,
+				gm.joined_at AS membership_joined_at, (
+					SELECT COUNT(*)::int FROM group_memberships count_gm
+					WHERE count_gm.group_id = g.id AND count_gm.status = 'active'
+				) AS member_count
+			FROM group_memberships gm
+			JOIN groups g ON g.id = gm.group_id
+			WHERE gm.user_id = $1 AND gm.status = $2 AND g.deleted_at IS NULL
+			ORDER BY gm.joined_at DESC NULLS LAST, g.created_at DESC
+			LIMIT $3 OFFSET $4`,
+			[Number(userId), String(status), safeLimit, safeOffset],
+		);
+		return rows.map((row) => ({
+			...normalizeGroupRow(row),
+			membership: normalizeGroupMembershipRow({
+				group_id: row.id, user_id: userId, role_id: row.membership_role_id,
+				status: row.membership_status, joined_at: row.membership_joined_at,
+			}),
+		}));
+	}
+
+	async createGroupRole(roleData) {
+		const now = roleData.createdAt ? toIsoString(roleData.createdAt) : new Date().toISOString();
+		const { rows } = await this.pool.query(
+			`INSERT INTO group_roles (id, group_id, name, permissions, is_system, sort_order, created_at, updated_at)
+			 VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $7) RETURNING *`,
+			[
+				String(roleData.id), String(roleData.groupId), String(roleData.name || ''),
+				JSON.stringify(Array.isArray(roleData.permissions) ? roleData.permissions : []),
+				Boolean(roleData.isSystem), Number(roleData.sortOrder) || 0, now,
+			],
+		);
+		return normalizeGroupRoleRow(rows[0] || null);
+	}
+
+	async getGroupRoles(groupId) {
+		const { rows } = await this.pool.query(
+			`SELECT * FROM group_roles WHERE group_id = $1 ORDER BY sort_order ASC, name ASC, id ASC`,
+			[String(groupId)],
+		);
+		return rows.map(normalizeGroupRoleRow);
+	}
+
+	async updateGroupRole(roleId, fields) {
+		const fieldMap = { name: 'name', permissions: 'permissions', sortOrder: 'sort_order', sort_order: 'sort_order' };
+		const sets = [];
+		const values = [];
+		const assigned = new Set();
+		for (const [key, column] of Object.entries(fieldMap)) {
+			if (fields[key] === undefined || assigned.has(column)) continue;
+			assigned.add(column);
+			if (column === 'permissions') values.push(JSON.stringify(Array.isArray(fields[key]) ? fields[key] : []));
+			else if (column === 'sort_order') values.push(Number(fields[key]) || 0);
+			else values.push(String(fields[key] || ''));
+			sets.push(`${column} = $${values.length}${column === 'permissions' ? '::jsonb' : ''}`);
+		}
+		if (sets.length === 0) return null;
+		sets.push('updated_at = NOW()');
+		values.push(String(roleId));
+		const { rows } = await this.pool.query(
+			`UPDATE group_roles SET ${sets.join(', ')} WHERE id = $${values.length} RETURNING *`, values,
+		);
+		return normalizeGroupRoleRow(rows[0] || null);
+	}
+
+	async deleteGroupRole(roleId) {
+		const { rows } = await this.pool.query(`DELETE FROM group_roles WHERE id = $1 RETURNING *`, [String(roleId)]);
+		return normalizeGroupRoleRow(rows[0] || null);
+	}
+
+	async getGroupMembership(groupId, userId) {
+		const { rows } = await this.pool.query(
+			`SELECT * FROM group_memberships WHERE group_id = $1 AND user_id = $2 LIMIT 1`,
+			[String(groupId), Number(userId)],
+		);
+		return normalizeGroupMembershipRow(rows[0] || null);
+	}
+
+	async getGroupMemberships(groupId, { status = null, limit = 100, offset = 0 } = {}) {
+		const safeLimit = Math.max(1, Math.min(Number(limit) || 100, 200));
+		const safeOffset = Math.max(0, Number(offset) || 0);
+		const values = [String(groupId)];
+		let where = 'group_id = $1';
+		if (status) { values.push(String(status)); where += ` AND status = $${values.length}`; }
+		values.push(safeLimit, safeOffset);
+		const { rows } = await this.pool.query(
+			`SELECT * FROM group_memberships WHERE ${where}
+			 ORDER BY joined_at ASC NULLS LAST, user_id ASC LIMIT $${values.length - 1} OFFSET $${values.length}`,
+			values,
+		);
+		return rows.map(normalizeGroupMembershipRow);
+	}
+
+	async createGroupMembership(membershipData) {
+		const now = membershipData.updatedAt ? toIsoString(membershipData.updatedAt) : new Date().toISOString();
+		const joinedAt = membershipData.joinedAt ? toIsoString(membershipData.joinedAt) : null;
+		const { rows } = await this.pool.query(
+			`INSERT INTO group_memberships (group_id, user_id, role_id, status, joined_at, updated_at)
+			 VALUES ($1, $2, $3, $4, $5, $6)
+			 ON CONFLICT (group_id, user_id) DO UPDATE SET role_id = EXCLUDED.role_id, status = EXCLUDED.status,
+			 joined_at = EXCLUDED.joined_at, updated_at = EXCLUDED.updated_at RETURNING *`,
+			[String(membershipData.groupId), Number(membershipData.userId), membershipData.roleId ?? null,
+				String(membershipData.status || 'active'), joinedAt, now],
+		);
+		return normalizeGroupMembershipRow(rows[0] || null);
+	}
+
+	async updateGroupMembership(groupId, userId, fields) {
+		const sets = [];
+		const values = [];
+		if (fields.roleId !== undefined || fields.role_id !== undefined) {
+			values.push(fields.roleId ?? fields.role_id ?? null); sets.push(`role_id = $${values.length}`);
+		}
+		if (fields.status !== undefined) { values.push(String(fields.status)); sets.push(`status = $${values.length}`); }
+		if (fields.joinedAt !== undefined || fields.joined_at !== undefined) {
+			values.push(toIsoString(fields.joinedAt ?? fields.joined_at)); sets.push(`joined_at = $${values.length}`);
+		}
+		if (sets.length === 0) return this.getGroupMembership(groupId, userId);
+		sets.push('updated_at = NOW()');
+		values.push(String(groupId), Number(userId));
+		const { rows } = await this.pool.query(
+			`UPDATE group_memberships SET ${sets.join(', ')} WHERE group_id = $${values.length - 1} AND user_id = $${values.length} RETURNING *`, values,
+		);
+		return normalizeGroupMembershipRow(rows[0] || null);
+	}
+
+	async createGroupInvite(inviteData) {
+		const now = inviteData.createdAt ? toIsoString(inviteData.createdAt) : new Date().toISOString();
+		const { rows } = await this.pool.query(
+			`INSERT INTO group_invites (id, group_id, inviter_id, invitee_id, status, created_at)
+			 VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+			[String(inviteData.id), String(inviteData.groupId), Number(inviteData.inviterId), Number(inviteData.inviteeId),
+				String(inviteData.status || 'pending'), now],
+		);
+		return normalizeGroupInviteRow(rows[0] || null);
+	}
+
+	async getGroupInvite(inviteId) {
+		const { rows } = await this.pool.query(`SELECT * FROM group_invites WHERE id = $1 LIMIT 1`, [String(inviteId)]);
+		return normalizeGroupInviteRow(rows[0] || null);
+	}
+
+	async getGroupInvites({ groupId = null, inviteeId = null, status = null, limit = 100, offset = 0 } = {}) {
+		const values = [];
+		const clauses = [];
+		if (groupId != null) { values.push(String(groupId)); clauses.push(`group_id = $${values.length}`); }
+		if (inviteeId != null) { values.push(Number(inviteeId)); clauses.push(`invitee_id = $${values.length}`); }
+		if (status != null) { values.push(String(status)); clauses.push(`status = $${values.length}`); }
+		if (clauses.length === 0) return [];
+		values.push(Math.max(1, Math.min(Number(limit) || 100, 200)), Math.max(0, Number(offset) || 0));
+		const { rows } = await this.pool.query(
+			`SELECT * FROM group_invites WHERE ${clauses.join(' AND ')} ORDER BY created_at DESC
+			 LIMIT $${values.length - 1} OFFSET $${values.length}`,
+			values,
+		);
+		return rows.map(normalizeGroupInviteRow);
+	}
+
+	async updateGroupInvite(inviteId, fields) {
+		const sets = [];
+		const values = [];
+		if (fields.status !== undefined) { values.push(String(fields.status)); sets.push(`status = $${values.length}`); }
+		if (fields.respondedAt !== undefined || fields.responded_at !== undefined) {
+			values.push(toIsoString(fields.respondedAt ?? fields.responded_at)); sets.push(`responded_at = $${values.length}`);
+		} else if (fields.status && fields.status !== 'pending') { sets.push('responded_at = NOW()'); }
+		if (sets.length === 0) return this.getGroupInvite(inviteId);
+		values.push(String(inviteId));
+		const { rows } = await this.pool.query(
+			`UPDATE group_invites SET ${sets.join(', ')} WHERE id = $${values.length} RETURNING *`, values,
+		);
+		return normalizeGroupInviteRow(rows[0] || null);
+	}
+
+	async createGroupJoinRequest(requestData) {
+		const now = requestData.createdAt ? toIsoString(requestData.createdAt) : new Date().toISOString();
+		const { rows } = await this.pool.query(
+			`INSERT INTO group_join_requests (id, group_id, user_id, status, created_at)
+			 VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+			[String(requestData.id), String(requestData.groupId), Number(requestData.userId), String(requestData.status || 'pending'), now],
+		);
+		return normalizeGroupJoinRequestRow(rows[0] || null);
+	}
+
+	async getGroupJoinRequest(requestId) {
+		const { rows } = await this.pool.query(`SELECT * FROM group_join_requests WHERE id = $1 LIMIT 1`, [String(requestId)]);
+		return normalizeGroupJoinRequestRow(rows[0] || null);
+	}
+
+	async getGroupJoinRequests({ groupId = null, userId = null, status = null, limit = 100, offset = 0 } = {}) {
+		const values = [];
+		const clauses = [];
+		if (groupId != null) { values.push(String(groupId)); clauses.push(`group_id = $${values.length}`); }
+		if (userId != null) { values.push(Number(userId)); clauses.push(`user_id = $${values.length}`); }
+		if (status != null) { values.push(String(status)); clauses.push(`status = $${values.length}`); }
+		if (clauses.length === 0) return [];
+		values.push(Math.max(1, Math.min(Number(limit) || 100, 200)), Math.max(0, Number(offset) || 0));
+		const { rows } = await this.pool.query(
+			`SELECT * FROM group_join_requests WHERE ${clauses.join(' AND ')} ORDER BY created_at DESC
+			 LIMIT $${values.length - 1} OFFSET $${values.length}`,
+			values,
+		);
+		return rows.map(normalizeGroupJoinRequestRow);
+	}
+
+	async updateGroupJoinRequest(requestId, fields) {
+		const sets = [];
+		const values = [];
+		if (fields.status !== undefined) { values.push(String(fields.status)); sets.push(`status = $${values.length}`); }
+		if (fields.reviewedBy !== undefined || fields.reviewed_by !== undefined) {
+			values.push(fields.reviewedBy ?? fields.reviewed_by ?? null); sets.push(`reviewed_by = $${values.length}`);
+		}
+		if (fields.reviewedAt !== undefined || fields.reviewed_at !== undefined) {
+			values.push(toIsoString(fields.reviewedAt ?? fields.reviewed_at)); sets.push(`reviewed_at = $${values.length}`);
+		} else if (fields.status && fields.status !== 'pending') { sets.push('reviewed_at = NOW()'); }
+		if (sets.length === 0) return this.getGroupJoinRequest(requestId);
+		values.push(String(requestId));
+		const { rows } = await this.pool.query(
+			`UPDATE group_join_requests SET ${sets.join(', ')} WHERE id = $${values.length} RETURNING *`, values,
+		);
+		return normalizeGroupJoinRequestRow(rows[0] || null);
+	}
+
+	async getGroupPostIds(groupId, { limit = 30, offset = 0, beforeId = null, authorId = null } = {}) {
+		const safeLimit = Math.max(1, Math.min(Number(limit) || 30, 100));
+		const values = [String(groupId)];
+		const clauses = ['group_id = $1'];
+		if (authorId != null && authorId !== '' && Number.isInteger(Number(authorId)) && Number(authorId) >= 0) {
+			values.push(Number(authorId)); clauses.push(`user_id = $${values.length}`);
+		}
+		if (Number.isInteger(Number(beforeId)) && Number(beforeId) > 0) {
+			values.push(Number(beforeId)); clauses.push(`id < $${values.length}`);
+		}
+		values.push(safeLimit + 1);
+		const limitIndex = values.length;
+		let offsetSql = '';
+		if (!clauses.some((clause) => clause.startsWith('id <'))) {
+			values.push(Math.max(0, Number(offset) || 0)); offsetSql = ` OFFSET $${values.length}`;
+		}
+		const { rows } = await this.pool.query(
+			`SELECT id FROM posts WHERE ${clauses.join(' AND ')} ORDER BY created_at DESC, id DESC LIMIT $${limitIndex}${offsetSql}`,
+			values,
+		);
+		const ids = rows.slice(0, safeLimit).map((row) => Number(row.id));
+		return { ids, has_more: rows.length > safeLimit, next_cursor: rows.length > safeLimit ? ids.at(-1) || null : null };
+	}
+
+	async getGroupAnnouncementPostIds(groupId, params = {}) {
+		const safeLimit = Math.max(1, Math.min(Number(params.limit) || 30, 100));
+		const values = [String(groupId)];
+		const clauses = ['group_id = $1', 'group_announcement = true'];
+		if (Number.isInteger(Number(params.beforeId)) && Number(params.beforeId) > 0) {
+			values.push(Number(params.beforeId)); clauses.push(`id < $${values.length}`);
+		}
+		values.push(safeLimit + 1);
+		const limitIndex = values.length;
+		let offsetSql = '';
+		if (!clauses.some((clause) => clause.startsWith('id <'))) {
+			values.push(Math.max(0, Number(params.offset) || 0)); offsetSql = ` OFFSET $${values.length}`;
+		}
+		const { rows } = await this.pool.query(
+			`SELECT id FROM posts WHERE ${clauses.join(' AND ')} ORDER BY created_at DESC, id DESC LIMIT $${limitIndex}${offsetSql}`,
+			values,
+		);
+		const ids = rows.slice(0, safeLimit).map((row) => Number(row.id));
+		return { ids, has_more: rows.length > safeLimit, next_cursor: rows.length > safeLimit ? ids.at(-1) || null : null };
+	}
+
+	async searchGroupPostIds(userId, query, { limit = 30, offset = 0, beforeId = null } = {}) {
+		const normalizedQuery = String(query || '').trim().toLowerCase();
+		if (!normalizedQuery) return { ids: [], has_more: false, next_cursor: null };
+		const safeLimit = Math.max(1, Math.min(Number(limit) || 30, 100));
+		const values = [Number(userId), `%${normalizedQuery}%`];
+		const clauses = ['gm.user_id = $1', "gm.status = 'active'", 'p.group_id = gm.group_id', 'LOWER(p.content) LIKE $2'];
+		if (Number.isInteger(Number(beforeId)) && Number(beforeId) > 0) {
+			values.push(Number(beforeId)); clauses.push(`p.id < $${values.length}`);
+		}
+		values.push(safeLimit + 1);
+		const limitIndex = values.length;
+		let offsetSql = '';
+		if (!clauses.some((clause) => clause.startsWith('p.id <'))) {
+			values.push(Math.max(0, Number(offset) || 0)); offsetSql = ` OFFSET $${values.length}`;
+		}
+		const { rows } = await this.pool.query(
+			`SELECT p.id FROM posts p JOIN group_memberships gm ON ${clauses.join(' AND ')}
+			 ORDER BY p.created_at DESC, p.id DESC LIMIT $${limitIndex}${offsetSql}`,
+			values,
+		);
+		const ids = rows.slice(0, safeLimit).map((row) => Number(row.id));
+		return { ids, has_more: rows.length > safeLimit, next_cursor: rows.length > safeLimit ? ids.at(-1) || null : null };
+	}
+
 	// ==================== Posts ====================
 
 	async createPost(postData) {
@@ -1231,12 +1733,14 @@ class PostgresAdapter extends DatabaseAdapter {
 			postData.repostTo ? Number(postData.repostTo) : null,
 			JSON.stringify(normalizePostTags(postData.tags)),
 			postData.tagsGeneratedAt ? toIsoString(postData.tagsGeneratedAt) : null,
+			postData.groupId ?? postData.group_id ?? null,
+			Boolean(postData.groupAnnouncement ?? postData.group_announcement),
 			now,
 		];
 		return this._withTransaction(async (client) => {
 			const { rows } = await client.query(
-`INSERT INTO posts (user_id, content, attachments, mask, lock, announcement, reply_to, repost_to, tags, tags_generated_at, created_at)
-				 VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7, $8, $9::jsonb, $10, $11)
+`INSERT INTO posts (user_id, content, attachments, mask, lock, announcement, reply_to, repost_to, tags, tags_generated_at, group_id, group_announcement, created_at)
+				 VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13)
 			 RETURNING *`,
 				values,
 			);
@@ -1438,7 +1942,7 @@ class PostgresAdapter extends DatabaseAdapter {
 	async getRecentPosts(limit = 30) {
 		const safeLimit = Math.min(Math.max(Number(limit) || 30, 1), 100);
 		const { rows } = await this.pool.query(
-			`SELECT * FROM posts WHERE reply_to IS NULL ORDER BY created_at DESC, id DESC LIMIT $1`,
+			`SELECT * FROM posts WHERE group_id IS NULL AND reply_to IS NULL ORDER BY created_at DESC, id DESC LIMIT $1`,
 			[safeLimit],
 		);
 		return rows.map(normalizePostRow);
@@ -1447,7 +1951,7 @@ class PostgresAdapter extends DatabaseAdapter {
 	async getPostsByUserId(userId, limit = 50, _currentUserId = null) {
 		const safeLimit = Math.min(Math.max(Number(limit) || 50, 1), 100);
 		const { rows } = await this.pool.query(
-			`SELECT * FROM posts WHERE user_id = $1 ORDER BY created_at DESC, id DESC LIMIT $2`,
+			`SELECT * FROM posts WHERE user_id = $1 AND group_id IS NULL ORDER BY created_at DESC, id DESC LIMIT $2`,
 			[Number(userId), safeLimit],
 		);
 		return rows.map(normalizePostRow);
@@ -1472,29 +1976,29 @@ class PostgresAdapter extends DatabaseAdapter {
 			const ids = [...new Set((followIds || []).map(Number).filter(Number.isSafeInteger))];
 			if (ids.length === 0) return { ids: [], has_more: false, next_cursor: null };
 			if (normalizedBeforeId != null) {
-				query = `SELECT id FROM posts WHERE user_id = ANY($1::int[]) AND reply_to IS NULL AND id < $2
+				query = `SELECT id FROM posts WHERE user_id = ANY($1::int[]) AND group_id IS NULL AND reply_to IS NULL AND id < $2
 					ORDER BY created_at DESC, id DESC LIMIT $3`;
 				values = [ids, normalizedBeforeId, normalizedLimit + 1];
 			} else {
-				query = `SELECT id FROM posts WHERE user_id = ANY($1::int[]) AND reply_to IS NULL
+				query = `SELECT id FROM posts WHERE user_id = ANY($1::int[]) AND group_id IS NULL AND reply_to IS NULL
 					ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3`;
 				values = [ids, normalizedLimit + 1, normalizedOffset];
 			}
 		} else if (tab === 'announce') {
 			if (normalizedBeforeId != null) {
-				query = `SELECT id FROM posts WHERE announcement = TRUE AND reply_to IS NULL
+				query = `SELECT id FROM posts WHERE group_id IS NULL AND announcement = TRUE AND reply_to IS NULL
 					AND id < $1 ORDER BY created_at DESC, id DESC LIMIT $2`;
 				values = [normalizedBeforeId, normalizedLimit + 1];
 			} else {
-				query = `SELECT id FROM posts WHERE announcement = TRUE AND reply_to IS NULL
+				query = `SELECT id FROM posts WHERE group_id IS NULL AND announcement = TRUE AND reply_to IS NULL
 					ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2`;
 				values = [normalizedLimit + 1, normalizedOffset];
 			}
 		} else if (normalizedBeforeId != null) {
-			query = `SELECT id FROM posts WHERE reply_to IS NULL AND id < $1 ORDER BY created_at DESC, id DESC LIMIT $2`;
+			query = `SELECT id FROM posts WHERE group_id IS NULL AND reply_to IS NULL AND id < $1 ORDER BY created_at DESC, id DESC LIMIT $2`;
 			values = [normalizedBeforeId, normalizedLimit + 1];
 		} else {
-			query = `SELECT id FROM posts WHERE reply_to IS NULL ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2`;
+			query = `SELECT id FROM posts WHERE group_id IS NULL AND reply_to IS NULL ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2`;
 			values = [normalizedLimit + 1, normalizedOffset];
 		}
 		const { rows } = await this.pool.query(query, values);
@@ -1516,7 +2020,7 @@ class PostgresAdapter extends DatabaseAdapter {
 		const scoringBlockSize = Math.max(240, normalizedLimit * 8);
 		const candidateLimit = scoringBlockSize + 1;
 		const values = [];
-		const candidateClauses = ['p.reply_to IS NULL'];
+			const candidateClauses = ['p.group_id IS NULL', 'p.reply_to IS NULL'];
 		if (normalizedBeforeId != null) {
 			values.push(normalizedBeforeId);
 			candidateClauses.push(`p.id < $${values.length}`);
@@ -1660,7 +2164,7 @@ class PostgresAdapter extends DatabaseAdapter {
 			? Number(beforeId)
 			: null;
 		const values = [Number(userId)];
-		const clauses = ['user_id = $1'];
+		const clauses = ['user_id = $1', 'group_id IS NULL'];
 		if (subType === 'posts_only') clauses.push('reply_to IS NULL');
 		if (subType === 'replies_only') clauses.push('reply_to IS NOT NULL');
 		if (normalizedBeforeId != null) {
@@ -1698,13 +2202,13 @@ class PostgresAdapter extends DatabaseAdapter {
 		const pattern = `%${q.toLowerCase()}%`;
 		const { rows } = normalizedBeforeId != null
 			? await this.pool.query(
-				`SELECT id FROM posts WHERE LOWER(content) LIKE $1 AND id < $2
-				 ORDER BY created_at DESC, id DESC LIMIT $3`,
+				`SELECT id FROM posts WHERE group_id IS NULL AND LOWER(content) LIKE $1 AND id < $2
+					 ORDER BY created_at DESC, id DESC LIMIT $3`,
 				[pattern, normalizedBeforeId, normalizedLimit + 1],
 			)
 			: await this.pool.query(
-				`SELECT id FROM posts WHERE LOWER(content) LIKE $1
-				 ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3`,
+				`SELECT id FROM posts WHERE group_id IS NULL AND LOWER(content) LIKE $1
+					 ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3`,
 				[pattern, normalizedLimit + 1, normalizedOffset],
 			);
 		const ids = rows.slice(0, normalizedLimit).map((row) => Number(row.id));
@@ -1720,8 +2224,8 @@ class PostgresAdapter extends DatabaseAdapter {
 		if (!q) return [];
 		const safeLimit = Math.min(Math.max(Number(limit) || 20, 1), 100);
 		const { rows } = await this.pool.query(
-			`SELECT * FROM posts 
-			 WHERE LOWER(content) LIKE $1 
+`SELECT * FROM posts 
+				 WHERE group_id IS NULL AND LOWER(content) LIKE $1
 			 ORDER BY created_at DESC, id DESC
 			 LIMIT $2`,
 			[`%${q.toLowerCase()}%`, safeLimit],
@@ -1838,7 +2342,7 @@ class PostgresAdapter extends DatabaseAdapter {
 	async getTrendingHashtags(limit = 10) {
 		const normalizedLimit = Math.max(1, Math.min(Number(limit) || 10, 50));
 		const { rows } = await this.pool.query(
-			'SELECT content, tags FROM posts ORDER BY created_at DESC LIMIT 500',
+			'SELECT content, tags FROM posts WHERE group_id IS NULL ORDER BY created_at DESC LIMIT 500',
 		);
 		const counts = new Map();
 		for (const row of rows) {
