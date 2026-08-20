@@ -1733,11 +1733,14 @@ export default {
 
 			if (method === 'GET' && pathname === '/posts/trending-hashtags') {
 				const limit = Math.min(Number(url.searchParams.get('limit') || 10), 50);
-				const { results } = await db.prepare('SELECT content FROM posts ORDER BY created_at DESC LIMIT 500').all();
+				const { results } = await db.prepare('SELECT content, tags FROM posts ORDER BY created_at DESC LIMIT 500').all();
 				const counts = new Map();
 				for (const row of results || []) {
 					const matches = (row.content || '').match(/#([^<>/@#\s]+)/g) || [];
-					const uniqueTags = new Set(matches.map((match) => match.slice(1).toLowerCase()));
+					const uniqueTags = new Set([
+						...matches.map((match) => match.slice(1).toLowerCase()),
+						...normalizePostTags(row.tags),
+					]);
 					for (const tag of uniqueTags) {
 						counts.set(tag, (counts.get(tag) || 0) + 1);
 					}

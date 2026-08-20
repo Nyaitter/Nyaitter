@@ -2258,7 +2258,10 @@ class InMemoryAdapter extends DatabaseAdapter {
 		for (const post of this.posts.values()) {
 			const content = post.content || '';
 			const matches = content.match(/#([^<>/@#\s]+)/g) || [];
-			const uniqueTags = new Set(matches.map((match) => match.slice(1).toLowerCase()));
+			const uniqueTags = new Set([
+				...matches.map((match) => match.slice(1).toLowerCase()),
+				...(Array.isArray(post.tags) ? post.tags.map((tag) => String(tag || '').trim().toLowerCase()).filter(Boolean) : []),
+			]);
 			for (const tag of uniqueTags) {
 				counts.set(tag, (counts.get(tag) || 0) + 1);
 			}

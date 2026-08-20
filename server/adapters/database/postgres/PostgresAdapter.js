@@ -1838,12 +1838,15 @@ class PostgresAdapter extends DatabaseAdapter {
 	async getTrendingHashtags(limit = 10) {
 		const normalizedLimit = Math.max(1, Math.min(Number(limit) || 10, 50));
 		const { rows } = await this.pool.query(
-			'SELECT content FROM posts ORDER BY created_at DESC LIMIT 500',
+			'SELECT content, tags FROM posts ORDER BY created_at DESC LIMIT 500',
 		);
 		const counts = new Map();
 		for (const row of rows) {
 			const matches = (row.content || '').match(/#([^<>/@#\s]+)/g) || [];
-			const uniqueTags = new Set(matches.map((match) => match.slice(1).toLowerCase()));
+			const uniqueTags = new Set([
+				...matches.map((match) => match.slice(1).toLowerCase()),
+				...normalizePostTags(row.tags),
+			]);
 			for (const tag of uniqueTags) {
 				counts.set(tag, (counts.get(tag) || 0) + 1);
 			}
