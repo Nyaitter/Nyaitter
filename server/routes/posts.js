@@ -27,6 +27,10 @@ const {
 const {
 	createNotificationIfAllowed,
 } = require('../services/NotificationDeliveryService');
+const {
+	resolvePostingUser,
+	assertPostingUserWritable,
+} = require('../services/auth/PostAsUserService');
 
 const router = express.Router();
 const { createRateLimiter } = require('../middleware/rateLimit');
@@ -277,11 +281,28 @@ router.post('/', requireAuth, postWriteLimiter, async (req, res) => {
 	const storage = getStorageAdapter(req);
 	const postService = new PostService({ dbAdapter: db, storageAdapter: storage });
 
-	const { content, attachments = [], mask, lock, announcement, reply_to, repost_to } = req.body;
-	const userId = req.user.id;
+	const {
+		content,
+		attachments = [],
+		mask,
+		lock,
+		announcement,
+		reply_to,
+		repost_to,
+		post_as_user_id,
+	} = req.body;
+	let postingUser;
+	try {
+		postingUser = assertPostingUserWritable(
+			await resolvePostingUser(req, db, post_as_user_id),
+		);
+	} catch (error) {
+		return res.status(error.statusCode || 403).json({ error: error.message });
+	}
+	const userId = Number(postingUser.id);
 	const isAnnouncement = announcement === true;
 
-	if (isAnnouncement && req.user.admin !== true) {
+	if (isAnnouncement && postingUser.admin !== true) {
 		return res.status(403).json({ error: 'Only administrators can create announcements' });
 	}
 	if (isAnnouncement && (reply_to || repost_to)) {
@@ -321,7 +342,7 @@ router.post('/', requireAuth, postWriteLimiter, async (req, res) => {
 	try {
 		for (const targetId of [reply_to, repost_to].filter(Boolean)) {
 			const target = await db.getPostById(Number(targetId));
-			if (!target || !(await canViewPost(db, target, userId, null, null, req.user?.visibilityUser || null))) {
+				if (!target || !(await canViewPost(db, target, userId, null, null, postingUser))) {
 				return res.status(404).json({ error: 'Post not found' });
 			}
 		}

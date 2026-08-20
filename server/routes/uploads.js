@@ -7,6 +7,10 @@ const {
 	normalizeContentType,
 	normalizeStorageKey,
 } = require('../adapters/storage/safeStoragePath');
+const {
+	resolvePostingUser,
+	assertPostingUserWritable,
+} = require('../services/auth/PostAsUserService');
 
 const router = express.Router();
 const { createRateLimiter } = require('../middleware/rateLimit');
@@ -78,7 +82,15 @@ router.post('/', requireAuth, uploadLimiter, async (req, res) => {
 		return res.status(501).json({ error: 'Storage adapter not available' });
 	}
 
-	const { file, fileName, contentType } = req.body || {};
+	const { file, fileName, contentType, as_user_id } = req.body || {};
+	let uploadUser;
+	try {
+		uploadUser = assertPostingUserWritable(
+			await resolvePostingUser(req, req.app.locals.dbAdapter, as_user_id),
+		);
+	} catch (error) {
+		return res.status(error.statusCode || 403).json({ error: error.message });
+	}
 	if (!file || typeof fileName !== 'string' || !fileName.trim()) {
 		return res.status(400).json({ error: 'file and fileName are required' });
 	}
@@ -106,7 +118,7 @@ router.post('/', requireAuth, uploadLimiter, async (req, res) => {
 			file: buffer,
 			fileName,
 			contentType: normalizedContentType,
-			folder: `attachments/${req.user.id}`,
+			folder: `attachments/${uploadUser.id}`,
 		});
 		res.json(result);
 	} catch (err) {
@@ -153,7 +165,15 @@ router.get('/storage', requireAuth, async (req, res) => {
 
 router.delete('/', requireAuth, uploadLimiter, async (req, res) => {
 	const storage = getStorageAdapter(req);
-	const { fileIds } = req.body || {};
+	const { fileIds, as_user_id } = req.body || {};
+	let uploadUser;
+	try {
+		uploadUser = assertPostingUserWritable(
+			await resolvePostingUser(req, req.app.locals.dbAdapter, as_user_id),
+		);
+	} catch (error) {
+		return res.status(error.statusCode || 403).json({ error: error.message });
+	}
 	if (!Array.isArray(fileIds) || fileIds.length === 0) {
 		return res.status(400).json({ error: 'fileIds is required' });
 	}
@@ -163,7 +183,7 @@ router.delete('/', requireAuth, uploadLimiter, async (req, res) => {
 
 	try {
 		for (const fileId of fileIds) {
-			if (typeof fileId !== 'string' || !isOwnedAttachmentKey(fileId, req.user.id)) {
+				if (typeof fileId !== 'string' || !isOwnedAttachmentKey(fileId, uploadUser.id)) {
 				return res.status(403).json({ error: 'You can only delete your own attachments' });
 			}
 		}
