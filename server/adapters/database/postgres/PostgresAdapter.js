@@ -1233,13 +1233,19 @@ class PostgresAdapter extends DatabaseAdapter {
 			postData.tagsGeneratedAt ? toIsoString(postData.tagsGeneratedAt) : null,
 			now,
 		];
-		const { rows } = await this.pool.query(
+		return this._withTransaction(async (client) => {
+			const { rows } = await client.query(
 `INSERT INTO posts (user_id, content, attachments, mask, lock, announcement, reply_to, repost_to, tags, tags_generated_at, created_at)
 				 VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7, $8, $9::jsonb, $10, $11)
 			 RETURNING *`,
-			values,
-		);
-		return normalizePostRow(rows[0] || null);
+				values,
+			);
+			const post = normalizePostRow(rows[0] || null);
+			if (post) {
+				await this._adjustUserKeywordAffinitiesForTags(client, post.userId, post.tags, 1);
+			}
+			return post;
+		});
 	}
 
 	async getPostById(id) {
@@ -1359,15 +1365,15 @@ class PostgresAdapter extends DatabaseAdapter {
 			values.push(fields.content);
 			sets.push(`content = $${values.length}`);
 		}
-			if (fields.tags !== undefined) {
-				values.push(JSON.stringify(normalizePostTags(fields.tags)));
-				sets.push(`tags = $${values.length}::jsonb`);
-			}
-			if (fields.tagsGeneratedAt !== undefined) {
-				values.push(fields.tagsGeneratedAt ? toIsoString(fields.tagsGeneratedAt) : null);
-				sets.push(`tags_generated_at = $${values.length}`);
-			}
-			if (fields.attachments !== undefined) {
+		if (fields.tags !== undefined) {
+			values.push(JSON.stringify(normalizePostTags(fields.tags)));
+			sets.push(`tags = $${values.length}::jsonb`);
+		}
+		if (fields.tagsGeneratedAt !== undefined) {
+			values.push(fields.tagsGeneratedAt ? toIsoString(fields.tagsGeneratedAt) : null);
+			sets.push(`tags_generated_at = $${values.length}`);
+		}
+		if (fields.attachments !== undefined) {
 			values.push(fields.attachments ? JSON.stringify(fields.attachments) : null);
 			sets.push(`attachments = $${values.length}::jsonb`);
 		}
@@ -1382,12 +1388,25 @@ class PostgresAdapter extends DatabaseAdapter {
 		if (sets.length === 0) {
 			return this.getPostById(postId);
 		}
-		values.push(Number(postId));
-		const { rows } = await this.pool.query(
-			`UPDATE posts SET ${sets.join(', ')} WHERE id = $${values.length} RETURNING *`,
-			values,
-		);
-		return normalizePostRow(rows[0] || null);
+		return this._withTransaction(async (client) => {
+			const existingResult = await client.query(
+				'SELECT user_id, tags FROM posts WHERE id = $1 FOR UPDATE',
+				[Number(postId)],
+			);
+			const existing = existingResult.rows[0];
+			if (!existing) return null;
+			const updateValues = [...values, Number(postId)];
+			const { rows } = await client.query(
+				`UPDATE posts SET ${sets.join(', ')} WHERE id = $${updateValues.length} RETURNING *`,
+				updateValues,
+			);
+			const updated = normalizePostRow(rows[0] || null);
+			if (updated && fields.tags !== undefined) {
+				await this._adjustUserKeywordAffinitiesForTags(client, existing.user_id, existing.tags, -1);
+				await this._adjustUserKeywordAffinitiesForTags(client, existing.user_id, updated.tags, 1);
+			}
+			return updated;
+		});
 	}
 
 	async deletePost(postId, userId) {
@@ -1880,27 +1899,30 @@ class PostgresAdapter extends DatabaseAdapter {
 
 	// ==================== Reactions ====================
 
-	async _adjustUserKeywordAffinities(client, userId, postId, delta) {
+	async _adjustUserKeywordAffinitiesForTags(client, userId, tags, delta) {
 		const normalizedDelta = Number(delta);
-		if (!Number.isFinite(normalizedDelta) || normalizedDelta === 0) return;
-		const { rows } = await client.query(
-			'SELECT tags FROM posts WHERE id = $1 LIMIT 1',
-			[Number(postId)],
-		);
-		const tags = normalizePostTags(rows[0]?.tags);
-		if (tags.length === 0) return;
+		const normalizedTags = normalizePostTags(tags);
+		if (!Number.isFinite(normalizedDelta) || normalizedDelta === 0 || normalizedTags.length === 0) return;
 		await client.query(
 			`INSERT INTO user_keyword_affinities (user_id, keyword, score, updated_at)
 			 SELECT $1, keyword, $3::numeric, NOW() FROM unnest($2::text[]) AS keyword
 			 ON CONFLICT (user_id, keyword) DO UPDATE
 			 SET score = GREATEST(0, user_keyword_affinities.score + EXCLUDED.score),
 				 updated_at = NOW()`,
-			[Number(userId), tags, normalizedDelta],
+			[Number(userId), normalizedTags, normalizedDelta],
 		);
 		await client.query(
 			'DELETE FROM user_keyword_affinities WHERE user_id = $1 AND score <= 0',
 			[Number(userId)],
 		);
+	}
+
+	async _adjustUserKeywordAffinities(client, userId, postId, delta) {
+		const { rows } = await client.query(
+			'SELECT tags FROM posts WHERE id = $1 LIMIT 1',
+			[Number(postId)],
+		);
+		await this._adjustUserKeywordAffinitiesForTags(client, userId, rows[0]?.tags, delta);
 	}
 
 	async toggleLike(userId, postId) {

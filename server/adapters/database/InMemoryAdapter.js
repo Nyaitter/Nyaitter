@@ -388,9 +388,8 @@ class InMemoryAdapter extends DatabaseAdapter {
 			if (postIds.size === 0) index.delete(normalizedUserId);
 		}
 
-			_adjustUserKeywordAffinities(userId, postId, delta) {
-				const post = this.posts.get(Number(postId));
-				const keywords = Array.isArray(post?.tags) ? post.tags : [];
+			_adjustUserKeywordAffinitiesForTags(userId, tags, delta) {
+				const keywords = Array.isArray(tags) ? tags : [];
 				if (!Number.isFinite(Number(delta)) || keywords.length === 0) return;
 				const normalizedUserId = Number(userId);
 				if (!this.userKeywordAffinityByUser.has(normalizedUserId)) {
@@ -405,6 +404,11 @@ class InMemoryAdapter extends DatabaseAdapter {
 					else affinities.set(normalizedKeyword, nextScore);
 				}
 				if (affinities.size === 0) this.userKeywordAffinityByUser.delete(normalizedUserId);
+			}
+
+			_adjustUserKeywordAffinities(userId, postId, delta) {
+				const post = this.posts.get(Number(postId));
+				this._adjustUserKeywordAffinitiesForTags(userId, post?.tags, delta);
 			}
 
 			_updateFollowIndexes(followerId, followingId, following) {
@@ -855,6 +859,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 		};
 		this.posts.set(id, post);
 		this._addPostIndexes(post);
+		this._adjustUserKeywordAffinitiesForTags(post.userId, post.tags, 1);
 		return post;
 	}
 
@@ -886,12 +891,17 @@ class InMemoryAdapter extends DatabaseAdapter {
 
 		const post = this.posts.get(postId);
 		if (!post) return null;
+		const previousTags = Array.isArray(post.tags) ? [...post.tags] : [];
 			if (fields.content !== undefined) post.content = fields.content;
 			if (fields.tags !== undefined) post.tags = Array.isArray(fields.tags) ? [...new Set(fields.tags.map((tag) => String(tag || '').trim().toLowerCase()).filter(Boolean))].slice(0, 4) : [];
 			if (fields.tagsGeneratedAt !== undefined) post.tagsGeneratedAt = fields.tagsGeneratedAt || null;
 			if (fields.attachments !== undefined) post.attachments = fields.attachments;
 					if (fields.mask !== undefined) post.mask = !!fields.mask;
 			if (fields.lock !== undefined) post.lock = !!fields.lock;
+			if (fields.tags !== undefined) {
+				this._adjustUserKeywordAffinitiesForTags(post.userId, previousTags, -1);
+				this._adjustUserKeywordAffinitiesForTags(post.userId, post.tags, 1);
+			}
 			return post;
 
 	}

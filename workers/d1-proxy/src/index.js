@@ -264,14 +264,12 @@ function normalizePostRow(row) {
 	};
 }
 
-async function adjustUserKeywordAffinities(db, userId, postId, delta) {
+async function adjustUserKeywordAffinitiesForTags(db, userId, tags, delta) {
 	const normalizedDelta = Number(delta);
-	if (!Number.isFinite(normalizedDelta) || normalizedDelta === 0) return;
-	const post = await db.prepare('SELECT tags FROM posts WHERE id = ?').bind(Number(postId)).first();
-	const tags = normalizePostTags(post?.tags);
-	if (tags.length === 0) return;
+	const normalizedTags = normalizePostTags(tags);
+	if (!Number.isFinite(normalizedDelta) || normalizedDelta === 0 || normalizedTags.length === 0) return;
 	const now = new Date().toISOString();
-	const statements = tags.map((keyword) => db.prepare(
+	const statements = normalizedTags.map((keyword) => db.prepare(
 		`INSERT INTO user_keyword_affinities (user_id, keyword, score, updated_at)
 		 VALUES (?, ?, ?, ?)
 		 ON CONFLICT(user_id, keyword) DO UPDATE SET
@@ -281,6 +279,11 @@ async function adjustUserKeywordAffinities(db, userId, postId, delta) {
 	if (statements.length > 0) await db.batch(statements);
 	await db.prepare('DELETE FROM user_keyword_affinities WHERE user_id = ? AND score <= 0')
 		.bind(Number(userId)).run();
+}
+
+async function adjustUserKeywordAffinities(db, userId, postId, delta) {
+	const post = await db.prepare('SELECT tags FROM posts WHERE id = ?').bind(Number(postId)).first();
+	await adjustUserKeywordAffinitiesForTags(db, userId, post?.tags, delta);
 }
 
 function normalizeGroupDmRow(row, viewerId = null) {
@@ -1229,16 +1232,18 @@ export default {
 					const announcement = postData.announcement ? 1 : 0;
 					const replyTo = postData.replyTo ? Number(postData.replyTo) : null;
 					const repostTo = postData.repostTo ? Number(postData.repostTo) : null;
-					const tags = JSON.stringify(normalizePostTags(postData.tags));
+					const normalizedTags = normalizePostTags(postData.tags);
+					const tags = JSON.stringify(normalizedTags);
 					const tagsGeneratedAt = postData.tagsGeneratedAt || null;
 					const now = new Date().toISOString();
 
 				const res = await db.prepare(
 `INSERT INTO posts (user_id, content, attachments, mask, lock, announcement, reply_to, repost_to, tags, tags_generated_at, created_at)
-							 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+								 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 					).bind(userId, content, attachments, mask, lock, announcement, replyTo, repostTo, tags, tagsGeneratedAt, now).run();
 
 				const created = await db.prepare('SELECT * FROM posts WHERE id = ?').bind(res.meta.last_row_id).first();
+				await adjustUserKeywordAffinitiesForTags(db, userId, normalizedTags, 1);
 				return json(normalizePostRow(created));
 			}
 
@@ -1290,13 +1295,16 @@ export default {
 			if (method === 'POST' && pathname.match(/^\/posts\/(\d+)$/)) {
 				const postId = Number(pathname.split('/')[2]);
 				const fields = await request.json();
+				const existing = fields.tags !== undefined
+					? await db.prepare('SELECT user_id, tags FROM posts WHERE id = ?').bind(postId).first()
+					: null;
 				const sets = [];
 				const values = [];
 
-									if (fields.content !== undefined) { sets.push('content = ?'); values.push(fields.content); }
-					if (fields.tags !== undefined) { sets.push('tags = ?'); values.push(JSON.stringify(normalizePostTags(fields.tags))); }
-					if (fields.tagsGeneratedAt !== undefined) { sets.push('tags_generated_at = ?'); values.push(fields.tagsGeneratedAt || null); }
-					if (fields.attachments !== undefined) { sets.push('attachments = ?'); values.push(fields.attachments ? JSON.stringify(fields.attachments) : null); }
+				if (fields.content !== undefined) { sets.push('content = ?'); values.push(fields.content); }
+				if (fields.tags !== undefined) { sets.push('tags = ?'); values.push(JSON.stringify(normalizePostTags(fields.tags))); }
+				if (fields.tagsGeneratedAt !== undefined) { sets.push('tags_generated_at = ?'); values.push(fields.tagsGeneratedAt || null); }
+				if (fields.attachments !== undefined) { sets.push('attachments = ?'); values.push(fields.attachments ? JSON.stringify(fields.attachments) : null); }
 				if (fields.mask !== undefined) { sets.push('mask = ?'); values.push(fields.mask ? 1 : 0); }
 				if (fields.lock !== undefined) { sets.push('lock = ?'); values.push(fields.lock ? 1 : 0); }
 
@@ -1305,6 +1313,10 @@ export default {
 					await db.prepare(`UPDATE posts SET ${sets.join(', ')} WHERE id = ?`).bind(...values).run();
 				}
 				const row = await db.prepare('SELECT * FROM posts WHERE id = ?').bind(postId).first();
+				if (row && existing) {
+					await adjustUserKeywordAffinitiesForTags(db, existing.user_id, existing.tags, -1);
+					await adjustUserKeywordAffinitiesForTags(db, existing.user_id, row.tags, 1);
+				}
 				return json(normalizePostRow(row));
 			}
 
