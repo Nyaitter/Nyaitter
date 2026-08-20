@@ -194,21 +194,28 @@ function corsAllowedOriginsSetting() {
 
 const turnstileSecretKey = process.env.TURNSTILE_SECRET_KEY || get('turnstile.secret', '');
 
+const apiEndpoint = normalizeApiEndpoint(
+  process.env.NYAITTER_API_ENDPOINT || get('server.apiEndpoint', '/server'),
+);
+const defaultUserFilesEndpoint = `${apiEndpoint === '/' ? '' : apiEndpoint}/uploads` || '/uploads';
+const configuredUserFilesEndpoint = process.env.NYAITTER_USER_FILES_ENDPOINT !== undefined
+  ? process.env.NYAITTER_USER_FILES_ENDPOINT
+  : get('userFiles.endpoint', undefined);
+
 const config = {
   server: {
     port: parseInt(process.env.PORT, 10) || get('server.port', 3000),
     jsonBodyLimit: process.env.JSON_BODY_LIMIT || get('server.jsonBodyLimit', '2mb'),
     trustProxy: process.env.TRUST_PROXY === 'true' || get('server.trustProxy', false),
-    apiEndpoint: normalizeApiEndpoint(
-      process.env.NYAITTER_API_ENDPOINT || get('server.apiEndpoint', '/server'),
-    ),
+    apiEndpoint,
   },
 
   userFiles: {
+    // 未指定時はAPIエンドポイント配下で配信する。空文字の明示指定だけが配信無効化を表す。
     endpoint: normalizeUserFilesEndpoint(
-      process.env.NYAITTER_USER_FILES_ENDPOINT !== undefined
-        ? process.env.NYAITTER_USER_FILES_ENDPOINT
-        : get('userFiles.endpoint', ''),
+      configuredUserFilesEndpoint === undefined
+        ? defaultUserFilesEndpoint
+        : configuredUserFilesEndpoint,
     ),
     port: optionalPort(
       'NYAITTER_USER_FILES_PORT',
