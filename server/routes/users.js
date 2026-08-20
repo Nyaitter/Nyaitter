@@ -232,9 +232,9 @@ async function publishNewNotification(req, userId, notification) {
 	}
 }
 
-function serializeUserCard(user, publicUrl) {
+function serializeUserCard(user, publicUrl, { includeSearchExclusion = false } = {}) {
 	return {
-		...serializeUserBrief(user, publicUrl),
+		...serializeUserBrief(user, publicUrl, { includeSearchExclusion }),
 		me: user.me || user.bio || '',
 		created_at: user.created_at || user.createdAt || null,
 	};
@@ -373,7 +373,9 @@ router.get('/search', optionalAuth, async (req, res) => {
 	try {
 					const users = await db.searchUsers(query, limit, offset);
 				res.json({
-					users: users.map((user) => serializeUserCard(user, getPublicUrl(req))),
+					users: users.map((user) => serializeUserCard(user, getPublicUrl(req), {
+						includeSearchExclusion: Boolean(req.user?.admin),
+					})),
 					offset,
 				});
 
@@ -403,7 +405,9 @@ router.get('/recommended', optionalAuth, async (req, res) => {
 			}
 			selected = candidates.slice(0, 3);
 		}
-		res.json({ users: selected.map((user) => serializeUserCard(user, getPublicUrl(req))) });
+			res.json({ users: selected.map((user) => serializeUserCard(user, getPublicUrl(req), {
+				includeSearchExclusion: Boolean(req.user?.admin),
+			})) });
 
 	} catch (err) {
 		console.error('[users] recommended error:', err);
@@ -473,7 +477,9 @@ router.get('/', optionalAuth, async (req, res) => {
 
 	try {
 					const users = await db.getUsersByIds(ids);
-			res.json({ users: users.map((user) => serializeUserCard(user, getPublicUrl(req))) });
+			res.json({ users: users.map((user) => serializeUserCard(user, getPublicUrl(req), {
+				includeSearchExclusion: Boolean(req.user?.admin),
+			})) });
 
 	} catch (err) {
 		console.error('[users] batch error:', err);

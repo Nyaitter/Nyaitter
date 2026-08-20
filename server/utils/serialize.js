@@ -12,7 +12,7 @@ const {
 } = require('./postVisibility');
 const { getVisibleDmUnreadCount } = require('../services/DmVisibilityService');
 
-function serializeUserBrief(user, publicUrl = null) {
+function serializeUserBrief(user, publicUrl = null, { includeSearchExclusion = false } = {}) {
 	if (!user) return null;
 	return {
 		id: user.id,
@@ -26,6 +26,7 @@ function serializeUserBrief(user, publicUrl = null) {
 		admin: !!user.admin,
 		verify: !!user.verify,
 		is_imposter: !!user.settings?.imposter?.parent_id,
+		...(includeSearchExclusion ? { shadow: !!user.shadow } : {}),
 	};
 }
 
@@ -230,6 +231,7 @@ async function serializePublicProfile(
 		admin: !!user.admin,
 		verify: !!user.verify,
 		is_imposter: !!user.settings?.imposter?.parent_id,
+		...(viewer?.admin ? { shadow: !!user.shadow } : {}),
 		visibility,
 		...(viewerId != null ? { relationship: { viewer_blocks_profile: viewerBlocksProfile, profile_blocks_viewer: profileBlocksViewer } } : {}),
 		...(visibility.scid === 'public' && user.scid ? { scid: user.scid } : {}),
