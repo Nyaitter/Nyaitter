@@ -65,6 +65,27 @@ httpServer.keepAliveTimeout = 65000;
 httpServer.headersTimeout = 66000;
 
 let userFilesServer = null;
+const configuredUploadDir = config.storage?.local?.uploadDir || './uploads';
+const uploadsDir = path.isAbsolute(configuredUploadDir)
+    ? configuredUploadDir
+    : path.resolve(process.cwd(), configuredUploadDir);
+const userFilesEndpoint = config.userFiles?.endpoint;
+const userFilesPort = config.userFiles?.port;
+const userFilesStaticOptions = {
+    maxAge: '7d',
+    etag: true,
+    lastModified: true,
+    setHeaders: (res) => {
+        res.setHeader('X-Content-Type-Options', 'nosniff');
+    },
+};
+
+// 通常ポートのユーザーファイル配信は、同名のAPIアップロード操作ルートより先に登録する。
+// express.staticはGET/HEAD以外を通過させるため、POST /<api>/uploadsは従来どおりAPIが処理する。
+if (userFilesEndpoint && !userFilesPort) {
+    app.use(userFilesEndpoint, express.static(uploadsDir, userFilesStaticOptions));
+}
+
 const realtimeConnections = new ConnectionManager();
 const realtimeServer = new WebSocketServer({
     noServer: true,
@@ -350,30 +371,12 @@ if (hasStaticPage) {
 }
 
 // ── User Files Serving ─────────────────────────────────────────────────────────
-const configuredUploadDir = config.storage?.local?.uploadDir || './uploads';
-const uploadsDir = path.isAbsolute(configuredUploadDir)
-    ? configuredUploadDir
-    : path.resolve(process.cwd(), configuredUploadDir);
-const userFilesEndpoint = config.userFiles?.endpoint;
-const userFilesPort = config.userFiles?.port;
-
-if (userFilesEndpoint) {
-    const staticOptions = {
-        maxAge: '7d',
-        etag: true,
-        lastModified: true,
-        setHeaders: (res) => {
-            res.setHeader('X-Content-Type-Options', 'nosniff');
-        },
-    };
-    if (userFilesPort) {
-        const userFilesApp = express();
-        userFilesApp.disable('x-powered-by');
-        userFilesApp.use(userFilesEndpoint, express.static(uploadsDir, staticOptions));
-        userFilesServer = http.createServer(userFilesApp);
-    } else {
-        app.use(userFilesEndpoint, express.static(uploadsDir, staticOptions));
-    }
+// 専用ポートでは別Expressアプリにのみ公開し、通常ポートでは上でAPIルートより先に登録済み。
+if (userFilesEndpoint && userFilesPort) {
+    const userFilesApp = express();
+    userFilesApp.disable('x-powered-by');
+    userFilesApp.use(userFilesEndpoint, express.static(uploadsDir, userFilesStaticOptions));
+    userFilesServer = http.createServer(userFilesApp);
 }
 
 // ── Error & 404 Handlers ───────────────────────────────────────────────────────

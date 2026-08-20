@@ -197,7 +197,15 @@ const turnstileSecretKey = process.env.TURNSTILE_SECRET_KEY || get('turnstile.se
 const apiEndpoint = normalizeApiEndpoint(
   process.env.NYAITTER_API_ENDPOINT || get('server.apiEndpoint', '/server'),
 );
-const defaultUserFilesEndpoint = `${apiEndpoint === '/' ? '' : apiEndpoint}/uploads` || '/uploads';
+const configuredUserFilesPort = optionalPort(
+  'NYAITTER_USER_FILES_PORT',
+  process.env.NYAITTER_USER_FILES_PORT !== undefined
+    ? process.env.NYAITTER_USER_FILES_PORT
+    : get('userFiles.port', null),
+);
+const defaultUserFilesEndpoint = configuredUserFilesPort
+  ? '/uploads'
+  : (`${apiEndpoint === '/' ? '' : apiEndpoint}/uploads` || '/uploads');
 const configuredUserFilesEndpoint = process.env.NYAITTER_USER_FILES_ENDPOINT !== undefined
   ? process.env.NYAITTER_USER_FILES_ENDPOINT
   : get('userFiles.endpoint', undefined);
@@ -217,12 +225,7 @@ const config = {
         ? defaultUserFilesEndpoint
         : configuredUserFilesEndpoint,
     ),
-    port: optionalPort(
-      'NYAITTER_USER_FILES_PORT',
-      process.env.NYAITTER_USER_FILES_PORT !== undefined
-        ? process.env.NYAITTER_USER_FILES_PORT
-        : get('userFiles.port', null),
-    ),
+    port: configuredUserFilesPort,
   },
 
   static: {
