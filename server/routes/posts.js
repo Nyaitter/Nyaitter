@@ -1065,6 +1065,7 @@ router.put('/:id', requireAuth, postWriteLimiter, async (req, res) => {
 				const updated = await db.updatePost(postId, {
 				content: normalizedContent,
 				tags: await extractPostKeywords(normalizedContent),
+				tagsGeneratedAt: new Date().toISOString(),
 			attachments:
 				Array.isArray(attachments) && attachments.length > 0
 					? attachments

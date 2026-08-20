@@ -392,6 +392,17 @@ async function serializePostsBatch(
 		Number(post.id),
 		canViewPostWithContext(post, visibilityContext),
 	]));
+	const postKeywordBackfillService = db.postKeywordBackfillService;
+	if (postKeywordBackfillService) {
+		for (const post of allPosts) {
+			if (!visibleByPostId.get(Number(post.id))) continue;
+			try {
+				postKeywordBackfillService.enqueue(db, post);
+			} catch (error) {
+				console.warn('[serialize] post keyword backfill enqueue failed:', error.message);
+			}
+		}
+	}
 	const briefUsersById = new Map();
 	const visitingPostIds = new Set();
 

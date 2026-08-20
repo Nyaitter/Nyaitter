@@ -220,6 +220,7 @@ async function processCreatePostAction(context, payload) {
     userId,
     content,
     tags,
+    tagsGeneratedAt: new Date().toISOString(),
     attachments: processedAttachments,
     mask: Boolean(payload.mask),
     lock: Boolean(payload.lock),

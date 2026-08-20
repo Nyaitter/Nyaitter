@@ -10,7 +10,7 @@ class PostService {
    * - raw files: { buffer, fileName, contentType }
    * - or pre-uploaded: { id, url, type, name }
    */
-  async createPost({ userId, content, tags = [], attachments = [], mask = false, lock = false, announcement = false, replyTo = null, repostTo = null }) {
+  async createPost({ userId, content, tags = [], tagsGeneratedAt = null, attachments = [], mask = false, lock = false, announcement = false, replyTo = null, repostTo = null }) {
     const attachmentData = [];
     const uploadedKeys = [];
 
@@ -51,6 +51,7 @@ class PostService {
         userId,
         content,
         tags,
+        tagsGeneratedAt,
         attachments: attachmentData.length > 0 ? attachmentData : null,
         mask,
         lock,

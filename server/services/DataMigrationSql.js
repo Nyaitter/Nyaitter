@@ -12,7 +12,7 @@ const TABLE_COLUMNS = Object.freeze({
   trusted_login_ips: ['user_id', 'ip_hash', 'ip_masked', 'created_at', 'last_used_at'],
   login_approvals: ['id', 'user_id', 'ip_hash', 'ip_masked', 'user_agent', 'poll_token_hash', 'status', 'created_at', 'expires_at', 'decided_at', 'consumed_at'],
   bot_tokens: ['token_id', 'token_hash', 'user_id', 'name', 'created_at', 'last_used_at'],
-  posts: ['id', 'user_id', 'content', 'attachments', 'mask', 'lock', 'announcement', 'reply_to', 'repost_to', 'tags', 'created_at'],
+  posts: ['id', 'user_id', 'content', 'attachments', 'mask', 'lock', 'announcement', 'reply_to', 'repost_to', 'tags', 'tags_generated_at', 'created_at'],
   likes: ['user_id', 'post_id', 'created_at'],
   stars: ['user_id', 'post_id', 'created_at'],
   reposts: ['user_id', 'post_id', 'created_at'],
@@ -35,7 +35,7 @@ const JSON_COLUMNS = new Set([
 ]);
 const ARRAY_COLUMNS = new Set(['participants', 'member']);
 const DATE_COLUMNS = new Set([
-  'created_at', 'updated_at', 'expires_at', 'last_used_at', 'decided_at', 'consumed_at',
+  'created_at', 'updated_at', 'tags_generated_at', 'expires_at', 'last_used_at', 'decided_at', 'consumed_at',
   'sent_at', 'read_at', 'time', 'assigned_at', 'resolved_at', 'log_time',
 ]);
 

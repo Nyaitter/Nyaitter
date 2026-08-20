@@ -185,7 +185,8 @@ class InMemoryAdapter extends DatabaseAdapter {
 		for (const row of [...data.tables.posts].sort((left, right) => String(left.created_at).localeCompare(String(right.created_at)))) {
 			const post = {
 				id: row.id, userId: row.user_id, content: row.content,
-				tags: Array.isArray(row.tags) ? row.tags : [], attachments: row.attachments,
+				tags: Array.isArray(row.tags) ? row.tags : [],
+				tagsGeneratedAt: row.tags_generated_at ?? row.tagsGeneratedAt ?? null, attachments: row.attachments,
 				mask: row.mask, lock: row.lock, announcement: row.announcement,
 				replyTo: row.reply_to, repostTo: row.repost_to, createdAt: row.created_at,
 			};
@@ -843,6 +844,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 			userId: postData.userId,
 				content: postData.content,
 				tags: Array.isArray(postData.tags) ? [...new Set(postData.tags.map((tag) => String(tag || '').trim().toLowerCase()).filter(Boolean))].slice(0, 4) : [],
+				tagsGeneratedAt: postData.tagsGeneratedAt || null,
 				attachments: postData.attachments || null,
 			mask: !!postData.mask,
 			lock: !!postData.lock,
@@ -886,6 +888,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 		if (!post) return null;
 			if (fields.content !== undefined) post.content = fields.content;
 			if (fields.tags !== undefined) post.tags = Array.isArray(fields.tags) ? [...new Set(fields.tags.map((tag) => String(tag || '').trim().toLowerCase()).filter(Boolean))].slice(0, 4) : [];
+			if (fields.tagsGeneratedAt !== undefined) post.tagsGeneratedAt = fields.tagsGeneratedAt || null;
 			if (fields.attachments !== undefined) post.attachments = fields.attachments;
 					if (fields.mask !== undefined) post.mask = !!fields.mask;
 			if (fields.lock !== undefined) post.lock = !!fields.lock;

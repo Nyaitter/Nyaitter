@@ -63,6 +63,8 @@ function normalizePost(post) {
 	post.replyTo = post.replyTo ?? post.reply_to ?? null;
 	post.repostTo = post.repostTo ?? post.repost_to ?? null;
 	post.createdAt = post.createdAt ?? post.created_at ?? null;
+	post.tagsGeneratedAt = post.tagsGeneratedAt ?? post.tags_generated_at ?? null;
+	post.tags_generated_at = post.tagsGeneratedAt;
 	post.mask = !!post.mask;
 	post.lock = !!post.lock;
 	post.announcement = !!post.announcement;

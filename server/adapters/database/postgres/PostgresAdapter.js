@@ -86,6 +86,7 @@ function normalizePostRow(row) {
 	const replyTo = row.reply_to ?? row.replyTo;
 	const repostTo = row.repost_to ?? row.repostTo;
 	const createdAt = toIsoString(row.created_at ?? row.createdAt);
+	const tagsGeneratedAt = toIsoString(row.tags_generated_at ?? row.tagsGeneratedAt);
 	const rawAttachments = parseJsonSafe(row.attachments, []);
 	const attachments = Array.isArray(rawAttachments)
 		? rawAttachments
@@ -98,6 +99,8 @@ function normalizePostRow(row) {
 		user_id: userId,
 		content: row.content || '',
 		tags,
+		tagsGeneratedAt,
+		tags_generated_at: tagsGeneratedAt,
 		attachments,
 		mask: Boolean(row.mask),
 		lock: Boolean(row.lock),
@@ -1227,11 +1230,12 @@ class PostgresAdapter extends DatabaseAdapter {
 			postData.replyTo ? Number(postData.replyTo) : null,
 			postData.repostTo ? Number(postData.repostTo) : null,
 			JSON.stringify(normalizePostTags(postData.tags)),
+			postData.tagsGeneratedAt ? toIsoString(postData.tagsGeneratedAt) : null,
 			now,
 		];
 		const { rows } = await this.pool.query(
-`INSERT INTO posts (user_id, content, attachments, mask, lock, announcement, reply_to, repost_to, tags, created_at)
-				 VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7, $8, $9::jsonb, $10)
+`INSERT INTO posts (user_id, content, attachments, mask, lock, announcement, reply_to, repost_to, tags, tags_generated_at, created_at)
+				 VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7, $8, $9::jsonb, $10, $11)
 			 RETURNING *`,
 			values,
 		);
@@ -1358,6 +1362,10 @@ class PostgresAdapter extends DatabaseAdapter {
 			if (fields.tags !== undefined) {
 				values.push(JSON.stringify(normalizePostTags(fields.tags)));
 				sets.push(`tags = $${values.length}::jsonb`);
+			}
+			if (fields.tagsGeneratedAt !== undefined) {
+				values.push(fields.tagsGeneratedAt ? toIsoString(fields.tagsGeneratedAt) : null);
+				sets.push(`tags_generated_at = $${values.length}`);
 			}
 			if (fields.attachments !== undefined) {
 			values.push(fields.attachments ? JSON.stringify(fields.attachments) : null);

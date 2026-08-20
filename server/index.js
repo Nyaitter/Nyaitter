@@ -30,6 +30,7 @@ const { ModerationReportService } = require('./services/ModerationReportService'
 const { startModerationAssignmentScheduler } = require('./services/ModerationAssignmentScheduler');
 const { AutoModerationService } = require('./services/AutoModerationService');
 const PostActionQueue = require('./services/PostActionQueue');
+const PostKeywordBackfillService = require('./services/PostKeywordBackfillService');
 const { serializeNotification } = require('./utils/serialize');
 const { getPublicUrl } = require('./utils/nyaitterAddress');
 const { startOperatorControlServer } = require('./utils/operatorControl');
@@ -438,11 +439,16 @@ const autoModerationService = new AutoModerationService({
     moderationConfig: config.geminiModeration,
 });
 const postActionQueue = new PostActionQueue();
+const postKeywordBackfillQueue = new PostActionQueue({ maxPendingJobs: 2000 });
+const postKeywordBackfillService = new PostKeywordBackfillService({ postActionQueue: postKeywordBackfillQueue });
+dbAdapter.postKeywordBackfillService = postKeywordBackfillService;
 
 app.locals.pushNotificationService = pushNotificationService;
 app.locals.moderationReportService = moderationReportService;
 app.locals.autoModerationService = autoModerationService;
 app.locals.postActionQueue = postActionQueue;
+app.locals.postKeywordBackfillQueue = postKeywordBackfillQueue;
+app.locals.postKeywordBackfillService = postKeywordBackfillService;
 
 async function startServer() {
     await dbAdapter.connect();
@@ -513,6 +519,8 @@ async function shutdown(signal) {
         moderationScheduler?.stop();
         moderationScheduler = null;
         autoModerationService.stop();
+        postKeywordBackfillService.stop();
+        postKeywordBackfillQueue.stop();
         postActionQueue.stop();
         realtimeConnections.closeAll();
         if (operatorControl) {

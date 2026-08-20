@@ -127,7 +127,7 @@ const MIGRATION_COLUMNS = {
 	trusted_login_ips: ['user_id', 'ip_hash', 'ip_masked', 'created_at', 'last_used_at'],
 	login_approvals: ['id', 'user_id', 'ip_hash', 'ip_masked', 'user_agent', 'poll_token_hash', 'status', 'created_at', 'expires_at', 'decided_at', 'consumed_at'],
 	bot_tokens: ['token_id', 'token_hash', 'user_id', 'name', 'created_at', 'last_used_at'],
-	posts: ['id', 'user_id', 'content', 'attachments', 'mask', 'lock', 'announcement', 'reply_to', 'repost_to', 'tags', 'created_at'],
+	posts: ['id', 'user_id', 'content', 'attachments', 'mask', 'lock', 'announcement', 'reply_to', 'repost_to', 'tags', 'tags_generated_at', 'created_at'],
 	likes: ['user_id', 'post_id', 'created_at'],
 	stars: ['user_id', 'post_id', 'created_at'],
 	reposts: ['user_id', 'post_id', 'created_at'],
@@ -249,6 +249,8 @@ function normalizePostRow(row) {
 		user_id: row.user_id,
 		content: row.content || '',
 		tags: normalizePostTags(row.tags),
+		tagsGeneratedAt: row.tags_generated_at || null,
+		tags_generated_at: row.tags_generated_at || null,
 		attachments: parseJsonSafe(row.attachments, []),
 		mask: Boolean(row.mask),
 		lock: Boolean(row.lock),
@@ -1228,12 +1230,13 @@ export default {
 					const replyTo = postData.replyTo ? Number(postData.replyTo) : null;
 					const repostTo = postData.repostTo ? Number(postData.repostTo) : null;
 					const tags = JSON.stringify(normalizePostTags(postData.tags));
+					const tagsGeneratedAt = postData.tagsGeneratedAt || null;
 					const now = new Date().toISOString();
 
 				const res = await db.prepare(
-`INSERT INTO posts (user_id, content, attachments, mask, lock, announcement, reply_to, repost_to, tags, created_at)
-							 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-					).bind(userId, content, attachments, mask, lock, announcement, replyTo, repostTo, tags, now).run();
+`INSERT INTO posts (user_id, content, attachments, mask, lock, announcement, reply_to, repost_to, tags, tags_generated_at, created_at)
+							 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+					).bind(userId, content, attachments, mask, lock, announcement, replyTo, repostTo, tags, tagsGeneratedAt, now).run();
 
 				const created = await db.prepare('SELECT * FROM posts WHERE id = ?').bind(res.meta.last_row_id).first();
 				return json(normalizePostRow(created));
@@ -1292,6 +1295,7 @@ export default {
 
 									if (fields.content !== undefined) { sets.push('content = ?'); values.push(fields.content); }
 					if (fields.tags !== undefined) { sets.push('tags = ?'); values.push(JSON.stringify(normalizePostTags(fields.tags))); }
+					if (fields.tagsGeneratedAt !== undefined) { sets.push('tags_generated_at = ?'); values.push(fields.tagsGeneratedAt || null); }
 					if (fields.attachments !== undefined) { sets.push('attachments = ?'); values.push(fields.attachments ? JSON.stringify(fields.attachments) : null); }
 				if (fields.mask !== undefined) { sets.push('mask = ?'); values.push(fields.mask ? 1 : 0); }
 				if (fields.lock !== undefined) { sets.push('lock = ?'); values.push(fields.lock ? 1 : 0); }
