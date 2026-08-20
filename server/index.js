@@ -29,6 +29,7 @@ const PushNotificationService = require('./services/PushNotificationService');
 const { ModerationReportService } = require('./services/ModerationReportService');
 const { startModerationAssignmentScheduler } = require('./services/ModerationAssignmentScheduler');
 const { AutoModerationService } = require('./services/AutoModerationService');
+const PostActionQueue = require('./services/PostActionQueue');
 const { serializeNotification } = require('./utils/serialize');
 const { getPublicUrl } = require('./utils/nyaitterAddress');
 const { startOperatorControlServer } = require('./utils/operatorControl');
@@ -436,10 +437,12 @@ const autoModerationService = new AutoModerationService({
     publishNotification: publishModerationNotification,
     moderationConfig: config.geminiModeration,
 });
+const postActionQueue = new PostActionQueue();
 
 app.locals.pushNotificationService = pushNotificationService;
 app.locals.moderationReportService = moderationReportService;
 app.locals.autoModerationService = autoModerationService;
+app.locals.postActionQueue = postActionQueue;
 
 async function startServer() {
     await dbAdapter.connect();
@@ -510,6 +513,7 @@ async function shutdown(signal) {
         moderationScheduler?.stop();
         moderationScheduler = null;
         autoModerationService.stop();
+        postActionQueue.stop();
         realtimeConnections.closeAll();
         if (operatorControl) {
             await operatorControl.close();

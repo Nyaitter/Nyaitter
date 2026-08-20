@@ -28,9 +28,9 @@ const {
 	createNotificationIfAllowed,
 } = require('../services/NotificationDeliveryService');
 const {
-	resolvePostingUser,
-	assertPostingUserWritable,
-} = require('../services/auth/PostAsUserService');
+	processCreatePostAction,
+	processDeletePostAction,
+} = require('../services/PostActionProcessor');
 
 const router = express.Router();
 const { createRateLimiter } = require('../middleware/rateLimit');
@@ -67,19 +67,6 @@ async function publishNewNotification(req, userId, notification) {
 	}
 }
 
-async function publishNewTimelinePost(req, post) {
-	if (!post || post.replyTo != null || post.reply_to != null) return;
-	const realtime = req.app.locals.realtime;
-	if (!realtime?.publishPostToFollowers) return;
-
-	try {
-		await realtime.publishPostToFollowers(post.userId, getDbAdapter(req), post);
-	} catch (error) {
-		// 投稿自体はすでに永続化済みのため、リアルタイム配信失敗で投稿APIを失敗させない。
-		console.warn('[posts] timeline realtime delivery failed:', error.message);
-	}
-}
-
 function getStorageAdapter(req) {
 	return req.app.locals.storageAdapter;
 }
@@ -97,31 +84,6 @@ function enqueueGeminiModeration(req, post) {
 
 function contentLengthError(range) {
 	return `content must be ${describeIntegerRange(range)} characters`;
-}
-
-function getAttachmentStorageKeys(attachments) {
-	let parsed = attachments;
-	if (typeof parsed === 'string') {
-		try { parsed = JSON.parse(parsed); } catch (_) { parsed = null; }
-	}
-	if (!Array.isArray(parsed)) return [];
-	return [...new Set(parsed
-		.map((attachment) => attachment && (attachment.id || attachment.key || null))
-		.filter((key) => typeof key === 'string' && key.length > 0))];
-}
-
-async function deleteStoredAttachments(storage, attachments, context) {
-	const keys = getAttachmentStorageKeys(attachments);
-	if (keys.length === 0 || !storage) return;
-	try {
-		if (typeof storage.deleteMany === 'function') {
-			await storage.deleteMany(keys);
-		} else if (typeof storage.delete === 'function') {
-			await Promise.all(keys.map((key) => storage.delete(key)));
-		}
-	} catch (error) {
-		console.warn(`[posts] Failed to delete ${keys.length} attachment(s) from storage during ${context}:`, error.message);
-	}
 }
 
 function safeParsePostId(idStr) {
@@ -276,11 +238,22 @@ function isValidAttachmentUrl(value) {
 	}
 }
 
-router.post('/', requireAuth, postWriteLimiter, async (req, res) => {
-	const db = getDbAdapter(req);
-	const storage = getStorageAdapter(req);
-	const postService = new PostService({ dbAdapter: db, storageAdapter: storage });
+function createPostActionContext(req) {
+	return {
+		db: getDbAdapter(req),
+		storage: getStorageAdapter(req),
+		realtime: req.app.locals.realtime,
+		pushService: req.app.locals.pushNotificationService,
+		autoModerationService: req.app.locals.autoModerationService,
+		publicUrl: getPublicUrl(req),
+		authRequest: {
+			user: { ...req.user, visibilityUser: null },
+			headers: { cookie: req.headers.cookie || '' },
+		},
+	};
+}
 
+router.post('/', requireAuth, postWriteLimiter, (req, res) => {
 	const {
 		content,
 		attachments = [],
@@ -290,107 +263,41 @@ router.post('/', requireAuth, postWriteLimiter, async (req, res) => {
 		reply_to,
 		repost_to,
 		post_as_user_id,
-	} = req.body;
-	let postingUser;
-	try {
-		postingUser = assertPostingUserWritable(
-			await resolvePostingUser(req, db, post_as_user_id),
-		);
-	} catch (error) {
-		return res.status(error.statusCode || 403).json({ error: error.message });
-	}
-	const userId = Number(postingUser.id);
-	const isAnnouncement = announcement === true;
-
-	if (isAnnouncement && postingUser.admin !== true) {
-		return res.status(403).json({ error: 'Only administrators can create announcements' });
-	}
-	if (isAnnouncement && (reply_to || repost_to)) {
-		return res.status(400).json({ error: 'Announcements cannot be replies or reposts' });
-	}
-
-	const hasContent =
-		typeof content === 'string' && content.trim().length > 0;
+	} = req.body || {};
+	const hasContent = typeof content === 'string' && content.trim().length > 0;
 	const hasAttachments = Array.isArray(attachments) && attachments.length > 0;
 	const isSimpleRepost = (content === null || content === undefined || content === '') && repost_to;
 
 	if (!hasContent && !hasAttachments && !isSimpleRepost) {
 		return res.status(400).json({ error: 'content, attachments, or repost_to is required' });
 	}
-	const trimmed = hasContent ? content.trim() : '';
-	if (hasContent && !isWithinRange(trimmed.length, config.limits.postContentLength)) {
+	if (hasContent && !isWithinRange(content.trim().length, config.limits.postContentLength)) {
 		return res.status(400).json({ error: contentLengthError(config.limits.postContentLength) });
 	}
+	if (!Array.isArray(attachments)) {
+		return res.status(400).json({ error: 'attachments must be an array' });
+	}
 
-	let processedAttachments;
-	try {
-		validateAttachmentReferences(attachments, userId);
-		processedAttachments = attachments.map((att) => {
-			if (att.data !== undefined) {
-				return {
-					buffer: decodeBase64File(att.data),
-					fileName: att.fileName || 'file',
-					contentType: normalizeContentType(att.contentType),
-				};
-			}
-			return att;
-		});
-	} catch (error) {
-		return res.status(400).json({ error: error.message || 'Invalid attachments' });
+	const queue = req.app.locals.postActionQueue;
+	if (!queue) {
+		return res.status(503).json({ error: 'Post action queue is unavailable' });
 	}
 
 	try {
-		for (const targetId of [reply_to, repost_to].filter(Boolean)) {
-			const target = await db.getPostById(Number(targetId));
-				if (!target || !(await canViewPost(db, target, userId, null, null, postingUser))) {
-				return res.status(404).json({ error: 'Post not found' });
-			}
-		}
-
-		const post = await postService.createPost({
-			userId,
-			content: trimmed,
-			attachments: processedAttachments,
-			mask: !!mask,
-				lock: !!lock,
-				announcement: isAnnouncement,
-				replyTo: reply_to || null,
-			repostTo: repost_to || null,
-		});
-
-		const replyTargetId = Number(reply_to);
-		if (Number.isInteger(replyTargetId) && replyTargetId > 0) {
-			const parent = await db.getPostById(replyTargetId);
-			if (parent && Number(parent.userId) !== Number(userId)) {
-				const notification = await createNotificationIfAllowed(db, {
-					userId: parent.userId,
-					type: 'reply',
-					fromUserId: userId,
-					target: { kind: 'post', id: post.id },
-				});
-				if (notification) {
-					await publishNewNotification(req, parent.userId, notification);
-				}
-			}
-		}
-
-
-			
-
-				await publishNewTimelinePost(req, post);
-			enqueueGeminiModeration(req, post);
-
-			res.status(201).json({
-
-			success: true,
-			post: await serializePost(db, post, userId, 0, getPublicUrl(req)),
-		});
-	} catch (err) {
-		console.error('[posts] create error:', err);
-		if (Number.isInteger(err?.statusCode)) {
-			return res.status(err.statusCode).json({ error: err.message });
-		}
-		res.status(500).json({ error: '投稿の作成に失敗しました' });
+		const context = createPostActionContext(req);
+		const actionId = queue.enqueue('create', () => processCreatePostAction(context, {
+			content,
+			attachments,
+			mask,
+			lock,
+			announcement: announcement === true,
+			replyTo: reply_to,
+			repostTo: repost_to,
+			postAsUserId: post_as_user_id,
+		}));
+		return res.status(202).json({ success: true, queued: true, action_id: actionId });
+	} catch (error) {
+		return res.status(error.statusCode || 503).json({ error: error.message });
 	}
 });
 
@@ -1001,64 +908,53 @@ router.post('/:id/star', requireAuth, postWriteLimiter, async (req, res) => {
 	}
 });
 
-router.delete('/:id', requireAuth, postWriteLimiter, async (req, res) => {
-	const db = getDbAdapter(req);
-	const storage = getStorageAdapter(req);
+router.delete('/:id', requireAuth, postWriteLimiter, (req, res) => {
 	const postId = safeParsePostId(req.params.id);
-	const userId = req.user.id;
-
 	if (!postId) {
 		return res.status(400).json({ error: 'Invalid post id' });
 	}
 
+	const queue = req.app.locals.postActionQueue;
+	if (!queue) {
+		return res.status(503).json({ error: 'Post action queue is unavailable' });
+	}
 	try {
-		const postToDelete = await db.getPostById(postId);
-		const success = await db.deletePost(postId, userId);
-
-		if (!success) {
-			return res.status(403).json({ error: 'You do not have permission to delete this post' });
-		}
-
-			if (postToDelete) {
-				await deleteStoredAttachments(storage, postToDelete.attachments, 'post deletion');
-			}
-
-		res.json({ success: true, message: 'Post deleted' });
-	} catch (err) {
-		console.error('[posts] delete error:', err);
-		res.status(500).json({ error: '投稿の削除に失敗しました' });
+		const context = createPostActionContext(req);
+		const userId = Number(req.user.id);
+		const actionId = queue.enqueue('delete', () => processDeletePostAction(
+			context,
+			{ postId, userId },
+		));
+		return res.status(202).json({ success: true, queued: true, action_id: actionId });
+	} catch (error) {
+		return res.status(error.statusCode || 503).json({ error: error.message });
 	}
 });
 
-router.delete('/admin/:id', requireAuth, postWriteLimiter, async (req, res) => {
-	const db = getDbAdapter(req);
-	const storage = getStorageAdapter(req);
+router.delete('/admin/:id', requireAuth, postWriteLimiter, (req, res) => {
 	const postId = safeParsePostId(req.params.id);
 
 	if (!req.user.admin) {
 		return res.status(403).json({ error: 'Admin access required' });
 	}
-
 	if (!postId) {
 		return res.status(400).json({ error: 'Invalid post id' });
 	}
 
+	const queue = req.app.locals.postActionQueue;
+	if (!queue) {
+		return res.status(503).json({ error: 'Post action queue is unavailable' });
+	}
 	try {
-		const postToDelete = await db.getPostById(postId);
-		const success = await db.adminDeletePost(postId);
-
-		if (!success) {
-			return res.status(404).json({ error: 'Post not found' });
-		}
-
-			if (postToDelete) {
-				await deleteStoredAttachments(storage, postToDelete.attachments, 'admin post deletion');
-			}
-
-		res.json({ success: true, message: 'Post deleted by admin' });
-	} catch (err) {
-		console.error('[posts] admin delete error:', err);
-		res.status(500).json({ error: '管理者削除に失敗しました' });
+		const context = createPostActionContext(req);
+		const userId = Number(req.user.id);
+		const actionId = queue.enqueue('admin-delete', () => processDeletePostAction(
+			context,
+			{ postId, userId, admin: true },
+		));
+		return res.status(202).json({ success: true, queued: true, action_id: actionId });
+	} catch (error) {
+		return res.status(error.statusCode || 503).json({ error: error.message });
 	}
 });
 
