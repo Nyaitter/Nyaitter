@@ -7,6 +7,7 @@ const { requireAuth, optionalAuth } = require('../middleware/auth');
 const { serializePostsByIds, serializeNotification } = require('../utils/serialize');
 const { getPublicUrl } = require('../utils/nyaitterAddress');
 const { createNotificationIfAllowed } = require('../services/NotificationDeliveryService');
+const { resolvePostingUser } = require('../services/auth/PostAsUserService');
 const {
   GROUP_VISIBILITIES,
   normalizeGroupId,
@@ -103,6 +104,29 @@ async function publishNotification(req, userId, notification) {
   }
 }
 
+async function listGroupInvitePermissionUserIds(db, group) {
+  const roles = await db.getGroupRoles(group.id);
+  const rolesById = new Map(roles.map((role) => [String(role.id), role]));
+  const userIds = [];
+  const pageSize = 200;
+  for (let offset = 0; ; offset += pageSize) {
+    const memberships = await db.getGroupMemberships(group.id, { status: 'active', limit: pageSize, offset });
+    for (const membership of memberships) {
+      const userId = Number(membership.userId ?? membership.user_id);
+      const roleId = membership.roleId ?? membership.role_id ?? null;
+      const role = rolesById.get(String(roleId)) || null;
+      if (Number.isInteger(userId) && hasPermission(group, membership, role, 'invite')) userIds.push(userId);
+    }
+    if (memberships.length < pageSize) break;
+  }
+  return [...new Set(userIds)];
+}
+
+async function cancelPendingGroupJoinRequests(db, groupId, userId) {
+  const requests = await db.getGroupJoinRequests({ groupId, userId, status: 'pending', limit: 100 });
+  await Promise.all(requests.map((request) => db.updateGroupJoinRequest(request.id, { status: 'cancelled' })));
+}
+
 async function getDefaultMemberRoleOrThrow(db, groupId) {
   const roles = await db.getGroupRoles(groupId);
   const memberRole = getDefaultMemberRole(roles);
@@ -186,7 +210,9 @@ router.post('/', requireAuth, async (req, res) => {
 
 router.get('/mine', requireAuth, async (req, res) => {
   try {
-    const groups = await getDb(req).getUserGroups(req.user.id, {
+    const db = getDb(req);
+    const postingUser = await resolvePostingUser(req, db, req.query.post_as_user_id);
+    const groups = await db.getUserGroups(postingUser.id, {
       status: 'active',
       limit: normalizeLimit(req.query.limit, 100, 200),
       offset: normalizeOffset(req.query.offset),
@@ -201,22 +227,6 @@ router.get('/mine', requireAuth, async (req, res) => {
   }
 });
 
-router.get('/shared/:userId', requireAuth, async (req, res) => {
-  const targetUserId = normalizeUserId(req.params.userId);
-  if (targetUserId == null) return res.status(400).json({ error: 'ユーザーIDが正しくありません。' });
-  try {
-    const db = getDb(req);
-    const [viewerGroups, targetGroups] = await Promise.all([
-      db.getUserGroups(req.user.id, { status: 'active', limit: 200, offset: 0 }),
-      db.getUserGroups(targetUserId, { status: 'active', limit: 200, offset: 0 }),
-    ]);
-    const targetGroupIds = new Set(targetGroups.map((group) => String(group.id)));
-    const groups = viewerGroups.filter((group) => targetGroupIds.has(String(group.id)));
-    res.json({ groups: groups.map((group) => groupPayload(group, { membership: membershipPayload(group.membership) })) });
-  } catch (error) {
-    errorResponse(res, error, 'shared group list error');
-  }
-});
 
 router.get('/invites/mine', requireAuth, async (req, res) => {
   try {
@@ -248,6 +258,7 @@ router.post('/invites/:inviteId/respond', requireAuth, async (req, res) => {
     const existing = await db.getGroupMembership(group.id, req.user.id);
     if (existing?.status === 'banned') return res.status(403).json({ error: 'このグループへの参加は禁止されています。' });
     await db.createGroupMembership({ groupId: group.id, userId: req.user.id, roleId: memberRole.id, status: 'active', joinedAt: new Date().toISOString() });
+    await cancelPendingGroupJoinRequests(db, group.id, req.user.id);
     const updated = await db.updateGroupInvite(invite.id, { status: 'accepted' });
     res.json({ invite: updated, membership: membershipPayload(await db.getGroupMembership(group.id, req.user.id)) });
   } catch (error) {
@@ -262,12 +273,23 @@ router.get('/:groupId', optionalAuth, async (req, res) => {
     const db = getDb(req);
     const owner = await db.getUserById(group.ownerId ?? group.owner_id);
     let membershipState = { membership: null, roles: [] };
-    if (req.user) membershipState = await resolveGroupMembership(db, group, req.user.id);
-    res.json({ group: groupPayload(group, {
-      owner: owner ? { id: owner.id, name: owner.name || '', nyaitter_id: owner.handle || null, icon_data: owner.icon_data || null } : null,
-      membership: membershipPayload(membershipState.membership),
-      roles: membershipState.membership?.status === 'active' ? membershipState.roles.map(rolePayload) : undefined,
-    }) });
+    let pendingJoinRequest = null;
+    if (req.user) {
+      const postingUser = await resolvePostingUser(req, db, req.query.post_as_user_id);
+      [membershipState, pendingJoinRequest] = await Promise.all([
+        resolveGroupMembership(db, group, postingUser.id),
+        db.getGroupJoinRequests({ groupId: group.id, userId: postingUser.id, status: 'pending', limit: 1 })
+          .then((requests) => requests[0] || null),
+      ]);
+    }
+    res.json({
+      group: groupPayload(group, {
+        owner: owner ? { id: owner.id, name: owner.name || '', nyaitter_id: owner.handle || null, icon_data: owner.icon_data || null } : null,
+        membership: membershipPayload(membershipState.membership),
+        roles: membershipState.membership?.status === 'active' ? membershipState.roles.map(rolePayload) : undefined,
+      }),
+      join_request: pendingJoinRequest,
+    });
   } catch (error) {
     errorResponse(res, error, 'detail error');
   }
@@ -343,11 +365,28 @@ router.post('/:groupId/join', requireAuth, async (req, res) => {
       const requests = await db.getGroupJoinRequests({ groupId: group.id, userId: req.user.id, status: 'pending', limit: 1 });
       if (requests.length > 0) return res.status(409).json({ error: '参加申請はすでに送信されています。' });
       const request = await db.createGroupJoinRequest({ id: crypto.randomUUID(), groupId: group.id, userId: req.user.id, status: 'pending' });
+      const recipientIds = (await listGroupInvitePermissionUserIds(db, group))
+        .filter((userId) => userId !== Number(req.user.id));
+      await Promise.all(recipientIds.map(async (userId) => {
+        try {
+          const notification = await createNotificationIfAllowed(db, {
+            userId,
+            type: 'group_join_request',
+            fromUserId: req.user.id,
+            target: { kind: 'route', value: `#group/${group.id}/manage` },
+            message: `「${group.name}」への参加申請が届いています。`,
+          });
+          await publishNotification(req, userId, notification);
+        } catch (error) {
+          console.warn('[groups] join request notification delivery failed:', error.message);
+        }
+      }));
       return res.status(202).json({ join_request: request, pending: true });
     }
     await assertMembershipCapacity(req, group, req.user.id);
     const memberRole = await getDefaultMemberRoleOrThrow(db, group.id);
     const membership = await db.createGroupMembership({ groupId: group.id, userId: req.user.id, roleId: memberRole.id, status: 'active', joinedAt: new Date().toISOString() });
+    await cancelPendingGroupJoinRequests(db, group.id, req.user.id);
     res.status(201).json({ membership: membershipPayload(membership), joined: true });
   } catch (error) {
     errorResponse(res, error, 'join error');
@@ -384,14 +423,18 @@ router.post('/:groupId/invites', requireAuth, async (req, res) => {
     const existing = await db.getGroupInvites({ groupId: group.id, inviteeId, status: 'pending', limit: 1 });
     if (existing.length > 0) return res.status(409).json({ error: '保留中の招待がすでにあります。' });
     const invite = await db.createGroupInvite({ id: crypto.randomUUID(), groupId: group.id, inviterId: req.user.id, inviteeId, status: 'pending' });
-    const notification = await createNotificationIfAllowed(db, {
-      userId: inviteeId,
-      type: 'group_invite',
-      fromUserId: req.user.id,
-      target: { kind: 'route', value: '#groups' },
-      message: `「${group.name}」へのグループ招待が届いています。`,
-    });
-    await publishNotification(req, inviteeId, notification);
+    try {
+      const notification = await createNotificationIfAllowed(db, {
+        userId: inviteeId,
+        type: 'group_invite',
+        fromUserId: req.user.id,
+        target: { kind: 'route', value: '#groups' },
+        message: `「${group.name}」へのグループ招待が届いています。`,
+      });
+      await publishNotification(req, inviteeId, notification);
+    } catch (error) {
+      console.warn('[groups] invite notification delivery failed:', error.message);
+    }
     res.status(201).json({ invite });
   } catch (error) {
     errorResponse(res, error, 'invite create error');
@@ -421,9 +464,16 @@ router.post('/:groupId/join-requests/:requestId/respond', requireAuth, async (re
     const request = await db.getGroupJoinRequest(req.params.requestId);
     if (!request || String(request.groupId ?? request.group_id) !== group.id || request.status !== 'pending') return res.status(404).json({ error: '保留中の参加申請が見つかりません。' });
     if (decision === 'approve') {
-      await assertMembershipCapacity(req, group, request.userId ?? request.user_id);
-      const memberRole = await getDefaultMemberRoleOrThrow(db, group.id);
-      await db.createGroupMembership({ groupId: group.id, userId: request.userId ?? request.user_id, roleId: memberRole.id, status: 'active', joinedAt: new Date().toISOString() });
+      const applicantId = Number(request.userId ?? request.user_id);
+      const existingMembership = await db.getGroupMembership(group.id, applicantId);
+      if (existingMembership?.status === 'banned') {
+        return res.status(403).json({ error: 'このユーザーはグループへの参加を禁止されています。' });
+      }
+      if (existingMembership?.status !== 'active') {
+        await assertMembershipCapacity(req, group, applicantId);
+        const memberRole = await getDefaultMemberRoleOrThrow(db, group.id);
+        await db.createGroupMembership({ groupId: group.id, userId: applicantId, roleId: memberRole.id, status: 'active', joinedAt: new Date().toISOString() });
+      }
     }
     const updated = await db.updateGroupJoinRequest(request.id, { status: decision === 'approve' ? 'approved' : 'declined', reviewedBy: req.user.id });
     res.json({ join_request: updated });
@@ -504,8 +554,16 @@ router.get('/:groupId/members', requireAuth, async (req, res) => {
   try {
     const group = await getGroupOr404(req, res);
     if (!group) return;
-    await requireActiveMembership(getDb(req), group, req.user.id);
-    const memberships = await getDb(req).getGroupMemberships(group.id, { status: req.query.status || 'active', limit: 200, offset: normalizeOffset(req.query.offset) });
+    const requestedStatus = String(req.query.status || 'active');
+    if (!['active', 'pending', 'invited', 'banned'].includes(requestedStatus)) {
+      return res.status(400).json({ error: 'メンバー状態が正しくありません。' });
+    }
+    if (requestedStatus === 'active') {
+      await requireActiveMembership(getDb(req), group, req.user.id);
+    } else {
+      await requireGroupPermission(getDb(req), group, req.user.id, 'ban');
+    }
+    const memberships = await getDb(req).getGroupMemberships(group.id, { status: requestedStatus, limit: 200, offset: normalizeOffset(req.query.offset) });
     const users = await getDb(req).getUsersByIds(memberships.map((membership) => membership.userId ?? membership.user_id));
     const usersById = new Map(users.map((user) => [Number(user.id), user]));
     res.json({ members: memberships.map((membership) => ({ membership: membershipPayload(membership), user: usersById.get(Number(membership.userId ?? membership.user_id)) || null })) });
@@ -524,6 +582,8 @@ router.patch('/:groupId/members/:userId', requireAuth, async (req, res) => {
     const state = await requireActiveMembership(db, group, req.user.id);
     if (!isAdmin(group, state.membership, state.role)) return res.status(403).json({ error: 'メンバーを管理する権限がありません。' });
     if (isOwner(group, memberId)) return res.status(403).json({ error: 'オーナーのロールは変更できません。' });
+    const member = await db.getGroupMembership(group.id, memberId);
+    if (!member || member.status !== 'active') return res.status(404).json({ error: '参加中のメンバーが見つかりません。' });
     const roleId = String(req.body?.role_id || '').trim();
     const role = (await db.getGroupRoles(group.id)).find((candidate) => String(candidate.id) === roleId);
     if (!role) return res.status(400).json({ error: 'ロールが正しくありません。' });
@@ -544,10 +604,20 @@ router.post('/:groupId/members/:userId/ban', requireAuth, async (req, res) => {
     const db = getDb(req);
     await requireGroupPermission(db, group, req.user.id, 'ban');
     if (isOwner(group, memberId)) return res.status(403).json({ error: 'オーナーを追放することはできません。' });
+    if (!await db.getUserById(memberId)) return res.status(404).json({ error: 'ユーザーが見つかりません。' });
     const current = await db.getGroupMembership(group.id, memberId);
+    if (current?.status === 'active' && !isOwner(group, req.user.id)) {
+      const roles = await db.getGroupRoles(group.id);
+      const targetRoleId = current.roleId ?? current.role_id ?? null;
+      const targetRole = roles.find((role) => String(role.id) === String(targetRoleId)) || null;
+      if (isAdmin(group, current, targetRole)) {
+        return res.status(403).json({ error: '管理者を禁止できるのはオーナーのみです。' });
+      }
+    }
     const updated = current
       ? await db.updateGroupMembership(group.id, memberId, { status: 'banned', roleId: null, joinedAt: null })
       : await db.createGroupMembership({ groupId: group.id, userId: memberId, roleId: null, status: 'banned', joinedAt: null });
+    await cancelPendingGroupJoinRequests(db, group.id, memberId);
     res.json({ membership: membershipPayload(updated) });
   } catch (error) {
     errorResponse(res, error, 'member ban error');

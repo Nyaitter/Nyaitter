@@ -1653,7 +1653,7 @@ class PostgresAdapter extends DatabaseAdapter {
 		const safeLimit = Math.max(1, Math.min(Number(limit) || 30, 100));
 		const values = [String(groupId)];
 		const clauses = ['group_id = $1'];
-		if (Number.isInteger(Number(authorId)) && Number(authorId) >= 0) {
+		if (authorId != null && authorId !== '' && Number.isInteger(Number(authorId)) && Number(authorId) >= 0) {
 			values.push(Number(authorId)); clauses.push(`user_id = $${values.length}`);
 		}
 		if (Number.isInteger(Number(beforeId)) && Number(beforeId) > 0) {

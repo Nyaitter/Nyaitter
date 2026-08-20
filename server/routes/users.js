@@ -125,6 +125,7 @@ function getStorageAdapter(req) {
 	return req.app.locals.storageAdapter;
 }
 
+
 function validateProfileText(value, label, range) {
 	if (value === undefined) return null;
 	if (typeof value !== 'string') return `${label} must be a string`;
@@ -434,6 +435,7 @@ router.get('/logs', requireAuth, async (req, res) => {
 	}
 });
 
+
 router.get('/:userId', optionalAuth, async (req, res) => {
 	const db = getDbAdapter(req);
 	const userId = parseInt(req.params.userId, 10);
@@ -449,15 +451,33 @@ router.get('/:userId', optionalAuth, async (req, res) => {
 		}
 
 			const viewerId = req.user ? req.user.id : null;
-			res.json({
-				user: await serializePublicProfile(
-					db,
-					user,
-					viewerId,
-					getPublicUrl(req),
-					req.user?.visibilityUser || null,
-				),
-			});
+			const profile = await serializePublicProfile(
+				db,
+				user,
+				viewerId,
+				getPublicUrl(req),
+				req.user?.visibilityUser || null,
+			);
+			let groups = [];
+			if (viewerId != null) {
+				const [viewerGroups, targetGroups] = await Promise.all([
+					db.getUserGroups(viewerId, { status: 'active', limit: 200, offset: 0 }),
+					db.getUserGroups(userId, { status: 'active', limit: 200, offset: 0 }),
+				]);
+				const targetGroupIds = new Set(targetGroups.map((group) => String(group.id)));
+				groups = viewerGroups
+					.filter((group) => targetGroupIds.has(String(group.id)))
+					.map((group) => ({
+						id: String(group.id),
+						name: group.name || '',
+						description: group.description || '',
+						icon_data: group.iconData ?? group.icon_data ?? null,
+						header_image: group.headerImage ?? group.header_image ?? null,
+						visibility: group.visibility || 'open',
+						member_count: Math.max(0, Number(group.memberCount ?? group.member_count) || 0),
+					}));
+			}
+			res.json({ user: { ...profile, groups } });
 	} catch (err) {
 		console.error('[users] profile error:', err);
 		res.status(500).json({ error: 'プロフィール取得に失敗しました' });

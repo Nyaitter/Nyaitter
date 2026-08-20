@@ -313,7 +313,12 @@ function canViewPostWithContext(post, context) {
 
 	// グループ投稿は投稿者自身を含め、現在も参加状態がactiveのメンバーだけが閲覧できる。
 	// 退出後は過去投稿も閲覧できないというグループ境界を最初に適用する。
-	if (groupId && (context.viewerId == null || !context.activeGroupIds?.has(groupId))) return false;
+	if (groupId) {
+		if (context.viewerId == null || !context.activeGroupIds?.has(groupId)) return false;
+		// グループ参加者への公開範囲はグループの参加状態で決まる。
+		// 通常投稿用のlock設定で参加者を除外しない。
+		return !hasBlockRelationshipInContext(context, authorId);
+	}
 	if (hasBlockRelationshipInContext(context, authorId)) return false;
 	if (!isPrivatePost(post, author)) return true;
 	if (context.viewerId == null) return false;

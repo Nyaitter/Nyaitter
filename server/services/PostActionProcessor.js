@@ -169,6 +169,7 @@ function normalizeTargetPostId(value) {
 async function notifyGroupAnnouncement(context, group, post) {
   const memberIds = await listActiveGroupMemberIds(context.db, group.id);
   for (const memberId of memberIds) {
+    if (Number(memberId) === Number(post.userId)) continue;
     const notification = await createNotificationIfAllowed(context.db, {
       userId: memberId,
       type: 'group_announcement',
@@ -276,7 +277,14 @@ async function processCreatePostAction(context, payload) {
 
   const replyTarget = replyTo ? relatedPosts.get(replyTo) : null;
   const repostTarget = repostTo ? relatedPosts.get(repostTo) : null;
-  if (replyTarget) {
+  const needsGroupRecipientCheck = Boolean(group && (replyTarget || repostTarget || /@\d+/.test(content)));
+  const activeGroupMemberIds = needsGroupRecipientCheck
+    ? new Set(await listActiveGroupMemberIds(context.db, group.id))
+    : null;
+  const canNotifyPostRecipient = (recipientId) => (
+    !activeGroupMemberIds || activeGroupMemberIds.has(Number(recipientId))
+  );
+  if (replyTarget && canNotifyPostRecipient(replyTarget.userId)) {
     await notifyPostAction(context, {
       userId: replyTarget.userId,
       type: 'reply',
@@ -284,7 +292,7 @@ async function processCreatePostAction(context, payload) {
       postId: post.id,
     });
   }
-  if (repostTarget) {
+  if (repostTarget && canNotifyPostRecipient(repostTarget.userId)) {
     await notifyPostAction(context, {
       userId: repostTarget.userId,
       type: isSimpleRepost ? 'repost' : 'quote',
@@ -303,6 +311,7 @@ async function processCreatePostAction(context, payload) {
     if (!Number.isInteger(mentionedUserId) || mentionedUserId <= 0) continue;
     if (excludedNotificationIds.has(mentionedUserId)) continue;
     excludedNotificationIds.add(mentionedUserId);
+    if (!canNotifyPostRecipient(mentionedUserId)) continue;
     await notifyPostAction(context, {
       userId: mentionedUserId,
       type: 'mention',

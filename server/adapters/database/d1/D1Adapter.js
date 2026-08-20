@@ -795,7 +795,9 @@ class D1Adapter extends DatabaseAdapter {
 	async getGroupPostIds(groupId, { limit = 30, offset = 0, beforeId = null, authorId = null } = {}) {
 		return this._read(this._query(`/groups/${this._groupPath(groupId)}/posts`, {
 			limit: this._limit(limit, 30, 100), offset: Math.max(0, Number(offset) || 0), beforeId: beforeId ?? undefined,
-			authorId: Number.isInteger(Number(authorId)) && Number(authorId) >= 0 ? Number(authorId) : undefined,
+			authorId: authorId != null && authorId !== '' && Number.isInteger(Number(authorId)) && Number(authorId) >= 0
+				? Number(authorId)
+				: undefined,
 		}), { cacheSeconds: 0 });
 	}
 
