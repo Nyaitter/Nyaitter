@@ -1439,12 +1439,11 @@ export default {
 						FROM reposts r JOIN candidates c ON c.id = r.post_id
 						GROUP BY r.post_id
 					)`;
-						const engagementScore = `MIN(22.0,
-							/* Temporarily disabled: simple like score.
-							COALESCE(l.count, 0) * 4.0 / (COALESCE(l.count, 0) + 4.0)
-							+ simple star score.
-							COALESCE(s.count, 0) * 8.0 / (COALESCE(s.count, 0) + 2.0)
-							+ */ COALESCE(r.count, 0) * 10.0 / (COALESCE(r.count, 0) + 2.0))`;
+							const engagementScore = `MIN(22.0,
+								/* Keep simple like and star scores below the repost score. */
+								COALESCE(l.count, 0) * 2.0 / (COALESCE(l.count, 0) + 4.0)
+								+ COALESCE(s.count, 0) * 4.0 / (COALESCE(s.count, 0) + 2.0)
+								+ COALESCE(r.count, 0) * 10.0 / (COALESCE(r.count, 0) + 2.0))`;
 					const recencyScore = `48.0 / (1.0 + MAX(0.0, (julianday('now') - julianday(c.created_at)) * 24.0) / 6.0)`;
 					const query = viewerId == null
 						? `${commonCtes}, scored AS (

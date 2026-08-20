@@ -2187,13 +2187,15 @@ class InMemoryAdapter extends DatabaseAdapter {
 							0,
 						),
 					);
+					const likeCount = this.likeCountByPost.get(Number(post.id)) || 0;
+					const starCount = this.starCountByPost.get(Number(post.id)) || 0;
+					const repostCount = this.repostCountByPost.get(Number(post.id)) || 0;
 					const engagementScore = Math.min(
 						22,
-						/* Temporarily disabled: simple like score.
-						Math.log1p(this.likeCountByPost.get(Number(post.id)) || 0) * 2
-							+ simple star score.
-							Math.log1p(this.starCountByPost.get(Number(post.id)) || 0) * 4
-							+ */ Math.log1p(this.repostCountByPost.get(Number(post.id)) || 0) * 5,
+						// Keep simple like and star scores below the repost score.
+						Math.log1p(likeCount)
+							+ Math.log1p(starCount) * 2
+							+ Math.log1p(repostCount) * 5,
 					);
 					return { post, score: recencyScore + graphScore + affinityScore + keywordScore + engagementScore };
 			});

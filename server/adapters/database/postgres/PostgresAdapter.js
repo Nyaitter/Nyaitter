@@ -1589,11 +1589,10 @@ class PostgresAdapter extends DatabaseAdapter {
 					)
 					+ LEAST(
 						22::DECIMAL,
-							/* Temporarily disabled: simple like score.
-							COALESCE(l.count, 0)::DECIMAL * 4::DECIMAL / (COALESCE(l.count, 0)::DECIMAL + 4::DECIMAL)
-							+ simple star score.
-							COALESCE(s.count, 0)::DECIMAL * 8::DECIMAL / (COALESCE(s.count, 0)::DECIMAL + 2::DECIMAL)
-							+ */ COALESCE(r.count, 0)::DECIMAL * 10::DECIMAL / (COALESCE(r.count, 0)::DECIMAL + 2::DECIMAL)
+								/* Keep simple like and star scores below the repost score. */
+								COALESCE(l.count, 0)::DECIMAL * 2::DECIMAL / (COALESCE(l.count, 0)::DECIMAL + 4::DECIMAL)
+								+ COALESCE(s.count, 0)::DECIMAL * 4::DECIMAL / (COALESCE(s.count, 0)::DECIMAL + 2::DECIMAL)
+								+ COALESCE(r.count, 0)::DECIMAL * 10::DECIMAL / (COALESCE(r.count, 0)::DECIMAL + 2::DECIMAL)
 					)
 					${normalizedViewerId != null ? `+ CASE
 						WHEN df.user_id IS NOT NULL THEN 24::DECIMAL
