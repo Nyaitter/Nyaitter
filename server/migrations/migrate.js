@@ -85,20 +85,26 @@ async function waitForRetry(attempt) {
   await new Promise((resolve) => setTimeout(resolve, delay));
 }
 
+function quoteSqlLiteral(value) {
+  return `'${String(value).replace(/'/g, "''")}'`;
+}
+
 async function applyMigration(client, file) {
   const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf8');
+  const transactionSql = [
+    'BEGIN;',
+    sql,
+    `INSERT INTO nyaitter_schema_migrations (filename) VALUES (${quoteSqlLiteral(file)});`,
+    'COMMIT;',
+  ].join('\n');
 
   for (let attempt = 0; attempt <= transactionRetries; attempt += 1) {
     let started = false;
     try {
-      await client.query('BEGIN');
+      // パラメーターを使わない単純クエリでは複数文を1往復で送信できる。
+      // Migrationごとの原子性を保ちつつ、リモートDBへの4回の往復を1回へ削減する。
       started = true;
-      await client.query(sql);
-      await client.query(
-        'INSERT INTO nyaitter_schema_migrations (filename) VALUES ($1)',
-        [file],
-      );
-      await client.query('COMMIT');
+      await client.query(transactionSql);
       return;
     } catch (error) {
       if (started) {
