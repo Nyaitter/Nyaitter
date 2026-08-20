@@ -974,8 +974,14 @@ class InMemoryAdapter extends DatabaseAdapter {
 	}
 
 	async deleteGroup(groupId) {
-		const group = this.groups.get(String(groupId));
+		const normalizedGroupId = String(groupId);
+		const group = this.groups.get(normalizedGroupId);
 		if (!group || group.deletedAt) return null;
+		for (const post of [...this.posts.values()]) {
+			if (String(post.groupId ?? post.group_id ?? '') === normalizedGroupId) {
+				await this.adminDeletePost(post.id);
+			}
+		}
 		group.deletedAt = new Date().toISOString();
 		group.updatedAt = group.deletedAt;
 		return this._cloneGroup(group);

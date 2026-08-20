@@ -893,7 +893,7 @@ class PostgresAdapter extends DatabaseAdapter {
 			}
 
 			const { rows: channelRows } = await client.query(
-				`SELECT id, participants FROM dm_channels WHERE $1 = ANY(participants) FOR UPDATE`,
+				`SELECT id, participants FROM dm_channels WHERE $1::int = ANY(participants) FOR UPDATE`,
 				[userId],
 			);
 			for (const channel of channelRows) {
@@ -903,10 +903,10 @@ class PostgresAdapter extends DatabaseAdapter {
 			}
 
 			const { rows: groupRows } = await client.query(
-				`SELECT id, host_id, member, post, unread
-				 FROM group_dms
-				 WHERE host_id = $1 OR $1 = ANY(member)
-				 FOR UPDATE`,
+`SELECT id, host_id, member, post, unread
+					 FROM group_dms
+					 WHERE host_id = $1 OR $1::int = ANY(member)
+					 FOR UPDATE`,
 				[userId],
 			);
 			for (const group of groupRows) {
@@ -1379,12 +1379,32 @@ class PostgresAdapter extends DatabaseAdapter {
 	}
 
 	async deleteGroup(groupId) {
-		const { rows } = await this.pool.query(
-			`UPDATE groups SET deleted_at = NOW(), updated_at = NOW()
-			 WHERE id = $1 AND deleted_at IS NULL RETURNING *`,
-			[String(groupId)],
-		);
-		return normalizeGroupRow(rows[0] || null);
+		return this._withTransaction(async (client) => {
+			const normalizedGroupId = String(groupId);
+			const { rows } = await client.query(
+				`UPDATE groups SET deleted_at = NOW(), updated_at = NOW()
+				 WHERE id = $1 AND deleted_at IS NULL RETURNING *`,
+				[normalizedGroupId],
+			);
+			if (!rows[0]) return null;
+
+			const { rows: postRows } = await client.query(
+				'SELECT id FROM posts WHERE group_id = $1 FOR UPDATE',
+				[normalizedGroupId],
+			);
+			const postIds = postRows.map((post) => Number(post.id));
+			if (postIds.length > 0) {
+				await client.query('UPDATE posts SET reply_to = NULL WHERE reply_to = ANY($1::int[])', [postIds]);
+				await client.query('UPDATE posts SET repost_to = NULL WHERE repost_to = ANY($1::int[])', [postIds]);
+				await client.query('DELETE FROM likes WHERE post_id = ANY($1::int[])', [postIds]);
+				await client.query('DELETE FROM stars WHERE post_id = ANY($1::int[])', [postIds]);
+				await client.query('DELETE FROM reposts WHERE post_id = ANY($1::int[])', [postIds]);
+				await client.query('DELETE FROM pinned_posts WHERE post_id = ANY($1::int[])', [postIds]);
+				await client.query('DELETE FROM posts WHERE id = ANY($1::int[])', [postIds]);
+			}
+
+			return normalizeGroupRow(rows[0]);
+		});
 	}
 
 	async transferGroupOwnership(groupId, newOwnerId) {

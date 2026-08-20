@@ -1349,7 +1349,16 @@ export default {
 			if (method === 'DELETE' && pathname.match(/^\/groups\/[^/]+$/)) {
 				const groupId = decodeURIComponent(pathname.split('/')[2]);
 				const now = new Date().toISOString();
-				await db.prepare('UPDATE groups SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL').bind(now, now, groupId).run();
+				await db.batch([
+					db.prepare('UPDATE groups SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL').bind(now, now, groupId),
+					db.prepare('UPDATE posts SET reply_to = NULL WHERE reply_to IN (SELECT id FROM posts WHERE group_id = ?)').bind(groupId),
+					db.prepare('UPDATE posts SET repost_to = NULL WHERE repost_to IN (SELECT id FROM posts WHERE group_id = ?)').bind(groupId),
+					db.prepare('DELETE FROM likes WHERE post_id IN (SELECT id FROM posts WHERE group_id = ?)').bind(groupId),
+					db.prepare('DELETE FROM stars WHERE post_id IN (SELECT id FROM posts WHERE group_id = ?)').bind(groupId),
+					db.prepare('DELETE FROM reposts WHERE post_id IN (SELECT id FROM posts WHERE group_id = ?)').bind(groupId),
+					db.prepare('DELETE FROM pinned_posts WHERE post_id IN (SELECT id FROM posts WHERE group_id = ?)').bind(groupId),
+					db.prepare('DELETE FROM posts WHERE group_id = ?').bind(groupId),
+				]);
 				const row = await db.prepare('SELECT * FROM groups WHERE id = ?').bind(groupId).first();
 				return row ? json(normalizeGroupRow(row)) : notFound('Group not found');
 			}
