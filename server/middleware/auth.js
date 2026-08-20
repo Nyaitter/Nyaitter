@@ -223,6 +223,9 @@ function isSameOriginRequest(req) {
     }
   }
 
+  // npm run devでは開発用認証バイパスと全オリジンCORSを同時に有効化するため、
+  // Cookie付きの状態変更要求もオリジンで拒否しない。
+  if (isDevelopmentCorsMode()) return true;
   return config.cors?.credentials === true && isCorsOriginAllowed(origin);
 }
 
