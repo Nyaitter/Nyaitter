@@ -201,6 +201,23 @@ router.get('/mine', requireAuth, async (req, res) => {
   }
 });
 
+router.get('/shared/:userId', requireAuth, async (req, res) => {
+  const targetUserId = normalizeUserId(req.params.userId);
+  if (targetUserId == null) return res.status(400).json({ error: 'ユーザーIDが正しくありません。' });
+  try {
+    const db = getDb(req);
+    const [viewerGroups, targetGroups] = await Promise.all([
+      db.getUserGroups(req.user.id, { status: 'active', limit: 200, offset: 0 }),
+      db.getUserGroups(targetUserId, { status: 'active', limit: 200, offset: 0 }),
+    ]);
+    const targetGroupIds = new Set(targetGroups.map((group) => String(group.id)));
+    const groups = viewerGroups.filter((group) => targetGroupIds.has(String(group.id)));
+    res.json({ groups: groups.map((group) => groupPayload(group, { membership: membershipPayload(group.membership) })) });
+  } catch (error) {
+    errorResponse(res, error, 'shared group list error');
+  }
+});
+
 router.get('/invites/mine', requireAuth, async (req, res) => {
   try {
     const invites = await getDb(req).getGroupInvites({ inviteeId: req.user.id, status: 'pending', limit: 100 });
