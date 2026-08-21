@@ -124,6 +124,21 @@ AUTH_PASSKEY_ORIGIN=https://nyaitter.example.com
    - 不要な連携をいつでも解除できます。
    - ※ アカウントに最低1つの認証方法が残るよう、自動で保護されます（誤って全解除してログインできなくなる心配はありません）。
 
+## 認証方法ごとの新規登録の制御 (ALLOW_SIGNUP)
+
+各認証方法ごとに、**新規アカウントの作成（登録）を許可するか** を個別に設定できます。  
+`false` に設定した場合、その方法での新規登録は拒否され、既にアカウントをお持ちの既存ユーザーのログインのみが許可されます。
+
+```dotenv
+# server/.env
+AUTH_METHOD_SCRATCH_ALLOW_SIGNUP=true      # Scratchでの新規登録
+AUTH_METHOD_EMAIL_ALLOW_SIGNUP=true        # メールでの新規登録
+AUTH_METHOD_PASSKEY_ALLOW_SIGNUP=true      # パスキーでの新規登録
+AUTH_METHOD_NYAITTER_AUTH_ALLOW_SIGNUP=true # 他サーバー連携での新規登録
+```
+
+> **プライバシー保護**: メールアドレス認証などで新規アカウントを作成する際は、メールアドレスの一部が公開ユーザー名になってしまうのを防ぐため、登録画面で希望のユーザー名（表示名）を入力します。
+
 ---
 
 ## 設定の動作確認

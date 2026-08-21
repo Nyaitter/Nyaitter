@@ -14,7 +14,18 @@ class NyaitterAuthProvider extends BaseAuthProvider {
   }
 
   isEnabled(config, req = null) {
+    if (config?.auth?.methods?.nyaitter?.enabled !== undefined) {
+      return Boolean(config.auth.methods.nyaitter.enabled);
+    }
     if (config?.auth?.nyaitterAuth?.enabled === false) return false;
+    return true;
+  }
+
+  isSignupAllowed(config, req = null) {
+    const methodConfig = config?.auth?.methods?.nyaitter || config?.auth?.nyaitterAuth || {};
+    if (methodConfig.allowSignup !== undefined) {
+      return Boolean(methodConfig.allowSignup);
+    }
     return true;
   }
 
@@ -23,6 +34,7 @@ class NyaitterAuthProvider extends BaseAuthProvider {
       name: this.name,
       displayName: this.displayName,
       enabled: this.isEnabled(config, req),
+      allowSignup: this.isSignupAllowed(config, req),
       description: '他のNyaitterサーバーのアカウントを使用してログイン・連携します（同一サーバーは不可）。',
     };
   }
@@ -200,6 +212,13 @@ class NyaitterAuthProvider extends BaseAuthProvider {
     }
 
     // 3. Create new user account
+    if (!this.isSignupAllowed(context.config || {}, context.req || null)) {
+      const err = new Error(`この認証方式（${this.displayName}）での新規アカウント作成は無効化されています。`);
+      err.status = 403;
+      err.code = 'signup_disabled';
+      throw err;
+    }
+
     const newUser = await db.createUser({
       scid: identity.scid || null,
       name: identity.name,

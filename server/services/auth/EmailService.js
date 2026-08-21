@@ -71,7 +71,7 @@ class EmailService {
     return { code, expiresAt, expiresIn: expiryMinutes * 60 };
   }
 
-  verifyCode(email, inputCode) {
+  verifyCode(email, inputCode, { consume = true } = {}) {
     const normalized = this.normalizeEmail(email);
     const record = this.pendingCodes.get(normalized);
 
@@ -95,9 +95,15 @@ class EmailService {
       return { success: false, reason: '認証コードが一致しません。正しく入力してください。' };
     }
 
-    // Consume code on successful verification
-    this.pendingCodes.delete(normalized);
+    if (consume) {
+      this.pendingCodes.delete(normalized);
+    }
     return { success: true };
+  }
+
+  consumeCode(email) {
+    const normalized = this.normalizeEmail(email);
+    this.pendingCodes.delete(normalized);
   }
 
   async sendVerificationEmail(email, code, { siteName = 'Nyaitter' } = {}) {

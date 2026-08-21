@@ -27,6 +27,7 @@ class EmailAuthProvider extends BaseAuthProvider {
       name: this.name,
       displayName: this.displayName,
       enabled: this.isEnabled(config, req),
+      allowSignup: this.isSignupAllowed(config, req),
       codeLength: emailConfig.codeLength || 6,
       turnstileRequired: Boolean(config?.turnstile?.enabled),
     };
@@ -90,21 +91,21 @@ class EmailAuthProvider extends BaseAuthProvider {
     }
 
     const normalizedEmail = this.emailService.normalizeEmail(email);
-    const result = this.emailService.verifyCode(normalizedEmail, code);
+    const result = this.emailService.verifyCode(normalizedEmail, code, { consume: false });
     if (!result.success) {
       const err = new Error(result.reason || '認証コードの検証に失敗しました。');
       err.status = 400;
       throw err;
     }
 
-    const defaultName = normalizedEmail.split('@')[0].slice(0, 50);
+    const providedName = payload.name ? String(payload.name).trim() : null;
 
     return {
       success: true,
       identity: {
         authProvider: 'email',
         externalId: normalizedEmail,
-        name: defaultName,
+        name: providedName,
       },
       profile: {
         email: normalizedEmail,
@@ -113,23 +114,10 @@ class EmailAuthProvider extends BaseAuthProvider {
   }
 
   async resolveUser(db, authResult, context = {}) {
-    const { identity, profile } = authResult;
-    const email = identity.externalId;
-
-    let user = null;
-    if (typeof db.getUserByExternalId === 'function') {
-      user = await db.getUserByExternalId('email', email);
+    const user = await super.resolveUser(db, authResult, context);
+    if (authResult?.identity?.externalId) {
+      this.emailService.consumeCode(authResult.identity.externalId);
     }
-
-    if (!user) {
-      user = await db.createUser({
-        name: identity.name || email.split('@')[0],
-        auth_provider: 'email',
-        external_id: email,
-        external_profile: profile || { email },
-      });
-    }
-
     return user;
   }
 }

@@ -28,6 +28,7 @@ class PasskeyAuthProvider extends BaseAuthProvider {
       name: this.name,
       displayName: this.displayName,
       enabled: this.isEnabled(config, req),
+      allowSignup: this.isSignupAllowed(config, req),
       rpName: passkeyConfig.rpName || 'Nyaitter',
       rpId,
     };

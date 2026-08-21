@@ -276,6 +276,8 @@ router.post('/:provider/verify', async (req, res) => {
     const { user } = await authService.verifyAndResolveUser(provider, req, req.body, {
       config,
       db,
+      payload: req.body,
+      req,
     });
 
     const result = await beginProtectedLogin(req, res, user);
@@ -410,6 +412,8 @@ router.post('/scratch/verify', async (req, res) => {
     }, {
       config,
       db,
+      payload: req.body,
+      req,
     });
 
     const result = await beginProtectedLogin(req, res, user);

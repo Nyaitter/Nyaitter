@@ -33,6 +33,20 @@ class BaseAuthProvider {
   }
 
   /**
+   * Check if new account registration is permitted for this auth provider.
+   * @param {object} config - Server config
+   * @param {object} [req] - Express request
+   * @returns {boolean}
+   */
+  isSignupAllowed(config, req = null) {
+    const methodConfig = config?.auth?.methods?.[this.name] || config?.auth?.[this.name] || {};
+    if (methodConfig.allowSignup !== undefined) {
+      return Boolean(methodConfig.allowSignup);
+    }
+    return true;
+  }
+
+  /**
    * Get public configuration / metadata exposed to clients.
    * @param {object} config
    * @param {object} [req]
@@ -43,6 +57,7 @@ class BaseAuthProvider {
       name: this.name,
       displayName: this.displayName,
       enabled: this.isEnabled(config, req),
+      allowSignup: this.isSignupAllowed(config, req),
     };
   }
 
@@ -112,17 +127,57 @@ class BaseAuthProvider {
       }
     }
 
-    // 2. Create new user
+    // 2. Check if new account creation is allowed for this provider
+    const cfg = context.config || {};
+    if (!this.isSignupAllowed(cfg, context.req)) {
+      const err = new Error('この認証方式での新規アカウント作成は無効化されています。');
+      err.status = 403;
+      err.code = 'signup_disabled';
+      throw err;
+    }
+
+    // 3. Resolve username for new user account
+    let finalUserName = '';
+    const isPublicHandleProvider = providerName === 'scratch' || providerName === 'nyaitter';
+
+    if (isPublicHandleProvider) {
+      finalUserName = String(identity.name || identity.scid || '').trim();
+    } else {
+      // For email, passkey, etc., require explicit user-provided username to protect privacy
+      const providedName = String(context.payload?.name || context.payload?.username || context.name || identity.name || '').trim();
+      const isFallbackOrEmail = !providedName
+        || providedName === String(identity.externalId)
+        || providedName.includes('@')
+        || providedName === `${this.displayName}_User`
+        || providedName === 'Passkey User';
+
+      if (isFallbackOrEmail) {
+        const err = new Error('ユーザー名を設定してください。');
+        err.status = 400;
+        err.code = 'username_required';
+        throw err;
+      }
+      finalUserName = providedName;
+    }
+
+    const maxNameLen = cfg.limits?.userNameLength?.max || 50;
+    if (finalUserName.length > maxNameLen) {
+      const err = new Error(`ユーザー名は${maxNameLen}文字以内で入力してください。`);
+      err.status = 400;
+      throw err;
+    }
+
+    // 4. Create new user
     const newUser = await db.createUser({
       scid: identity.scid || null,
-      name: identity.name || identity.scid || `${this.displayName}_User`,
+      name: finalUserName,
       auth_provider: providerName,
       external_id: identity.externalId != null ? String(identity.externalId) : null,
       provider_domain: identity.providerDomain || null,
       external_profile: profile || null,
     });
 
-    // 3. Link initial auth provider
+    // 5. Link initial auth provider
     if (typeof db.linkAuthProvider === 'function') {
       try {
         await db.linkAuthProvider(newUser.id, providerName, providerUserId, profile || {});

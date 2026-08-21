@@ -444,6 +444,10 @@ const config = {
 	          'AUTH_METHOD_SCRATCH_ENABLED',
 	          envBoolean('AUTH_SCRATCH_ENABLED', get('auth.methods.scratch.enabled', true)),
 	        ),
+	        allowSignup: envBoolean(
+	          'AUTH_METHOD_SCRATCH_ALLOW_SIGNUP',
+	          envBoolean('AUTH_SCRATCH_ALLOW_SIGNUP', get('auth.methods.scratch.allowSignup', true)),
+	        ),
 	        verificationProjectId: String(
 	          process.env.AUTH_SCRATCH_VERIFICATION_PROJECT_ID
 	          || process.env.SCRATCH_VERIFICATION_PROJECT_ID
@@ -471,6 +475,10 @@ const config = {
 	          'AUTH_METHOD_PASSKEY_ENABLED',
 	          envBoolean('AUTH_PASSKEY_ENABLED', get('auth.methods.passkey.enabled', false)),
 	        ),
+	        allowSignup: envBoolean(
+	          'AUTH_METHOD_PASSKEY_ALLOW_SIGNUP',
+	          envBoolean('AUTH_PASSKEY_ALLOW_SIGNUP', get('auth.methods.passkey.allowSignup', true)),
+	        ),
 	        rpName: String(
 	          process.env.AUTH_PASSKEY_RP_NAME || get('auth.methods.passkey.rpName', 'Nyaitter'),
 	        ).trim(),
@@ -485,6 +493,10 @@ const config = {
 	        enabled: envBoolean(
 	          'AUTH_METHOD_EMAIL_ENABLED',
 	          envBoolean('AUTH_EMAIL_ENABLED', get('auth.methods.email.enabled', true)),
+	        ),
+	        allowSignup: envBoolean(
+	          'AUTH_METHOD_EMAIL_ALLOW_SIGNUP',
+	          envBoolean('AUTH_EMAIL_ALLOW_SIGNUP', get('auth.methods.email.allowSignup', true)),
 	        ),
 	        codeExpiryMinutes: envNonNegativeInteger(
 	          'AUTH_EMAIL_CODE_EXPIRY_MINUTES',
@@ -530,10 +542,24 @@ const config = {
 	          ).trim(),
 	        },
 	      },
+	      nyaitter: {
+	        enabled: envBoolean(
+	          'AUTH_METHOD_NYAITTER_AUTH_ENABLED',
+	          envBoolean('AUTH_NYAITTER_ENABLED', get('auth.methods.nyaitter.enabled', get('auth.nyaitterAuth.enabled', true))),
+	        ),
+	        allowSignup: envBoolean(
+	          'AUTH_METHOD_NYAITTER_AUTH_ALLOW_SIGNUP',
+	          envBoolean('AUTH_NYAITTER_ALLOW_SIGNUP', get('auth.methods.nyaitter.allowSignup', get('auth.nyaitterAuth.allowSignup', true))),
+	        ),
+	      },
 	      oauth: {
 	        enabled: envBoolean(
 	          'AUTH_METHOD_OAUTH_ENABLED',
 	          envBoolean('AUTH_OAUTH_ENABLED', get('auth.methods.oauth.enabled', false)),
+	        ),
+	        allowSignup: envBoolean(
+	          'AUTH_METHOD_OAUTH_ALLOW_SIGNUP',
+	          envBoolean('AUTH_OAUTH_ALLOW_SIGNUP', get('auth.methods.oauth.allowSignup', true)),
 	        ),
 	        providers: get('auth.methods.oauth.providers', {}),
 	      },
@@ -541,6 +567,10 @@ const config = {
 	        enabled: envBoolean(
 	          'AUTH_METHOD_PASSWORD_ENABLED',
 	          envBoolean('AUTH_PASSWORD_ENABLED', get('auth.methods.password.enabled', false)),
+	        ),
+	        allowSignup: envBoolean(
+	          'AUTH_METHOD_PASSWORD_ALLOW_SIGNUP',
+	          envBoolean('AUTH_PASSWORD_ALLOW_SIGNUP', get('auth.methods.password.allowSignup', true)),
 	        ),
 	      },
 	    },
