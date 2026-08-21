@@ -230,12 +230,17 @@ function normalizeGroupDmRow(row, viewerId = null) {
 	const post = parseJsonSafe(row.post, []);
 	const time = toIsoString(row.time);
 	const createdAt = toIsoString(row.created_at);
+	const memberList = Array.isArray(member) ? member.map(Number).filter(Number.isInteger) : [];
+	const accepted = Array.isArray(unread?._accepted)
+		? unread._accepted.map(Number).filter(Number.isInteger)
+		: memberList;
 
 	const res = {
 		id: String(row.id),
 		host_id: Number(row.host_id ?? row.hostId),
 		title: row.title || '',
-		member: Array.isArray(member) ? member.map(Number).filter(Number.isInteger) : [],
+		member: memberList,
+		accepted,
 		unread: typeof unread === 'object' && unread !== null ? unread : {},
 		post: Array.isArray(post) ? post : [],
 		time,
@@ -2942,12 +2947,16 @@ class PostgresAdapter extends DatabaseAdapter {
 		const id = crypto.randomUUID();
 		const now = new Date().toISOString();
 		const title = String(dmData.title || '');
+		const unreadObj = dmData.unread && typeof dmData.unread === 'object' ? { ...dmData.unread } : {};
+		if (Array.isArray(dmData.accepted)) {
+			unreadObj._accepted = dmData.accepted.map(Number).filter(Number.isInteger);
+		}
 
 		const { rows } = await this.pool.query(
 			`INSERT INTO group_dms (id, host_id, title, member, post, unread, time, created_at)
-			 VALUES ($1, $2, $3, $4::int[], '[]'::jsonb, '{}'::jsonb, $5, $5)
+			 VALUES ($1, $2, $3, $4::int[], '[]'::jsonb, $5::jsonb, $6, $6)
 			 RETURNING *`,
-			[id, hostId, title, member, now],
+			[id, hostId, title, member, JSON.stringify(unreadObj), now],
 		);
 		return normalizeGroupDmRow(rows[0], hostId);
 	}
@@ -2977,6 +2986,12 @@ class PostgresAdapter extends DatabaseAdapter {
 		if (updates.unread !== undefined) {
 			sets.push(`unread = $${i++}::jsonb`);
 			values.push(JSON.stringify(updates.unread));
+		} else if (updates.accepted !== undefined) {
+			const existing = await this.getGroupDm(dmId);
+			const unreadObj = existing?.unread && typeof existing.unread === 'object' ? { ...existing.unread } : {};
+			unreadObj._accepted = Array.from(new Set(updates.accepted.map(Number).filter(Number.isInteger)));
+			sets.push(`unread = $${i++}::jsonb`);
+			values.push(JSON.stringify(unreadObj));
 		}
 		if (updates.time !== undefined) {
 			sets.push(`time = $${i++}`);

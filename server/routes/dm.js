@@ -244,10 +244,17 @@ async function serializeGroupDm(db, dm, userId, { includePosts = true } = {}) {
 	const unreadCount = Number(
 		dm.unread?.[userId] ?? dm.unread?.[String(userId)] ?? dm.unread_count ?? 0,
 	);
+	const acceptedList = Array.isArray(dm.accepted)
+		? dm.accepted.map(Number)
+		: (Array.isArray(dm.unread?._accepted) ? dm.unread._accepted.map(Number) : (dm.member || []).map(Number));
+	const isPending = !acceptedList.includes(Number(userId));
+
 	return {
 		id: dm.id,
 		title: dm.title || '',
 		member: dm.member.slice(),
+		accepted: acceptedList,
+		is_pending: isPending,
 		host_id: dm.host_id,
 		created_at: dm.created_at || dm.createdAt || dm.time || null,
 		post: includePosts ? messages : [],
@@ -433,13 +440,21 @@ router.post('/', requireAuth, async (req, res) => {
 				});
 			}
 
+		const acceptedMembers = [userId];
+		for (const memberId of membersToValidate) {
+			if (typeof db.isFollowing === 'function' && await db.isFollowing(memberId, userId)) {
+				acceptedMembers.push(memberId);
+			}
+		}
+
 		const dm = await db.createGroupDm({
 			hostId: userId,
 			member: memberIds,
+			accepted: acceptedMembers,
 			title: typeof title === 'string' ? title.trim() : '',
 		});
 
-		res.status(201).json({ dm, created: true });
+		res.status(201).json({ dm: await serializeGroupDm(db, dm, userId), created: true });
 	} catch (err) {
 		console.error('[dm] create error:', err);
 		res.status(500).json({ error: 'DM 作成に失敗しました' });
@@ -617,22 +632,91 @@ router.post('/:dmId/messages', requireAuth, dmSendLimiter, async (req, res) => {
 			}
 		}
 
-				const updated = await db.appendToGroupDm(dmId, msg, userId);
-				const sender = await db.getUserById(userId);
-				await publishDmMessage(req, updated.member || [], dmId, msg, sender ? serializeDmMember(sender) : null);
-				await publishDmUnreadCounts(
-					req,
-					(updated.member || []).filter((memberId) => Number(memberId) !== Number(userId)),
-					dmId,
-				);
+		const currentAccepted = Array.isArray(dm.accepted)
+			? dm.accepted.slice()
+			: (Array.isArray(dm.unread?._accepted) ? dm.unread._accepted.slice() : (dm.member || []).slice());
+		if (!currentAccepted.includes(userId)) {
+			currentAccepted.push(userId);
+			await db.updateGroupDm(dmId, { accepted: currentAccepted });
+		}
 
-			res.status(201).json({
+		const updated = await db.appendToGroupDm(dmId, msg, userId);
+		const sender = await db.getUserById(userId);
+		await publishDmMessage(req, updated.member || [], dmId, msg, sender ? serializeDmMember(sender) : null);
+		await publishDmUnreadCounts(
+			req,
+			(updated.member || []).filter((memberId) => Number(memberId) !== Number(userId)),
+			dmId,
+		);
+
+		res.status(201).json({
 			dm: await serializeGroupDm(db, updated, userId),
 			message: msg,
 		});
 	} catch (err) {
 		console.error('[dm] send error:', err);
 		res.status(500).json({ error: 'メッセージ送信に失敗しました' });
+	}
+});
+
+router.post('/:dmId/accept', requireAuth, async (req, res) => {
+	const db = getDbAdapter(req);
+	const userId = req.user.id;
+	const dmId = req.params.dmId;
+
+	try {
+		const dm = await db.getGroupDm(dmId);
+		if (!dm) {
+			return res.status(404).json({ error: 'DM not found' });
+		}
+		if (!dm.member.includes(userId)) {
+			return res.status(403).json({ error: 'Forbidden' });
+		}
+
+		const currentAccepted = Array.isArray(dm.accepted)
+			? dm.accepted.slice()
+			: (Array.isArray(dm.unread?._accepted) ? dm.unread._accepted.slice() : (dm.member || []).slice());
+
+		if (!currentAccepted.includes(userId)) {
+			currentAccepted.push(userId);
+			const updated = await db.updateGroupDm(dmId, { accepted: currentAccepted });
+			await publishDmUnreadCounts(req, dm.member, dmId);
+			return res.json({
+				success: true,
+				dm: await serializeGroupDm(db, updated || dm, userId),
+			});
+		}
+
+		res.json({
+			success: true,
+			dm: await serializeGroupDm(db, dm, userId),
+		});
+	} catch (err) {
+		console.error('[dm] accept error:', err);
+		res.status(500).json({ error: 'DM の承認に失敗しました' });
+	}
+});
+
+router.post('/:dmId/decline', requireAuth, async (req, res) => {
+	const db = getDbAdapter(req);
+	const userId = req.user.id;
+	const dmId = req.params.dmId;
+
+	try {
+		const dm = await db.getGroupDm(dmId);
+		if (!dm) {
+			return res.status(404).json({ error: 'DM not found' });
+		}
+		if (!dm.member.includes(userId)) {
+			return res.status(403).json({ error: 'Forbidden' });
+		}
+
+		await db.leaveGroupDm(dmId, userId);
+		await publishDmUnreadCounts(req, dm.member, dmId);
+		res.json({ success: true });
+	} catch (err) {
+		console.error('[dm] decline error:', err);
+		res.status(500).json({ error: 'メッセージリクエストの拒否に失敗しました' });
 	}
 });
 
@@ -650,12 +734,12 @@ router.post('/:dmId/read', requireAuth, async (req, res) => {
 			return res.status(403).json({ error: 'Forbidden' });
 		}
 
-			const unreadBefore = Number(dm.unread?.[userId] || 0);
-			await db.markGroupDmRead(dmId, userId);
-			if (unreadBefore > 0) {
-				await publishDmUnreadCounts(req, [userId], dmId);
-			}
-			res.json({ success: true });
+		const unreadBefore = Number(dm.unread?.[userId] || 0);
+		await db.markGroupDmRead(dmId, userId);
+		if (unreadBefore > 0) {
+			await publishDmUnreadCounts(req, [userId], dmId);
+		}
+		res.json({ success: true });
 	} catch (err) {
 		console.error('[dm] mark read error:', err);
 		res.status(500).json({ error: '既読マーク失敗' });
@@ -676,9 +760,9 @@ router.post('/:dmId/leave', requireAuth, async (req, res) => {
 			return res.status(403).json({ error: 'Forbidden' });
 		}
 
-			await db.leaveGroupDm(dmId, userId);
-			await publishDmUnreadCounts(req, [userId], dmId);
-			res.json({ success: true });
+		await db.leaveGroupDm(dmId, userId);
+		await publishDmUnreadCounts(req, [userId], dmId);
+		res.json({ success: true });
 	} catch (err) {
 		console.error('[dm] leave error:', err);
 		res.status(500).json({ error: 'DM から退出できませんでした' });

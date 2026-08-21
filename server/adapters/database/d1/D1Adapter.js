@@ -154,10 +154,15 @@ function normalizeGroupJoinRequest(request) {
 function serializeGroupDm(row, userId = null) {
 	if (!row) return null;
 	const unread = row.unread || {};
+	const memberList = Array.isArray(row.member) ? row.member.map(Number) : [];
+	const accepted = Array.isArray(row.accepted)
+		? row.accepted.map(Number)
+		: (Array.isArray(unread?._accepted) ? unread._accepted.map(Number) : memberList);
 	const res = {
 		id: row.id,
 		title: row.title || '',
-		member: Array.isArray(row.member) ? row.member.map(Number) : [],
+		member: memberList,
+		accepted,
 		host_id: row.host_id ?? row.hostId,
 		time: row.time instanceof Date ? row.time.toISOString() : (row.time || null),
 		post: Array.isArray(row.post) ? row.post : [],

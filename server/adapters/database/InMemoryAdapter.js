@@ -1628,6 +1628,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 			id: dm.id,
 			title: dm.title || '',
 			member: dm.member.slice(),
+			accepted: Array.isArray(dm.accepted) ? dm.accepted.slice() : dm.member.slice(),
 			host_id: dm.host_id,
 			time: dm.time,
 			post: dm.post ? dm.post.slice() : [],
@@ -1657,6 +1658,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 			id,
 			host_id: dmData.hostId,
 			member: dmData.member.slice(),
+			accepted: Array.isArray(dmData.accepted) ? dmData.accepted.slice() : dmData.member.slice(),
 			title: dmData.title || '',
 			time: new Date().toISOString(),
 			post: [],
@@ -1677,6 +1679,9 @@ class InMemoryAdapter extends DatabaseAdapter {
 			const memberSet = new Set(updates.member.map(Number).filter(Number.isInteger));
 			dm.member = Array.from(memberSet);
 			this._addGroupDmMemberIndexes(dm);
+		}
+		if (updates.accepted !== undefined) {
+			dm.accepted = Array.from(new Set(updates.accepted.map(Number).filter(Number.isInteger)));
 		}
 		if (updates.host_id !== undefined && updates.host_id !== null) {
 			dm.host_id = updates.host_id;
