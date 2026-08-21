@@ -12,6 +12,7 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3
 const OWNER_PERMISSIONS = Object.freeze([...GROUP_PERMISSIONS]);
 const ADMIN_PERMISSIONS = Object.freeze([...GROUP_PERMISSIONS]);
 const MEMBER_PERMISSIONS = Object.freeze(['post']);
+const DEFAULT_SYSTEM_ROLE_SORT_ORDERS = Object.freeze({ owner: 0, admin: 1, member: 2 });
 
 function normalizeGroupId(value) {
   const id = String(value || '').trim();
@@ -169,8 +170,23 @@ async function createGroupWithDefaultRoles(db, {
   }
 }
 
+function getDefaultSystemRole(roles, roleType) {
+  const expectedSortOrder = DEFAULT_SYSTEM_ROLE_SORT_ORDERS[roleType];
+  if (expectedSortOrder === undefined) return null;
+  const systemRoles = (roles || []).filter((role) => Boolean(role?.isSystem ?? role?.is_system));
+  return systemRoles.find((role) => Number(role.sortOrder ?? role.sort_order) === expectedSortOrder)
+    || systemRoles.find((role) => role.name === roleType)
+    || null;
+}
+
+function isDefaultOwnerRole(role) {
+  if (!Boolean(role?.isSystem ?? role?.is_system)) return false;
+  return Number(role.sortOrder ?? role.sort_order) === DEFAULT_SYSTEM_ROLE_SORT_ORDERS.owner
+    || role.name === 'owner';
+}
+
 function getDefaultMemberRole(roles) {
-  return (roles || []).find((role) => role.isSystem && role.name === 'member') || null;
+  return getDefaultSystemRole(roles, 'member');
 }
 
 function isOwner(group, userId) {
@@ -191,6 +207,7 @@ module.exports = {
   OWNER_PERMISSIONS,
   ADMIN_PERMISSIONS,
   MEMBER_PERMISSIONS,
+  DEFAULT_SYSTEM_ROLE_SORT_ORDERS,
   normalizeGroupId,
   normalizeVisibility,
   normalizePermissionList,
@@ -207,5 +224,7 @@ module.exports = {
   listActiveGroupMemberIds,
   countCreatedGroups,
   createGroupWithDefaultRoles,
+  getDefaultSystemRole,
+  isDefaultOwnerRole,
   getDefaultMemberRole,
 };

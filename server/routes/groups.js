@@ -26,6 +26,8 @@ const {
   countCreatedGroups,
   createGroupWithDefaultRoles,
   getDefaultMemberRole,
+  getDefaultSystemRole,
+  isDefaultOwnerRole,
 } = require('../services/GroupService');
 
 const router = express.Router();
@@ -328,8 +330,8 @@ router.post('/:groupId/transfer-owner', requireAuth, async (req, res) => {
     const newOwnerMembership = await db.getGroupMembership(group.id, newOwnerId);
     if (!newOwnerMembership || newOwnerMembership.status !== 'active') return res.status(409).json({ error: '新しいオーナーは参加中のメンバーである必要があります。' });
     const roles = await db.getGroupRoles(group.id);
-    const ownerRole = roles.find((role) => (role.isSystem ?? role.is_system) && role.name === 'owner');
-    const adminRole = roles.find((role) => (role.isSystem ?? role.is_system) && role.name === 'admin');
+    const ownerRole = getDefaultSystemRole(roles, 'owner');
+    const adminRole = getDefaultSystemRole(roles, 'admin');
     if (!ownerRole || !adminRole) throw new Error('グループのシステムロールが見つかりません。');
     const changed = await db.transferGroupOwnership(group.id, newOwnerId);
     if (!changed) return res.status(404).json({ error: 'グループが見つかりません。' });
@@ -520,7 +522,10 @@ router.patch('/:groupId/roles/:roleId', requireAuth, async (req, res) => {
     if (!isAdmin(group, state.membership, state.role)) return res.status(403).json({ error: 'ロールを管理する権限がありません。' });
     const role = (await db.getGroupRoles(group.id)).find((candidate) => String(candidate.id) === String(req.params.roleId));
     if (!role) return res.status(404).json({ error: 'ロールが見つかりません。' });
-    if (role.isSystem ?? role.is_system) return res.status(403).json({ error: 'システムロールは変更できません。' });
+    if (isDefaultOwnerRole(role)) return res.status(403).json({ error: 'オーナーロールは変更できません。' });
+    if (req.body?.sort_order !== undefined && Boolean(role.isSystem ?? role.is_system)) {
+      return res.status(403).json({ error: '既定ロールの並び順は変更できません。' });
+    }
     const fields = {};
     if (req.body?.name !== undefined) fields.name = String(req.body.name).trim();
     if (req.body?.permissions !== undefined) fields.permissions = normalizePermissionList(req.body.permissions);
