@@ -184,6 +184,9 @@
 	"health": {
 		"detailed": false
 	},
+	"rules": {
+		"filePath": "rule.nd"
+	},
 	"federation": {
 		"publicUrl": "",
 		"domain": "example.com",

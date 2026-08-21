@@ -290,6 +290,8 @@ const restRoutes = [
     ['appeals', require('./routes/appeals')],
     ['verification-applications', require('./routes/verificationApplications')],
     ['push', require('./routes/push')],
+    ['rules', require('./routes/rules')],
+    ['rule', require('./routes/rules')],
 ];
 
 for (const [resourcePath, router] of restRoutes) {

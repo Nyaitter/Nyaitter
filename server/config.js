@@ -766,6 +766,14 @@ const config = {
     detailed: get('health.detailed', false),
   },
 
+  rules: {
+    filePath: String(
+      process.env.RULES_FILE_PATH
+      || process.env.RULE_FILE_PATH
+      || get('rules.filePath', get('rulesFilePath', 'rule.nd')),
+    ).trim(),
+  },
+
   federation: {
     // PUBLIC_URL is optional. When absent, public URLs are derived from each
     // request's protocol and host (with proxy headers honored only if trustProxy is enabled).
