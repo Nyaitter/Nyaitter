@@ -1720,30 +1720,37 @@ class PostgresAdapter extends DatabaseAdapter {
 		ids.forEach((id) => result.set(id, []));
 
 		const { rows } = await this.pool.query(
-			`SELECT gm.user_id, g.id AS group_id, g.name, g.icon_data, gm.joined_at
-			 FROM group_memberships gm
-			 JOIN groups g ON g.id = gm.group_id
-			 WHERE gm.user_id = ANY($1::int[])
-			   AND gm.status = 'active'
-			   AND g.deleted_at IS NULL
-			   AND g.icon_data IS NOT NULL
-			   AND g.icon_data <> ''
-			   AND g.visibility IN ('open', 'open_invite')
-			 ORDER BY gm.user_id, gm.joined_at DESC NULLS LAST, g.created_at DESC`,
+			`WITH ranked_badges AS (
+				SELECT gm.user_id, g.id AS group_id, g.name, g.icon_data,
+				       ROW_NUMBER() OVER (
+				           PARTITION BY gm.user_id
+				           ORDER BY gm.joined_at DESC NULLS LAST, g.created_at DESC
+				       ) AS rn
+				FROM group_memberships gm
+				JOIN groups g ON g.id = gm.group_id
+				WHERE gm.user_id = ANY($1::int[])
+				  AND gm.status = 'active'
+				  AND g.deleted_at IS NULL
+				  AND g.icon_data IS NOT NULL
+				  AND g.icon_data <> ''
+				  AND g.visibility IN ('open', 'open_invite')
+			)
+			SELECT user_id, group_id, name, icon_data
+			FROM ranked_badges
+			WHERE rn <= 3
+			ORDER BY user_id, rn ASC`,
 			[ids],
 		);
 
 		for (const row of rows) {
 			const userId = Number(row.user_id);
 			const list = result.get(userId) || [];
-			if (list.length < 3) {
-				list.push({
-					id: String(row.group_id),
-					name: String(row.name || ''),
-					icon_data: row.icon_data,
-				});
-				result.set(userId, list);
-			}
+			list.push({
+				id: String(row.group_id),
+				name: String(row.name || ''),
+				icon_data: row.icon_data,
+			});
+			result.set(userId, list);
 		}
 		return result;
 	}
@@ -2112,35 +2119,21 @@ class PostgresAdapter extends DatabaseAdapter {
 			? parsedViewerId
 			: null;
 
-		// 単一 CTE で likes/stars/reposts/replies を並列集計し、往復回数を最小化する。
 		const viewerCols = viewerId != null
-			? `, BOOL_OR(lk.user_id = $2)::bool AS liked_by_me
-			   , BOOL_OR(sk.user_id = $2)::bool AS starred_by_me`
+			? `, EXISTS(SELECT 1 FROM likes WHERE post_id = pid.id AND user_id = $2) AS liked_by_me
+			   , EXISTS(SELECT 1 FROM stars WHERE post_id = pid.id AND user_id = $2) AS starred_by_me`
 			: `, FALSE AS liked_by_me, FALSE AS starred_by_me`;
-		const viewerLikeJoin = viewerId != null
-			? `LEFT JOIN likes lk ON lk.post_id = pid.id AND lk.user_id = $2`
-			: '';
-		const viewerStarJoin = viewerId != null
-			? `LEFT JOIN stars sk ON sk.post_id = pid.id AND sk.user_id = $2`
-			: '';
 		const params = viewerId != null ? [ids, viewerId] : [ids];
 
 		const { rows } = await this.pool.query(
 			`SELECT
 				pid.id AS post_id,
-				COUNT(DISTINCT l.post_id)::int   AS like_count,
-				COUNT(DISTINCT s.post_id)::int   AS star_count,
-				COUNT(DISTINCT r.post_id)::int   AS repost_count,
-				COUNT(DISTINCT rep.id)::int       AS reply_count
+				(SELECT COUNT(*)::int FROM likes WHERE post_id = pid.id) AS like_count,
+				(SELECT COUNT(*)::int FROM stars WHERE post_id = pid.id) AS star_count,
+				(SELECT COUNT(*)::int FROM reposts WHERE post_id = pid.id) AS repost_count,
+				(SELECT COUNT(*)::int FROM posts WHERE reply_to = pid.id) AS reply_count
 				${viewerCols}
-			 FROM unnest($1::int[]) AS pid(id)
-			 LEFT JOIN likes    l   ON l.post_id   = pid.id
-			 LEFT JOIN stars    s   ON s.post_id   = pid.id
-			 LEFT JOIN reposts  r   ON r.post_id   = pid.id
-			 LEFT JOIN posts    rep ON rep.reply_to = pid.id
-			 ${viewerLikeJoin}
-			 ${viewerStarJoin}
-			 GROUP BY pid.id`,
+			 FROM unnest($1::int[]) AS pid(id)`,
 			params,
 		);
 		return rows.map((row) => ({
@@ -3876,6 +3869,19 @@ class PostgresAdapter extends DatabaseAdapter {
 				) AS pinned_post_id,
 				(SELECT COUNT(*)::int FROM notifications WHERE user_id = $1 AND read = false)
 					AS unread_notification_count,
+				COALESCE((
+					SELECT jsonb_agg(jsonb_build_object('id', g.id, 'name', g.name, 'icon_data', g.icon_data))
+					FROM (
+						SELECT g.id, g.name, g.icon_data
+						FROM group_memberships gm
+						JOIN groups g ON g.id = gm.group_id
+						WHERE gm.user_id = $1 AND gm.status = 'active'
+						  AND g.deleted_at IS NULL AND g.icon_data IS NOT NULL AND g.icon_data <> ''
+						  AND g.visibility IN ('open', 'open_invite')
+						ORDER BY gm.joined_at DESC NULLS LAST, g.created_at DESC
+						LIMIT 3
+					) g
+				), '[]'::jsonb) AS group_badges,
 				COALESCE((SELECT jsonb_agg(to_jsonb(n) ORDER BY n.created_at DESC, n.id DESC) FROM notification_rows n), '[]'::jsonb)
 					AS notifications,
 				COALESCE((SELECT jsonb_agg(to_jsonb(u)) FROM notification_users u), '[]'::jsonb)
@@ -3891,6 +3897,7 @@ class PostgresAdapter extends DatabaseAdapter {
 		const rawNotifs = Array.isArray(result.notifications) ? result.notifications : parseJsonSafe(result.notifications, []);
 		const rawUsers = Array.isArray(result.notification_users) ? result.notification_users : parseJsonSafe(result.notification_users, []);
 		const rawPosts = Array.isArray(result.notification_posts) ? result.notification_posts : parseJsonSafe(result.notification_posts, []);
+		const rawBadges = Array.isArray(result.group_badges) ? result.group_badges : parseJsonSafe(result.group_badges, []);
 
 		return {
 			follow: normalizeIds(result.follow_ids),
@@ -3900,6 +3907,11 @@ class PostgresAdapter extends DatabaseAdapter {
 				? Number(result.pinned_post_id)
 				: null,
 			unreadCount: Math.max(0, Number(result.unread_notification_count) || 0),
+			group_badges: rawBadges.map((gb) => ({
+				id: String(gb.id),
+				name: String(gb.name || ''),
+				icon_data: gb.icon_data,
+			})),
 			notifications: rawNotifs.map((r) => ({
 				id: Number(r.id),
 				userId: Number(r.user_id),

@@ -1264,6 +1264,37 @@ class InMemoryAdapter extends DatabaseAdapter {
 		return result;
 	}
 
+	async getUserBootstrapData(userId, notificationLimit = 200) {
+		const targetId = Number(userId);
+		const [follow, like, star, pin, notifs, unreadCount, groupBadgesMap] = await Promise.all([
+			this.getFollowIds(targetId),
+			this.getLikeIds(targetId),
+			this.getStarIds(targetId),
+			this.getPinnedPostId(targetId),
+			this.getNotifications(targetId, notificationLimit),
+			this.getUnreadNotificationCount(targetId),
+			this.getUsersGroupBadgesBatch([targetId]),
+		]);
+		const groupBadges = groupBadgesMap.get(targetId) || [];
+		const fromUserIds = [...new Set((notifs || []).map((n) => Number(n.fromUserId || n.from_user_id)).filter(Number.isInteger))];
+		const targetPostIds = [...new Set((notifs || []).map((n) => (n.target?.kind === 'post' ? Number(n.target.id) : null)).filter((id) => Number.isInteger(id) && id > 0))];
+		const [notificationUsers, notificationPosts] = await Promise.all([
+			this.getUsersByIds(fromUserIds),
+			this.getPostsByIds(targetPostIds),
+		]);
+		return {
+			follow,
+			like,
+			star,
+			pin,
+			unreadCount,
+			group_badges: groupBadges,
+			notifications: notifs,
+			notificationUsers,
+			notificationPosts,
+		};
+	}
+
 	async createGroupRole(roleData) {
 		const now = roleData.createdAt || new Date().toISOString();
 		const role = { id: String(roleData.id), groupId: String(roleData.groupId), name: String(roleData.name || ''),
@@ -1768,6 +1799,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 			host_id: dm.host_id,
 			time: dm.time,
 			post: dm.post ? dm.post.slice() : [],
+			unread: dm.unread ? { ...dm.unread } : {},
 			unread_count: (dm.unread && dm.unread[userId]) || 0,
 		};
 	}
@@ -1798,7 +1830,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 			title: dmData.title || '',
 			time: new Date().toISOString(),
 			post: [],
-			unread: {},
+			unread: dmData.unread && typeof dmData.unread === 'object' ? { ...dmData.unread } : {},
 		};
 		this.groupDms.set(id, dm);
 		this._addGroupDmMemberIndexes(dm);

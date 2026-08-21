@@ -67,8 +67,12 @@ async function getVisibleDmUnreadCount(db, userId, { viewer: knownViewer = null 
 	const dms = await getVisibilityDms(normalizedUserId);
 	if (!Array.isArray(dms) || dms.length === 0) return 0;
 
+	// 未読が存在するDMのみを対象とする。未読合計が0の場合は追加のユーザー取得をスキップして即座に0を返す。
+	const dmsWithUnread = dms.filter((dm) => getDmUnreadCount(dm, normalizedUserId) > 0);
+	if (dmsWithUnread.length === 0) return 0;
+
 	const memberIds = new Set();
-	for (const dm of dms) {
+	for (const dm of dmsWithUnread) {
 		for (const memberId of dm?.member || []) {
 			const normalizedMemberId = Number(memberId);
 			if (Number.isInteger(normalizedMemberId) && normalizedMemberId !== normalizedUserId) {
@@ -85,7 +89,7 @@ async function getVisibleDmUnreadCount(db, userId, { viewer: knownViewer = null 
 	const viewerBlockedIds = new Set(normalizeBlockList(viewer?.block, viewer?.id));
 	const memberBlocksViewer = new Map();
 	let unreadCount = 0;
-	for (const dm of dms) {
+	for (const dm of dmsWithUnread) {
 		const hasBlockedMember = (dm?.member || []).some((memberId) => {
 			const normalizedMemberId = Number(memberId);
 			if (!Number.isInteger(normalizedMemberId) || normalizedMemberId === normalizedUserId) return false;

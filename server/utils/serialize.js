@@ -131,7 +131,9 @@ async function serializeUser(db, user, viewerId = null, publicUrl = null) {
 		})
 		: [];
 
-	let groupBadges = Array.isArray(user.group_badges) ? user.group_badges.slice(0, 3) : null;
+	let groupBadges = Array.isArray(user.group_badges)
+		? user.group_badges.slice(0, 3)
+		: (Array.isArray(accountState?.group_badges) ? accountState.group_badges.slice(0, 3) : null);
 	if (!groupBadges && typeof db.getUserGroups === 'function') {
 		try {
 			const groups = await db.getUserGroups(id, { status: 'active', limit: 20 });
