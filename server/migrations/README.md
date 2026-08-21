@@ -1,28 +1,23 @@
-# DBスキーマ
+# データベースの初期化・更新 (マイグレーション)
 
-`npm run migrate`は、選択中のDBへ**完全な初期スキーマ**を一度に作成します。PostgreSQLとCloudflare D1はいずれも新規の空DBで実行してください。
+データベースに必要なテーブルを一括で作成・更新するコマンドです。
 
-## 実行
+## 実行方法
 
-`server/.env`またはデプロイ先のシークレットへDB接続設定を入れ、リポジトリのルートで実行します。
+`server/.env` にデータベースの設定（PostgreSQL または D1）を記入し、リポジトリのルートで実行します。
 
 ```bash
 npm run migrate
 ```
 
-| DB | 必要な主な設定 |
+## 各データベースでの設定例
+
+| データベース | `server/.env` に必要な設定 |
 |---|---|
-| PostgreSQL | `DB_ADAPTER=postgres`、`DATABASE_URL` |
-| Cloudflare D1 | `DB_ADAPTER=d1`、`D1_WORKER_URL`、`D1_WORKER_TOKEN` |
+| PostgreSQL | `DB_ADAPTER=postgres`<br>`DATABASE_URL=postgres://...` |
+| Cloudflare D1 | `DB_ADAPTER=d1`<br>`D1_WORKER_URL=https://...`<br>`D1_WORKER_TOKEN=...` |
 
-ローカルD1へ適用する場合は、次を実行します。
+---
 
-```bash
-DB_ADAPTER=d1 D1_MIGRATION_TARGET=local npm run migrate
-```
+- 関連: [PostgreSQL 設定ガイド](../help/database-postgres.md) / [Cloudflare D1 設定ガイド](../help/database-d1-worker.md)
 
-## DBデータの移行
-
-既存データを別のDBへ移す場合は、移行先にこの初期スキーマを適用してから`npm run migrate:data`を実行します。接続設定と実行例は[Server README](../README.md#dbデータの移行)を参照してください。
-
-接続文字列やD1トークンはGitへ追加しません。

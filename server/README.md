@@ -1,201 +1,115 @@
-# Nyaitter Server
+# Nyaitter Server 設定・運用ガイド
 
-NyaitterのAPI、認証、投稿、通知、DM、ファイル保存、リアルタイム配信を提供するNode.jsサーバーです。ブラウザはDB、R2、D1へ直接接続しません。
+Nyaitter のデータ保存、アカウント管理、通知、投稿配信を行うサーバーです。
 
-## 起動
+## 起動手順
 
-リポジトリのルートで実行します。
-
+1. 必要なパッケージをインストールし、設定ファイルを用意します。
 ```bash
 npm install
 cp server/.env.example server/.env
+```
+
+2. サーバーを起動します。
+```bash
 npm start
 ```
 
-既定のURLは <http://localhost:3000/> です。既定の`memory` DBは再起動で消えます。
+ブラウザで <http://localhost:3000/> を開きます。
+初期状態ではデータが一時保存（メモリ）のため、サーバーを再起動すると消えます。
 
-| URL | 用途 |
-|---|---|
-| `/server/health` | 応答確認 |
-| `/server/ready` | DBなどの準備完了確認 |
-| `/server/status` | Server・認証・Client向け制限情報 |
-| `/server/apidocs` | API仕様 |
+## データの保存先（データベース）の設定
 
-## Client
-
-起動時に`page/`があれば静的Clientを配信します。Clientを取得または更新するには、次を実行します。
+本番運用ではデータを保存するために PostgreSQL または Cloudflare D1 を使用します。
+`server/.env` に保存先を設定し、データベースの初期化を実行してください。
 
 ```bash
-npm run sync:client
-```
-
-取得先は`NYAITTER_CLIENT_REPOSITORY`または`client.repository`で指定します。起動時に`page/`がなかった場合は、同期後にServerを再起動してください。
-
-## APIとユーザーファイル
-
-APIの基準パスは`NYAITTER_API_ENDPOINT`または`server.apiEndpoint`です。既定値は`/server`です。`/api`の有無はどちらも利用できます。
-
-```text
-/server/posts       /server/api/posts
-/server/uploads     /server/api/uploads
-/server/users       /server/api/users
-```
-
-Serverからユーザーファイルを配信する場合は、ClientとServerへ同じ公開パスを設定します。
-
-```js
-// page/config.js
-userFileEndpoint: '/uploads'
-```
-
-```dotenv
-NYAITTER_USER_FILES_ENDPOINT=/uploads
-```
-
-R2などの公開ドメインを直接使う場合は、Clientの`userFileEndpoint`にそのURLを設定し、`NYAITTER_USER_FILES_ENDPOINT`は設定しません。
-
-## 設定
-
-通常設定は`server/config.json`、秘密情報は`server/.env`またはデプロイ先のシークレット管理に置きます。
-
-| 分類 | 主な設定 |
-|---|---|
-| 起動 | `PORT`、`NODE_ENV`、`TRUST_PROXY` |
-| 認証 | `AUTH_METHOD_SCRATCH_ENABLED`、`AUTH_METHOD_EMAIL_ENABLED`、`AUTH_METHOD_PASSKEY_ENABLED`（詳細は [認証ガイド](./help/auth-providers.md)） |
-| API・Client | `NYAITTER_API_ENDPOINT`、`NYAITTER_CLIENT_REPOSITORY` |
-| CORS | `NYAITTER_CORS_ALLOWED_ORIGINS`、`NYAITTER_CORS_CREDENTIALS` |
-| DB | `DB_ADAPTER`、`DATABASE_URL`、`COCKROACH_DATABASE_URL`、`D1_WORKER_URL`、`D1_WORKER_TOKEN` |
-| ファイル | `STORAGE_ADAPTER`、`STORAGE_USER_QUOTA_MB`、`R2_*` |
-| Push | `VAPID_SUBJECT`、`VAPID_PUBLIC_KEY`、`VAPID_PRIVATE_KEY` |
-| 自動モデレーション | `GEMINI_API_KEY`、`GEMINI_MODEL`、`GEMINI_MOD_PROMPT` |
-| Turnstile | `TURNSTILE_SECRET_KEY`（クライアントのサイトキーは `page/config.js` の `turnstileSiteKey`） |
-
-別オリジンのClientでCookieを使う場合は、ClientのオリジンとCookie利用を設定します。
-
-```dotenv
-NYAITTER_CORS_ALLOWED_ORIGINS=https://client.example.com
-NYAITTER_CORS_CREDENTIALS=true
-```
-
-設定を確認するには、次を実行します。
-
-```bash
-npm run check:config
-```
-
-## DBと移行
-
-DBを変更または更新した後は、リポジトリのルートで移行を実行します。
-
-```bash
+# データベースの初期化・更新
 npm run migrate
 ```
 
-| `DB_ADAPTER` | 用途 | 移行 |
-|---|---|---|
-| `memory` | 開発 | 不要 |
-| `postgres` | PostgreSQL | `server/migrations/`を適用 |
-| `d1` | Cloudflare D1 | Worker側のD1移行を適用 |
-
-### PostgreSQL
-
-PostgreSQL互換DBも`postgres`を使います。`DATABASE_URL`にはホスト名だけではなく、完全な`postgres://`または`postgresql://`接続文字列を設定します。
+### PostgreSQL を使う場合（おすすめ）
 
 ```dotenv
 DB_ADAPTER=postgres
-DATABASE_URL=postgres://user:password@db.example.com:5432/nyaitter?sslmode=require
+DATABASE_URL=postgres://ユーザー名:パスワード@ホスト名:5432/データベース名?sslmode=require
 ```
 
-
-### Cloudflare D1
+### Cloudflare D1 を使う場合
 
 ```dotenv
 DB_ADAPTER=d1
-D1_WORKER_URL=https://nyaitter-d1-proxy.example.workers.dev
-D1_WORKER_TOKEN=<WorkerのAUTH_TOKENと同じ値>
+D1_WORKER_URL=https://あなたのWorker名.workers.dev
+D1_WORKER_TOKEN=安全なランダム文字列
 ```
 
-既定ではリモートD1へ移行します。ローカルD1では次を実行します。
+## 画像・ファイルの保存先
 
-```bash
-D1_MIGRATION_TARGET=local npm run migrate
-```
+添付画像やアイコンの保存先を設定します。
 
-### DBデータの移行
+| 設定値 | 保存先 | 用途 |
+|---|---|---|
+| `STORAGE_ADAPTER=local` | サーバー本体のディスク | 1台のサーバーでシンプルに動かす場合（既定値: `./uploads`） |
+| `STORAGE_ADAPTER=r2` | Cloudflare R2 | 複数サーバー構成や大量の画像を扱う場合 |
 
-空の移行先DBへ先に`npm run migrate`で初期スキーマを作成します。`npm run migrate:data`は`memory`、`postgres`、`d1`間のデータ移行に使います。
-
-```bash
-# バックアップ
-npm run migrate:data -- --from d1 --output nyaitter-backup.json
-
-# 復元
-npm run migrate:data -- --to postgres --input nyaitter-backup.json --replace
-```
-
-`--replace`は移行先のデータを置き換えます。移行元は`NYAITTER_DATA_SOURCE_`、移行先は`NYAITTER_DATA_DESTINATION_`を接頭辞にして接続情報を設定します。
-
-| DB | 接続設定 |
-|---|---|
-| PostgreSQL | `DATABASE_URL` |
-| Cloudflare D1 | `D1_WORKER_URL`、`D1_WORKER_TOKEN` |
-| memory | `OPERATOR_SOCKET`（対象Serverの起動が必要） |
-
-D1からPostgreSQLへ直接移す例です。
-
-```bash
-NYAITTER_DATA_SOURCE_D1_WORKER_URL=https://d1-proxy.example.workers.dev \
-NYAITTER_DATA_SOURCE_D1_WORKER_TOKEN=<D1のWorkerトークン> \
-NYAITTER_DATA_DESTINATION_DATABASE_URL='postgresql://user:password@db.example.com:5432/nyaitter?sslmode=require' \
-npm run migrate:data -- --from d1 --to postgres --replace --output nyaitter-backup.json
-```
-
-## ファイル保存
-
-| `STORAGE_ADAPTER` | 用途 |
-|---|---|
-| `local` | 開発または永続ディスクを持つ単一Server |
-| `r2` | Cloudflare R2 |
-
-画像はEXIFを削除し、必要に応じて縮小・WebP変換します。ユーザーごとの保存上限は`STORAGE_USER_QUOTA_MB`で設定します。
-
-## 主な機能設定
-
-文字数の範囲は`10`、`10..`、`..10`、`10..15`の形式で設定します。時間は`10min`、`15m10s`、`1000ms`の形式で設定します。
-
+### 画像保存の上限設定
+ユーザー1人あたりの最大保存容量（メガバイト単位）を指定できます。
 ```dotenv
-NYAITTER_LIMIT_POST_CONTENT_LENGTH=..1000
-NYAITTER_LIMIT_PROFILE_BIO_LENGTH=..500
-NYAITTER_RATE_LIMIT_POST_WRITE_WINDOW=15m10s
-NYAITTER_RATE_LIMIT_POST_WRITE_MAX=30
+STORAGE_USER_QUOTA_MB=1024 # 1GB
 ```
 
-`GET /server/status`はClient向けに文字数、ファイル容量、レート制限を返します。
+## 主な機能と環境設定
 
-標準Clientの「プライバシーとセキュリティ」ではNyaitterIDの再割り当てとアカウント削除を行えます。再割り当て後もアカウントデータとセッションは新しいIDへ引き継がれます。削除は2回確認後に実行され、元に戻せません。
+設定は `server/.env` に記述します。
 
-投稿中の先頭のHTTPS URLにはカードを表示できます。URLを`<`と`>`で囲むとカードを表示しません。
+### 1. ログイン方法の有効化
+```dotenv
+AUTH_METHOD_SCRATCH_ENABLED=true  # Scratch認証
+AUTH_METHOD_EMAIL_ENABLED=true    # メールアドレス認証
+AUTH_METHOD_PASSKEY_ENABLED=true  # パスキー（生体認証）
+```
+※詳細は [認証設定ガイド](./help/auth-providers.md) をご覧ください。
 
-Push通知を使う場合は、次を設定します。
-
+### 2. プッシュ通知 (Web Push)
 ```dotenv
 VAPID_SUBJECT=mailto:admin@example.com
-VAPID_PUBLIC_KEY=<public-key>
-VAPID_PRIVATE_KEY=<private-key>
+VAPID_PUBLIC_KEY=公開キー
+VAPID_PRIVATE_KEY=秘密キー
 ```
 
-Gemini自動モデレーションは、次の3項目をすべて設定すると有効です。
-
+### 3. AI自動モデレーション (Google Gemini)
+投稿内容をAIで自動判定して不適切な投稿を防ぎます。
 ```dotenv
-GEMINI_API_KEY=<api-key>
+GEMINI_API_KEY=あなたのAPIキー
 GEMINI_MODEL=gemini-2.0-flash
 GEMINI_MOD_PROMPT=投稿をコミュニティルールに基づいて判定してください。
 ```
 
-`GEMINI_MOD_MAX_IMAGES`は判定に送る添付画像数です。`0`では本文だけを送ります。
+### 4. 設定の自己診断
+設定に誤りがないか自動で検査できます。
+```bash
+npm run check:config
+```
 
-## 公開前の確認
+## データのバックアップと移行
 
-`NODE_ENV=production`を設定し、`DEV_BYPASS_AUTH`は有効にしません。DB、ストレージ、Push、外部サービスの秘密情報をGitやClientへ含めず、移行前にはバックアップを取ります。`TRUST_PROXY=true`は信頼できるリバースプロキシの背後でだけ設定します。
+別のデータベースへデータを移す場合は次のコマンドを使います。
 
-詳しい構成は[ヘルプ文書](./help/README.md)を参照してください。
+```bash
+# バックアップの書き出し
+npm run migrate:data -- --from postgres --output backup.json
+
+# バックアップからの復元
+npm run migrate:data -- --to postgres --input backup.json --replace
+```
+
+## ドキュメント一覧
+
+- [保存先の選び方](./help/adapters-overview.md)
+- [PostgreSQL 設定ガイド](./help/database-postgres.md)
+- [Cloudflare D1 設定ガイド](./help/database-d1-worker.md)
+- [Cloudflare R2 設定ガイド](./help/storage-r2.md)
+- [ローカル保存 設定ガイド](./help/storage-local.md)
+- [認証プロバイダー設定](./help/auth-providers.md)
+- [NyaitterAuth 外部連携ガイド](./help/nyaitter-auth.md)
+- [本番公開前チェックリスト](./help/production-checklist.md)

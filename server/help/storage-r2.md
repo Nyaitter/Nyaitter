@@ -1,26 +1,27 @@
-# Cloudflare R2
+# Cloudflare R2 設定ガイド
 
-`r2`は添付ファイルをCloudflare R2へ保存します。R2のアクセスキーはNyaitter Serverだけが使います。
+画像を Cloudflare R2（オブジェクトストレージ）に保存する設定です。画像転送量が多い場合や、サーバーレス運用に適しています。
 
-## 設定
+## 1. 設定方法 (`server/.env`)
 
 ```dotenv
 STORAGE_ADAPTER=r2
-STORAGE_USER_QUOTA_MB=1024
-R2_ACCOUNT_ID=<account-id>
-R2_BUCKET=nyaitter-uploads
-R2_ACCESS_KEY_ID=<access-key-id>
-R2_SECRET_ACCESS_KEY=<secret-access-key>
-R2_PUBLIC_DOMAIN=https://media.example.com
+STORAGE_USER_QUOTA_MB=1024 # ユーザー1人あたりの上限 (1GB)
+
+# Cloudflare R2 の接続情報
+R2_ACCOUNT_ID=あなたのAccount ID
+R2_BUCKET=バケット名
+R2_ACCESS_KEY_ID=アクセスキーID
+R2_SECRET_ACCESS_KEY=シークレットアクセスキー
+R2_PUBLIC_DOMAIN=https://media.example.com # 公開カスタムドメイン（任意）
 ```
 
-`R2_PUBLIC_DOMAIN`を設定すると公開URLを使います。設定しない場合はServerが期限付きURLを使います。
+## 2. 動作のポイント
 
-公開ドメインから直接配信する場合は、Clientの`userFileEndpoint`にも同じURLを設定します。
+- `R2_PUBLIC_DOMAIN` を設定した場合、画像は直接 Cloudflare から配信され、サーバーの負荷を軽減できます。
+- クライアント側（`page/config.js`）の `userFileEndpoint` にも同じ公開ドメインを設定してください。
 
-```js
-// page/config.js
-userFileEndpoint: 'https://media.example.com'
-```
+---
 
-関連: [ローカルストレージ](./storage-local.md) / [Cloudflare構成](./cloudflare-hybrid.md)
+- 関連: [ローカル保存 設定ガイド](./storage-local.md) / [Cloudflare構成](./cloudflare-hybrid.md)
+

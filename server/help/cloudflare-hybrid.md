@@ -1,23 +1,17 @@
-# Cloudflare構成
+# Cloudflare 連携構成
 
-Cloudflareを使う場合も、ブラウザはNyaitter Serverへ接続します。D1、R2の資格情報はブラウザへ渡しません。
+Cloudflare のサービス（D1 データベース、R2 ストレージ）を Nyaitter と組み合わせて利用する構成です。
 
-```text
-ブラウザ → Nyaitter Server → D1 Proxy Worker → D1
-                         └→ R2
-```
+## 主な組み合わせパターン
 
-| DB | ファイル保存 | 設定例 |
-|---|---|---|
-| PostgreSQL | R2 | `DB_ADAPTER=postgres`、`STORAGE_ADAPTER=r2` |
-| D1 | R2 | `DB_ADAPTER=d1`、`STORAGE_ADAPTER=r2` |
+| 構成 | データベース (`DB_ADAPTER`) | ファイル保存 (`STORAGE_ADAPTER`) | メリット |
+|---|---|---|---|
+| **D1 + R2 (おすすめ)** | `d1` | `r2` | データベースも画像保存もすべて Cloudflare 上で管理できます。 |
+| **PostgreSQL + R2** | `postgres` | `r2` | 安定したPostgreSQLを使いつつ、重い画像データのみ R2 に逃がせます。 |
 
-D1ではWorkerの`AUTH_TOKEN`とServerの`D1_WORKER_TOKEN`を同じ値にします。R2のアクセスキー、D1トークン、DB接続文字列は`server/.env`またはデプロイ先のシークレット管理に置きます。
+## 各機能の個別設定ガイド
 
-設定後は移行します。
+- データベース設定: [Cloudflare D1 設定ガイド](./database-d1-worker.md)
+- 画像保存設定: [Cloudflare R2 設定ガイド](./storage-r2.md)
+- 本番運用前の確認: [本番公開前チェックリスト](./production-checklist.md)
 
-```bash
-npm run migrate
-```
-
-関連: [D1とWorker](./database-d1-worker.md) / [R2](./storage-r2.md) / [本番チェックリスト](./production-checklist.md)

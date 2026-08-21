@@ -1,32 +1,28 @@
 # 保存先の選び方
 
-NyaitterはDBとファイル保存先を別々に設定できます。APIとClientの使い方は変わりません。
+Nyaitter は「データベース」と「ファイル保存先」を自由に組み合わせて設定できます。
 
-## DB
+## 1. データベースの選び方 (`DB_ADAPTER`)
 
-| `DB_ADAPTER` | 用途 |
-|---|---|
-| `memory` | 開発用。再起動で消えます。 |
-| `postgres` | PostgreSQL。 |
-| `d1` | Cloudflare D1。D1 Proxy Workerが必要です。 |
+| 設定値 | 保存先 | 特徴 |
+|---|---|---|
+| `DB_ADAPTER=memory` | メモリ（一時保存） | 設定不要ですぐ動かせます。サーバーを再起動するとデータは消えます。 |
+| `DB_ADAPTER=postgres` | PostgreSQL | 最も標準的で安定したデータベースです。 |
+| `DB_ADAPTER=d1` | Cloudflare D1 | Cloudflare のインフラでサーバーレス運用したい場合に使用します。 |
 
-永続DBを設定または更新した後は、リポジトリのルートで移行します。
+> データベースを設定した後は、必ず `npm run migrate` を実行して初期化してください。
 
-```bash
-npm run migrate
-```
+## 2. ファイル保存先の選び方 (`STORAGE_ADAPTER`)
 
-## DBデータの移行
+| 設定値 | 保存先 | 特徴 |
+|---|---|---|
+| `STORAGE_ADAPTER=local` | サーバー本体のディスク | サーバー1台で動かす場合に簡単です。（既定の保存先: `./uploads`） |
+| `STORAGE_ADAPTER=r2` | Cloudflare R2 | 複数サーバー構成や、大量の画像・動画を扱う場合に適しています。 |
 
-空の移行先DBへ`npm run migrate`で初期スキーマを作成してから、`npm run migrate:data`を実行します。バックアップ、復元、接続設定は[Server README](../README.md#dbデータの移行)を参照してください。
+## 関連ドキュメント
 
-## ファイル保存
+- [PostgreSQL 設定ガイド](./database-postgres.md)
+- [Cloudflare D1 設定ガイド](./database-d1-worker.md)
+- [ローカル保存 設定ガイド](./storage-local.md)
+- [Cloudflare R2 設定ガイド](./storage-r2.md)
 
-| `STORAGE_ADAPTER` | 用途 |
-|---|---|
-| `local` | 開発または永続ディスクを持つ単一Server。 |
-| `r2` | Cloudflare R2。 |
-
-ユーザーごとの保存上限は`STORAGE_USER_QUOTA_MB`で設定します。
-
-関連: [PostgreSQL](./database-postgres.md) / [D1とWorker](./database-d1-worker.md) / [ローカルストレージ](./storage-local.md) / [Cloudflare R2](./storage-r2.md)

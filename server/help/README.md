@@ -1,17 +1,16 @@
 # セットアップ・運用ガイド
 
-まずは[Server README](../README.md)で起動と共通設定を確認してください。ここでは保存先ごとの設定を説明します。
+Nyaitter Server のセットアップと各種機能の設定ガイド一覧です。
 
-| やりたいこと | 文書 |
+| 目的 | ガイド |
 |---|---|
-| DB・保存先を選ぶ | [保存先の選び方](./adapters-overview.md) |
-| DBデータを移す | [Server README](../README.md#dbデータの移行) |
-| PostgreSQLを使う | [PostgreSQL](./database-postgres.md) |
-| Cloudflare D1を使う | [D1とWorker](./database-d1-worker.md) |
-| ローカルへ保存する | [ローカルストレージ](./storage-local.md) |
-| R2へ保存する | [Cloudflare R2](./storage-r2.md) |
-| Cloudflareを併用する | [Cloudflare構成](./cloudflare-hybrid.md) |
-| 認証方法を設定する | [認証プロバイダー設定](./auth-providers.md) |
-| 公開前に確認する | [本番チェックリスト](./production-checklist.md) |
+| データベース・保存先の選び方 | [保存先の選び方](./adapters-overview.md) |
+| PostgreSQL を使う | [PostgreSQL 設定ガイド](./database-postgres.md) |
+| Cloudflare D1 を使う | [Cloudflare D1 設定ガイド](./database-d1-worker.md) |
+| 画像をサーバー本体に保存する | [ローカル保存 設定ガイド](./storage-local.md) |
+| 画像を Cloudflare R2 に保存する | [Cloudflare R2 設定ガイド](./storage-r2.md) |
+| Cloudflare 連携（D1 + R2） | [Cloudflare 連携構成](./cloudflare-hybrid.md) |
+| ログイン方法（Scratch / メール / パスキー） | [認証設定ガイド](./auth-providers.md) |
+| 外部アプリ・他サーバー連携 | [NyaitterAuth ガイド](./nyaitter-auth.md) |
+| 公開前の最終確認 | [本番公開前チェックリスト](./production-checklist.md) |
 
-公開運用では永続DB（`postgres`または`d1`）を使います。秘密情報は`server/.env`またはデプロイ先のシークレット管理に置き、Gitへ追加しません。

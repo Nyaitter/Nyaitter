@@ -1,58 +1,45 @@
-# Nyaitter D1 Proxy Worker
+# D1 Proxy Worker ガイド
 
-Nyaitter ServerからCloudflare D1へ接続するためのWorkerです。ブラウザはWorkerやD1へ直接接続しません。
+Nyaitter サーバーが Cloudflare D1（データベース）と安全に通信するためのプログラム（Worker）です。
 
-```text
-Nyaitter Server → D1 Proxy Worker → D1
-```
+## セットアップ手順
 
-## 作成
-
+### 1. D1 データベースの作成
 ```bash
 cd workers/d1-proxy
 npm install
+
+# D1 データベースを作成
 npx wrangler d1 create nyaitter-d1
 ```
 
-作成時に表示された`database_id`を`wrangler.toml`の`[[d1_databases]]`へ設定します。
+表示された `database_id` を `wrangler.toml` の `database_id = "..."` に貼り付けます。
 
-## 認証
-
+### 2. 通信用シークレットの設定
 ```bash
 npx wrangler secret put AUTH_TOKEN
+# 画面の指示に従い、安全なランダム文字列を入力します
 ```
 
-`AUTH_TOKEN`は十分に長いランダム値にします。Server側の`D1_WORKER_TOKEN`へ同じ値を設定し、Git、`wrangler.toml`、Clientへは含めません。
-
-## 移行とデプロイ
-
-リポジトリのルートでD1移行を実行します。
-
+### 3. データベースの初期化と公開
 ```bash
+# データベースの初期化
+cd ../..
 DB_ADAPTER=d1 npm run migrate
-```
 
-ローカルD1では次を実行します。
-
-```bash
-DB_ADAPTER=d1 D1_MIGRATION_TARGET=local npm run migrate
-```
-
-他のDBとのデータ移行は、空のD1へ初期スキーマを作成した後にServer側で`npm run migrate:data`を実行します。詳細は[Server設定](../../server/README.md#dbデータの移行)を参照してください。
-
-Workerをデプロイします。
-
-```bash
+# Worker のデプロイ
 cd workers/d1-proxy
 npm run deploy
 ```
 
-## Server設定
-
+### 4. サーバー本体（`server/.env`）への設定
 ```dotenv
 DB_ADAPTER=d1
-D1_WORKER_URL=https://nyaitter-d1-proxy.example.workers.dev
-D1_WORKER_TOKEN=<AUTH_TOKENと同じ値>
+D1_WORKER_URL=https://あなたのWorker名.workers.dev
+D1_WORKER_TOKEN=手順2で設定したAUTH_TOKEN
 ```
 
-関連: [D1とWorker](../../server/help/database-d1-worker.md) / [Server設定](../../server/README.md)
+---
+
+- 関連: [Cloudflare D1 設定ガイド](../../server/help/database-d1-worker.md)
+

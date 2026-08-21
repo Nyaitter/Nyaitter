@@ -1,41 +1,41 @@
 # Nyaitter
 
-Nyaitter は、NyaX をベースにした Scratcher 向けのオープンソース SNS です。ブラウザ用のシングルページアプリケーションと、認証・API・WebSocket を提供する Node.js サーバーで構成されています。
+Nyaitter は、Scratcher 向けのオープンソース SNS です。Webブラウザから使える画面と、アカウント管理やデータ配信を行うサーバーで構成されています。
 
 | 区分 | 配置 | 内容 |
 |---|---|---|
-| NyaitterClient | `page/` | バニラ JavaScript による画面、PWA、サービスワーカー |
-| NyaitterServer | `server/` | Express API、認証、リアルタイム配信、DB・ストレージアダプター |
-| D1 Proxy Worker | `workers/d1-proxy/` | Cloudflare D1 を利用する場合の認証済みプロキシ |
+| NyaitterClient | `page/` | Web画面（ブラウザで表示する画面） |
+| NyaitterServer | `server/` | サーバー本体（データの保存・配信・アカウント管理） |
+| D1 Proxy Worker | `workers/d1-proxy/` | Cloudflare D1（データベース）を使う場合の接続用プログラム |
 
 ## 主な機能
 
-投稿、返信、引用、リポスト、いいね、スター、検索、フォロー、通知、グループ機能（Open / OpenInvite / アイコンバッジ表示）、グループ DM、Web Push、マルチプロバイダー認証（Scratch、メールアドレス、パスキー）を提供します。投稿の公開範囲、検索除外、双方向のブロック関係はサーバー側の共通可視性ルールで判定されます。
+投稿、返信、引用、リポスト、いいね、スター、検索、フォロー、通知、グループ機能、グループDM、プッシュ通知、各種ログイン（Scratch、メールアドレス、パスキー）が使えます。
 
-> ブロック関係にある利用者同士では、相互の投稿・投稿通知・DMメッセージを表示しません。DMへの新規招待やメンバー追加も拒否されます。
+> ブロック関係にある利用者同士では、お互いの投稿・通知・DMメッセージが表示されず、DMへの追加も防ぎます。
 
 ## クイックスタート
 
-Node.js 18 以上を用意し、リポジトリのルートで実行します。
+Node.js（バージョン18以上）をインストールし、次のコマンドを実行します。
 
 ```bash
 npm install
 npm start
 ```
 
-ブラウザで <http://localhost:3000/> を開きます。稼働確認には <http://localhost:3000/server/health> を利用できます。
+ブラウザで <http://localhost:3000/> を開くと利用できます。
 
-開発時の既定値は `InMemoryAdapter` と `LocalStorageAdapter` です。**メモリ上のデータはサーバー再起動時に失われます。** 実運用の手順は `server/README.md` と `server/help/` を参照してください。
+初期状態ではデータが一時保存（メモリ）のため、サーバーを再起動するとデータが消えます。データを保存して本格的に運用する手順は `server/README.md` を確認してください。
 
 ## ライセンス
 
-NyaitterClient と NyaitterServer は **MIT ライセンス**です。著作権表示を保持する限り、利用・改変・再配布できます。詳細は同梱の `LICENSE` を確認してください。
+MIT ライセンスです。著作権表示を残すことで、誰でも自由に利用・改変・再配布できます。詳細は `LICENSE` を確認してください。
 
 ## ドキュメント
 
-- サーバーの起動、API、認証、リアルタイム配信: [`server/README.md`](./server/README.md)
-- 認証プロバイダー設定（Scratch、メール、パスキー）: [`server/help/auth-providers.md`](./server/help/auth-providers.md)
-- DB・ストレージアダプター: [`server/adapters/README.md`](./server/adapters/README.md)
-- PostgreSQL、D1、R2、ローカルストレージ、本番運用: [`server/help/README.md`](./server/help/README.md)
-- DBスキーマ・データ移行: [`server/migrations/README.md`](./server/migrations/README.md)
-- Cloudflare D1 Proxy Worker: [`workers/d1-proxy/README.md`](./workers/d1-proxy/README.md)
+- サーバーの起動・設定・運用: [`server/README.md`](./server/README.md)
+- ログイン方法の設定（Scratch、メール、パスキー）: [`server/help/auth-providers.md`](./server/help/auth-providers.md)
+- データの保存先の選び方: [`server/adapters/README.md`](./server/adapters/README.md)
+- 各種セットアップガイド: [`server/help/README.md`](./server/help/README.md)
+- 外部アプリ連携機能: [`server/help/nyaitter-auth.md`](./server/help/nyaitter-auth.md)
+

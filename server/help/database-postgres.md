@@ -1,37 +1,33 @@
-# PostgreSQL
+# PostgreSQL 設定ガイド
 
-## 設定
+PostgreSQL を Nyaitter のデータベースとして使用する手順です。
 
-`server/.env`またはデプロイ先のシークレットに接続文字列を設定します。
+## 1. 接続先の設定
+
+`server/.env` に PostgreSQL の接続URLを設定します。
 
 ```dotenv
 DB_ADAPTER=postgres
-DATABASE_URL=postgres://user:password@db.example.com:5432/nyaitter?sslmode=require
+DATABASE_URL=postgres://ユーザー名:パスワード@ホスト名:5432/データベース名?sslmode=require
 ```
 
-接続先がSSLを要求する場合は、接続先の案内に従ったURLを使います。接続文字列はGitへ追加しません。
+## 2. データベースの初期化
 
-## 初期化と移行
-
-依存関係を導入した後、リポジトリのルートで実行します。
+次のコマンドを実行して、データベースに必要なテーブルを作成します。
 
 ```bash
-npm install
 npm run migrate
+```
+
+## 3. サーバーの起動と確認
+
+```bash
 npm start
 ```
 
-`npm run migrate`は空のPostgreSQL DBへ完全な初期スキーマを作成します。
+ブラウザで <http://localhost:3000/> を開いて動作を確認します。
 
-他のDBからPostgreSQLへデータを移す場合は、空のPostgreSQL DBへ初期スキーマを作成した後に`npm run migrate:data`を実行します。接続設定と実行例は[Server README](../README.md#dbデータの移行)を参照してください。
-## 確認
+---
 
-```bash
-npm run check:config
-curl --fail http://127.0.0.1:3000/server/health
-curl --fail http://127.0.0.1:3000/server/ready
-```
+- 関連: [Cloudflare R2 設定ガイド](./storage-r2.md) / [本番公開前チェックリスト](./production-checklist.md)
 
-接続エラー時は`DB_ADAPTER`、`DATABASE_URL`、DBのネットワーク設定、SSL要件を確認してください。
-
-関連: [R2](./storage-r2.md) / [本番チェックリスト](./production-checklist.md)
