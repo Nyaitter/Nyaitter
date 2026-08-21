@@ -47,14 +47,24 @@ class DatabaseAdapter {
 		throw new Error('getUserById() must be implemented');
 	}
 
-	
-	async getUserByNyaitterAddress(address) {
-		throw new Error('getUserByNyaitterAddress() must be implemented');
+	async getUserByExternalId(authProvider, externalId) {
+		throw new Error('getUserByExternalId() must be implemented');
 	}
 
-	
-	async getOrCreateExternalUser(params) {
-		throw new Error('getOrCreateExternalUser() must be implemented');
+	async getUserAuthProviders(userId) {
+		throw new Error('getUserAuthProviders() must be implemented');
+	}
+
+	async findUserByAuthProvider(provider, providerUserId) {
+		throw new Error('findUserByAuthProvider() must be implemented');
+	}
+
+	async linkAuthProvider(userId, provider, providerUserId, providerProfile = {}) {
+		throw new Error('linkAuthProvider() must be implemented');
+	}
+
+	async unlinkAuthProvider(userId, provider, providerUserId = null) {
+		throw new Error('unlinkAuthProvider() must be implemented');
 	}
 
 	

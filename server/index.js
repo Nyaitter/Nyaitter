@@ -34,6 +34,9 @@ const PostKeywordBackfillService = require('./services/PostKeywordBackfillServic
 const { serializeNotification } = require('./utils/serialize');
 const { getPublicUrl } = require('./utils/nyaitterAddress');
 const { startOperatorControlServer } = require('./utils/operatorControl');
+const { getEmbeddedMailServer } = require('./services/mail/EmbeddedMailServer');
+
+let embeddedMailServer = null;
 
 // ── Security Check ─────────────────────────────────────────────────────────────
 if (process.env.DEV_BYPASS_AUTH === 'true') {
@@ -494,6 +497,15 @@ async function startServer() {
                 console.log(`[user-files] Serving ${userFilesEndpoint} on http://localhost:${userFilesPort}${userFilesEndpoint}`);
             });
         }
+
+        const embeddedMailConfig = config.auth?.methods?.email?.embeddedServer;
+        if (embeddedMailConfig?.enabled) {
+            embeddedMailServer = getEmbeddedMailServer(embeddedMailConfig);
+            await embeddedMailServer.start().catch((err) => {
+                console.error('[mail-server] Failed to start embedded mail server:', err.message);
+            });
+        }
+
         console.log('[server] Ready. DB Adapter initialized.');
     });
 }
@@ -530,6 +542,10 @@ async function shutdown(signal) {
         if (operatorControl) {
             await operatorControl.close();
             operatorControl = null;
+        }
+        if (embeddedMailServer) {
+            await embeddedMailServer.close();
+            embeddedMailServer = null;
         }
         await new Promise((resolve) => {
             if (!httpServer.listening) return resolve();

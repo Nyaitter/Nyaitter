@@ -527,12 +527,8 @@ class D1Adapter extends DatabaseAdapter {
 		return normalizeUser(await this._read(`/users/${userId}`));
 	}
 
-	async getUserByNyaitterAddress(address) {
-		return normalizeUser(await this._read(`/users/address/${encodeURIComponent(String(address))}`));
-	}
-
-	async getOrCreateExternalUser(params) {
-		return normalizeUser(await this._write('/users/external', params));
+	async getUserByExternalId(authProvider, externalId) {
+		return normalizeUser(await this._read(`/users/external/${encodeURIComponent(String(authProvider))}/${encodeURIComponent(String(externalId))}`));
 	}
 
 	async createUser(userData) {

@@ -11,6 +11,7 @@
 | ローカルへ保存する | [ローカルストレージ](./storage-local.md) |
 | R2へ保存する | [Cloudflare R2](./storage-r2.md) |
 | Cloudflareを併用する | [Cloudflare構成](./cloudflare-hybrid.md) |
+| 認証方法を設定する | [認証プロバイダー設定](./auth-providers.md) |
 | 公開前に確認する | [本番チェックリスト](./production-checklist.md) |
 
 公開運用では永続DB（`postgres`または`d1`）を使います。秘密情報は`server/.env`またはデプロイ先のシークレット管理に置き、Gitへ追加しません。

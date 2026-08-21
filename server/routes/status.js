@@ -1,10 +1,9 @@
 const express = require('express');
 const config = require('../config');
 const {
-	buildLocalNyaitterAddress,
-	getAddressDomain,
 	getPublicUrl,
 } = require('../utils/nyaitterAddress');
+const { defaultRegistry: authProviderRegistry } = require('../services/auth/AuthProviderRegistry');
 
 const router = express.Router();
 
@@ -75,7 +74,6 @@ router.get('/status', async (req, res) => {
 	}
 
 	const publicUrl = getPublicUrl(req);
-	const domain = getAddressDomain(publicUrl);
 
 	res.json({
 		server: 'ok',
@@ -83,22 +81,9 @@ router.get('/status', async (req, res) => {
 		database: dbStatus,
 		identity: {
 			public_url: publicUrl,
-			domain,
-			example_address: buildLocalNyaitterAddress(1, req),
 			nyaitter_id_format: '#{localId}',
-			address_format: '#{localId}@{serverDomain}',
 		},
-		auth_methods: [
-			'scratch',
-			'external_nyaitter',
-		],
-		external_login: {
-			enabled: !!config.federation?.allow_external_login,
-			trusted_servers: (config.federation?.trusted_servers || []).map((server) => ({
-				nyaitter_id: server.nyaitter_id,
-				domain: server.domain,
-			})),
-		},
+		auth_methods: authProviderRegistry.listEnabledProviderNames(config, req),
 		turnstile: {
 			enabled: Boolean(config.turnstile?.enabled),
 		},

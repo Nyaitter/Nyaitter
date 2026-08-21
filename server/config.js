@@ -430,30 +430,136 @@ const config = {
 	    botTokenPrefix: get('auth.botTokenPrefix', 'bot_'),
 	    sessionTokenBytes: get('auth.sessionTokenBytes', 32),
 	    botTokenIdBytes: get('auth.botTokenIdBytes', 16),
-		    verificationCodeBytes: get('auth.verificationCodeBytes', 4),
-		    maxPendingVerificationCodes: exactIntegerSetting(
-		      'maximum pending Scratch verification codes',
-		      ['NYAITTER_AUTH_MAX_PENDING_VERIFICATION_CODES'],
-		      ['auth.maxPendingVerificationCodes'],
-		      1000,
-		      1,
-		    ),
-		    scratchVerification: {
+	    verificationCodeBytes: get('auth.verificationCodeBytes', 4),
+	    maxPendingVerificationCodes: exactIntegerSetting(
+	      'maximum pending Scratch verification codes',
+	      ['NYAITTER_AUTH_MAX_PENDING_VERIFICATION_CODES'],
+	      ['auth.maxPendingVerificationCodes'],
+	      1000,
+	      1,
+	    ),
+	    methods: {
+	      scratch: {
+	        enabled: envBoolean(
+	          'AUTH_METHOD_SCRATCH_ENABLED',
+	          envBoolean('AUTH_SCRATCH_ENABLED', get('auth.methods.scratch.enabled', true)),
+	        ),
+	        verificationProjectId: String(
+	          process.env.AUTH_SCRATCH_VERIFICATION_PROJECT_ID
+	          || process.env.SCRATCH_VERIFICATION_PROJECT_ID
+	          || get('auth.methods.scratch.verificationProjectId', '1239738451'),
+	        ).trim(),
+	        ipRestrictionEnabled: envBoolean(
+	          'SCRATCH_IP_RESTRICTION_ENABLED',
+	          get('auth.methods.scratch.ipRestrictionEnabled', get('auth.scratchVerification.ipRestrictionEnabled', true)),
+	        ),
+	        rejectNewScratcher: envBoolean(
+	          'SCRATCH_REJECT_NEW_SCRATCHER',
+	          get('auth.methods.scratch.rejectNewScratcher', get('auth.scratchVerification.rejectNewScratcher', true)),
+	        ),
+	        rejectStudentAccounts: envBoolean(
+	          'SCRATCH_REJECT_STUDENT_ACCOUNTS',
+	          get('auth.methods.scratch.rejectStudentAccounts', get('auth.scratchVerification.rejectStudentAccounts', true)),
+	        ),
+	        minQualifiedFollowers: envNonNegativeInteger(
+	          'SCRATCH_MIN_QUALIFIED_FOLLOWERS',
+	          get('auth.methods.scratch.minQualifiedFollowers', get('auth.scratchVerification.minQualifiedFollowers', 25)),
+	        ),
+	      },
+	      passkey: {
+	        enabled: envBoolean(
+	          'AUTH_METHOD_PASSKEY_ENABLED',
+	          envBoolean('AUTH_PASSKEY_ENABLED', get('auth.methods.passkey.enabled', false)),
+	        ),
+	        rpName: String(
+	          process.env.AUTH_PASSKEY_RP_NAME || get('auth.methods.passkey.rpName', 'Nyaitter'),
+	        ).trim(),
+	        rpId: String(
+	          process.env.AUTH_PASSKEY_RP_ID || get('auth.methods.passkey.rpId', 'localhost'),
+	        ).trim(),
+	        origin: String(
+	          process.env.AUTH_PASSKEY_ORIGIN || get('auth.methods.passkey.origin', ''),
+	        ).trim(),
+	      },
+	      email: {
+	        enabled: envBoolean(
+	          'AUTH_METHOD_EMAIL_ENABLED',
+	          envBoolean('AUTH_EMAIL_ENABLED', get('auth.methods.email.enabled', true)),
+	        ),
+	        codeExpiryMinutes: envNonNegativeInteger(
+	          'AUTH_EMAIL_CODE_EXPIRY_MINUTES',
+	          get('auth.methods.email.codeExpiryMinutes', 10),
+	        ),
+	        codeLength: envNonNegativeInteger(
+	          'AUTH_EMAIL_CODE_LENGTH',
+	          get('auth.methods.email.codeLength', 6),
+	        ),
+	        smtp: {
+	          host: String(process.env.SMTP_HOST || get('auth.methods.email.smtp.host', '')).trim(),
+	          port: envNonNegativeInteger('SMTP_PORT', get('auth.methods.email.smtp.port', 587)),
+	          secure: envBoolean('SMTP_SECURE', get('auth.methods.email.smtp.secure', false)),
+	          user: String(process.env.SMTP_USER || get('auth.methods.email.smtp.user', '')).trim(),
+	          pass: String(process.env.SMTP_PASS || get('auth.methods.email.smtp.pass', '')),
+	          from: String(
+	            process.env.SMTP_FROM
+	            || process.env.EMAIL_FROM
+	            || get('auth.methods.email.smtp.from', 'noreply@localhost')
+	          ).trim(),
+	        },
+	        embeddedServer: {
+	          enabled: envBoolean(
+	            'AUTH_EMAIL_EMBEDDED_SERVER_ENABLED',
+	            envBoolean('EMBEDDED_MAIL_SERVER_ENABLED', get('auth.methods.email.embeddedServer.enabled', false)),
+	          ),
+	          port: envNonNegativeInteger(
+	            'EMBEDDED_MAIL_SERVER_PORT',
+	            envNonNegativeInteger('SMTP_SERVER_PORT', get('auth.methods.email.embeddedServer.port', 2525)),
+	          ),
+	          host: String(
+	            process.env.EMBEDDED_MAIL_SERVER_HOST
+	            || process.env.SMTP_SERVER_HOST
+	            || get('auth.methods.email.embeddedServer.host', '0.0.0.0')
+	          ).trim(),
+	          directDelivery: envBoolean(
+	            'EMBEDDED_MAIL_DIRECT_DELIVERY_ENABLED',
+	            envBoolean('SMTP_DIRECT_DELIVERY_ENABLED', get('auth.methods.email.embeddedServer.directDelivery', false)),
+	          ),
+	          hostname: String(
+	            process.env.EMBEDDED_MAIL_HOSTNAME
+	            || get('auth.methods.email.embeddedServer.hostname', 'localhost')
+	          ).trim(),
+	        },
+	      },
+	      oauth: {
+	        enabled: envBoolean(
+	          'AUTH_METHOD_OAUTH_ENABLED',
+	          envBoolean('AUTH_OAUTH_ENABLED', get('auth.methods.oauth.enabled', false)),
+	        ),
+	        providers: get('auth.methods.oauth.providers', {}),
+	      },
+	      password: {
+	        enabled: envBoolean(
+	          'AUTH_METHOD_PASSWORD_ENABLED',
+	          envBoolean('AUTH_PASSWORD_ENABLED', get('auth.methods.password.enabled', false)),
+	        ),
+	      },
+	    },
+	    scratchVerification: {
 	      ipRestrictionEnabled: envBoolean(
 	        'SCRATCH_IP_RESTRICTION_ENABLED',
-	        get('auth.scratchVerification.ipRestrictionEnabled', true),
+	        get('auth.methods.scratch.ipRestrictionEnabled', get('auth.scratchVerification.ipRestrictionEnabled', true)),
 	      ),
 	      rejectNewScratcher: envBoolean(
 	        'SCRATCH_REJECT_NEW_SCRATCHER',
-	        get('auth.scratchVerification.rejectNewScratcher', true),
+	        get('auth.methods.scratch.rejectNewScratcher', get('auth.scratchVerification.rejectNewScratcher', true)),
 	      ),
 	      rejectStudentAccounts: envBoolean(
 	        'SCRATCH_REJECT_STUDENT_ACCOUNTS',
-	        get('auth.scratchVerification.rejectStudentAccounts', true),
+	        get('auth.methods.scratch.rejectStudentAccounts', get('auth.scratchVerification.rejectStudentAccounts', true)),
 	      ),
 	      minQualifiedFollowers: envNonNegativeInteger(
 	        'SCRATCH_MIN_QUALIFIED_FOLLOWERS',
-	        get('auth.scratchVerification.minQualifiedFollowers', 25),
+	        get('auth.methods.scratch.minQualifiedFollowers', get('auth.scratchVerification.minQualifiedFollowers', 25)),
 	      ),
 	    },
 	  },

@@ -1,6 +1,5 @@
 const {
 	formatNyaitterId,
-	getUserNyaitterAddress,
 	getUserNyaitterId,
 } = require('./nyaitterAddress');
 const { normalizeNotificationRecord } = require('./notification');
@@ -17,9 +16,6 @@ function serializeUserBrief(user, publicUrl = null, { includeSearchExclusion = f
 	return {
 		id: user.id,
 		nyaitter_id: getUserNyaitterId(user),
-		nyaitter_address: publicUrl
-			? getAddressForPublicUrl(user, publicUrl)
-			: getUserNyaitterAddress(user),
 		name: user.name || '',
 		scid: user.scid || null,
 		icon_data: user.icon_data || null,
@@ -28,14 +24,6 @@ function serializeUserBrief(user, publicUrl = null, { includeSearchExclusion = f
 		is_imposter: !!user.settings?.imposter?.parent_id,
 		...(includeSearchExclusion ? { shadow: !!user.shadow } : {}),
 	};
-}
-
-function getAddressForPublicUrl(user, publicUrl) {
-	if (!user) return null;
-	if (user.auth_provider === 'nyaitter' && user.external_id != null && user.provider_domain) {
-		return getUserNyaitterAddress(user);
-	}
-	return `${formatNyaitterId(user.id)}@${new URL(publicUrl).host}`;
 }
 
 async function serializeNotifications(db, notifications, publicUrl = null, options = {}) {
@@ -146,9 +134,6 @@ async function serializeUser(db, user, viewerId = null, publicUrl = null) {
 		name: user.name || '',
 		scid: user.scid || null,
 		handle: getUserNyaitterId(user),
-		nyaitter_address: publicUrl
-			? getAddressForPublicUrl(user, publicUrl)
-			: getUserNyaitterAddress(user),
 		me: user.me || user.bio || '',
 		icon_data: user.icon_data || null,
 		header_image: user.header_image || null,
@@ -522,9 +507,6 @@ async function serializeReply(db, post, currentUserId = null, publicUrl = null) 
 		created_at: post.createdAt,
 		author_id: author ? author.id : null,
 		author_nyaitter_id: author ? getUserNyaitterId(author) : null,
-		author_nyaitter_address: author
-			? (publicUrl ? getAddressForPublicUrl(author, publicUrl) : getUserNyaitterAddress(author))
-			: null,
 		author_name: author ? author.name : '',
 		author_scid: author ? author.scid : null,
 		author_icon_data: author ? author.icon_data : null,

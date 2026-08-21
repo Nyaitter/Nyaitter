@@ -4,7 +4,6 @@ const { Pool } = require('pg');
 const crypto = require('crypto');
 const DatabaseAdapter = require('../DatabaseAdapter');
 const {
-	buildExternalNyaitterAddress,
 	formatNyaitterId,
 } = require('../../../utils/nyaitterAddress');
 const appConfig = require('../../../config');
@@ -515,34 +514,157 @@ class PostgresAdapter extends DatabaseAdapter {
 		return normalizeUserRow(rows[0]);
 	}
 
-	async getUserByNyaitterAddress(address) {
-		if (!address) return null;
+	async getUserByExternalId(authProvider, externalId) {
+		if (!authProvider || externalId == null) return null;
 		const { rows } = await this.pool.query(
-			'SELECT * FROM users WHERE nyaitter_address = $1 LIMIT 1',
-			[String(address)],
+			'SELECT * FROM users WHERE auth_provider = $1 AND external_id = $2 LIMIT 1',
+			[String(authProvider), String(externalId)],
 		);
 		return normalizeUserRow(rows[0]);
 	}
 
-	async getOrCreateExternalUser({ providerDomain, externalId, profile = {} }) {
-		const address = buildExternalNyaitterAddress(externalId, providerDomain);
+	async getUserAuthProviders(userId) {
+		const targetId = Number(userId);
+		const user = await this.getUserById(targetId);
+		if (!user) return [];
 
-		const user = await this.getUserByNyaitterAddress(address);
-		if (user) return user;
-		return this.createUser({
-			name: profile.name || formatNyaitterId(externalId),
-			me: profile.me || profile.bio || '',
-			bio: profile.bio || profile.me || '',
-			icon_data: profile.icon_data || null,
-			header_image: profile.header_image || null,
-			handle: formatNyaitterId(externalId),
-			nyaitter_address: address,
-			auth_provider: 'nyaitter',
-			provider_domain: providerDomain,
-			external_id: externalId,
-			external_profile: profile.external_profile || profile,
-			block: profile.block || [],
-		});
+		const { rows } = await this.pool.query(
+			'SELECT id, user_id AS "userId", provider, provider_user_id AS "providerUserId", provider_profile AS "providerProfile", created_at AS "createdAt" FROM user_auth_providers WHERE user_id = $1 ORDER BY id ASC',
+			[targetId],
+		);
+
+		if (rows.length === 0) {
+			if (user.scid) {
+				return [{
+					id: 0,
+					userId: targetId,
+					provider: 'scratch',
+					providerUserId: user.scid,
+					providerProfile: { username: user.scid },
+					isPrimary: true,
+					createdAt: user.created_at || new Date(),
+				}];
+			} else if (user.auth_provider && user.external_id) {
+				return [{
+					id: 0,
+					userId: targetId,
+					provider: user.auth_provider,
+					providerUserId: user.external_id,
+					providerProfile: user.external_profile || {},
+					isPrimary: true,
+					createdAt: user.created_at || new Date(),
+				}];
+			}
+		}
+
+		return rows.map((r) => ({
+			id: r.id,
+			userId: r.userId,
+			provider: r.provider,
+			providerUserId: r.providerUserId,
+			providerProfile: typeof r.providerProfile === 'string' ? JSON.parse(r.providerProfile) : (r.providerProfile || {}),
+			createdAt: r.createdAt,
+		}));
+	}
+
+	async findUserByAuthProvider(provider, providerUserId) {
+		if (!provider || providerUserId == null) return null;
+		const normProvider = String(provider).toLowerCase();
+		const normUserId = String(providerUserId).trim();
+
+		const { rows } = await this.pool.query(
+			`SELECT u.* FROM users u
+			 JOIN user_auth_providers p ON u.id = p.user_id
+			 WHERE LOWER(p.provider) = $1 AND LOWER(p.provider_user_id) = $2
+			 LIMIT 1`,
+			[normProvider, normUserId.toLowerCase()],
+		);
+
+		if (rows.length > 0) return normalizeUserRow(rows[0]);
+
+		if (normProvider === 'scratch' || normProvider === 'local') {
+			const userByScid = await this.getUserByScid(normUserId);
+			if (userByScid) return userByScid;
+		}
+
+		const userByExt = await this.getUserByExternalId(normProvider, normUserId);
+		if (userByExt) return userByExt;
+
+		return null;
+	}
+
+	async linkAuthProvider(userId, provider, providerUserId, providerProfile = {}) {
+		const targetId = Number(userId);
+		const normProvider = String(provider).toLowerCase();
+		const normUserId = String(providerUserId).trim();
+
+		const existingUser = await this.findUserByAuthProvider(normProvider, normUserId);
+		if (existingUser && existingUser.id !== targetId) {
+			const err = new Error('この認証情報は既に他のアカウントに紐付けられています。');
+			err.status = 409;
+			err.code = 'auth_provider_already_linked';
+			throw err;
+		}
+
+		const profileJson = JSON.stringify(providerProfile || {});
+		const { rows } = await this.pool.query(
+			`INSERT INTO user_auth_providers (user_id, provider, provider_user_id, provider_profile, created_at)
+			 VALUES ($1, $2, $3, $4::jsonb, NOW())
+			 ON CONFLICT (provider, provider_user_id) DO UPDATE SET provider_profile = EXCLUDED.provider_profile
+			 RETURNING id, user_id AS "userId", provider, provider_user_id AS "providerUserId", provider_profile AS "providerProfile", created_at AS "createdAt"`,
+			[targetId, normProvider, normUserId, profileJson],
+		);
+
+		if (normProvider === 'scratch') {
+			await this.pool.query(
+				'UPDATE users SET scid = COALESCE(scid, $1) WHERE id = $2',
+				[normUserId, targetId],
+			);
+		}
+
+		const r = rows[0];
+		return {
+			id: r.id,
+			userId: r.userId,
+			provider: r.provider,
+			providerUserId: r.providerUserId,
+			providerProfile: typeof r.providerProfile === 'string' ? JSON.parse(r.providerProfile) : (r.providerProfile || {}),
+			createdAt: r.createdAt,
+		};
+	}
+
+	async unlinkAuthProvider(userId, provider, providerUserId = null) {
+		const targetId = Number(userId);
+		const normProvider = String(provider).toLowerCase();
+		const linkedProviders = await this.getUserAuthProviders(targetId);
+
+		if (linkedProviders.length <= 1) {
+			const err = new Error('最後のログイン方法を解除することはできません。アカウントには最低1つのログイン方法が必要です。');
+			err.status = 400;
+			err.code = 'cannot_unlink_last_provider';
+			throw err;
+		}
+
+		if (providerUserId != null) {
+			await this.pool.query(
+				'DELETE FROM user_auth_providers WHERE user_id = $1 AND LOWER(provider) = $2 AND LOWER(provider_user_id) = $3',
+				[targetId, normProvider, String(providerUserId).toLowerCase()],
+			);
+		} else {
+			await this.pool.query(
+				'DELETE FROM user_auth_providers WHERE user_id = $1 AND LOWER(provider) = $2',
+				[targetId, normProvider],
+			);
+		}
+
+		if (normProvider === 'scratch') {
+			await this.pool.query(
+				'UPDATE users SET scid = NULL WHERE id = $1',
+				[targetId],
+			);
+		}
+
+		return { success: true };
 	}
 
 	async createUser(userData) {

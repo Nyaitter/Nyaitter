@@ -2,7 +2,6 @@ const DatabaseAdapter = require('./DatabaseAdapter');
 const config = require('../../config');
 const crypto = require('crypto');
 const {
-	buildExternalNyaitterAddress,
 	formatNyaitterId,
 } = require('../../utils/nyaitterAddress');
 const { normalizeTarget } = require('../../utils/notification');
@@ -68,7 +67,10 @@ class InMemoryAdapter extends DatabaseAdapter {
 		this.nextDmId = 1;
 		this.logs = []; // { scratch_id, nyaitter_id, masked_ip_uuid, log_time }
 
-		this.nyaitterAddressToId = new Map();
+		this.externalAuthToId = new Map(); // `${provider}:${external_id}` -> id
+		this.userAuthProviders = new Map(); // id -> { id, userId, provider, providerUserId, providerProfile, createdAt }
+		this.authProviderLookup = new Map(); // `${provider}:${providerUserId}` -> providerRecordId
+		this.nextAuthProviderId = 1;
 	}
 
 	async exportDataSnapshot() {
@@ -160,7 +162,9 @@ class InMemoryAdapter extends DatabaseAdapter {
 			};
 			this.users.set(user.id, user);
 			if (user.scid) this.scidToId.set(user.scid, user.id);
-			if (user.nyaitter_address) this.nyaitterAddressToId.set(String(user.nyaitter_address).toLowerCase(), user.id);
+			if (user.auth_provider && user.external_id != null) {
+				this.externalAuthToId.set(`${String(user.auth_provider).toLowerCase()}:${String(user.external_id)}`, user.id);
+			}
 		}
 		for (const row of data.tables.sessions) {
 			if (!row.token) continue;
@@ -507,51 +511,162 @@ class InMemoryAdapter extends DatabaseAdapter {
 		return this._normalizeUserBlockList(this.users.get(id));
 	}
 
-	async getUserByNyaitterAddress(address) {
-		if (!this.nyaitterAddressToId) return null;
-		const id = this.nyaitterAddressToId.get(address);
-		return id != null
+	async getUserByExternalId(authProvider, externalId) {
+		if (!authProvider || externalId == null) return null;
+		const key = `${String(authProvider).toLowerCase()}:${String(externalId)}`;
+		const id = this.externalAuthToId.get(key);
+		return id !== undefined
 			? this._normalizeUserBlockList(this.users.get(id))
 			: null;
 	}
 
-	async getOrCreateExternalUser({
-		providerDomain,
-		externalId,
-		profile = {},
-	}) {
-		const address = buildExternalNyaitterAddress(externalId, providerDomain);
+	async getUserAuthProviders(userId) {
+		const targetId = Number(userId);
+		const user = this.users.get(targetId);
+		if (!user) return [];
 
-		let user = await this.getUserByNyaitterAddress(address);
-		if (user) return user;
+		const records = [];
+		for (const record of this.userAuthProviders.values()) {
+			if (record.userId === targetId) {
+				records.push({ ...record });
+			}
+		}
 
-		const id = this._allocateUserId();
-		user = this._withUserDefaults({
-			id,
-			name: profile.name || formatNyaitterId(externalId),
-			me: profile.me || profile.bio || '',
-			bio: profile.bio || profile.me || '',
-			icon_data: profile.icon_data || null,
-			header_image: profile.header_image || null,
-			scid: null,
-			handle: formatNyaitterId(externalId),
-			nyaitter_address: address,
-			auth_provider: 'nyaitter',
-			provider_domain: providerDomain,
-			external_id: externalId,
-			external_profile: profile.external_profile || profile,
-			uuid: null,
-			settings: {},
-			created_at: new Date(),
-		});
+		if (records.length === 0) {
+			if (user.scid) {
+				records.push({
+					id: 0,
+					userId: targetId,
+					provider: 'scratch',
+					providerUserId: user.scid,
+					providerProfile: { username: user.scid },
+					isPrimary: true,
+					createdAt: user.createdAt || new Date(),
+				});
+			} else if (user.auth_provider && user.external_id) {
+				records.push({
+					id: 0,
+					userId: targetId,
+					provider: user.auth_provider,
+					providerUserId: user.external_id,
+					providerProfile: user.external_profile || {},
+					isPrimary: true,
+					createdAt: user.createdAt || new Date(),
+				});
+			}
+		}
 
-		this.users.set(id, user);
-		this.nyaitterAddressToId.set(address, id);
-
-		return user;
+		return records;
 	}
 
-	
+	async findUserByAuthProvider(provider, providerUserId) {
+		if (!provider || providerUserId == null) return null;
+		const normProvider = String(provider).toLowerCase();
+		const normUserId = String(providerUserId).trim();
+		const key = `${normProvider}:${normUserId.toLowerCase()}`;
+
+		const recordId = this.authProviderLookup.get(key);
+		if (recordId !== undefined) {
+			const record = this.userAuthProviders.get(recordId);
+			if (record) {
+				const user = this.users.get(record.userId);
+				if (user) return this._normalizeUserBlockList(user);
+			}
+		}
+
+		if (normProvider === 'scratch' || normProvider === 'local') {
+			const userByScid = await this.getUserByScid(normUserId);
+			if (userByScid) return userByScid;
+		}
+
+		const userByExt = await this.getUserByExternalId(normProvider, normUserId);
+		if (userByExt) return userByExt;
+
+		return null;
+	}
+
+	async linkAuthProvider(userId, provider, providerUserId, providerProfile = {}) {
+		const targetId = Number(userId);
+		const user = this.users.get(targetId);
+		if (!user) throw new Error('ユーザーが見つかりません。');
+
+		const normProvider = String(provider).toLowerCase();
+		const normUserId = String(providerUserId).trim();
+		const key = `${normProvider}:${normUserId.toLowerCase()}`;
+
+		const existingUser = await this.findUserByAuthProvider(normProvider, normUserId);
+		if (existingUser && existingUser.id !== targetId) {
+			const err = new Error('この認証情報は既に他のアカウントに紐付けられています。');
+			err.status = 409;
+			err.code = 'auth_provider_already_linked';
+			throw err;
+		}
+
+		// If already linked to this exact user, return existing record
+		const existingRecordId = this.authProviderLookup.get(key);
+		if (existingRecordId !== undefined) {
+			return this.userAuthProviders.get(existingRecordId);
+		}
+
+		const id = this.nextAuthProviderId++;
+		const record = {
+			id,
+			userId: targetId,
+			provider: normProvider,
+			providerUserId: normUserId,
+			providerProfile: providerProfile || {},
+			createdAt: new Date(),
+		};
+
+		this.userAuthProviders.set(id, record);
+		this.authProviderLookup.set(key, id);
+		this.externalAuthToId.set(key, targetId);
+
+		if (normProvider === 'scratch' && !user.scid) {
+			user.scid = normUserId;
+			this.scidToId.set(normUserId, targetId);
+		}
+
+		return record;
+	}
+
+	async unlinkAuthProvider(userId, provider, providerUserId = null) {
+		const targetId = Number(userId);
+		const user = this.users.get(targetId);
+		if (!user) throw new Error('ユーザーが見つかりません。');
+
+		const normProvider = String(provider).toLowerCase();
+		const linkedProviders = await this.getUserAuthProviders(targetId);
+
+		if (linkedProviders.length <= 1) {
+			const err = new Error('最後のログイン方法を解除することはできません。アカウントには最低1つのログイン方法が必要です。');
+			err.status = 400;
+			err.code = 'cannot_unlink_last_provider';
+			throw err;
+		}
+
+		let deleted = false;
+		for (const [id, record] of this.userAuthProviders.entries()) {
+			if (record.userId === targetId && record.provider === normProvider) {
+				if (providerUserId == null || String(record.providerUserId).toLowerCase() === String(providerUserId).toLowerCase()) {
+					const key = `${record.provider}:${String(record.providerUserId).toLowerCase()}`;
+					this.userAuthProviders.delete(id);
+					this.authProviderLookup.delete(key);
+					this.externalAuthToId.delete(key);
+					deleted = true;
+				}
+			}
+		}
+
+		if (normProvider === 'scratch' && user.scid) {
+			this.scidToId.delete(user.scid);
+			user.scid = null;
+			deleted = true;
+		}
+
+		return { success: true, deleted };
+	}
+
 	_withUserDefaults(user) {
 		const normalized = {
 			me: '',
@@ -564,41 +679,36 @@ class InMemoryAdapter extends DatabaseAdapter {
 			verify: false,
 			freeze: null,
 			shadow: false,
-							lock: false,
-				account_operation: null,
-				...(user || {}),
-			};
-			normalized.block = normalizeBlockList(normalized.block, normalized.id);
+			lock: false,
+			account_operation: null,
+			...(user || {}),
+		};
+		normalized.block = normalizeBlockList(normalized.block, normalized.id);
 
 		return normalized;
 	}
 
 	async createUser(userData) {
 		const id = this._allocateUserId();
-			const handle = userData.auth_provider === 'nyaitter' && userData.external_id != null
-				? formatNyaitterId(userData.external_id)
-				: formatNyaitterId(id);
+		const handle = formatNyaitterId(id);
 
 		const adminScids = (process.env.ADMIN_SCIDS || '')
 			.split(',')
 			.map((s) => s.trim())
 			.filter(Boolean);
 
-					const user = this._withUserDefaults({
-				id,
-				name: userData.name || userData.scid || userData.handle,
-				me: userData.me || userData.bio || '',
-
-				bio: userData.bio || userData.me || '',
-				icon_data: userData.icon_data || null,
-				header_image: userData.header_image || null,
-				scid: userData.scid || null,
-				handle: handle,
-				nyaitter_address: userData.nyaitter_address || null,
-
+		const user = this._withUserDefaults({
+			id,
+			name: userData.name || userData.scid || userData.handle || handle,
+			me: userData.me || userData.bio || '',
+			bio: userData.bio || userData.me || '',
+			icon_data: userData.icon_data || null,
+			header_image: userData.header_image || null,
+			scid: userData.scid || null,
+			handle: userData.handle || handle,
 			auth_provider: userData.auth_provider || 'local',
 			provider_domain: userData.provider_domain || null,
-			external_id: userData.external_id || null,
+			external_id: userData.external_id != null ? String(userData.external_id) : null,
 			external_profile: userData.external_profile || null,
 			uuid: userData.uuid || null,
 			settings: userData.settings || {},
@@ -608,9 +718,9 @@ class InMemoryAdapter extends DatabaseAdapter {
 
 		this.users.set(id, user);
 		if (user.scid) this.scidToId.set(user.scid, id);
-		if (user.nyaitter_address) {
-			this.nyaitterAddressToId = this.nyaitterAddressToId || new Map();
-			this.nyaitterAddressToId.set(user.nyaitter_address, id);
+		if (user.auth_provider && user.external_id != null) {
+			const key = `${String(user.auth_provider).toLowerCase()}:${String(user.external_id)}`;
+			this.externalAuthToId.set(key, id);
 		}
 
 		return user;

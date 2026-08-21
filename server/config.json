@@ -60,13 +60,55 @@
 			"maxImages": 0
 		},
 		"auth": {
-
-		"sessionExpiryDays": 30,
-		"verificationCodeExpiryMinutes": 15,
-		"botTokenPrefix": "bot_",
-		"sessionTokenBytes": 32,
-		"botTokenIdBytes": 16,
+			"sessionExpiryDays": 30,
+			"verificationCodeExpiryMinutes": 15,
+			"botTokenPrefix": "bot_",
+			"sessionTokenBytes": 32,
+			"botTokenIdBytes": 16,
 			"verificationCodeBytes": 4,
+			"methods": {
+				"scratch": {
+					"enabled": true,
+					"verificationProjectId": "1239738451",
+					"ipRestrictionEnabled": true,
+					"rejectNewScratcher": true,
+					"rejectStudentAccounts": true,
+					"minQualifiedFollowers": 25
+				},
+				"passkey": {
+					"enabled": false,
+					"rpName": "Nyaitter",
+					"rpId": "localhost",
+					"origin": "http://localhost:3000"
+				},
+				"email": {
+					"enabled": true,
+					"codeExpiryMinutes": 10,
+					"codeLength": 6,
+					"smtp": {
+						"host": "",
+						"port": 587,
+						"secure": false,
+						"user": "",
+						"pass": "",
+						"from": "noreply@localhost"
+					},
+					"embeddedServer": {
+						"enabled": false,
+						"port": 2525,
+						"host": "0.0.0.0",
+						"directDelivery": false,
+						"hostname": "localhost"
+					}
+				},
+				"oauth": {
+					"enabled": false,
+					"providers": {}
+				},
+				"password": {
+					"enabled": false
+				}
+			},
 			"scratchVerification": {
 				"ipRestrictionEnabled": true,
 				"rejectNewScratcher": true,

@@ -10,7 +10,7 @@ Nyaitter は、NyaX をベースにした Scratcher 向けのオープンソー�
 
 ## 主な機能
 
-投稿、返信、引用、リポスト、いいね、スター、検索、フォロー、通知、グループ DM、Web Push、外部 Nyaitter アドレスでのログインを提供します。投稿の公開範囲、検索除外、双方向のブロック関係はサーバー側の共通可視性ルールで判定されます。
+投稿、返信、引用、リポスト、いいね、スター、検索、フォロー、通知、グループ DM、Web Push、マルチプロバイダー認証（Scratch、メールアドレス、パスキー）を提供します。投稿の公開範囲、検索除外、双方向のブロック関係はサーバー側の共通可視性ルールで判定されます。
 
 > ブロック関係にある利用者同士では、相互の投稿・投稿通知・DMメッセージを表示しません。DMへの新規招待やメンバー追加も拒否されます。
 
@@ -34,6 +34,7 @@ NyaitterClient と NyaitterServer は **MIT ライセンス**です。著作権�
 ## ドキュメント
 
 - サーバーの起動、API、認証、リアルタイム配信: [`server/README.md`](./server/README.md)
+- 認証プロバイダー設定（Scratch、メール、パスキー）: [`server/help/auth-providers.md`](./server/help/auth-providers.md)
 - DB・ストレージアダプター: [`server/adapters/README.md`](./server/adapters/README.md)
 - PostgreSQL、D1、R2、ローカルストレージ、本番運用: [`server/help/README.md`](./server/help/README.md)
 - DBスキーマ・データ移行: [`server/migrations/README.md`](./server/migrations/README.md)

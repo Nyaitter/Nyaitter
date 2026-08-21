@@ -70,74 +70,19 @@ function getPublicUrl(req = null) {
   return `http://localhost:${port}`;
 }
 
-function getAddressDomain(publicUrl) {
-  const parsed = new URL(publicUrl);
-  const defaultPort = DEFAULT_PORTS.get(parsed.protocol);
-  return parsed.port && parsed.port !== defaultPort
-    ? `${parsed.hostname}:${parsed.port}`
-    : parsed.hostname;
-}
-
-function buildNyaitterAddress(id, publicUrl) {
-  return `${formatNyaitterId(id)}@${getAddressDomain(publicUrl)}`;
-}
-
-function buildLocalNyaitterAddress(id, req = null) {
-  return buildNyaitterAddress(id, getPublicUrl(req));
-}
-
-function buildExternalNyaitterAddress(externalId, providerDomain) {
-  const normalizedDomain = String(providerDomain || '').trim().toLowerCase();
-  if (!isSafeHost(normalizedDomain)) {
-    throw new Error('Invalid Nyaitter provider domain');
-  }
-  return `${formatNyaitterId(externalId)}@${normalizedDomain}`;
-}
-
-function parseNyaitterAddress(value) {
-  if (typeof value !== 'string') return null;
-  const match = value.trim().match(/^#(\d{1,16})@([A-Za-z0-9.-]+(?::\d{1,5})?)$/);
-  if (!match) return null;
-
-  const id = Number(match[1]);
-  const domain = match[2].toLowerCase();
-  if (!Number.isSafeInteger(id) || id < 0 || !isSafeHost(domain)) return null;
-
-  return {
-    id,
-    domain,
-    address: buildExternalNyaitterAddress(id, domain),
-  };
-}
-
 function getUserNyaitterId(user) {
 	if (!user) return null;
 	return formatNyaitterId(
-				user.auth_provider === 'nyaitter' && user.external_id != null
-				? user.external_id
-				: user.id,
-
+		user.auth_provider === 'nyaitter' && user.external_id != null
+			? user.external_id
+			: user.id,
 	);
 }
 
-function getUserNyaitterAddress(user, req = null) {
-	if (!user) return null;
-	if (user.auth_provider === 'nyaitter' && user.external_id != null && user.provider_domain) {
-		return buildExternalNyaitterAddress(user.external_id, user.provider_domain);
-	}
-	return buildLocalNyaitterAddress(user.id, req);
-}
-
 module.exports = {
-
-  buildExternalNyaitterAddress,
-  buildLocalNyaitterAddress,
-  buildNyaitterAddress,
   formatNyaitterId,
-  getAddressDomain,
   getPublicUrl,
-  getUserNyaitterAddress,
   getUserNyaitterId,
   normalizePublicUrl,
-  parseNyaitterAddress,
+  isSafeHost,
 };

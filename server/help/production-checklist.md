@@ -9,6 +9,8 @@
 - [ ] 永続DBとして`postgres`または`d1`を設定した。
 - [ ] DB・R2・D1・VAPID・外部APIの秘密情報をシークレット管理へ置いた。
 - [ ] DBのバックアップを取り、`npm run migrate`を実行した。
+- [ ] 利用する認証方式（Scratch、メール、パスキー）を設定し、`npm run check:config`で確認した。
+- [ ] メール認証を使う場合は、SMTPまたは組み込みメールサーバーの設定とドメインを設定した。
 - [ ] ファイル保存先と`STORAGE_USER_QUOTA_MB`を設定した。
 - [ ] Push通知を使う場合はVAPID設定を保存した。
 
@@ -26,4 +28,4 @@
 - [ ] DBとファイル保存の復旧手順を定期的に確認する。
 - [ ] 秘密情報を定期的に更新し、漏えい時に失効できるようにする。
 
-関連: [PostgreSQL](./database-postgres.md) / [D1とWorker](./database-d1-worker.md) / [R2](./storage-r2.md)
+関連: [認証プロバイダー設定](./auth-providers.md) / [PostgreSQL](./database-postgres.md) / [D1とWorker](./database-d1-worker.md) / [R2](./storage-r2.md)

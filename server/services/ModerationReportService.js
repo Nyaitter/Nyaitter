@@ -32,7 +32,6 @@ function snapshotUser(user) {
     name: user.name || '',
     scid: user.scid || null,
     handle: user.handle || null,
-    nyaitter_address: user.nyaitter_address || null,
     icon_data: user.icon_data || null,
     verify: Boolean(user.verify),
     freeze: user.freeze || null,

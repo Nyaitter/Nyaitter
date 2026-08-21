@@ -16,9 +16,6 @@ const {
   rememberAccountSession,
   getValidRememberedAccounts,
 } = require('../services/auth/RememberedAccountService');
-const ExternalLoginStateStore = require('../services/auth/ExternalLoginStateStore');
-const ExternalLoginProofStore = require('../services/auth/ExternalLoginProofStore');
-const { normalizeExternalProfile } = require('../services/auth/ExternalProfileMapper');
 const { requireAuth, requireAuthAllowFrozen, optionalAuth } = require('../middleware/auth');
 
 const config = require('../config');
@@ -32,9 +29,7 @@ const {
 const {
   formatNyaitterId,
   getPublicUrl,
-  getUserNyaitterAddress,
   getUserNyaitterId,
-  parseNyaitterAddress,
 } = require('../utils/nyaitterAddress');
 const {
   getRequestLoginMetadata,
@@ -42,10 +37,11 @@ const {
   hashApprovalPollToken,
   isUnknownLoginProtectionEnabled,
 } = require('../services/auth/LoginSecurityService');
+const AuthService = require('../services/auth/AuthService');
+const { defaultRegistry: authProviderRegistry } = require('../services/auth/AuthProviderRegistry');
 
 const router = express.Router();
-const externalLoginStateStore = new ExternalLoginStateStore();
-const externalLoginProofStore = new ExternalLoginProofStore();
+const authService = new AuthService({ registry: authProviderRegistry, config });
 
 function getDbAdapter(req) {
   return req.app.locals.dbAdapter;
@@ -103,7 +99,6 @@ function serializeLoginUser(user, req) {
     icon_data: user.icon_data || null,
     scid: user.scid || null,
     handle: getUserNyaitterId(user),
-    nyaitter_address: getUserNyaitterAddress(user, req),
     auth_provider: user.auth_provider,
     provider_domain: user.provider_domain || null,
     external_profile: user.external_profile || null,
@@ -238,95 +233,196 @@ function sendLoginResult(req, res, user, result, { external = false } = {}) {
 	});
 }
 
-router.post('/scratch/generate', async (req, res) => {
-  const { username, turnstile_token: turnstileToken } = req.body;
-  if (!username || typeof username !== 'string') {
-    return res.status(400).json({ error: 'username is required' });
-  }
-  if (!isValidScratchUsername(username)) {
-    return res.status(400).json({ error: 'Invalid Scratch username format' });
-  }
-
-  if (config.turnstile?.enabled) {
-    const turnstileResult = await verifyTurnstileToken(turnstileToken);
-    if (turnstileResult.success !== true) {
-      return res.status(403).json({
-        error: 'Turnstileチャレンジを完了してください。',
-        code: 'turnstile_required',
-      });
-    }
-  }
-
-  const { ipHash } = getRequestLoginMetadata(req);
-  const { code, expiresAt } = generateVerificationCode(username, ipHash);
-
+/**
+ * GET /server/auth/providers
+ * 利用可能な認証プロバイダーの一覧と設定を返す
+ */
+router.get('/providers', (req, res) => {
   res.json({
-    code,
-    expiresAt,
-    profileUrl: `https://scratch.mit.edu/users/${username}/`,
+    providers: authService.getPublicProviders(req),
   });
 });
 
-router.post('/scratch/verify', async (req, res) => {
-  const { username, code } = req.body;
-  // Express derives req.ip from X-Forwarded-For only when trust proxy is enabled.
-  // Reading the header directly would allow an untrusted client to forge its IP.
-  const ip = req.ip || req.socket?.remoteAddress || '127.0.0.1';
-  const { ipHash } = getRequestLoginMetadata(req);
-
-  if (!username || !code) {
-    return res.status(400).json({ error: 'username and code are required' });
-  }
-  if (!isValidScratchUsername(username)) {
-    return res.status(400).json({ error: 'Invalid Scratch username format' });
-  }
-
-  const bypassAuth = process.env.DEV_BYPASS_AUTH === 'true';
-  const isProd = (process.env.NODE_ENV || 'development') === 'production';
-
-  if (bypassAuth && isProd) {
-    return res.status(403).json({ error: 'DEV_BYPASS_AUTH is disabled in production' });
-  }
-
-  if (!bypassAuth) {
-    // コメントの反映待ちやアカウント条件の不一致でログインに失敗しても、コードは
-    // 発行時の有効期限まで再試行できるよう、ここでは消費しない。
-    const codeResult = await verifyPendingCode(username, code.toUpperCase(), ipHash);
-    if (!codeResult.success) {
-      return res.status(400).json({ error: codeResult.reason });
-    }
-
-    const accountCheck = await verifyScratchAccount(username, code, ip);
-    if (!accountCheck.ok) {
-      return res.status(400).json({ error: accountCheck.reason || 'Scratchアカウントの検証に失敗しました。' });
-    }
-
-    // コメントとアカウント条件の両方を通過した時点でだけ消費する。端末承認待ちも
-    // 検証済みログインとして扱うため、承認経由でコードが残り続けることはない。
-    const consumption = consumeVerificationCode(username, code, ipHash);
-    if (!consumption.success) {
-      return res.status(400).json({ error: consumption.reason });
-    }
-  } else {
-    console.warn('[auth] DEV_BYPASS_AUTH が有効です。すべての検証をスキップしています。');
-  }
-
-  const db = getDbAdapter(req);
-
-  let user = await db.getUserByScid(username);
-  if (!user) {
-    user = await db.createUser({
-      scid: username,
-      name: username,
-      auth_provider: 'local',
+/**
+ * POST /server/auth/:provider/initiate
+ * 任意の認証プロバイダーの認証開始（コード発行、チャレンジ作成等）
+ */
+router.post('/:provider/initiate', async (req, res) => {
+  const provider = String(req.params.provider || '').toLowerCase();
+  try {
+    const data = await authService.initiate(provider, req, req.body, {
+      config,
+      verifyTurnstile: verifyTurnstileToken,
+    });
+    res.json(data);
+  } catch (error) {
+    const status = error.status || 500;
+    res.status(status).json({
+      error: error.message || '認証の開始に失敗しました。',
+      code: error.code || undefined,
     });
   }
+});
 
-  const result = await beginProtectedLogin(req, res, user);
-  if (result.kind === 'authenticated') {
-    console.log(`[auth] Scratch認証成功: ${username} (userId=${user.id})`);
+/**
+ * POST /server/auth/:provider/verify
+ * 任意の認証プロバイダーの検証とログイン処理
+ */
+router.post('/:provider/verify', async (req, res) => {
+  const provider = String(req.params.provider || '').toLowerCase();
+  const db = getDbAdapter(req);
+  try {
+    const { user } = await authService.verifyAndResolveUser(provider, req, req.body, {
+      config,
+      db,
+    });
+
+    const result = await beginProtectedLogin(req, res, user);
+    if (result.kind === 'authenticated') {
+      console.log(`[auth] ${provider}認証成功: ${user.name} (userId=${user.id})`);
+    }
+    return sendLoginResult(req, res, user, result);
+  } catch (error) {
+    const status = error.status || 500;
+    res.status(status).json({
+      error: error.message || '認証に失敗しました。',
+      code: error.code || undefined,
+    });
   }
-  return sendLoginResult(req, res, user, result);
+});
+
+/**
+ * GET /server/auth/linked-providers
+ * ログイン中ユーザーに紐づけられている認証プロバイダー一覧を取得
+ */
+router.get('/linked-providers', requireAuth, async (req, res) => {
+  const db = getDbAdapter(req);
+  try {
+    const providers = await authService.getLinkedProviders(req.user.id, db);
+    res.json({
+      linked_providers: providers,
+    });
+  } catch (error) {
+    const status = error.status || 500;
+    res.status(status).json({
+      error: error.message || '連携済み認証方式の取得に失敗しました。',
+      code: error.code || undefined,
+    });
+  }
+});
+
+/**
+ * POST /server/auth/link/:provider/initiate
+ * 既存アカウントへの新しい認証プロバイダー紐づけ認証を開始
+ */
+router.post('/link/:provider/initiate', requireAuth, async (req, res) => {
+  const provider = String(req.params.provider || '').toLowerCase();
+  try {
+    const data = await authService.initiate(provider, req, req.body, {
+      config,
+      verifyTurnstile: verifyTurnstileToken,
+    });
+    res.json(data);
+  } catch (error) {
+    const status = error.status || 500;
+    res.status(status).json({
+      error: error.message || '認証の開始に失敗しました。',
+      code: error.code || undefined,
+    });
+  }
+});
+
+/**
+ * POST /server/auth/link/:provider/verify
+ * 既存アカウントへ新しい認証プロバイダーを紐づけ
+ */
+router.post('/link/:provider/verify', requireAuth, async (req, res) => {
+  const provider = String(req.params.provider || '').toLowerCase();
+  const db = getDbAdapter(req);
+  try {
+    const result = await authService.linkProvider(provider, req.user.id, req, req.body, {
+      config,
+      db,
+    });
+    res.json({
+      success: true,
+      message: '認証方法の紐づけが完了しました。',
+      linked_provider: result.linkedProvider,
+    });
+  } catch (error) {
+    const status = error.status || 500;
+    res.status(status).json({
+      error: error.message || '認証方法の紐づけに失敗しました。',
+      code: error.code || undefined,
+    });
+  }
+});
+
+/**
+ * DELETE /server/auth/link/:provider
+ * 既存アカウントから認証プロバイダーの紐づけを解除
+ */
+router.delete('/link/:provider', requireAuth, async (req, res) => {
+  const provider = String(req.params.provider || '').toLowerCase();
+  const providerUserId = req.body?.provider_user_id || req.query?.provider_user_id || null;
+  const db = getDbAdapter(req);
+  try {
+    await authService.unlinkProvider(provider, req.user.id, db, providerUserId);
+    res.json({
+      success: true,
+      message: '認証方法の連携を解除しました。',
+    });
+  } catch (error) {
+    const status = error.status || 500;
+    res.status(status).json({
+      error: error.message || '認証方法の解除に失敗しました。',
+      code: error.code || undefined,
+    });
+  }
+});
+
+router.post('/scratch/generate', async (req, res) => {
+  try {
+    const data = await authService.initiate('scratch', req, {
+      username: req.body?.username,
+      turnstileToken: req.body?.turnstile_token,
+    }, {
+      config,
+      verifyTurnstile: verifyTurnstileToken,
+    });
+    res.json(data);
+  } catch (error) {
+    const status = error.status || 500;
+    res.status(status).json({
+      error: error.message || 'コードの生成に失敗しました。',
+      code: error.code || undefined,
+    });
+  }
+});
+
+router.post('/scratch/verify', async (req, res) => {
+  const db = getDbAdapter(req);
+  try {
+    const { user } = await authService.verifyAndResolveUser('scratch', req, {
+      username: req.body?.username,
+      code: req.body?.code,
+    }, {
+      config,
+      db,
+    });
+
+    const result = await beginProtectedLogin(req, res, user);
+    if (result.kind === 'authenticated') {
+      console.log(`[auth] Scratch認証成功: ${user.scid || user.name} (userId=${user.id})`);
+    }
+    return sendLoginResult(req, res, user, result);
+  } catch (error) {
+    const status = error.status || 500;
+    res.status(status).json({
+      error: error.message || '認証に失敗しました。',
+      code: error.code || undefined,
+    });
+  }
 });
 
 /**
@@ -814,370 +910,6 @@ router.delete('/bot-tokens/:tokenId', requireAuth, async (req, res) => {
   } else {
     res.status(404).json({ error: 'トークンが見つかりません' });
   }
-});
-
-function resolveExternalServer(domain, nyaitterAddress) {
-  const configuredServers = config.federation?.trusted_servers || [];
-  // 未設定時に利用者入力のドメインへサーバーから接続すると、内部ネットワークを
-  // 参照できるSSRF経路になる。外部ログインは常に明示的な許可リストに限定する。
-  if (configuredServers.length === 0) return null;
-
-  const configured = configuredServers.find((server) =>
-    String(server.domain || '').toLowerCase() === domain || server.nyaitter_id === nyaitterAddress,
-  );
-  return configured ? { ...configured, trust_mode: 'allowlist' } : null;
-}
-
-async function verifyExternalLoginProof(trustedServer, nyaitterAddress, proof) {
-  if (!trustedServer.verify_endpoint) {
-    throw new Error('Trusted server does not provide a verification endpoint');
-  }
-
-  const endpoint = new URL(trustedServer.verify_endpoint);
-  const localDevelopmentHost = /^(localhost|127\.0\.0\.1)(?::\d{1,5})?$/i.test(endpoint.host);
-  if (endpoint.protocol !== 'https:' && !(localDevelopmentHost && endpoint.protocol === 'http:')) {
-    throw new Error('Trusted server verification endpoint must use HTTPS (http is allowed only for localhost)');
-  }
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 8000);
-  try {
-    const response = await fetch(endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify({ nyaitter_address: nyaitterAddress, proof }),
-      signal: controller.signal,
-    });
-    if (!response.ok) {
-      throw new Error(`External proof verification failed: ${response.status}`);
-    }
-    const result = await response.json();
-    if (result?.valid !== true || !result.profile || typeof result.profile !== 'object') {
-      throw new Error('External proof was not accepted');
-    }
-    return result.profile;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-/**
- * GET /server/auth/external/trusted
- * 信頼できる外部Nyaitterサーバーの一覧を返す（ログインUI用）
- */
-router.get('/external/trusted', (req, res) => {
-  const trusted = (config.federation?.trusted_servers || []).map(s => ({
-    nyaitter_id: s.nyaitter_id,
-    domain: s.domain,
-  }));
-  res.json({
-    trusted_servers: trusted,
-		enabled: Boolean(config.federation?.allow_external_login && trusted.length > 0),
-		trust_mode: 'allowlist',
-		standard_endpoints: null,
-  });
-});
-
-/**
- * POST /server/auth/external/init
- * 外部Nyaitterサーバーでのログインを開始する
- *
- * 注意: nyaitter_address のドメイン部（#id@ドメイン）は、
- * そのNyaitterサーバーを実際にホストしているドメインに依存します。
- */
-router.post('/external/init', async (req, res) => {
-  const { nyaitter_address } = req.body;
-
-  if (!nyaitter_address || typeof nyaitter_address !== 'string') {
-    return res.status(400).json({
-      error: 'nyaitter_address is required',
-      example: '#1234@your-nyaitter-domain.example.com'
-    });
-  }
-
-  if (!config.federation?.allow_external_login) {
-    return res.status(403).json({ error: 'External Nyaitter login is not enabled on this server' });
-  }
-
-  const parsedAddress = parseNyaitterAddress(nyaitter_address);
-  if (!parsedAddress) {
-    return res.status(400).json({
-      error: 'Invalid nyaitter_address format',
-      expected: '#{id}@{domain}',
-      note: 'The domain part depends on where that Nyaitter instance is hosted.'
-    });
-  }
-
-  const { id: externalId, domain, address: canonicalAddress } = parsedAddress;
-  const trusted = resolveExternalServer(domain, canonicalAddress);
-
-  if (!trusted) {
-    return res.status(403).json({ error: 'This Nyaitter server is not in the trusted list' });
-  }
-
-  const publicUrl = getPublicUrl(req);
-  const state = externalLoginStateStore.create({ nyaitterAddress: canonicalAddress });
-  const callbackUrl = new URL('/login', publicUrl);
-  callbackUrl.searchParams.set('external_login', '1');
-  callbackUrl.searchParams.set('state', state);
-
-  let authUrl;
-  try {
-    const defaultProtocol = /^(localhost|127\.0\.0\.1)(?::\d{1,5})?$/i.test(domain) ? 'http' : 'https';
-    const endpoint = new URL(trusted.auth_endpoint || `${defaultProtocol}://${domain}/auth/external`);
-    const localDevelopmentHost = /^(localhost|127\.0\.0\.1)(?::\d{1,5})?$/i.test(endpoint.host);
-    if (endpoint.protocol !== 'https:' && !(localDevelopmentHost && endpoint.protocol === 'http:')) {
-      throw new Error('External authentication endpoint must use HTTPS (http is allowed only for localhost)');
-    }
-    endpoint.searchParams.set('redirect', callbackUrl.toString());
-    endpoint.searchParams.set('nyaitter_address', canonicalAddress);
-    endpoint.searchParams.set('state', state);
-    authUrl = endpoint.toString();
-  } catch (error) {
-    return res.status(500).json({ error: error.message || 'External authentication endpoint is invalid' });
-  }
-
-  res.json({
-    success: true,
-    message: 'External login initiated',
-    nyaitter_address: canonicalAddress,
-    target_domain: domain,
-    trust_mode: trusted.trust_mode,
-    auth_url: authUrl,
-    redirect_uri: callbackUrl.toString(),
-    expires_in: 600,
-    note: 'Redirect the user to auth_url. The external server must return to redirect_uri with proof and state query parameters.',
-  });
-});
-
-/**
- * POST /server/auth/external/complete
- * 外部Nyaitterサーバーでの認証完了後、プロフィール情報を受け取ってログイン/参加する
- *
- * 注意:
- * - nyaitter_address のドメイン部分は、外部サーバーが実際にホストされているドメインです。
- * - このサーバーの公開URLは、要求元URLから自動導出されます（PUBLIC_URL は要求がない処理のフォールバックです）。
- */
-router.post('/external/complete', async (req, res) => {
-  const { nyaitter_address, proof, state } = req.body || {};
-
-  if (!proof || typeof proof !== 'string') {
-    return res.status(400).json({ error: 'proof is required' });
-  }
-
-  const stateRecord = state ? externalLoginStateStore.get(state) : null;
-  if (state && !stateRecord) {
-    return res.status(400).json({ error: 'External login state is invalid or expired. Please start again.' });
-  }
-  const addressToVerify = stateRecord?.nyaitterAddress || nyaitter_address;
-  if (stateRecord && nyaitter_address && nyaitter_address !== stateRecord.nyaitterAddress) {
-    return res.status(400).json({ error: 'External login address does not match the pending login request' });
-  }
-
-  const parsedAddress = parseNyaitterAddress(addressToVerify);
-  if (!parsedAddress) {
-    return res.status(400).json({ error: 'Invalid nyaitter_address format; expected #1234@example.com' });
-  }
-  if (!config.federation?.allow_external_login) {
-    return res.status(403).json({ error: 'External Nyaitter login is not enabled on this server' });
-  }
-
-  const { id: externalId, domain: providerDomain, address: canonicalAddress } = parsedAddress;
-  const trustedServer = resolveExternalServer(providerDomain, canonicalAddress);
-  if (!trustedServer) {
-    return res.status(403).json({ error: 'This Nyaitter server is not in the trusted list' });
-  }
-
-  let verifiedProfile;
-  try {
-    verifiedProfile = await verifyExternalLoginProof(trustedServer, canonicalAddress, proof);
-  } catch (error) {
-    console.warn('[auth] external proof verification failed:', error.message);
-    return res.status(401).json({ error: 'External login proof could not be verified' });
-  }
-
-  if (state) externalLoginStateStore.consume(state);
-
-  const db = getDbAdapter(req);
-  const profile = normalizeExternalProfile(
-    verifiedProfile,
-    formatNyaitterId(externalId),
-  );
-
-  const user = await db.getOrCreateExternalUser({
-    providerDomain,
-    externalId,
-    profile,
-  });
-
-  const result = await beginProtectedLogin(req, res, user);
-  return sendLoginResult(req, res, user, result, { external: true });
-});
-
-function isSafeRedirectUrl(rawUrl) {
-  try {
-    const url = new URL(String(rawUrl || ''));
-    if (url.username || url.password) return false;
-    const localDevelopmentHost = /^(localhost|127\.0\.0\.1)(?::\d{1,5})?$/i.test(url.host);
-    return url.protocol === 'https:' || (localDevelopmentHost && url.protocol === 'http:');
-  } catch (_) {
-    return false;
-  }
-}
-
-function buildConfirmProfile(user, req) {
-  return {
-    name: user.name || '',
-    me: user.me || user.bio || '',
-    bio: user.me || user.bio || '',
-    icon_data: null,
-    header_image: null,
-    nyaitter_id: getUserNyaitterId(user),
-    nyaitter_address: getUserNyaitterAddress(user, req),
-  };
-}
-
-/**
- * GET /server/auth/external/confirm-context
- * 外部ログイン確認画面用。ログイン中ユーザーと要求アドレスの対応を返す。
- */
-router.get('/external/confirm-context', optionalAuth, async (req, res) => {
-  if (!config.federation?.allow_external_login) {
-    return res.status(403).json({ error: 'このサーバーでは外部Nyaitter連携が無効です。' });
-  }
-
-  const nyaitterAddress = String(req.query.nyaitter_address || '').trim();
-  const state = String(req.query.state || '').trim();
-  const redirect = String(req.query.redirect || '').trim();
-
-  if (!nyaitterAddress || !state || !redirect) {
-    return res.status(400).json({ error: 'nyaitter_address, state, redirect が必要です。' });
-  }
-  if (!parseNyaitterAddress(nyaitterAddress)) {
-    return res.status(400).json({ error: 'Nyaitterアドレスの形式が正しくありません。' });
-  }
-  if (!isSafeRedirectUrl(redirect)) {
-    return res.status(400).json({ error: '戻り先URLが安全ではありません。' });
-  }
-
-  const db = getDbAdapter(req);
-  let currentUser = null;
-  if (req.user?.id && req.user.tokenType === 'session') {
-    const user = await db.getUserById(req.user.id);
-    if (user) {
-      currentUser = serializeLoginUser(user, req);
-    }
-  }
-
-  const addressMatches = currentUser
-    && String(currentUser.nyaitter_address || '').toLowerCase() === nyaitterAddress.toLowerCase();
-
-  res.json({
-    enabled: true,
-    nyaitter_address: nyaitterAddress,
-    state,
-    redirect,
-    logged_in: Boolean(currentUser),
-    address_matches: Boolean(addressMatches),
-    user: currentUser,
-  });
-});
-
-/**
- * POST /server/auth/external/confirm
- * ログイン中ユーザーが外部ログイン要求を承認し、proof を発行する。
- */
-router.post('/external/confirm', requireAuth, requireInteractiveSession, async (req, res) => {
-  if (!config.federation?.allow_external_login) {
-    return res.status(403).json({ error: 'このサーバーでは外部Nyaitter連携が無効です。' });
-  }
-
-  const nyaitterAddress = String(req.body?.nyaitter_address || '').trim();
-  const state = String(req.body?.state || '').trim();
-  const redirect = String(req.body?.redirect || '').trim();
-
-  if (!nyaitterAddress || !state || !redirect) {
-    return res.status(400).json({ error: 'nyaitter_address, state, redirect が必要です。' });
-  }
-  if (state.length < 16 || state.length > 256) {
-    return res.status(400).json({ error: 'state が無効です。' });
-  }
-  if (!parseNyaitterAddress(nyaitterAddress)) {
-    return res.status(400).json({ error: 'Nyaitterアドレスの形式が正しくありません。' });
-  }
-  if (!isSafeRedirectUrl(redirect)) {
-    return res.status(400).json({ error: '戻り先URLが安全ではありません。' });
-  }
-
-  const db = getDbAdapter(req);
-  const user = await db.getUserById(req.user.id);
-  if (!user) {
-    return res.status(404).json({ error: 'ユーザーが見つかりません。' });
-  }
-
-  const localAddress = getUserNyaitterAddress(user, req);
-  if (!localAddress || localAddress.toLowerCase() !== nyaitterAddress.toLowerCase()) {
-    return res.status(403).json({
-      error: '要求されたNyaitterアドレスは、いまログインしているアカウントと一致しません。',
-      expected: localAddress,
-      requested: nyaitterAddress,
-    });
-  }
-
-  const profile = buildConfirmProfile(user, req);
-  const proof = externalLoginProofStore.create({
-    nyaitterAddress: localAddress,
-    profile,
-    userId: user.id,
-  });
-
-  let redirectUrl;
-  try {
-    const target = new URL(redirect);
-    target.searchParams.set('external_login', '1');
-    target.searchParams.set('state', state);
-    target.searchParams.set('proof', proof);
-    redirectUrl = target.toString();
-  } catch (_) {
-    return res.status(400).json({ error: '戻り先URLが無効です。' });
-  }
-
-  res.json({
-    success: true,
-    proof,
-    state,
-    redirect_url: redirectUrl,
-    expires_in: 600,
-  });
-});
-
-/**
- * POST /server/auth/external/verify
- * 他サーバーが proof の正当性を確認する。
- */
-router.post('/external/verify', async (req, res) => {
-  if (!config.federation?.allow_external_login) {
-    return res.status(403).json({ valid: false, error: 'External login is disabled on this server' });
-  }
-
-  const nyaitterAddress = String(req.body?.nyaitter_address || '').trim();
-  const proof = String(req.body?.proof || '').trim();
-  if (!nyaitterAddress || !proof) {
-    return res.status(400).json({ valid: false, error: 'nyaitter_address and proof are required' });
-  }
-
-  const record = externalLoginProofStore.consume(proof);
-  if (!record) {
-    return res.status(401).json({ valid: false, error: 'proof is invalid or expired' });
-  }
-  if (String(record.nyaitterAddress).toLowerCase() !== nyaitterAddress.toLowerCase()) {
-    return res.status(401).json({ valid: false, error: 'proof does not match nyaitter_address' });
-  }
-
-  res.json({
-    valid: true,
-    profile: record.profile,
-  });
 });
 
 module.exports = router;
