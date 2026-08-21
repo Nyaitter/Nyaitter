@@ -771,6 +771,42 @@ class D1Adapter extends DatabaseAdapter {
 		return Array.isArray(groups) ? groups.map((group) => ({ ...normalizeGroup(group), membership: normalizeGroupMembership(group.membership) })) : [];
 	}
 
+	async getUsersGroupBadgesBatch(userIds) {
+		const result = new Map();
+		const ids = [...new Set((userIds || []).map(Number).filter(Number.isInteger))];
+		if (ids.length === 0) return result;
+		ids.forEach((id) => result.set(id, []));
+
+		try {
+			const res = await this._write('/groups/user-badges-batch', { user_ids: ids });
+			if (res && res.badges) {
+				for (const [uid, badges] of Object.entries(res.badges)) {
+					result.set(Number(uid), Array.isArray(badges) ? badges.slice(0, 3) : []);
+				}
+				return result;
+			}
+		} catch (_) {
+			// Fallback to per-user retrieval below
+		}
+
+		await Promise.all(ids.map(async (userId) => {
+			try {
+				const groups = await this.getUserGroups(userId, { status: 'active', limit: 20 });
+				const badges = (groups || [])
+					.filter((g) => Boolean(g.icon_data || g.iconData) && (g.visibility === 'open' || g.visibility === 'open_invite'))
+					.slice(0, 3)
+					.map((g) => ({
+						id: String(g.id),
+						name: String(g.name || ''),
+						icon_data: g.icon_data || g.iconData,
+					}));
+				result.set(userId, badges);
+			} catch (_) {}
+		}));
+
+		return result;
+	}
+
 	async createGroupRole(roleData) {
 		return normalizeGroupRole(await this._write(`/groups/${this._groupPath(roleData.groupId)}/roles`, roleData));
 	}

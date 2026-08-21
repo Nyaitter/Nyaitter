@@ -1276,6 +1276,40 @@ export default {
 			}
 
 			// ==================== Groups ====================
+			if (method === 'POST' && pathname === '/groups/user-badges-batch') {
+				const body = await request.json().catch(() => ({}));
+				const userIds = Array.isArray(body?.user_ids) ? body.user_ids.map(Number).filter(Number.isInteger) : [];
+				if (userIds.length === 0) return json({ badges: {} });
+				const placeholders = userIds.map(() => '?').join(',');
+				const query = `
+					SELECT gm.user_id, g.id AS group_id, g.name, g.icon_data, gm.joined_at
+					FROM group_memberships gm
+					JOIN groups g ON g.id = gm.group_id
+					WHERE gm.user_id IN (${placeholders})
+					  AND gm.status = 'active'
+					  AND g.deleted_at IS NULL
+					  AND g.icon_data IS NOT NULL
+					  AND g.icon_data <> ''
+					  AND g.visibility IN ('open', 'open_invite')
+					ORDER BY gm.user_id, gm.joined_at DESC, g.created_at DESC
+				`;
+				const { results } = await db.prepare(query).bind(...userIds).all();
+				const badges = {};
+				userIds.forEach((id) => { badges[id] = []; });
+				for (const row of results || []) {
+					const uid = Number(row.user_id);
+					if (!badges[uid]) badges[uid] = [];
+					if (badges[uid].length < 3) {
+						badges[uid].push({
+							id: String(row.group_id),
+							name: row.name || '',
+							icon_data: row.icon_data,
+						});
+					}
+				}
+				return json({ badges });
+			}
+
 			if (method === 'GET' && pathname === '/groups') {
 				const rawVisibility = String(url.searchParams.get('visibility') || 'open,open_invite');
 				const visibility = rawVisibility.split(',').map((value) => value.trim()).filter(Boolean);

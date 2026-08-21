@@ -1713,6 +1713,41 @@ class PostgresAdapter extends DatabaseAdapter {
 		}));
 	}
 
+	async getUsersGroupBadgesBatch(userIds) {
+		const result = new Map();
+		const ids = [...new Set((userIds || []).map(Number).filter(Number.isInteger))];
+		if (ids.length === 0) return result;
+		ids.forEach((id) => result.set(id, []));
+
+		const { rows } = await this.pool.query(
+			`SELECT gm.user_id, g.id AS group_id, g.name, g.icon_data, gm.joined_at
+			 FROM group_memberships gm
+			 JOIN groups g ON g.id = gm.group_id
+			 WHERE gm.user_id = ANY($1::int[])
+			   AND gm.status = 'active'
+			   AND g.deleted_at IS NULL
+			   AND g.icon_data IS NOT NULL
+			   AND g.icon_data <> ''
+			   AND g.visibility IN ('open', 'open_invite')
+			 ORDER BY gm.user_id, gm.joined_at DESC NULLS LAST, g.created_at DESC`,
+			[ids],
+		);
+
+		for (const row of rows) {
+			const userId = Number(row.user_id);
+			const list = result.get(userId) || [];
+			if (list.length < 3) {
+				list.push({
+					id: String(row.group_id),
+					name: String(row.name || ''),
+					icon_data: row.icon_data,
+				});
+				result.set(userId, list);
+			}
+		}
+		return result;
+	}
+
 	async createGroupRole(roleData) {
 		const now = roleData.createdAt ? toIsoString(roleData.createdAt) : new Date().toISOString();
 		const { rows } = await this.pool.query(

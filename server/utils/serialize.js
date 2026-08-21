@@ -13,6 +13,9 @@ const { getVisibleDmUnreadCount } = require('../services/DmVisibilityService');
 
 function serializeUserBrief(user, publicUrl = null, { includeSearchExclusion = false } = {}) {
 	if (!user) return null;
+	const groupBadges = Array.isArray(user.group_badges)
+		? user.group_badges.slice(0, 3)
+		: (Array.isArray(user.groupBadges) ? user.groupBadges.slice(0, 3) : []);
 	return {
 		id: user.id,
 		nyaitter_id: getUserNyaitterId(user),
@@ -22,6 +25,7 @@ function serializeUserBrief(user, publicUrl = null, { includeSearchExclusion = f
 		admin: !!user.admin,
 		verify: !!user.verify,
 		is_imposter: !!user.settings?.imposter?.parent_id,
+		group_badges: groupBadges,
 		...(includeSearchExclusion ? { shadow: !!user.shadow } : {}),
 	};
 }
@@ -127,6 +131,23 @@ async function serializeUser(db, user, viewerId = null, publicUrl = null) {
 		})
 		: [];
 
+	let groupBadges = Array.isArray(user.group_badges) ? user.group_badges.slice(0, 3) : null;
+	if (!groupBadges && typeof db.getUserGroups === 'function') {
+		try {
+			const groups = await db.getUserGroups(id, { status: 'active', limit: 20 });
+			groupBadges = (groups || [])
+				.filter((g) => Boolean(g.icon_data || g.iconData) && (g.visibility === 'open' || g.visibility === 'open_invite'))
+				.slice(0, 3)
+				.map((g) => ({
+					id: String(g.id),
+					name: String(g.name || ''),
+					icon_data: g.icon_data || g.iconData,
+				}));
+		} catch (_) {
+			groupBadges = [];
+		}
+	}
+
 	return {
 		id: user.id,
 		nyaitter_id: getUserNyaitterId(user),
@@ -152,6 +173,7 @@ async function serializeUser(db, user, viewerId = null, publicUrl = null) {
 		like,
 		star,
 		pin,
+		group_badges: groupBadges || [],
 		created_at: user.created_at || user.createdAt || null,
 	};
 }
@@ -204,6 +226,23 @@ async function serializePublicProfile(
 	const mediaCount = stats?.mediaCount || 0;
 	const pinnedPostId = stats?.pinnedPostId || null;
 
+	let groupBadges = Array.isArray(user.group_badges) ? user.group_badges.slice(0, 3) : null;
+	if (!groupBadges && typeof db.getUserGroups === 'function') {
+		try {
+			const groups = await db.getUserGroups(user.id, { status: 'active', limit: 20 });
+			groupBadges = (groups || [])
+				.filter((g) => Boolean(g.icon_data || g.iconData) && (g.visibility === 'open' || g.visibility === 'open_invite'))
+				.slice(0, 3)
+				.map((g) => ({
+					id: String(g.id),
+					name: String(g.name || ''),
+					icon_data: g.icon_data || g.iconData,
+				}));
+		} catch (_) {
+			groupBadges = [];
+		}
+	}
+
 	return {
 		id: user.id,
 		nyaitter_id: getUserNyaitterId(user),
@@ -216,6 +255,7 @@ async function serializePublicProfile(
 		admin: !!user.admin,
 		verify: !!user.verify,
 		is_imposter: !!user.settings?.imposter?.parent_id,
+		group_badges: groupBadges || [],
 		...(viewer?.admin ? { shadow: !!user.shadow } : {}),
 		visibility,
 		...(viewerId != null ? { relationship: { viewer_blocks_profile: viewerBlocksProfile, profile_blocks_viewer: profileBlocksViewer } } : {}),
@@ -241,19 +281,61 @@ async function fetchPostsByIds(db, postIds) {
 	return (await Promise.all(ids.map((id) => db.getPostById(id)))).filter(Boolean);
 }
 
+async function attachGroupBadgesToUsers(db, users) {
+	if (!Array.isArray(users) || users.length === 0) return users;
+	const ids = [...new Set(users.map((u) => Number(u?.id)).filter(Number.isInteger))];
+	if (ids.length === 0) return users;
+
+	let badgesMap = new Map();
+	if (typeof db.getUsersGroupBadgesBatch === 'function') {
+		try {
+			badgesMap = await db.getUsersGroupBadgesBatch(ids);
+		} catch (_) {}
+	} else if (typeof db.getUserGroups === 'function') {
+		await Promise.all(ids.map(async (uid) => {
+			try {
+				const groups = await db.getUserGroups(uid, { status: 'active', limit: 20 });
+				const badges = (groups || [])
+					.filter((g) => Boolean(g.icon_data || g.iconData) && (g.visibility === 'open' || g.visibility === 'open_invite'))
+					.slice(0, 3)
+					.map((g) => ({
+						id: String(g.id),
+						name: String(g.name || ''),
+						icon_data: g.icon_data || g.iconData,
+					}));
+				badgesMap.set(uid, badges);
+			} catch (_) {}
+		}));
+	}
+
+	for (const user of users) {
+		if (!user) continue;
+		const uid = Number(user.id);
+		const badges = badgesMap instanceof Map ? badgesMap.get(uid) : badgesMap?.[uid];
+		user.group_badges = Array.isArray(badges)
+			? badges.slice(0, 3)
+			: (Array.isArray(user.group_badges) ? user.group_badges.slice(0, 3) : []);
+	}
+	return users;
+}
+
 async function fetchNotificationUsersByIds(db, userIds) {
 	const ids = [...new Set((userIds || []).map(Number).filter(Number.isInteger))];
 	if (ids.length === 0) return [];
+	let users = [];
 	if (typeof db.getUsersByIds === 'function') {
 		try {
-			const users = await db.getUsersByIds(ids);
-			if (Array.isArray(users)) return users.filter(Boolean);
+			const batch = await db.getUsersByIds(ids);
+			if (Array.isArray(batch)) users = batch.filter(Boolean);
 		} catch (_) {
 			// 一括取得が利用できない旧アダプターだけ、既存の単件取得へ後退する。
 		}
 	}
-	if (typeof db.getUserById !== 'function') return [];
-	return (await Promise.all(ids.map((id) => db.getUserById(id)))).filter(Boolean);
+	if (users.length === 0 && typeof db.getUserById === 'function') {
+		users = (await Promise.all(ids.map((id) => db.getUserById(id)))).filter(Boolean);
+	}
+	await attachGroupBadgesToUsers(db, users);
+	return users;
 }
 
 async function fetchUsersByIds(db, userIds) {
@@ -276,7 +358,9 @@ async function fetchUsersByIds(db, userIds) {
 		const completeUsers = await Promise.all(idsNeedingFullRecord.map((id) => db.getUserById(id)));
 		for (const user of completeUsers.filter(Boolean)) usersById.set(Number(user.id), user);
 	}
-	return ids.map((id) => usersById.get(id)).filter(Boolean);
+	const resultUsers = ids.map((id) => usersById.get(id)).filter(Boolean);
+	await attachGroupBadgesToUsers(db, resultUsers);
+	return resultUsers;
 }
 
 async function fetchPostMetrics(db, postIds, currentUserId) {

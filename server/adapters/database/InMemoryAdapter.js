@@ -1241,6 +1241,29 @@ class InMemoryAdapter extends DatabaseAdapter {
 			.map(({ group, membership }) => ({ ...this._cloneGroup(group), membership: this._cloneGroupMembership(membership) }));
 	}
 
+	async getUsersGroupBadgesBatch(userIds) {
+		const result = new Map();
+		const ids = [...new Set((userIds || []).map(Number).filter(Number.isInteger))];
+		for (const userId of ids) {
+			const groupIds = this.groupIdsByUser.get(userId) || new Set();
+			const activeGroupsWithIcons = [...groupIds]
+				.map((id) => ({
+					group: this.groups.get(id),
+					membership: this.groupMemberships.get(this._groupMemberKey(id, userId)),
+				}))
+				.filter(({ group, membership }) => group && !group.deletedAt && membership?.status === 'active' && Boolean(group.iconData) && (group.visibility === 'open' || group.visibility === 'open_invite'))
+				.sort((a, b) => String(b.membership.joinedAt || '').localeCompare(String(a.membership.joinedAt || '')))
+				.slice(0, 3)
+				.map(({ group }) => ({
+					id: String(group.id),
+					name: String(group.name || ''),
+					icon_data: group.iconData,
+				}));
+			result.set(userId, activeGroupsWithIcons);
+		}
+		return result;
+	}
+
 	async createGroupRole(roleData) {
 		const now = roleData.createdAt || new Date().toISOString();
 		const role = { id: String(roleData.id), groupId: String(roleData.groupId), name: String(roleData.name || ''),
