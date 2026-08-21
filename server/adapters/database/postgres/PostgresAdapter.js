@@ -2642,47 +2642,51 @@ class PostgresAdapter extends DatabaseAdapter {
 
 	async getTrendingHashtags(limit = 10) {
 		const normalizedLimit = Math.max(1, Math.min(Number(limit) || 10, 50));
-		// jsonb tags フィールドのキーワードをDB側で展開・集計し、
-		// JS側でのフルスキャン(LIMIT 500) を廃止して大幅に高速化する。
 		const { rows } = await this.pool.query(
-			`WITH candidate_posts AS (
-				SELECT id, content, tags
-				FROM posts
-				WHERE group_id IS NULL
-				  AND created_at >= NOW() - INTERVAL '3 days'
-			),
-			extracted_hashtags AS (
-				SELECT DISTINCT p.id,
-				       '#' || LOWER(m[1]) AS item
-				FROM candidate_posts p,
-				LATERAL regexp_matches(p.content, '[#＃]([\\p{L}\\p{N}_-]{3,48})', 'gu') AS m
-			),
-			extracted_keywords AS (
-				SELECT DISTINCT p.id, LOWER(tag_text) AS item
-				FROM candidate_posts p
-				CROSS JOIN LATERAL jsonb_array_elements_text(COALESCE(p.tags, '[]'::jsonb)) AS tag_text
-				WHERE char_length(tag_text) > 2
-				  AND NOT EXISTS (
-				      SELECT 1 FROM extracted_hashtags eh
-				      WHERE eh.id = p.id AND eh.item = '#' || LOWER(tag_text)
-				  )
-			),
-			combined_items AS (
-				SELECT id, item FROM extracted_hashtags
-				UNION ALL
-				SELECT id, item FROM extracted_keywords
-			)
-			SELECT item AS tag_name, COUNT(*)::int AS occurrence_count
-			FROM combined_items
-			GROUP BY item
-			ORDER BY occurrence_count DESC, item ASC
-			LIMIT $1`,
-			[normalizedLimit],
+			`SELECT content, tags
+			 FROM posts
+			 WHERE group_id IS NULL
+			   AND created_at >= NOW() - INTERVAL '3 days'
+			 ORDER BY created_at DESC
+			 LIMIT 500`,
 		);
-		return rows.map((row) => ({
-			tag_name: String(row.tag_name),
-			occurrence_count: Number(row.occurrence_count),
-		}));
+		const counts = new Map();
+		for (const row of rows) {
+			const content = row.content || '';
+			const hashtagMatches = content.match(/(?:#|＃)([\p{L}\p{N}_-]{1,48})/gu) || [];
+			const postHashtags = new Set(
+				hashtagMatches
+					.map((m) => m.replace(/^[#＃]/, '').toLowerCase())
+					.filter((tag) => tag.length > 2)
+			);
+
+			const uniqueItems = new Set();
+			for (const tag of postHashtags) {
+				uniqueItems.add(`#${tag}`);
+			}
+
+			const rawTags = Array.isArray(row.tags)
+				? row.tags
+				: (typeof row.tags === 'string' ? parseJsonSafe(row.tags, []) : []);
+			for (const rawTag of rawTags) {
+				const tag = String(rawTag || '').trim().toLowerCase().replace(/^[#＃]/, '');
+				if (tag.length > 2 && !postHashtags.has(tag)) {
+					uniqueItems.add(tag);
+				}
+			}
+
+			for (const item of uniqueItems) {
+				counts.set(item, (counts.get(item) || 0) + 1);
+			}
+		}
+
+		return Array.from(counts.entries())
+			.sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], 'ja'))
+			.slice(0, normalizedLimit)
+			.map(([tag_name, occurrence_count]) => ({
+				tag_name,
+				occurrence_count,
+			}));
 	}
 
 	async getPostCount(userId) {
