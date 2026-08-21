@@ -2037,20 +2037,38 @@ export default {
 
 			if (method === 'GET' && pathname === '/posts/trending-hashtags') {
 				const limit = Math.min(Number(url.searchParams.get('limit') || 10), 50);
-				const { results } = await db.prepare('SELECT content, tags FROM posts WHERE group_id IS NULL ORDER BY created_at DESC LIMIT 500').all();
+				const { results } = await db.prepare(
+					"SELECT content, tags FROM posts WHERE group_id IS NULL AND created_at >= datetime('now', '-3 days') ORDER BY created_at DESC LIMIT 500"
+				).all();
 				const counts = new Map();
 				for (const row of results || []) {
-					const matches = (row.content || '').match(/#([^<>/@#\s]+)/g) || [];
-					const uniqueTags = new Set([
-						...matches.map((match) => match.slice(1).toLowerCase()),
-						...normalizePostTags(row.tags),
-					]);
-					for (const tag of uniqueTags) {
-						counts.set(tag, (counts.get(tag) || 0) + 1);
+					const content = row.content || '';
+					const hashtagMatches = content.match(/(?:#|＃)([\p{L}\p{N}_-]{1,48})/gu) || [];
+					const postHashtags = new Set(
+						hashtagMatches
+							.map((m) => m.replace(/^[#＃]/, '').toLowerCase())
+							.filter((tag) => tag.length > 2)
+					);
+
+					const uniqueItems = new Set();
+					for (const tag of postHashtags) {
+						uniqueItems.add(`#${tag}`);
+					}
+
+					const tags = normalizePostTags(row.tags);
+					for (const rawTag of tags) {
+						const tag = String(rawTag || '').trim().toLowerCase().replace(/^[#＃]/, '');
+						if (tag.length > 2 && !postHashtags.has(tag)) {
+							uniqueItems.add(tag);
+						}
+					}
+
+					for (const item of uniqueItems) {
+						counts.set(item, (counts.get(item) || 0) + 1);
 					}
 				}
 				const sorted = Array.from(counts.entries())
-					.sort((a, b) => b[1] - a[1])
+					.sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], 'ja'))
 					.slice(0, limit)
 					.map(([tag_name, occurrence_count]) => ({ tag_name, occurrence_count }));
 				return json(sorted);

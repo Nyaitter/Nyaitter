@@ -1172,8 +1172,8 @@ class InMemoryAdapter extends DatabaseAdapter {
 
 	async createGroup(groupData) {
 		const now = groupData.createdAt || new Date().toISOString();
-		const group = { id: String(groupData.id), ownerId: Number(groupData.ownerId), name: String(groupData.name || ''),
-			description: String(groupData.description || ''), iconData: groupData.iconData ?? null, headerImage: groupData.headerImage ?? null,
+		const group = { id: String(groupData.id || Date.now()), ownerId: Number(groupData.ownerId ?? groupData.owner_id), name: String(groupData.name || ''),
+			description: String(groupData.description || ''), iconData: groupData.iconData ?? groupData.icon_data ?? null, headerImage: groupData.headerImage ?? groupData.header_image ?? null,
 			visibility: String(groupData.visibility || 'open'), deletedAt: null, createdAt: now, updatedAt: now };
 		this.groups.set(group.id, group);
 		return this._cloneGroup(group);
@@ -2881,19 +2881,39 @@ class InMemoryAdapter extends DatabaseAdapter {
 	
 	async getTrendingHashtags(limit = 10) {
 		const counts = new Map();
+		const threeDaysAgo = Date.now() - 3 * 24 * 60 * 60 * 1000;
 		for (const post of this.posts.values()) {
+			if (post.groupId || post.group_id) continue;
+			const createdAtTime = new Date(post.createdAt || post.created_at || 0).getTime();
+			if (createdAtTime && createdAtTime < threeDaysAgo) continue;
+
 			const content = post.content || '';
-			const matches = content.match(/#([^<>/@#\s]+)/g) || [];
-			const uniqueTags = new Set([
-				...matches.map((match) => match.slice(1).toLowerCase()),
-				...(Array.isArray(post.tags) ? post.tags.map((tag) => String(tag || '').trim().toLowerCase()).filter(Boolean) : []),
-			]);
-			for (const tag of uniqueTags) {
-				counts.set(tag, (counts.get(tag) || 0) + 1);
+			const hashtagMatches = content.match(/(?:#|＃)([\p{L}\p{N}_-]{1,48})/gu) || [];
+			const postHashtags = new Set(
+				hashtagMatches
+					.map((m) => m.replace(/^[#＃]/, '').toLowerCase())
+					.filter((tag) => tag.length > 2)
+			);
+
+			const uniqueItems = new Set();
+			for (const tag of postHashtags) {
+				uniqueItems.add(`#${tag}`);
+			}
+
+			const rawTags = Array.isArray(post.tags) ? post.tags : [];
+			for (const rawTag of rawTags) {
+				const tag = String(rawTag || '').trim().toLowerCase().replace(/^[#＃]/, '');
+				if (tag.length > 2 && !postHashtags.has(tag)) {
+					uniqueItems.add(tag);
+				}
+			}
+
+			for (const item of uniqueItems) {
+				counts.set(item, (counts.get(item) || 0) + 1);
 			}
 		}
 		return Array.from(counts.entries())
-			.sort((a, b) => b[1] - a[1])
+			.sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], 'ja'))
 			.slice(0, limit)
 			.map(([tag_name, occurrence_count]) => ({
 				tag_name,

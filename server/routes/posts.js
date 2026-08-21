@@ -597,6 +597,7 @@ router.get('/page', optionalAuth, async (req, res) => {
 					name: user.name || '',
 					scid: user.scid || null,
 					icon_data: user.icon_data || null,
+					group_badges: user.group_badges || [],
 				})),
 			},
 			meta: {

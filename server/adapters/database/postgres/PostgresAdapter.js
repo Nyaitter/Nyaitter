@@ -2645,24 +2645,42 @@ class PostgresAdapter extends DatabaseAdapter {
 		// jsonb tags フィールドのキーワードをDB側で展開・集計し、
 		// JS側でのフルスキャン(LIMIT 500) を廃止して大幅に高速化する。
 		const { rows } = await this.pool.query(
-			`SELECT keyword, COUNT(*)::int AS occurrence_count
-			 FROM (
-			   SELECT DISTINCT p.id, tag_text AS keyword
-			   FROM posts p
-			   CROSS JOIN LATERAL jsonb_array_elements_text(
-			     COALESCE(p.tags, '[]'::jsonb)
-			   ) AS tag_text
-			   WHERE p.group_id IS NULL
-			     AND p.created_at >= NOW() - INTERVAL '3 days'
-			     AND jsonb_array_length(COALESCE(p.tags, '[]'::jsonb)) > 0
-			 ) expanded
-			 GROUP BY keyword
-			 ORDER BY occurrence_count DESC, keyword ASC
-			 LIMIT $1`,
+			`WITH candidate_posts AS (
+				SELECT id, content, tags
+				FROM posts
+				WHERE group_id IS NULL
+				  AND created_at >= NOW() - INTERVAL '3 days'
+			),
+			extracted_hashtags AS (
+				SELECT DISTINCT p.id,
+				       '#' || LOWER(m[1]) AS item
+				FROM candidate_posts p,
+				LATERAL regexp_matches(p.content, '[#＃]([\\p{L}\\p{N}_-]{3,48})', 'gu') AS m
+			),
+			extracted_keywords AS (
+				SELECT DISTINCT p.id, LOWER(tag_text) AS item
+				FROM candidate_posts p
+				CROSS JOIN LATERAL jsonb_array_elements_text(COALESCE(p.tags, '[]'::jsonb)) AS tag_text
+				WHERE char_length(tag_text) > 2
+				  AND NOT EXISTS (
+				      SELECT 1 FROM extracted_hashtags eh
+				      WHERE eh.id = p.id AND eh.item = '#' || LOWER(tag_text)
+				  )
+			),
+			combined_items AS (
+				SELECT id, item FROM extracted_hashtags
+				UNION ALL
+				SELECT id, item FROM extracted_keywords
+			)
+			SELECT item AS tag_name, COUNT(*)::int AS occurrence_count
+			FROM combined_items
+			GROUP BY item
+			ORDER BY occurrence_count DESC, item ASC
+			LIMIT $1`,
 			[normalizedLimit],
 		);
 		return rows.map((row) => ({
-			tag_name: String(row.keyword),
+			tag_name: String(row.tag_name),
 			occurrence_count: Number(row.occurrence_count),
 		}));
 	}

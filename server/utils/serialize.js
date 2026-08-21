@@ -450,6 +450,7 @@ async function serializePostsBatch(
 	]);
 	const usersById = new Map(knownAuthorsById);
 	for (const user of additionalUsers) usersById.set(Number(user.id), user);
+	await attachGroupBadgesToUsers(db, Array.from(usersById.values()));
 	const metricsByPostId = new Map(metrics.map((metric) => [Number(metric.post_id), metric]));
 	const visibilityContext = await extendPostVisibilityContext(
 		db,
