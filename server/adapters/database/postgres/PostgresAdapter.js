@@ -1928,22 +1928,22 @@ class PostgresAdapter extends DatabaseAdapter {
 				SELECT p.id, 0 AS depth, ARRAY[p.id] AS path
 				FROM posts p WHERE p.id = ANY($1::int[])
 				UNION ALL
-				SELECT target.id, refs.depth + 1, refs.path || target.id
+				SELECT target_id, refs.depth + 1, refs.path || target_id
 				FROM post_references refs
-				JOIN LATERAL (
-					SELECT reply_to, repost_to FROM posts WHERE id = refs.id LIMIT 1
-				) source ON TRUE
-				CROSS JOIN LATERAL (VALUES (source.reply_to), (source.repost_to)) AS target(id)
+				CROSS JOIN LATERAL (VALUES (
+					(SELECT reply_to FROM posts WHERE id = refs.id LIMIT 1),
+					(SELECT repost_to FROM posts WHERE id = refs.id LIMIT 1)
+				)) AS targets(target_id)
 				WHERE refs.depth < $2
-					AND target.id IS NOT NULL
-					AND NOT target.id = ANY(refs.path)
-			), nearest_references AS (
-				SELECT DISTINCT ON (id) id, depth
+					AND target_id IS NOT NULL
+					AND NOT target_id = ANY(refs.path)
+			), collected_ids AS (
+				SELECT DISTINCT ON (id) id
 				FROM post_references
 				ORDER BY id, depth ASC
 			)
-			SELECT p.* FROM nearest_references refs
-			JOIN LATERAL (SELECT * FROM posts WHERE id = refs.id LIMIT 1) p ON TRUE`,
+			SELECT p.* FROM posts p
+			WHERE p.id = ANY(SELECT id FROM collected_ids)`,
 			[ids, normalizedMaxDepth],
 		);
 		return rows.map(normalizePostRow);
@@ -1959,53 +1959,45 @@ class PostgresAdapter extends DatabaseAdapter {
 			? parsedViewerId
 			: null;
 
-		const metricQueries = [
-			`SELECT 'like_count'::text AS kind, post_id, COUNT(*)::int AS value
-			 FROM likes WHERE post_id = ANY($1::int[]) GROUP BY post_id`,
-			`SELECT 'star_count'::text AS kind, post_id, COUNT(*)::int AS value
-			 FROM stars WHERE post_id = ANY($1::int[]) GROUP BY post_id`,
-			`SELECT 'repost_count'::text AS kind, post_id, COUNT(*)::int AS value
-			 FROM reposts WHERE post_id = ANY($1::int[]) GROUP BY post_id`,
-			`SELECT 'reply_count'::text AS kind, reply_to AS post_id, COUNT(*)::int AS value
-			 FROM posts WHERE reply_to = ANY($1::int[]) GROUP BY reply_to`,
-		];
-		if (viewerId != null) {
-			metricQueries.push(
-				`SELECT 'liked_by_me'::text AS kind, post_id, 1::int AS value
-				 FROM likes WHERE user_id = $2 AND post_id = ANY($1::int[])`,
-				`SELECT 'starred_by_me'::text AS kind, post_id, 1::int AS value
-				 FROM stars WHERE user_id = $2 AND post_id = ANY($1::int[])`,
-			);
-		}
-		const { rows } = await this.pool.query(
-			metricQueries.join('\nUNION ALL\n'),
-			viewerId == null ? [ids] : [ids, viewerId],
-		);
-		const likeMap = new Map();
-		const starMap = new Map();
-		const repostMap = new Map();
-		const replyMap = new Map();
-		const myLikesSet = new Set();
-		const myStarsSet = new Set();
-		for (const row of rows || []) {
-			const postId = Number(row.post_id);
-			if (!Number.isSafeInteger(postId) || postId <= 0) continue;
-			if (row.kind === 'like_count') likeMap.set(postId, Math.max(0, Number(row.value) || 0));
-			if (row.kind === 'star_count') starMap.set(postId, Math.max(0, Number(row.value) || 0));
-			if (row.kind === 'repost_count') repostMap.set(postId, Math.max(0, Number(row.value) || 0));
-			if (row.kind === 'reply_count') replyMap.set(postId, Math.max(0, Number(row.value) || 0));
-			if (row.kind === 'liked_by_me') myLikesSet.add(postId);
-			if (row.kind === 'starred_by_me') myStarsSet.add(postId);
-		}
+		// 単一 CTE で likes/stars/reposts/replies を並列集計し、往復回数を最小化する。
+		const viewerCols = viewerId != null
+			? `, BOOL_OR(lk.user_id = $2)::bool AS liked_by_me
+			   , BOOL_OR(sk.user_id = $2)::bool AS starred_by_me`
+			: `, FALSE AS liked_by_me, FALSE AS starred_by_me`;
+		const viewerLikeJoin = viewerId != null
+			? `LEFT JOIN likes lk ON lk.post_id = pid.id AND lk.user_id = $2`
+			: '';
+		const viewerStarJoin = viewerId != null
+			? `LEFT JOIN stars sk ON sk.post_id = pid.id AND sk.user_id = $2`
+			: '';
+		const params = viewerId != null ? [ids, viewerId] : [ids];
 
-		return ids.map((id) => ({
-			post_id: id,
-			like_count: likeMap.get(id) || 0,
-			star_count: starMap.get(id) || 0,
-			repost_count: repostMap.get(id) || 0,
-			reply_count: replyMap.get(id) || 0,
-			liked_by_me: myLikesSet.has(id),
-			starred_by_me: myStarsSet.has(id),
+		const { rows } = await this.pool.query(
+			`SELECT
+				pid.id AS post_id,
+				COUNT(DISTINCT l.post_id)::int   AS like_count,
+				COUNT(DISTINCT s.post_id)::int   AS star_count,
+				COUNT(DISTINCT r.post_id)::int   AS repost_count,
+				COUNT(DISTINCT rep.id)::int       AS reply_count
+				${viewerCols}
+			 FROM unnest($1::int[]) AS pid(id)
+			 LEFT JOIN likes    l   ON l.post_id   = pid.id
+			 LEFT JOIN stars    s   ON s.post_id   = pid.id
+			 LEFT JOIN reposts  r   ON r.post_id   = pid.id
+			 LEFT JOIN posts    rep ON rep.reply_to = pid.id
+			 ${viewerLikeJoin}
+			 ${viewerStarJoin}
+			 GROUP BY pid.id`,
+			params,
+		);
+		return rows.map((row) => ({
+			post_id: Number(row.post_id),
+			like_count: Math.max(0, Number(row.like_count) || 0),
+			star_count: Math.max(0, Number(row.star_count) || 0),
+			repost_count: Math.max(0, Number(row.repost_count) || 0),
+			reply_count: Math.max(0, Number(row.reply_count) || 0),
+			liked_by_me: Boolean(row.liked_by_me),
+			starred_by_me: Boolean(row.starred_by_me),
 		}));
 	}
 
@@ -2472,13 +2464,29 @@ class PostgresAdapter extends DatabaseAdapter {
 
 	async getTrendingPosts(limit = 20) {
 		const safeLimit = Math.min(Math.max(Number(limit) || 20, 1), 100);
+		// 直近7日以内の投稿のみを対象にすることで、全件スキャンを回避する。
 		const { rows } = await this.pool.query(
-			`SELECT p.*, 
-				(COALESCE(l.like_count, 0) + COALESCE(s.star_count, 0) * 2 + COALESCE(r.repost_count, 0) * 3) as score
+			`SELECT p.*,
+				(COALESCE(l.like_count, 0) + COALESCE(s.star_count, 0) * 2 + COALESCE(r.repost_count, 0) * 3) AS score
 			 FROM posts p
-			 LEFT JOIN (SELECT post_id, COUNT(*)::int as like_count FROM likes GROUP BY post_id) l ON l.post_id = p.id
-			 LEFT JOIN (SELECT post_id, COUNT(*)::int as star_count FROM stars GROUP BY post_id) s ON s.post_id = p.id
-			 LEFT JOIN (SELECT post_id, COUNT(*)::int as repost_count FROM reposts GROUP BY post_id) r ON r.post_id = p.id
+			 LEFT JOIN (
+			   SELECT post_id, COUNT(*)::int AS like_count FROM likes
+			   WHERE created_at >= NOW() - INTERVAL '3 days'
+			   GROUP BY post_id
+			 ) l ON l.post_id = p.id
+			 LEFT JOIN (
+			   SELECT post_id, COUNT(*)::int AS star_count FROM stars
+			   WHERE created_at >= NOW() - INTERVAL '3 days'
+			   GROUP BY post_id
+			 ) s ON s.post_id = p.id
+			 LEFT JOIN (
+			   SELECT post_id, COUNT(*)::int AS repost_count FROM reposts
+			   WHERE created_at >= NOW() - INTERVAL '3 days'
+			   GROUP BY post_id
+			 ) r ON r.post_id = p.id
+			 WHERE p.group_id IS NULL
+			   AND p.reply_to IS NULL
+			   AND p.created_at >= NOW() - INTERVAL '3 days'
 			 ORDER BY score DESC, p.created_at DESC
 			 LIMIT $1`,
 			[safeLimit],
@@ -2488,24 +2496,29 @@ class PostgresAdapter extends DatabaseAdapter {
 
 	async getTrendingHashtags(limit = 10) {
 		const normalizedLimit = Math.max(1, Math.min(Number(limit) || 10, 50));
+		// jsonb tags フィールドのキーワードをDB側で展開・集計し、
+		// JS側でのフルスキャン(LIMIT 500) を廃止して大幅に高速化する。
 		const { rows } = await this.pool.query(
-			'SELECT content, tags FROM posts WHERE group_id IS NULL ORDER BY created_at DESC LIMIT 500',
+			`SELECT keyword, COUNT(*)::int AS occurrence_count
+			 FROM (
+			   SELECT DISTINCT p.id, tag_text AS keyword
+			   FROM posts p
+			   CROSS JOIN LATERAL jsonb_array_elements_text(
+			     COALESCE(p.tags, '[]'::jsonb)
+			   ) AS tag_text
+			   WHERE p.group_id IS NULL
+			     AND p.created_at >= NOW() - INTERVAL '3 days'
+			     AND jsonb_array_length(COALESCE(p.tags, '[]'::jsonb)) > 0
+			 ) expanded
+			 GROUP BY keyword
+			 ORDER BY occurrence_count DESC, keyword ASC
+			 LIMIT $1`,
+			[normalizedLimit],
 		);
-		const counts = new Map();
-		for (const row of rows) {
-			const matches = (row.content || '').match(/#([^<>/@#\s]+)/g) || [];
-			const uniqueTags = new Set([
-				...matches.map((match) => match.slice(1).toLowerCase()),
-				...normalizePostTags(row.tags),
-			]);
-			for (const tag of uniqueTags) {
-				counts.set(tag, (counts.get(tag) || 0) + 1);
-			}
-		}
-		return Array.from(counts.entries())
-			.sort((a, b) => b[1] - a[1])
-			.slice(0, normalizedLimit)
-			.map(([tag_name, occurrence_count]) => ({ tag_name, occurrence_count }));
+		return rows.map((row) => ({
+			tag_name: String(row.keyword),
+			occurrence_count: Number(row.occurrence_count),
+		}));
 	}
 
 	async getPostCount(userId) {
