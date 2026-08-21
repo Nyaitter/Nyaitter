@@ -1669,10 +1669,10 @@ class PostgresAdapter extends DatabaseAdapter {
 		return normalizeGroupJoinRequestRow(rows[0] || null);
 	}
 
-	async getGroupPostIds(groupId, { limit = 30, offset = 0, beforeId = null, authorId = null } = {}) {
+	async getGroupPostIds(groupId, { limit = 30, offset = 0, beforeId = null, authorId = null, subType = 'posts_only' } = {}) {
 		const safeLimit = Math.max(1, Math.min(Number(limit) || 30, 100));
 		const values = [String(groupId)];
-		const clauses = ['group_id = $1'];
+		const clauses = ['group_id = $1', subType === 'replies_only' ? 'reply_to IS NOT NULL' : 'reply_to IS NULL'];
 		if (authorId != null && authorId !== '' && Number.isInteger(Number(authorId)) && Number(authorId) >= 0) {
 			values.push(Number(authorId)); clauses.push(`user_id = $${values.length}`);
 		}

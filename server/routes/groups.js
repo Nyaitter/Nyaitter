@@ -656,12 +656,13 @@ router.get('/:groupId/posts', requireAuth, async (req, res) => {
     const offset = beforeId == null ? normalizeOffset(req.query.offset) : 0;
     const authorId = req.query.author_id === undefined ? null : normalizeUserId(req.query.author_id);
     if (req.query.author_id !== undefined && authorId == null) return res.status(400).json({ error: '投稿者IDが正しくありません。' });
+    const subType = req.query.sub_type === 'replies_only' ? 'replies_only' : 'posts_only';
     const mode = String(req.query.mode || 'all');
     let page;
     if (mode === 'announcements') {
       page = await getDb(req).getGroupAnnouncementPostIds(group.id, { limit, offset, beforeId });
     } else if (mode === 'recommended') {
-      const candidatePage = await getDb(req).getGroupPostIds(group.id, { limit: Math.min(limit * 4, 100), offset, beforeId, authorId });
+      const candidatePage = await getDb(req).getGroupPostIds(group.id, { limit: Math.min(limit * 4, 100), offset, beforeId, authorId, subType });
       const metrics = await getDb(req).getPostMetricsBatch(candidatePage.ids || [], req.user.id);
       const metricsByPostId = new Map(metrics.map((metric) => [Number(metric.post_id ?? metric.postId), metric]));
       const rankedIds = [...(candidatePage.ids || [])].sort((left, right) => {
@@ -672,7 +673,7 @@ router.get('/:groupId/posts', requireAuth, async (req, res) => {
       });
       page = { ...candidatePage, ids: rankedIds.slice(0, limit) };
     } else {
-      page = await getDb(req).getGroupPostIds(group.id, { limit, offset, beforeId, authorId });
+      page = await getDb(req).getGroupPostIds(group.id, { limit, offset, beforeId, authorId, subType });
     }
     const posts = await serializePostsByIds(getDb(req), page.ids || [], req.user.id, getPublicUrl(req), req.user.visibilityUser || null);
     res.json({ posts, has_next: Boolean(page.has_more), next_cursor: page.next_cursor || null });

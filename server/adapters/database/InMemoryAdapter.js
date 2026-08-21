@@ -1157,11 +1157,14 @@ class InMemoryAdapter extends DatabaseAdapter {
 		return { ids, has_more: visible.length > safeLimit, next_cursor: visible.length > safeLimit ? ids.at(-1) || null : null };
 	}
 
-	async getGroupPostIds(groupId, { limit = 30, offset = 0, beforeId = null, authorId = null } = {}) {
+	async getGroupPostIds(groupId, { limit = 30, offset = 0, beforeId = null, authorId = null, subType = 'posts_only' } = {}) {
 		const normalizedAuthorId = authorId == null || authorId === ''
 			? null
 			: (Number.isInteger(Number(authorId)) && Number(authorId) >= 0 ? Number(authorId) : null);
-		return this._groupPostResult([...this.posts.values()].filter((post) => post.groupId === String(groupId) && (normalizedAuthorId == null || Number(post.userId) === normalizedAuthorId)), limit, offset, beforeId);
+		const replyOnly = subType === 'replies_only';
+		return this._groupPostResult([...this.posts.values()].filter((post) => post.groupId === String(groupId)
+			&& (replyOnly ? post.replyTo != null : post.replyTo == null)
+			&& (normalizedAuthorId == null || Number(post.userId) === normalizedAuthorId)), limit, offset, beforeId);
 	}
 
 	async getGroupAnnouncementPostIds(groupId, { limit = 30, offset = 0, beforeId = null } = {}) {

@@ -792,12 +792,13 @@ class D1Adapter extends DatabaseAdapter {
 		return normalizeGroupJoinRequest(await this._write(`/group-join-requests/${this._groupPath(requestId)}`, fields, 'PATCH'));
 	}
 
-	async getGroupPostIds(groupId, { limit = 30, offset = 0, beforeId = null, authorId = null } = {}) {
+	async getGroupPostIds(groupId, { limit = 30, offset = 0, beforeId = null, authorId = null, subType = 'posts_only' } = {}) {
 		return this._read(this._query(`/groups/${this._groupPath(groupId)}/posts`, {
 			limit: this._limit(limit, 30, 100), offset: Math.max(0, Number(offset) || 0), beforeId: beforeId ?? undefined,
 			authorId: authorId != null && authorId !== '' && Number.isInteger(Number(authorId)) && Number(authorId) >= 0
 				? Number(authorId)
 				: undefined,
+			subType: subType === 'replies_only' ? 'replies_only' : 'posts_only',
 		}), { cacheSeconds: 0 });
 	}
 
