@@ -168,6 +168,16 @@ class DatabaseAdapter {
 	async revokeBotToken(userId, tokenId) { throw new Error('revokeBotToken() must be implemented'); }
 	async updateBotTokenLastUsed(tokenId) { throw new Error('updateBotTokenLastUsed() must be implemented'); }
 
+	// ==================== Authorized Apps (NyaitterAuth) ====================
+	async createAuthorizedApp(userId, appId, appTokenHash, appName, appIconUrl, scopes, accessTokenId = null, accessTokenHash = null) { throw new Error('createAuthorizedApp() must be implemented'); }
+	async getAuthorizedAppByUserAndAppToken(userId, appId, appTokenHash) { throw new Error('getAuthorizedAppByUserAndAppToken() must be implemented'); }
+	async getAuthorizedAppByAccessTokenId(accessTokenId) { throw new Error('getAuthorizedAppByAccessTokenId() must be implemented'); }
+	async getUserAuthorizedApps(userId) { throw new Error('getUserAuthorizedApps() must be implemented'); }
+	async getAuthorizedAppById(id, userId) { throw new Error('getAuthorizedAppById() must be implemented'); }
+	async updateAuthorizedAppScopes(id, userId, scopes, accessTokenId = null, accessTokenHash = null) { throw new Error('updateAuthorizedAppScopes() must be implemented'); }
+	async updateAuthorizedAppLastUsed(id) { throw new Error('updateAuthorizedAppLastUsed() must be implemented'); }
+	async deleteAuthorizedApp(id, userId) { throw new Error('deleteAuthorizedApp() must be implemented'); }
+
 
 	// ==================== Groups ====================
 	async createGroup(groupData) { throw new Error('createGroup() must be implemented'); }

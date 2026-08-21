@@ -132,6 +132,34 @@ async function getAuthenticatedPrincipal(req) {
     }
   }
 
+  if (token.startsWith('nyauth_')) {
+    const NyaitterAuthManager = require('../services/auth/NyaitterAuthManager');
+    const authManager = new NyaitterAuthManager({
+      dbAdapter: req.app.locals.dbAdapter,
+    });
+    const appAuth = await authManager.validateAccessToken(token, req.app.locals.dbAdapter);
+    if (appAuth) {
+      const owner = await req.app.locals.dbAdapter.getUserById(appAuth.userId);
+      if (!owner) return null;
+      const principal = {
+        id: appAuth.userId,
+        tokenType: 'app',
+        isApp: true,
+        appId: appAuth.appId,
+        appName: appAuth.appName,
+        scopes: Array.isArray(appAuth.scopes) ? appAuth.scopes : [],
+        admin: false,
+        frozen: Boolean(owner.freeze),
+        accountOperation: owner.account_operation || null,
+      };
+      Object.defineProperty(principal, 'visibilityUser', {
+        value: owner,
+        enumerable: false,
+      });
+      return principal;
+    }
+  }
+
   return getSessionPrincipal(req, token);
 }
 

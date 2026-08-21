@@ -519,8 +519,60 @@ class D1Adapter extends DatabaseAdapter {
 	}
 
 	async updateBotTokenLastUsed(tokenId) {
-		if (!tokenId) return;
-		return this._write(`/bot-tokens/${encodeURIComponent(String(tokenId))}/last-used`);
+		await this._write(`/bot-tokens/${encodeURIComponent(String(tokenId))}/last-used`);
+	}
+
+	// ==================== Authorized Apps (NyaitterAuth) ====================
+
+	async createAuthorizedApp(userId, appId, appTokenHash, appName, appIconUrl, scopes, accessTokenId = null, accessTokenHash = null) {
+		return this._write(`/users/${requireId(userId, 'userId')}/authorized-apps`, {
+			appId: String(appId),
+			appTokenHash: String(appTokenHash),
+			appName: String(appName),
+			appIconUrl: appIconUrl ? String(appIconUrl) : null,
+			scopes: Array.isArray(scopes) ? scopes : [],
+			accessTokenId: accessTokenId ? String(accessTokenId) : null,
+			accessTokenHash: accessTokenHash ? String(accessTokenHash) : null,
+		});
+	}
+
+	async getAuthorizedAppByUserAndAppToken(userId, appId, appTokenHash) {
+		return this._read(`/users/${requireId(userId, 'userId')}/authorized-apps/lookup?appId=${encodeURIComponent(String(appId))}&appTokenHash=${encodeURIComponent(String(appTokenHash))}`, { cacheSeconds: 0 });
+	}
+
+	async getAuthorizedAppByAccessTokenId(accessTokenId) {
+		if (!accessTokenId) return null;
+		return this._read(`/authorized-apps/by-token/${encodeURIComponent(String(accessTokenId))}`, { cacheSeconds: 0 });
+	}
+
+	async getUserAuthorizedApps(userId) {
+		const apps = await this._read(`/users/${requireId(userId, 'userId')}/authorized-apps`, { cacheSeconds: 0 });
+		return Array.isArray(apps) ? apps : [];
+	}
+
+	async getAuthorizedAppById(id, userId = null) {
+		const query = userId !== null ? `?userId=${encodeURIComponent(String(userId))}` : '';
+		return this._read(`/authorized-apps/${encodeURIComponent(String(id))}${query}`, { cacheSeconds: 0 });
+	}
+
+	async updateAuthorizedAppScopes(id, userId, scopes, accessTokenId = null, accessTokenHash = null) {
+		return this._write(`/authorized-apps/${encodeURIComponent(String(id))}/scopes`, {
+			userId: userId !== null ? Number(userId) : undefined,
+			scopes: Array.isArray(scopes) ? scopes : [],
+			accessTokenId: accessTokenId ? String(accessTokenId) : null,
+			accessTokenHash: accessTokenHash ? String(accessTokenHash) : null,
+		});
+	}
+
+	async updateAuthorizedAppLastUsed(id) {
+		await this._write(`/authorized-apps/${encodeURIComponent(String(id))}/last-used`);
+		return true;
+	}
+
+	async deleteAuthorizedApp(id, userId = null) {
+		const query = userId !== null ? `?userId=${encodeURIComponent(String(userId))}` : '';
+		const result = await this._write(`/authorized-apps/${encodeURIComponent(String(id))}/delete${query}`);
+		return typeof result === 'boolean' ? result : !!result?.success;
 	}
 
 	async getUserByScid(scid) {

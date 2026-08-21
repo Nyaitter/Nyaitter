@@ -71,6 +71,11 @@ class InMemoryAdapter extends DatabaseAdapter {
 		this.userAuthProviders = new Map(); // id -> { id, userId, provider, providerUserId, providerProfile, createdAt }
 		this.authProviderLookup = new Map(); // `${provider}:${providerUserId}` -> providerRecordId
 		this.nextAuthProviderId = 1;
+
+		this.authorizedApps = new Map(); // id -> record
+		this.authorizedAppLookup = new Map(); // `${userId}:${appId}:${appTokenHash}` -> id
+		this.authorizedAppByAccessTokenId = new Map(); // accessTokenId -> id
+		this.nextAuthorizedAppId = 1;
 	}
 
 	async exportDataSnapshot() {
@@ -998,6 +1003,115 @@ class InMemoryAdapter extends DatabaseAdapter {
 		if (record) {
 			record.lastUsedAt = new Date();
 		}
+	}
+
+	// ==================== Authorized Apps (NyaitterAuth) ====================
+
+	async createAuthorizedApp(userId, appId, appTokenHash, appName, appIconUrl, scopes, accessTokenId = null, accessTokenHash = null) {
+		const key = `${userId}:${appId}:${appTokenHash}`;
+		const existingId = this.authorizedAppLookup.get(key);
+		const id = existingId || this.nextAuthorizedAppId++;
+		const now = new Date();
+		const record = {
+			id,
+			userId: Number(userId),
+			appId: String(appId),
+			appTokenHash: String(appTokenHash),
+			appName: String(appName),
+			appIconUrl: appIconUrl ? String(appIconUrl) : null,
+			scopes: Array.isArray(scopes) ? [...scopes] : [],
+			accessTokenId: accessTokenId ? String(accessTokenId) : null,
+			accessTokenHash: accessTokenHash ? String(accessTokenHash) : null,
+			createdAt: existingId ? this.authorizedApps.get(existingId)?.createdAt || now : now,
+			updatedAt: now,
+			lastUsedAt: null,
+		};
+		if (existingId) {
+			const prev = this.authorizedApps.get(existingId);
+			if (prev?.accessTokenId && prev.accessTokenId !== accessTokenId) {
+				this.authorizedAppByAccessTokenId.delete(prev.accessTokenId);
+			}
+		}
+		this.authorizedApps.set(id, record);
+		this.authorizedAppLookup.set(key, id);
+		if (accessTokenId) {
+			this.authorizedAppByAccessTokenId.set(accessTokenId, id);
+		}
+		return { ...record };
+	}
+
+	async getAuthorizedAppByUserAndAppToken(userId, appId, appTokenHash) {
+		const key = `${userId}:${appId}:${appTokenHash}`;
+		const id = this.authorizedAppLookup.get(key);
+		if (!id) return null;
+		const record = this.authorizedApps.get(id);
+		return record ? { ...record } : null;
+	}
+
+	async getAuthorizedAppByAccessTokenId(accessTokenId) {
+		if (!accessTokenId) return null;
+		const id = this.authorizedAppByAccessTokenId.get(accessTokenId);
+		if (!id) return null;
+		const record = this.authorizedApps.get(id);
+		return record ? { ...record } : null;
+	}
+
+	async getUserAuthorizedApps(userId) {
+		const targetUserId = Number(userId);
+		const results = [];
+		for (const record of this.authorizedApps.values()) {
+			if (record.userId === targetUserId) {
+				results.push({ ...record });
+			}
+		}
+		results.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+		return results;
+	}
+
+	async getAuthorizedAppById(id, userId = null) {
+		const numericId = Number(id);
+		const record = this.authorizedApps.get(numericId);
+		if (!record) return null;
+		if (userId !== null && record.userId !== Number(userId)) return null;
+		return { ...record };
+	}
+
+	async updateAuthorizedAppScopes(id, userId, scopes, accessTokenId = null, accessTokenHash = null) {
+		const numericId = Number(id);
+		const record = this.authorizedApps.get(numericId);
+		if (!record || (userId !== null && record.userId !== Number(userId))) return null;
+		if (record.accessTokenId && record.accessTokenId !== accessTokenId) {
+			this.authorizedAppByAccessTokenId.delete(record.accessTokenId);
+		}
+		record.scopes = Array.isArray(scopes) ? [...scopes] : [];
+		record.accessTokenId = accessTokenId ? String(accessTokenId) : null;
+		record.accessTokenHash = accessTokenHash ? String(accessTokenHash) : null;
+		record.updatedAt = new Date();
+		if (accessTokenId) {
+			this.authorizedAppByAccessTokenId.set(accessTokenId, numericId);
+		}
+		return { ...record };
+	}
+
+	async updateAuthorizedAppLastUsed(id) {
+		const numericId = Number(id);
+		const record = this.authorizedApps.get(numericId);
+		if (record) {
+			record.lastUsedAt = new Date();
+		}
+		return true;
+	}
+
+	async deleteAuthorizedApp(id, userId = null) {
+		const numericId = Number(id);
+		const record = this.authorizedApps.get(numericId);
+		if (!record || (userId !== null && record.userId !== Number(userId))) return false;
+		this.authorizedApps.delete(numericId);
+		this.authorizedAppLookup.delete(`${record.userId}:${record.appId}:${record.appTokenHash}`);
+		if (record.accessTokenId) {
+			this.authorizedAppByAccessTokenId.delete(record.accessTokenId);
+		}
+		return true;
 	}
 
 	// ==================== Groups ====================

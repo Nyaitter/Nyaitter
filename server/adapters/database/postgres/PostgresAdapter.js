@@ -1454,6 +1454,123 @@ class PostgresAdapter extends DatabaseAdapter {
 		);
 	}
 
+	// ==================== Authorized Apps (NyaitterAuth) ====================
+
+	async createAuthorizedApp(userId, appId, appTokenHash, appName, appIconUrl, scopes, accessTokenId = null, accessTokenHash = null) {
+		const now = new Date().toISOString();
+		const scopesJson = JSON.stringify(Array.isArray(scopes) ? scopes : []);
+		const { rows } = await this.pool.query(
+			`INSERT INTO authorized_apps (user_id, app_id, app_token_hash, app_name, app_icon_url, scopes, access_token_id, access_token_hash, created_at, updated_at)
+			 VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $9)
+			 ON CONFLICT (user_id, app_id, app_token_hash)
+			 DO UPDATE SET
+			   app_name = EXCLUDED.app_name,
+			   app_icon_url = EXCLUDED.app_icon_url,
+			   scopes = EXCLUDED.scopes,
+			   access_token_id = COALESCE(EXCLUDED.access_token_id, authorized_apps.access_token_id),
+			   access_token_hash = COALESCE(EXCLUDED.access_token_hash, authorized_apps.access_token_hash),
+			   updated_at = EXCLUDED.updated_at
+			 RETURNING *`,
+			[Number(userId), String(appId), String(appTokenHash), String(appName), appIconUrl ? String(appIconUrl) : null, scopesJson, accessTokenId, accessTokenHash, now],
+		);
+		return this._mapAuthorizedApp(rows[0]);
+	}
+
+	async getAuthorizedAppByUserAndAppToken(userId, appId, appTokenHash) {
+		const { rows } = await this.pool.query(
+			'SELECT * FROM authorized_apps WHERE user_id = $1 AND app_id = $2 AND app_token_hash = $3',
+			[Number(userId), String(appId), String(appTokenHash)],
+		);
+		return this._mapAuthorizedApp(rows[0]);
+	}
+
+	async getAuthorizedAppByAccessTokenId(accessTokenId) {
+		if (!accessTokenId) return null;
+		const { rows } = await this.pool.query(
+			'SELECT * FROM authorized_apps WHERE access_token_id = $1',
+			[String(accessTokenId)],
+		);
+		return this._mapAuthorizedApp(rows[0]);
+	}
+
+	async getUserAuthorizedApps(userId) {
+		const { rows } = await this.pool.query(
+			'SELECT * FROM authorized_apps WHERE user_id = $1 ORDER BY created_at DESC',
+			[Number(userId)],
+		);
+		return rows.map((r) => this._mapAuthorizedApp(r));
+	}
+
+	async getAuthorizedAppById(id, userId = null) {
+		const query = userId !== null
+			? 'SELECT * FROM authorized_apps WHERE id = $1 AND user_id = $2'
+			: 'SELECT * FROM authorized_apps WHERE id = $1';
+		const params = userId !== null ? [Number(id), Number(userId)] : [Number(id)];
+		const { rows } = await this.pool.query(query, params);
+		return this._mapAuthorizedApp(rows[0]);
+	}
+
+	async updateAuthorizedAppScopes(id, userId, scopes, accessTokenId = null, accessTokenHash = null) {
+		const now = new Date().toISOString();
+		const scopesJson = JSON.stringify(Array.isArray(scopes) ? scopes : []);
+		const query = userId !== null
+			? `UPDATE authorized_apps
+			   SET scopes = $3::jsonb, access_token_id = $4, access_token_hash = $5, updated_at = $6
+			   WHERE id = $1 AND user_id = $2
+			   RETURNING *`
+			: `UPDATE authorized_apps
+			   SET scopes = $2::jsonb, access_token_id = $3, access_token_hash = $4, updated_at = $5
+			   WHERE id = $1
+			   RETURNING *`;
+		const params = userId !== null
+			? [Number(id), Number(userId), scopesJson, accessTokenId, accessTokenHash, now]
+			: [Number(id), scopesJson, accessTokenId, accessTokenHash, now];
+		const { rows } = await this.pool.query(query, params);
+		return this._mapAuthorizedApp(rows[0]);
+	}
+
+	async updateAuthorizedAppLastUsed(id) {
+		const now = new Date().toISOString();
+		await this.pool.query(
+			'UPDATE authorized_apps SET last_used_at = $2 WHERE id = $1',
+			[Number(id), now],
+		);
+		return true;
+	}
+
+	async deleteAuthorizedApp(id, userId = null) {
+		const query = userId !== null
+			? 'DELETE FROM authorized_apps WHERE id = $1 AND user_id = $2'
+			: 'DELETE FROM authorized_apps WHERE id = $1';
+		const params = userId !== null ? [Number(id), Number(userId)] : [Number(id)];
+		const { rowCount } = await this.pool.query(query, params);
+		return (rowCount || 0) > 0;
+	}
+
+	_mapAuthorizedApp(row) {
+		if (!row) return null;
+		let parsedScopes = [];
+		if (Array.isArray(row.scopes)) {
+			parsedScopes = row.scopes;
+		} else if (typeof row.scopes === 'string') {
+			try { parsedScopes = JSON.parse(row.scopes); } catch (_) { parsedScopes = []; }
+		}
+		return {
+			id: row.id,
+			userId: Number(row.user_id),
+			appId: row.app_id,
+			appTokenHash: row.app_token_hash,
+			appName: row.app_name,
+			appIconUrl: row.app_icon_url || null,
+			scopes: Array.isArray(parsedScopes) ? parsedScopes : [],
+			accessTokenId: row.access_token_id || null,
+			accessTokenHash: row.access_token_hash || null,
+			createdAt: row.created_at,
+			updatedAt: row.updated_at,
+			lastUsedAt: row.last_used_at || null,
+		};
+	}
+
 	// ==================== Groups ====================
 
 	async createGroup(groupData) {

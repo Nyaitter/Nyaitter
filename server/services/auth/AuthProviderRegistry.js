@@ -3,6 +3,7 @@
 const ScratchAuthProvider = require('./providers/ScratchAuthProvider');
 const PasskeyAuthProvider = require('./providers/PasskeyAuthProvider');
 const EmailAuthProvider = require('./providers/EmailAuthProvider');
+const NyaitterAuthProvider = require('./providers/NyaitterAuthProvider');
 
 class AuthProviderRegistry {
   constructor() {
@@ -14,6 +15,7 @@ class AuthProviderRegistry {
     this.register(new ScratchAuthProvider());
     this.register(new PasskeyAuthProvider());
     this.register(new EmailAuthProvider());
+    this.register(new NyaitterAuthProvider());
   }
 
   /**

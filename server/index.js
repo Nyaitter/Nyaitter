@@ -292,6 +292,8 @@ const restRoutes = [
     ['push', require('./routes/push')],
     ['rules', require('./routes/rules')],
     ['rule', require('./routes/rules')],
+    ['auth/nyaitter-auth', require('./routes/nyaitterAuth')],
+    ['nyaitter-auth', require('./routes/nyaitterAuth')],
 ];
 
 for (const [resourcePath, router] of restRoutes) {
