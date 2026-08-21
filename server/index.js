@@ -474,7 +474,7 @@ async function startServer() {
     });
     console.log(`[operator-control] Listening on ${operatorControl.socketPath}`);
 
-    httpServer.listen(PORT, () => {
+    httpServer.listen(PORT, async () => {
         console.log(`
 ╔══════════════════════════════════════════════════════════════
 ║  Nyaitter Server                                           
