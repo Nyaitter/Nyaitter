@@ -52,11 +52,49 @@ class DatabaseAdapter {
 	}
 
 	async getUserAuthProviders(userId) {
-		throw new Error('getUserAuthProviders() must be implemented');
+		const targetId = Number(userId);
+		const user = typeof this.getUserById === 'function' ? await this.getUserById(targetId) : null;
+		if (!user) return [];
+		const records = [];
+		if (user.scid) {
+			records.push({
+				id: 0,
+				userId: targetId,
+				provider: 'scratch',
+				providerUserId: user.scid,
+				providerProfile: { username: user.scid },
+				isPrimary: true,
+				createdAt: user.created_at || user.createdAt || new Date(),
+			});
+		} else if (user.auth_provider && user.external_id) {
+			records.push({
+				id: 0,
+				userId: targetId,
+				provider: user.auth_provider,
+				providerUserId: user.external_id,
+				providerProfile: user.external_profile || {},
+				isPrimary: true,
+				createdAt: user.created_at || user.createdAt || new Date(),
+			});
+		}
+		return records;
 	}
 
 	async findUserByAuthProvider(provider, providerUserId) {
-		throw new Error('findUserByAuthProvider() must be implemented');
+		if (!provider || providerUserId == null) return null;
+		const normProvider = String(provider).toLowerCase();
+		const normUserId = String(providerUserId).trim();
+		if (normProvider === 'scratch' || normProvider === 'local') {
+			if (typeof this.getUserByScid === 'function') {
+				const userByScid = await this.getUserByScid(normUserId);
+				if (userByScid) return userByScid;
+			}
+		}
+		if (typeof this.getUserByExternalId === 'function') {
+			const userByExt = await this.getUserByExternalId(normProvider, normUserId);
+			if (userByExt) return userByExt;
+		}
+		return null;
 	}
 
 	async linkAuthProvider(userId, provider, providerUserId, providerProfile = {}) {

@@ -104,10 +104,26 @@ class AuthService {
    * @returns {Promise<object[]>}
    */
   async getLinkedProviders(userId, db) {
-    if (!db || typeof db.getUserAuthProviders !== 'function') {
+    if (!db) {
       return [];
     }
-    const providers = await db.getUserAuthProviders(userId);
+    let providers = [];
+    if (typeof db.getUserAuthProviders === 'function') {
+      providers = await db.getUserAuthProviders(userId);
+    }
+    const user = typeof db.getUserById === 'function' ? await db.getUserById(userId) : null;
+    if (user && user.scid) {
+      const hasScratch = providers.some((p) => String(p.provider).toLowerCase() === 'scratch');
+      if (!hasScratch) {
+        providers.unshift({
+          id: 0,
+          provider: 'scratch',
+          providerUserId: user.scid,
+          isPrimary: providers.length === 0,
+          createdAt: user.createdAt || user.created_at || new Date(),
+        });
+      }
+    }
     return providers.map((p) => {
       const providerInstance = this.registry.getProvider(p.provider);
       return {

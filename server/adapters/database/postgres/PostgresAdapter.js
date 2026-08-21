@@ -538,31 +538,7 @@ class PostgresAdapter extends DatabaseAdapter {
 			[targetId],
 		);
 
-		if (rows.length === 0) {
-			if (user.scid) {
-				return [{
-					id: 0,
-					userId: targetId,
-					provider: 'scratch',
-					providerUserId: user.scid,
-					providerProfile: { username: user.scid },
-					isPrimary: true,
-					createdAt: user.created_at || new Date(),
-				}];
-			} else if (user.auth_provider && user.external_id) {
-				return [{
-					id: 0,
-					userId: targetId,
-					provider: user.auth_provider,
-					providerUserId: user.external_id,
-					providerProfile: user.external_profile || {},
-					isPrimary: true,
-					createdAt: user.created_at || new Date(),
-				}];
-			}
-		}
-
-		return rows.map((r) => ({
+		const records = rows.map((r) => ({
 			id: r.id,
 			userId: r.userId,
 			provider: r.provider,
@@ -570,6 +546,31 @@ class PostgresAdapter extends DatabaseAdapter {
 			providerProfile: typeof r.providerProfile === 'string' ? JSON.parse(r.providerProfile) : (r.providerProfile || {}),
 			createdAt: r.createdAt,
 		}));
+
+		const hasScratch = records.some((r) => String(r.provider).toLowerCase() === 'scratch');
+		if (!hasScratch && user.scid) {
+			records.unshift({
+				id: 0,
+				userId: targetId,
+				provider: 'scratch',
+				providerUserId: user.scid,
+				providerProfile: { username: user.scid },
+				isPrimary: records.length === 0,
+				createdAt: user.created_at || new Date(),
+			});
+		} else if (records.length === 0 && user.auth_provider && user.external_id) {
+			records.push({
+				id: 0,
+				userId: targetId,
+				provider: user.auth_provider,
+				providerUserId: user.external_id,
+				providerProfile: user.external_profile || {},
+				isPrimary: true,
+				createdAt: user.created_at || new Date(),
+			});
+		}
+
+		return records;
 	}
 
 	async findUserByAuthProvider(provider, providerUserId) {

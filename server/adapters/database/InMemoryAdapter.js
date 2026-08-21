@@ -532,28 +532,27 @@ class InMemoryAdapter extends DatabaseAdapter {
 			}
 		}
 
-		if (records.length === 0) {
-			if (user.scid) {
-				records.push({
-					id: 0,
-					userId: targetId,
-					provider: 'scratch',
-					providerUserId: user.scid,
-					providerProfile: { username: user.scid },
-					isPrimary: true,
-					createdAt: user.createdAt || new Date(),
-				});
-			} else if (user.auth_provider && user.external_id) {
-				records.push({
-					id: 0,
-					userId: targetId,
-					provider: user.auth_provider,
-					providerUserId: user.external_id,
-					providerProfile: user.external_profile || {},
-					isPrimary: true,
-					createdAt: user.createdAt || new Date(),
-				});
-			}
+		const hasScratch = records.some((r) => String(r.provider).toLowerCase() === 'scratch');
+		if (!hasScratch && user.scid) {
+			records.unshift({
+				id: 0,
+				userId: targetId,
+				provider: 'scratch',
+				providerUserId: user.scid,
+				providerProfile: { username: user.scid },
+				isPrimary: records.length === 0,
+				createdAt: user.createdAt || new Date(),
+			});
+		} else if (records.length === 0 && user.auth_provider && user.external_id) {
+			records.push({
+				id: 0,
+				userId: targetId,
+				provider: user.auth_provider,
+				providerUserId: user.external_id,
+				providerProfile: user.external_profile || {},
+				isPrimary: true,
+				createdAt: user.createdAt || new Date(),
+			});
 		}
 
 		return records;
