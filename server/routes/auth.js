@@ -25,6 +25,7 @@ const {
   getImposterRole,
   canOperateImposter,
   listAccessibleImposters,
+  listOwnedImposters,
 } = require('../services/ImposterService');
 const {
   formatNyaitterId,
@@ -758,12 +759,37 @@ router.delete('/accounts/:userId', async (req, res) => {
 
     const sessionManager = new SessionManager({ dbAdapter: db });
     await sessionManager.invalidateSession(selected.userId, selected.token);
+
+    // 親アカウントがログアウトした場合、その親が所有するインポスターも同時にログアウトする
+    const imposterIds = new Set();
+    try {
+      const ownedImposters = await listOwnedImposters(db, selected.userId);
+      for (const imposter of ownedImposters) {
+        imposterIds.add(imposter.id);
+        req.app.locals.realtime?.closeUser?.(imposter.id, 1012, 'Parent account logout');
+        await db.invalidateAllSessions(imposter.id);
+      }
+    } catch (err) {
+      console.warn('[auth] Failed to log out owned imposters on account removal:', err.message);
+    }
+
+    const removedTokens = new Set([selected.token]);
+    const removedUserIds = new Set([selected.userId, ...imposterIds]);
+
+    for (const account of accounts) {
+      if (imposterIds.has(account.userId)) {
+        removedTokens.add(account.token);
+        await sessionManager.invalidateSession(account.userId, account.token).catch(() => {});
+      }
+    }
+
     const remaining = accounts
-      .filter((account) => account.token !== selected.token && account.userId !== selected.userId)
+      .filter((account) => !removedUserIds.has(account.userId) && !removedTokens.has(account.token))
       .map((account) => ({ token: account.token, userId: account.userId }));
     setRememberedAccountsCookie(res, remaining);
 
-    const activeRemoved = getCookieValue(req, 'nyaitter_session') === selected.token;
+    const currentToken = getCookieValue(req, 'nyaitter_session');
+    const activeRemoved = Boolean(currentToken && removedTokens.has(currentToken));
     if (activeRemoved) clearSessionCookie(res);
     res.json({ success: true, active_removed: activeRemoved });
   } catch (error) {
@@ -785,13 +811,41 @@ router.post('/logout', optionalAuth, async (req, res) => {
   const headerToken = authHeader?.startsWith('Bearer ') ? authHeader.split(' ')[1] : null;
   const token = headerToken || cookieToken;
 
+  const sessionManager = new SessionManager({ dbAdapter: db });
+
+  const imposterIds = new Set();
   if (token && req.user?.id) {
-    const sessionManager = new SessionManager({ dbAdapter: db });
     await sessionManager.invalidateSession(req.user.id, token);
+
+    // 親アカウントがログアウトした場合、その親が所有するインポスターも同時にログアウトする
+    try {
+      const ownedImposters = await listOwnedImposters(db, req.user.id);
+      for (const imposter of ownedImposters) {
+        imposterIds.add(imposter.id);
+        req.app.locals.realtime?.closeUser?.(imposter.id, 1012, 'Parent account logout');
+        await db.invalidateAllSessions(imposter.id);
+      }
+    } catch (err) {
+      console.warn('[auth] Failed to log out owned imposters on logout:', err.message);
+    }
   }
 
-  const remainingAccounts = readRememberedAccounts(req)
-    .filter((account) => account.token !== cookieToken);
+  const currentRemembered = readRememberedAccounts(req);
+  const remainingAccounts = [];
+  for (const account of currentRemembered) {
+    if (
+      account.token === cookieToken ||
+      (req.user?.id && account.userId === req.user.id) ||
+      imposterIds.has(account.userId)
+    ) {
+      if (account.token && account.token !== token) {
+        await sessionManager.invalidateSession(account.userId, account.token).catch(() => {});
+      }
+    } else {
+      remainingAccounts.push(account);
+    }
+  }
+
   setRememberedAccountsCookie(res, remainingAccounts);
   clearSessionCookie(res);
   res.json({ message: 'Logged out successfully' });
