@@ -2551,128 +2551,88 @@ class PostgresAdapter extends DatabaseAdapter {
 		const normalizedBeforeId = Number.isInteger(Number(beforeId)) && Number(beforeId) > 0
 			? Number(beforeId)
 			: null;
-		const normalizedViewerId = Number.isInteger(Number(viewerId)) ? Number(viewerId) : null;
-		const scoringBlockSize = Math.max(60, normalizedLimit * 2);
-		const candidateLimit = scoringBlockSize + 1;
-		const values = [];
-		const candidateClauses = ['p.group_id IS NULL', 'p.reply_to IS NULL'];
-		if (normalizedBeforeId != null) {
-			values.push(normalizedBeforeId);
-			candidateClauses.push(`p.id < $${values.length}`);
-		}
-		values.push(candidateLimit);
-		const candidateLimitParam = values.length;
-		values.push(normalizedOffset);
-		const candidateOffsetParam = values.length;
-		values.push(scoringBlockSize);
-		const scoringBlockSizeParam = values.length;
-		const personalScoreCtes = [];
-		if (normalizedViewerId != null) {
-			values.push(normalizedViewerId);
-			const keywordViewerParam = values.length;
-			values.push(normalizedViewerId);
-			const directViewerParam = values.length;
-			values.push(normalizedViewerId);
-			const secondDegreeViewerParam = values.length;
-			personalScoreCtes.push(
-				`viewer_keyword_profile AS (
-					SELECT keyword, score
-					FROM user_keyword_affinities
-					WHERE user_id = $${keywordViewerParam}
-					ORDER BY score DESC, keyword ASC
-					LIMIT 25
-				), viewer_keyword_affinity AS (
-					SELECT c.id AS post_id,
-						SUM(profile.score)::numeric AS score
-					FROM candidates c
-					CROSS JOIN LATERAL jsonb_array_elements_text(COALESCE(c.tags, '[]'::jsonb)) AS post_tag(keyword)
-					JOIN viewer_keyword_profile profile ON profile.keyword = post_tag.keyword
-					GROUP BY c.id
-				), direct_follows AS (
-					SELECT following_id AS user_id FROM follows WHERE follower_id = $${directViewerParam} LIMIT 100
-				), second_degree_follows AS (
-					SELECT DISTINCT f2.following_id AS user_id
-					FROM (SELECT following_id FROM follows WHERE follower_id = $${secondDegreeViewerParam} LIMIT 30) f1
-					JOIN follows f2 ON f2.follower_id = f1.following_id
-					WHERE f2.following_id <> $${secondDegreeViewerParam}
-					LIMIT 100
-				)`,
-			);
-		}
-		const { rows } = await this.pool.query(
-			`WITH candidate_source AS (
-				SELECT p.id, p.user_id, p.created_at, p.tags
-				FROM posts p
-				WHERE ${candidateClauses.join(' AND ')}
-				ORDER BY p.created_at DESC, p.id DESC
-				LIMIT $${candidateLimitParam} OFFSET $${candidateOffsetParam}
-			), candidates AS (
-				SELECT id, user_id, created_at, tags
-				FROM candidate_source
-				ORDER BY created_at DESC, id DESC
-				LIMIT $${scoringBlockSizeParam}
-			), like_counts AS (
-				SELECT l.post_id, COUNT(*)::int AS count
-				FROM likes l JOIN candidates c ON c.id = l.post_id
-				GROUP BY l.post_id
-			), star_counts AS (
-				SELECT s.post_id, COUNT(*)::int AS count
-				FROM stars s JOIN candidates c ON c.id = s.post_id
-				GROUP BY s.post_id
-			), repost_counts AS (
-				SELECT r.post_id, COUNT(*)::int AS count
-				FROM reposts r JOIN candidates c ON c.id = r.post_id
-				GROUP BY r.post_id
-			)${personalScoreCtes.length > 0 ? `, ${personalScoreCtes.join(', ')}` : ''}, scored AS (
-				SELECT c.id, c.created_at,
-					48::DECIMAL / (
-						1::DECIMAL + GREATEST(
-							0::DECIMAL,
-							EXTRACT(EPOCH FROM (NOW() - c.created_at))::DECIMAL / 3600::DECIMAL
-						) / 6::DECIMAL
-					)
-					+ LEAST(
-						22::DECIMAL,
-						COALESCE(l.count, 0)::DECIMAL * 2::DECIMAL / (COALESCE(l.count, 0)::DECIMAL + 4::DECIMAL)
-						+ COALESCE(s.count, 0)::DECIMAL * 4::DECIMAL / (COALESCE(s.count, 0)::DECIMAL + 2::DECIMAL)
-						+ COALESCE(r.count, 0)::DECIMAL * 10::DECIMAL / (COALESCE(r.count, 0)::DECIMAL + 2::DECIMAL)
-					)
-					${normalizedViewerId != null ? `+ CASE
-						WHEN df.user_id IS NOT NULL THEN 24::DECIMAL
-						WHEN sdf.user_id IS NOT NULL THEN 10::DECIMAL
-						ELSE 0::DECIMAL
-						END
-						+ LEAST(30::DECIMAL, COALESCE(vka.score, 0)::DECIMAL * 2::DECIMAL)` : ''} AS score
-				FROM candidates c
-				LEFT JOIN like_counts l ON l.post_id = c.id
-				LEFT JOIN star_counts s ON s.post_id = c.id
-				LEFT JOIN repost_counts r ON r.post_id = c.id
-				${normalizedViewerId != null ? `LEFT JOIN viewer_keyword_affinity vka ON vka.post_id = c.id
-				LEFT JOIN direct_follows df ON df.user_id = c.user_id
-				LEFT JOIN second_degree_follows sdf ON sdf.user_id = c.user_id` : ''}
-			), score_stats AS (
-				SELECT AVG(score) AS average_score FROM scored
-			)
-			SELECT
-				COALESCE(
-					array_agg(s.id ORDER BY s.score DESC, s.created_at DESC, s.id DESC),
-					ARRAY[]::integer[]
-				) AS ids,
-				(SELECT COUNT(*)::int FROM candidate_source) AS candidate_count
-			FROM scored s
-			CROSS JOIN score_stats stats
-			WHERE s.score >= stats.average_score * 0.75::DECIMAL`,
-			values,
-		);
-		const ids = Array.isArray(rows[0]?.ids)
-			? rows[0].ids.map(Number).filter(Number.isInteger)
-			: [];
-		const candidateCount = Math.max(0, Number(rows[0]?.candidate_count) || 0);
+		const parsedViewerId = Number(viewerId);
+		const validViewerId = Number.isSafeInteger(parsedViewerId) && parsedViewerId > 0 ? parsedViewerId : null;
+
+		const candidateLimit = Math.max(60, normalizedLimit * 2) + 1;
+		const query = normalizedBeforeId != null
+			? `SELECT p.id, p.user_id, p.created_at, p.tags,
+			          COALESCE(p.like_count, 0)::int AS like_count,
+			          COALESCE(p.star_count, 0)::int AS star_count,
+			          COALESCE(p.repost_count, 0)::int AS repost_count
+			   FROM posts p
+			   WHERE p.group_id IS NULL AND p.reply_to IS NULL AND p.id < $1
+			   ORDER BY p.created_at DESC, p.id DESC
+			   LIMIT $2 OFFSET $3`
+			: `SELECT p.id, p.user_id, p.created_at, p.tags,
+			          COALESCE(p.like_count, 0)::int AS like_count,
+			          COALESCE(p.star_count, 0)::int AS star_count,
+			          COALESCE(p.repost_count, 0)::int AS repost_count
+			   FROM posts p
+			   WHERE p.group_id IS NULL AND p.reply_to IS NULL
+			   ORDER BY p.created_at DESC, p.id DESC
+			   LIMIT $1 OFFSET $2`;
+
+		const params = normalizedBeforeId != null
+			? [normalizedBeforeId, candidateLimit, normalizedOffset]
+			: [candidateLimit, normalizedOffset];
+
+		const [candidatesResult, viewerKeywords, viewerFollows] = await Promise.all([
+			this.pool.query(query, params),
+			validViewerId != null
+				? this.pool.query('SELECT keyword, score FROM user_keyword_affinities WHERE user_id = $1 ORDER BY score DESC LIMIT 25', [validViewerId])
+				: Promise.resolve({ rows: [] }),
+			validViewerId != null
+				? this.pool.query('SELECT following_id FROM follows WHERE follower_id = $1 LIMIT 100', [validViewerId])
+				: Promise.resolve({ rows: [] }),
+		]);
+
+		const rows = candidatesResult.rows;
+		const hasMore = rows.length >= candidateLimit;
+		const candidateRows = rows.slice(0, candidateLimit - 1);
+
+		const keywordProfile = new Map(viewerKeywords.rows.map((r) => [String(r.keyword).toLowerCase(), Number(r.score) || 0]));
+		const directFollows = new Set(viewerFollows.rows.map((r) => Number(r.following_id)));
+		const now = Date.now();
+
+		// Fast in-memory scoring on Node.js server
+		const scored = candidateRows.map((post) => {
+			const createdAtMs = new Date(post.created_at).getTime();
+			const ageHours = Math.max(0, (now - createdAtMs) / (1000 * 3600));
+			const timeScore = 48 / (1 + (ageHours / 6));
+
+			const lCount = Number(post.like_count) || 0;
+			const sCount = Number(post.star_count) || 0;
+			const rCount = Number(post.repost_count) || 0;
+			const reactionScore = Math.min(22, (lCount * 2 / (lCount + 4)) + (sCount * 4 / (sCount + 2)) + (rCount * 10 / (rCount + 2)));
+
+			let socialScore = 0;
+			if (validViewerId != null) {
+				if (directFollows.has(Number(post.user_id))) {
+					socialScore += 24;
+				}
+				const tags = Array.isArray(post.tags) ? post.tags : parseJsonSafe(post.tags, []);
+				let keywordScore = 0;
+				for (const tag of tags) {
+					const s = keywordProfile.get(String(tag).toLowerCase());
+					if (s) keywordScore += s;
+				}
+				socialScore += Math.min(30, keywordScore * 2);
+			}
+
+			const totalScore = timeScore + reactionScore + socialScore;
+			return { id: Number(post.id), score: totalScore, createdAt: createdAtMs };
+		});
+
+		// Sort by score DESC, createdAt DESC
+		scored.sort((a, b) => b.score - a.score || b.createdAt - a.createdAt || b.id - a.id);
+
+		const selectedIds = scored.slice(0, normalizedLimit).map((s) => s.id);
 		return {
-			ids,
-			has_more: candidateCount > scoringBlockSize,
+			ids: selectedIds,
+			has_more: hasMore,
 			next_cursor: null,
-			next_offset: normalizedOffset + Math.min(candidateCount, scoringBlockSize),
+			next_offset: normalizedOffset + selectedIds.length,
 			use_offset_pagination: true,
 		};
 	}
