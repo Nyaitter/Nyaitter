@@ -433,6 +433,8 @@ if (userFilesEndpoint && userFilesPort) {
     userFilesServer = http.createServer(userFilesApp);
 }
 
+let postShareServer = null;
+
 // ── Error & 404 Handlers ───────────────────────────────────────────────────────
 app.use((err, req, res, next) => {
     console.error('[server] Unhandled error:', err);
@@ -549,6 +551,17 @@ async function startServer() {
             });
         }
 
+        const sharePort = config.postSharePort ? Number(config.postSharePort) : null;
+        if (sharePort && sharePort !== PORT && Number.isInteger(sharePort) && sharePort > 0) {
+            postShareServer = http.createServer(app);
+            postShareServer.once('error', (error) => {
+                console.error(`[share-server] Failed to listen on port ${sharePort}:`, error.message);
+            });
+            postShareServer.listen(sharePort, () => {
+                console.log(`[share-server] Listening for post share traffic on http://localhost:${sharePort}`);
+            });
+        }
+
         const embeddedMailConfig = config.auth?.methods?.email?.embeddedServer;
         if (embeddedMailConfig?.enabled) {
             embeddedMailServer = getEmbeddedMailServer(embeddedMailConfig);
@@ -607,6 +620,11 @@ async function shutdown(signal) {
             userFilesServer.close(() => resolve());
         });
         userFilesServer = null;
+        await new Promise((resolve) => {
+            if (!postShareServer?.listening) return resolve();
+            postShareServer.close(() => resolve());
+        });
+        postShareServer = null;
 
         if (dbAdapter && typeof dbAdapter.disconnect === 'function') {
             await dbAdapter.disconnect();
