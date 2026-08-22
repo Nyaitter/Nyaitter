@@ -418,31 +418,43 @@ router.post('/', requireAuth, async (req, res) => {
 		}
 
 		const membersToValidate = memberIds.filter((id) => id !== userId);
-			for (const memberId of membersToValidate) {
-				const user = await db.getUserById(memberId);
-				if (!user) {
-					return res
-						.status(404)
-						.json({ error: `User ${memberId} not found` });
-				}
+		const targetUsers = [];
+		for (const memberId of membersToValidate) {
+			const user = await db.getUserById(memberId);
+			if (!user) {
+				return res
+					.status(404)
+					.json({ error: `User ${memberId} not found` });
 			}
-			if (await hasBlockedDmMemberPair(db, memberIds)) {
+			const invitationPolicy = user.settings?.dm_invitation || user.settings?.dm_permission || 'require_approval';
+			if (invitationPolicy === 'deny' || invitationPolicy === 'reject') {
 				return res.status(403).json({
-					error: 'ブロック関係のユーザーとDMを作成できません',
+					error: `${user.name || 'ユーザー'}はDMの招待を受け付けていません`,
 				});
 			}
+			targetUsers.push(user);
+		}
+		if (await hasBlockedDmMemberPair(db, memberIds)) {
+			return res.status(403).json({
+				error: 'ブロック関係のユーザーとDMを作成できません',
+			});
+		}
 
-			const existing = await db.findGroupDmByMembers(memberIds);
-			if (existing) {
-				return res.json({
-					dm: await serializeGroupDm(db, existing, userId),
-					created: false,
-				});
-			}
+		const existing = await db.findGroupDmByMembers(memberIds);
+		if (existing) {
+			return res.json({
+				dm: await serializeGroupDm(db, existing, userId),
+				created: false,
+			});
+		}
 
 		const acceptedMembers = [userId];
-		for (const memberId of membersToValidate) {
-			if (typeof db.isFollowing === 'function' && await db.isFollowing(memberId, userId)) {
+		for (const targetUser of targetUsers) {
+			const memberId = targetUser.id;
+			const invitationPolicy = targetUser.settings?.dm_invitation || targetUser.settings?.dm_permission || 'require_approval';
+			if (invitationPolicy === 'always' || invitationPolicy === 'allow') {
+				acceptedMembers.push(memberId);
+			} else if (typeof db.isFollowing === 'function' && await db.isFollowing(memberId, userId)) {
 				acceptedMembers.push(memberId);
 			}
 		}
@@ -533,15 +545,43 @@ router.put('/:dmId', requireAuth, async (req, res) => {
 				) {
 					return res.status(400).json({ error: 'Invalid member ids' });
 				}
-					if (!memberIds.includes(userId)) {
-						return res.status(400).json({ error: 'Host must stay a member' });
+				if (!memberIds.includes(userId)) {
+					return res.status(400).json({ error: 'Host must stay a member' });
+				}
+				if (await hasBlockedDmMemberPair(db, memberIds)) {
+					return res.status(403).json({
+						error: 'ブロック関係のユーザーをDMに招待できません',
+					});
+				}
+
+				const currentAccepted = Array.isArray(dm.accepted)
+					? dm.accepted.slice()
+					: (Array.isArray(dm.unread?._accepted) ? dm.unread._accepted.slice() : (dm.member || []).slice());
+				const newlyAddedMemberIds = memberIds.filter((id) => !dm.member.includes(id));
+				for (const newMemberId of newlyAddedMemberIds) {
+					const user = await db.getUserById(newMemberId);
+					if (!user) {
+						return res.status(404).json({ error: `User ${newMemberId} not found` });
 					}
-					if (await hasBlockedDmMemberPair(db, memberIds)) {
+					const invitationPolicy = user.settings?.dm_invitation || user.settings?.dm_permission || 'require_approval';
+					if (invitationPolicy === 'deny' || invitationPolicy === 'reject') {
 						return res.status(403).json({
-							error: 'ブロック関係のユーザーをDMに招待できません',
+							error: `${user.name || 'ユーザー'}はDMの招待を受け付けていません`,
 						});
 					}
-					updates.member = memberIds;
+					if (invitationPolicy === 'always' || invitationPolicy === 'allow') {
+						if (!currentAccepted.includes(newMemberId)) {
+							currentAccepted.push(newMemberId);
+						}
+					} else if (typeof db.isFollowing === 'function' && await db.isFollowing(newMemberId, userId)) {
+						if (!currentAccepted.includes(newMemberId)) {
+							currentAccepted.push(newMemberId);
+						}
+					}
+				}
+
+				updates.member = memberIds;
+				updates.accepted = currentAccepted;
 			}
 			if (body.host_id !== undefined) {
 				if (!dm.member.includes(Number(body.host_id))) {
