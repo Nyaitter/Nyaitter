@@ -615,43 +615,63 @@ const config = {
 	    },
 	  },
 
-	  		  geminiModeration: (() => {
+	  autoMod: (() => {
 		    const apiKey = readSetting(
-		      ['GEMINI_API_KEY'],
-		      ['geminiModeration.apiKey', 'GEMINI_API_KEY'],
+		      ['AUTOMOD_API_KEY', 'GEMINI_API_KEY', 'OPENAI_API_KEY'],
+		      ['autoMod.apiKey', 'automod.apiKey', 'geminiModeration.apiKey', 'AUTOMOD_API_KEY', 'GEMINI_API_KEY'],
 		      '',
 		    );
 		    const model = readSetting(
-		      ['GEMINI_MODEL'],
-		      ['geminiModeration.model', 'GEMINI_MODEL'],
+		      ['AUTOMOD_MODEL', 'GEMINI_MODEL', 'OPENAI_MODEL'],
+		      ['autoMod.model', 'automod.model', 'geminiModeration.model', 'AUTOMOD_MODEL', 'GEMINI_MODEL'],
 		      '',
 		    );
 		    const prompt = readSetting(
-		      ['GEMINI_MOD_PROMPT'],
-		      ['geminiModeration.prompt', 'GEMINI_MOD_PROMPT'],
+		      ['AUTOMOD_PROMPT', 'AUTOMOD_MOD_PROMPT', 'GEMINI_MOD_PROMPT'],
+		      ['autoMod.prompt', 'automod.prompt', 'geminiModeration.prompt', 'AUTOMOD_PROMPT', 'GEMINI_MOD_PROMPT'],
 		      '',
 		    );
+		    const endpoint = readSetting(
+		      ['AUTOMOD_ENDPOINT', 'AUTOMOD_BASE_URL', 'OPENAI_BASE_URL'],
+		      ['autoMod.endpoint', 'autoMod.baseUrl', 'automod.endpoint', 'geminiModeration.endpoint'],
+		      '',
+		    );
+		    const configuredProvider = readSetting(
+		      ['AUTOMOD_PROVIDER'],
+		      ['autoMod.provider', 'automod.provider'],
+		      '',
+		    );
+		    const provider = configuredProvider
+		      ? String(configuredProvider).trim().toLowerCase()
+		      : (endpoint || process.env.OPENAI_API_KEY ? 'openai' : 'gemini');
+
 		    return {
 		      apiKey,
 		      model,
 		      prompt,
+		      endpoint,
+		      provider,
 		      maxImages: exactIntegerSetting(
-		        'Gemini moderation max images',
-		        ['GEMINI_MOD_MAX_IMAGES'],
-		        ['geminiModeration.maxImages', 'GEMINI_MOD_MAX_IMAGES'],
+		        'AutoMod max images',
+		        ['AUTOMOD_MAX_IMAGES', 'AUTOMOD_MOD_MAX_IMAGES', 'GEMINI_MOD_MAX_IMAGES'],
+		        ['autoMod.maxImages', 'automod.maxImages', 'geminiModeration.maxImages'],
 		        0,
 		        0,
 		      ),
 		      maxPendingJobs: exactIntegerSetting(
-		        'Gemini moderation max pending jobs',
-		        ['GEMINI_MOD_MAX_PENDING_JOBS'],
-		        ['geminiModeration.maxPendingJobs', 'GEMINI_MOD_MAX_PENDING_JOBS'],
+		        'AutoMod max pending jobs',
+		        ['AUTOMOD_MAX_PENDING_JOBS', 'AUTOMOD_MOD_MAX_PENDING_JOBS', 'GEMINI_MOD_MAX_PENDING_JOBS'],
+		        ['autoMod.maxPendingJobs', 'automod.maxPendingJobs', 'geminiModeration.maxPendingJobs'],
 		        500,
 		        1,
 		      ),
 		      enabled: Boolean(apiKey && model && prompt),
 		    };
 		  })(),
+
+		  get geminiModeration() {
+		    return this.autoMod;
+		  },
 
 		  // VAPID private keys must only be supplied through environment variables
 		  // in production. The public key is exposed only to authenticated clients.
@@ -875,13 +895,13 @@ function validateConfig() {
     }
   }
 
-  const geminiSettings = [
-    config.geminiModeration.apiKey,
-    config.geminiModeration.model,
-    config.geminiModeration.prompt,
+  const autoModSettings = [
+    config.autoMod.apiKey,
+    config.autoMod.model,
+    config.autoMod.prompt,
   ].filter(Boolean);
-  if (geminiSettings.length > 0 && !config.geminiModeration.enabled) {
-    console.warn('[config] Gemini moderation is disabled until GEMINI_API_KEY, GEMINI_MODEL, and GEMINI_MOD_PROMPT are all configured');
+  if (autoModSettings.length > 0 && !config.autoMod.enabled) {
+    console.warn('[config] AutoMod is disabled until AUTOMOD_API_KEY (or GEMINI_API_KEY), AUTOMOD_MODEL (or GEMINI_MODEL), and AUTOMOD_PROMPT (or GEMINI_MOD_PROMPT) are all configured');
   }
 
   if (config.server.port < 1 || config.server.port > 65535) {

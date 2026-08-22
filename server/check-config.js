@@ -414,6 +414,31 @@ function inspect() {
         );
     }
 
+    const autoModApiKey = firstSetting(
+        ['AUTOMOD_API_KEY', 'GEMINI_API_KEY', 'OPENAI_API_KEY'],
+        config,
+        ['autoMod.apiKey', 'automod.apiKey', 'geminiModeration.apiKey'],
+    );
+    const autoModModel = firstSetting(
+        ['AUTOMOD_MODEL', 'GEMINI_MODEL', 'OPENAI_MODEL'],
+        config,
+        ['autoMod.model', 'automod.model', 'geminiModeration.model'],
+    );
+    const autoModPrompt = firstSetting(
+        ['AUTOMOD_PROMPT', 'AUTOMOD_MOD_PROMPT', 'GEMINI_MOD_PROMPT'],
+        config,
+        ['autoMod.prompt', 'automod.prompt', 'geminiModeration.prompt'],
+    );
+    const autoModSpecified = [autoModApiKey, autoModModel, autoModPrompt].filter(isNonEmptyString).length;
+    if (autoModSpecified > 0 && autoModSpecified < 3) {
+        addIssue(
+            'warning',
+            'AUTOMOD_SETTINGS_INCOMPLETE',
+            'AutoModの設定が一部のみ指定されています（API Key, Model, Promptの3つが必要です）。',
+            'AUTOMOD_API_KEY, AUTOMOD_MODEL, AUTOMOD_PROMPT をすべて設定するか、すべて未設定にしてください。',
+        );
+    }
+
     if (isProduction) {
         const publicUrl = setting('PUBLIC_URL', config, 'federation.publicUrl');
         if (!isHttpUrl(publicUrl)) {

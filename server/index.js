@@ -504,7 +504,7 @@ const autoModerationService = new AutoModerationService({
     dbAdapter,
     storageAdapter,
     publishNotification: publishModerationNotification,
-    moderationConfig: config.geminiModeration,
+    moderationConfig: config.autoMod,
 });
 const postActionQueue = new PostActionQueue();
 const postKeywordBackfillQueue = new PostActionQueue({ maxPendingJobs: 2000 });
@@ -547,7 +547,7 @@ async function startServer() {
 ║
 ║  DB Adapter:      ${process.env.DB_ADAPTER || 'memory'}
 ║  Storage Adapter: ${process.env.STORAGE_ADAPTER || 'local'}
-║  Gemini moderation: ${autoModerationService.enabled ? 'enabled' : 'disabled'}
+║  AutoMod:         ${autoModerationService.enabled ? 'enabled' : 'disabled'}
 ╚══════════════════════════════════════════════════════════════
 `);
         if (userFilesServer) {
