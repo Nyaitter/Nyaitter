@@ -114,6 +114,14 @@ function normalizePostRow(row) {
 		reply_to: replyTo == null ? null : Number(replyTo),
 		repostTo: repostTo == null ? null : Number(repostTo),
 		repost_to: repostTo == null ? null : Number(repostTo),
+		like_count: Math.max(0, Number(row.like_count ?? row.likeCount) || 0),
+		likeCount: Math.max(0, Number(row.like_count ?? row.likeCount) || 0),
+		star_count: Math.max(0, Number(row.star_count ?? row.starCount) || 0),
+		starCount: Math.max(0, Number(row.star_count ?? row.starCount) || 0),
+		repost_count: Math.max(0, Number(row.repost_count ?? row.repostCount) || 0),
+		repostCount: Math.max(0, Number(row.repost_count ?? row.repostCount) || 0),
+		reply_count: Math.max(0, Number(row.reply_count ?? row.replyCount) || 0),
+		replyCount: Math.max(0, Number(row.reply_count ?? row.replyCount) || 0),
 		createdAt,
 		created_at: createdAt,
 	};
@@ -1017,11 +1025,34 @@ class PostgresAdapter extends DatabaseAdapter {
 			);
 			if (!userRows[0]) return false;
 
-			const { rows: postRows } = await client.query('SELECT id FROM posts WHERE user_id = $1', [userId]);
+			const { rows: postRows } = await client.query('SELECT id, reply_to, repost_to FROM posts WHERE user_id = $1', [userId]);
 			const postIds = postRows.map((row) => Number(row.id));
 			if (postIds.length > 0) {
+				// Decrement reply/repost counters on parents of posts created by this user
+				for (const p of postRows) {
+					if (p.reply_to) {
+						await client.query('UPDATE posts SET reply_count = GREATEST(0, reply_count - 1) WHERE id = $1', [Number(p.reply_to)]);
+					}
+					if (p.repost_to) {
+						await client.query('UPDATE posts SET repost_count = GREATEST(0, repost_count - 1) WHERE id = $1', [Number(p.repost_to)]);
+					}
+				}
 				await client.query('UPDATE posts SET reply_to = NULL WHERE reply_to = ANY($1::int[])', [postIds]);
 				await client.query('UPDATE posts SET repost_to = NULL WHERE repost_to = ANY($1::int[])', [postIds]);
+			}
+
+			// Decrement like counters for posts liked by this user
+			const { rows: userLikes } = await client.query('SELECT post_id FROM likes WHERE user_id = $1', [userId]);
+			const likedPostIds = userLikes.map((r) => Number(r.post_id)).filter((id) => !postIds.includes(id));
+			if (likedPostIds.length > 0) {
+				await client.query('UPDATE posts SET like_count = GREATEST(0, like_count - 1) WHERE id = ANY($1::int[])', [likedPostIds]);
+			}
+
+			// Decrement star counters for posts starred by this user
+			const { rows: userStars } = await client.query('SELECT post_id FROM stars WHERE user_id = $1', [userId]);
+			const starredPostIds = userStars.map((r) => Number(r.post_id)).filter((id) => !postIds.includes(id));
+			if (starredPostIds.length > 0) {
+				await client.query('UPDATE posts SET star_count = GREATEST(0, star_count - 1) WHERE id = ANY($1::int[])', [starredPostIds]);
 			}
 
 			const { rows: channelRows } = await client.query(
@@ -2057,6 +2088,12 @@ class PostgresAdapter extends DatabaseAdapter {
 			);
 			const post = normalizePostRow(rows[0] || null);
 			if (post) {
+				if (post.replyTo) {
+					await client.query('UPDATE posts SET reply_count = reply_count + 1 WHERE id = $1', [Number(post.replyTo)]);
+				}
+				if (post.repostTo) {
+					await client.query('UPDATE posts SET repost_count = repost_count + 1 WHERE id = $1', [Number(post.repostTo)]);
+				}
 				await this._adjustUserKeywordAffinitiesForTags(client, post.userId, post.tags, 1);
 			}
 			return post;
@@ -2123,61 +2160,45 @@ class PostgresAdapter extends DatabaseAdapter {
 			? parsedViewerId
 			: null;
 
-		const query = `WITH target_posts AS (
-			SELECT unnest($1::int[]) AS id
-		), like_counts AS (
-			SELECT post_id, COUNT(*)::int AS count
-			FROM likes
-			WHERE post_id = ANY($1::int[])
-			GROUP BY post_id
-		), star_counts AS (
-			SELECT post_id, COUNT(*)::int AS count
-			FROM stars
-			WHERE post_id = ANY($1::int[])
-			GROUP BY post_id
-		), repost_counts AS (
-			SELECT post_id, COUNT(*)::int AS count
-			FROM reposts
-			WHERE post_id = ANY($1::int[])
-			GROUP BY post_id
-		), reply_counts AS (
-			SELECT reply_to AS post_id, COUNT(*)::int AS count
-			FROM posts
-			WHERE reply_to = ANY($1::int[])
-			GROUP BY reply_to
-		)${viewerId != null ? `, my_likes AS (
-			SELECT post_id FROM likes WHERE user_id = $2 AND post_id = ANY($1::int[])
-		), my_stars AS (
-			SELECT post_id FROM stars WHERE user_id = $2 AND post_id = ANY($1::int[])
-		)` : ''}
-		SELECT
-			tp.id AS post_id,
-			COALESCE(lc.count, 0)::int AS like_count,
-			COALESCE(sc.count, 0)::int AS star_count,
-			COALESCE(rc.count, 0)::int AS repost_count,
-			COALESCE(rpc.count, 0)::int AS reply_count
-			${viewerId != null
-				? ', (ml.post_id IS NOT NULL) AS liked_by_me, (ms.post_id IS NOT NULL) AS starred_by_me'
-				: ', FALSE AS liked_by_me, FALSE AS starred_by_me'}
-		FROM target_posts tp
-		LEFT JOIN like_counts lc ON lc.post_id = tp.id
-		LEFT JOIN star_counts sc ON sc.post_id = tp.id
-		LEFT JOIN repost_counts rc ON rc.post_id = tp.id
-		LEFT JOIN reply_counts rpc ON rpc.post_id = tp.id
-		${viewerId != null ? `LEFT JOIN my_likes ml ON ml.post_id = tp.id
-		LEFT JOIN my_stars ms ON ms.post_id = tp.id` : ''}`;
+		const query = viewerId != null
+			? `SELECT
+				p.id AS post_id,
+				COALESCE(p.like_count, 0)::int AS like_count,
+				COALESCE(p.star_count, 0)::int AS star_count,
+				COALESCE(p.repost_count, 0)::int AS repost_count,
+				COALESCE(p.reply_count, 0)::int AS reply_count,
+				(l.post_id IS NOT NULL) AS liked_by_me,
+				(s.post_id IS NOT NULL) AS starred_by_me
+			   FROM posts p
+			   LEFT JOIN likes l ON l.post_id = p.id AND l.user_id = $2
+			   LEFT JOIN stars s ON s.post_id = p.id AND s.user_id = $2
+			   WHERE p.id = ANY($1::int[])`
+			: `SELECT
+				p.id AS post_id,
+				COALESCE(p.like_count, 0)::int AS like_count,
+				COALESCE(p.star_count, 0)::int AS star_count,
+				COALESCE(p.repost_count, 0)::int AS repost_count,
+				COALESCE(p.reply_count, 0)::int AS reply_count,
+				FALSE AS liked_by_me,
+				FALSE AS starred_by_me
+			   FROM posts p
+			   WHERE p.id = ANY($1::int[])`;
 
 		const params = viewerId != null ? [ids, viewerId] : [ids];
 		const { rows } = await this.pool.query(query, params);
-		return rows.map((row) => ({
-			post_id: Number(row.post_id),
-			like_count: Math.max(0, Number(row.like_count) || 0),
-			star_count: Math.max(0, Number(row.star_count) || 0),
-			repost_count: Math.max(0, Number(row.repost_count) || 0),
-			reply_count: Math.max(0, Number(row.reply_count) || 0),
-			liked_by_me: Boolean(row.liked_by_me),
-			starred_by_me: Boolean(row.starred_by_me),
-		}));
+		const rowMap = new Map(rows.map((r) => [Number(r.post_id), r]));
+		return ids.map((id) => {
+			const row = rowMap.get(id);
+			return {
+				post_id: id,
+				like_count: Math.max(0, Number(row?.like_count) || 0),
+				star_count: Math.max(0, Number(row?.star_count) || 0),
+				repost_count: Math.max(0, Number(row?.repost_count) || 0),
+				reply_count: Math.max(0, Number(row?.reply_count) || 0),
+				liked_by_me: Boolean(row?.liked_by_me),
+				starred_by_me: Boolean(row?.starred_by_me),
+			};
+		});
 	}
 
 	async updatePost(postId, fields) {
@@ -2233,10 +2254,19 @@ class PostgresAdapter extends DatabaseAdapter {
 
 	async deletePost(postId, userId) {
 		return this._withTransaction(async (client) => {
-			const { rows } = await client.query('SELECT user_id FROM posts WHERE id = $1 FOR UPDATE', [Number(postId)]);
+			const { rows } = await client.query('SELECT user_id, reply_to, repost_to FROM posts WHERE id = $1 FOR UPDATE', [Number(postId)]);
 			if (!rows[0] || Number(rows[0].user_id) !== Number(userId)) {
 				return false;
 			}
+			const post = rows[0];
+			if (post.reply_to) {
+				await client.query('UPDATE posts SET reply_count = GREATEST(0, reply_count - 1) WHERE id = $1', [Number(post.reply_to)]);
+			}
+			if (post.repost_to) {
+				await client.query('UPDATE posts SET repost_count = GREATEST(0, repost_count - 1) WHERE id = $1', [Number(post.repost_to)]);
+			}
+			await client.query('UPDATE posts SET reply_to = NULL WHERE reply_to = $1', [Number(postId)]);
+			await client.query('UPDATE posts SET repost_to = NULL WHERE repost_to = $1', [Number(postId)]);
 			await client.query('DELETE FROM likes WHERE post_id = $1', [Number(postId)]);
 			await client.query('DELETE FROM stars WHERE post_id = $1', [Number(postId)]);
 			await client.query('DELETE FROM reposts WHERE post_id = $1', [Number(postId)]);
@@ -2248,6 +2278,18 @@ class PostgresAdapter extends DatabaseAdapter {
 
 	async adminDeletePost(postId) {
 		return this._withTransaction(async (client) => {
+			const { rows } = await client.query('SELECT reply_to, repost_to FROM posts WHERE id = $1 FOR UPDATE', [Number(postId)]);
+			if (rows[0]) {
+				const post = rows[0];
+				if (post.reply_to) {
+					await client.query('UPDATE posts SET reply_count = GREATEST(0, reply_count - 1) WHERE id = $1', [Number(post.reply_to)]);
+				}
+				if (post.repost_to) {
+					await client.query('UPDATE posts SET repost_count = GREATEST(0, repost_count - 1) WHERE id = $1', [Number(post.repost_to)]);
+				}
+			}
+			await client.query('UPDATE posts SET reply_to = NULL WHERE reply_to = $1', [Number(postId)]);
+			await client.query('UPDATE posts SET repost_to = NULL WHERE repost_to = $1', [Number(postId)]);
 			await client.query('DELETE FROM likes WHERE post_id = $1', [Number(postId)]);
 			await client.query('DELETE FROM stars WHERE post_id = $1', [Number(postId)]);
 			await client.query('DELETE FROM reposts WHERE post_id = $1', [Number(postId)]);
@@ -2800,37 +2842,44 @@ class PostgresAdapter extends DatabaseAdapter {
 				'SELECT 1 FROM likes WHERE user_id = $1 AND post_id = $2',
 				[Number(userId), Number(postId)],
 			);
-				if (existing.rows.length > 0) {
-					await client.query(
-						'DELETE FROM likes WHERE user_id = $1 AND post_id = $2',
-						[Number(userId), Number(postId)],
-					);
-					await this._adjustUserKeywordAffinities(client, userId, postId, -1);
-				} else {
+			let newCount = 0;
+			if (existing.rows.length > 0) {
+				await client.query(
+					'DELETE FROM likes WHERE user_id = $1 AND post_id = $2',
+					[Number(userId), Number(postId)],
+				);
+				const { rows } = await client.query(
+					'UPDATE posts SET like_count = GREATEST(0, like_count - 1) WHERE id = $1 RETURNING like_count',
+					[Number(postId)],
+				);
+				newCount = Math.max(0, Number(rows[0]?.like_count) || 0);
+				await this._adjustUserKeywordAffinities(client, userId, postId, -1);
+			} else {
 				const now = new Date().toISOString();
-					await client.query(
-						'INSERT INTO likes (user_id, post_id, created_at) VALUES ($1, $2, $3)',
-						[Number(userId), Number(postId), now],
-					);
-					await this._adjustUserKeywordAffinities(client, userId, postId, 1);
-				}
-			const countResult = await client.query(
-				'SELECT COUNT(*)::int AS count FROM likes WHERE post_id = $1',
-				[Number(postId)],
-			);
+				await client.query(
+					'INSERT INTO likes (user_id, post_id, created_at) VALUES ($1, $2, $3)',
+					[Number(userId), Number(postId), now],
+				);
+				const { rows } = await client.query(
+					'UPDATE posts SET like_count = like_count + 1 WHERE id = $1 RETURNING like_count',
+					[Number(postId)],
+				);
+				newCount = Math.max(0, Number(rows[0]?.like_count) || 0);
+				await this._adjustUserKeywordAffinities(client, userId, postId, 1);
+			}
 			return {
 				liked: existing.rows.length === 0,
-				count: Number(countResult.rows[0]?.count || 0),
+				count: newCount,
 			};
 		});
 	}
 
 	async getLikeCount(postId) {
 		const { rows } = await this.pool.query(
-			'SELECT COUNT(*)::int as count FROM likes WHERE post_id = $1',
+			'SELECT like_count FROM posts WHERE id = $1',
 			[Number(postId)],
 		);
-		return Number(rows[0]?.count || 0);
+		return Number(rows[0]?.like_count || 0);
 	}
 
 	async hasUserLikedPost(userId, postId) {
@@ -2855,37 +2904,44 @@ class PostgresAdapter extends DatabaseAdapter {
 				'SELECT 1 FROM stars WHERE user_id = $1 AND post_id = $2',
 				[Number(userId), Number(postId)],
 			);
-				if (existing.rows.length > 0) {
-					await client.query(
-						'DELETE FROM stars WHERE user_id = $1 AND post_id = $2',
-						[Number(userId), Number(postId)],
-					);
-					await this._adjustUserKeywordAffinities(client, userId, postId, -3);
-				} else {
+			let newCount = 0;
+			if (existing.rows.length > 0) {
+				await client.query(
+					'DELETE FROM stars WHERE user_id = $1 AND post_id = $2',
+					[Number(userId), Number(postId)],
+				);
+				const { rows } = await client.query(
+					'UPDATE posts SET star_count = GREATEST(0, star_count - 1) WHERE id = $1 RETURNING star_count',
+					[Number(postId)],
+				);
+				newCount = Math.max(0, Number(rows[0]?.star_count) || 0);
+				await this._adjustUserKeywordAffinities(client, userId, postId, -3);
+			} else {
 				const now = new Date().toISOString();
-					await client.query(
-						'INSERT INTO stars (user_id, post_id, created_at) VALUES ($1, $2, $3)',
-						[Number(userId), Number(postId), now],
-					);
-					await this._adjustUserKeywordAffinities(client, userId, postId, 3);
-				}
-			const countResult = await client.query(
-				'SELECT COUNT(*)::int AS count FROM stars WHERE post_id = $1',
-				[Number(postId)],
-			);
+				await client.query(
+					'INSERT INTO stars (user_id, post_id, created_at) VALUES ($1, $2, $3)',
+					[Number(userId), Number(postId), now],
+				);
+				const { rows } = await client.query(
+					'UPDATE posts SET star_count = star_count + 1 WHERE id = $1 RETURNING star_count',
+					[Number(postId)],
+				);
+				newCount = Math.max(0, Number(rows[0]?.star_count) || 0);
+				await this._adjustUserKeywordAffinities(client, userId, postId, 3);
+			}
 			return {
 				starred: existing.rows.length === 0,
-				count: Number(countResult.rows[0]?.count || 0),
+				count: newCount,
 			};
 		});
 	}
 
 	async getStarCount(postId) {
 		const { rows } = await this.pool.query(
-			'SELECT COUNT(*)::int as count FROM stars WHERE post_id = $1',
+			'SELECT star_count FROM posts WHERE id = $1',
 			[Number(postId)],
 		);
-		return Number(rows[0]?.count || 0);
+		return Number(rows[0]?.star_count || 0);
 	}
 
 	async hasUserStarredPost(userId, postId) {
