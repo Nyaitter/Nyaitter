@@ -35,6 +35,7 @@ class NyaitterAuthProvider extends BaseAuthProvider {
       displayName: this.displayName,
       enabled: this.isEnabled(config, req),
       allowSignup: this.isSignupAllowed(config, req),
+      turnstileRequired: Boolean(config?.turnstile?.enabled),
       description: '他のNyaitterサーバーのアカウントを使用してログイン・連携します（同一サーバーは不可）。',
     };
   }
@@ -74,6 +75,20 @@ class NyaitterAuthProvider extends BaseAuthProvider {
   }
 
   async initiate(req, payload = {}, context = {}) {
+    const { turnstileToken, turnstile_token } = payload;
+    const { config, verifyTurnstile } = context;
+
+    if (config?.turnstile?.enabled && typeof verifyTurnstile === 'function') {
+      const token = turnstileToken || turnstile_token;
+      const turnstileResult = await verifyTurnstile(token);
+      if (turnstileResult.success !== true) {
+        const err = new Error('Turnstileチャレンジを完了してください。');
+        err.status = 400;
+        err.code = 'turnstile_required';
+        throw err;
+      }
+    }
+
     const rawServerUrl = String(payload.serverUrl || payload.server_url || '').trim();
     if (!rawServerUrl) {
       const err = new Error('連携元のNyaitterサーバーURLを入力してください。同一サーバーでのNyaitterAuthログインは利用できません。');

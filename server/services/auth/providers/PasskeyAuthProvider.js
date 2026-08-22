@@ -29,6 +29,7 @@ class PasskeyAuthProvider extends BaseAuthProvider {
       displayName: this.displayName,
       enabled: this.isEnabled(config, req),
       allowSignup: this.isSignupAllowed(config, req),
+      turnstileRequired: Boolean(config?.turnstile?.enabled),
       rpName: passkeyConfig.rpName || 'Nyaitter',
       rpId,
     };
@@ -62,7 +63,20 @@ class PasskeyAuthProvider extends BaseAuthProvider {
   }
 
   async initiate(req, payload = {}, context = {}) {
-    const { config } = context;
+    const { turnstileToken, turnstile_token } = payload;
+    const { config, verifyTurnstile } = context;
+
+    if (config?.turnstile?.enabled && typeof verifyTurnstile === 'function') {
+      const token = turnstileToken || turnstile_token;
+      const turnstileResult = await verifyTurnstile(token);
+      if (turnstileResult.success !== true) {
+        const err = new Error('Turnstileチャレンジを完了してください。');
+        err.status = 400;
+        err.code = 'turnstile_required';
+        throw err;
+      }
+    }
+
     const passkeyConfig = config?.auth?.methods?.passkey || {};
     const rpId = passkeyConfig.rpId || req?.hostname || 'localhost';
 
