@@ -70,6 +70,28 @@ function getPublicUrl(req = null) {
   return `http://localhost:${port}`;
 }
 
+function getPostShareUrl(req = null) {
+  if (process.env.POST_SHARE_URL || config.postShareUrl) {
+    const directUrl = normalizePublicUrl(process.env.POST_SHARE_URL || config.postShareUrl);
+    if (directUrl) return directUrl;
+  }
+
+  const portSetting = process.env.POST_SHARE_PORT || config.postSharePort;
+  if (portSetting) {
+    const port = Number(portSetting);
+    if (Number.isInteger(port) && port >= 1 && port <= 65535) {
+      const publicBase = getPublicUrl(req);
+      try {
+        const parsed = new URL(publicBase);
+        parsed.port = (port === 80 || port === 443) ? '' : String(port);
+        return parsed.origin;
+      } catch (_) {}
+    }
+  }
+
+  return getPublicUrl(req);
+}
+
 function getUserNyaitterId(user) {
 	if (!user) return null;
 	return formatNyaitterId(
@@ -82,6 +104,7 @@ function getUserNyaitterId(user) {
 module.exports = {
   formatNyaitterId,
   getPublicUrl,
+  getPostShareUrl,
   getUserNyaitterId,
   normalizePublicUrl,
   isSafeHost,

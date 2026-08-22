@@ -2,6 +2,7 @@ const express = require('express');
 const config = require('../config');
 const {
 	getPublicUrl,
+	getPostShareUrl,
 } = require('../utils/nyaitterAddress');
 const { defaultRegistry: authProviderRegistry } = require('../services/auth/AuthProviderRegistry');
 
@@ -81,7 +82,7 @@ router.get('/status', async (req, res) => {
 		database: dbStatus,
 		identity: {
 			public_url: publicUrl,
-			post_share_url: config.postShareUrl || publicUrl,
+			post_share_url: getPostShareUrl(req),
 			nyaitter_id_format: '#{localId}',
 		},
 		auth_methods: authProviderRegistry.listEnabledProviderNames(config, req),
