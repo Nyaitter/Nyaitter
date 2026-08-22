@@ -204,8 +204,8 @@ function mapModerationReport(row) {
 class D1Adapter extends DatabaseAdapter {
 	constructor(options = {}) {
 		super();
-		this.workerUrl = options.workerUrl || process.env.D1_WORKER_URL || '';
-		this.authToken = options.authToken || process.env.D1_WORKER_TOKEN || '';
+		this.workerUrl = options.workerUrl || options.endpoint || process.env.D1_WORKER_URL || '';
+		this.authToken = options.authToken || options.token || process.env.D1_WORKER_TOKEN || '';
 		this.fetchImpl = options.fetch || globalThis.fetch;
 		this.requestTimeoutMs = boundedInteger(options.requestTimeoutMs ?? process.env.D1_REQUEST_TIMEOUT_MS, 10000, 100, 60000);
 		this.retryAttempts = boundedInteger(options.retryAttempts ?? process.env.D1_RETRY_ATTEMPTS, 1, 0, 4);
@@ -1075,8 +1075,16 @@ class D1Adapter extends DatabaseAdapter {
 		const type = typeof options === 'string' ? options : options?.type;
 		const queryParams = { limit: this._limit(limit, 10, 50) };
 		if (type) queryParams.type = type;
-		const list = await this._read(this._query('/posts/trending-hashtags', queryParams), { cacheSeconds: 0 });
-		return Array.isArray(list) ? list : [];
+		if (options?.summary) queryParams.summary = 'true';
+		const res = await this._read(this._query('/posts/trending-hashtags', queryParams), { cacheSeconds: 0 });
+		if (res && typeof res === 'object' && !Array.isArray(res)) {
+			return {
+				trends: Array.isArray(res.trends) ? res.trends : [],
+				hashtags: Array.isArray(res.hashtags) ? res.hashtags : [],
+				tags: Array.isArray(res.tags) ? res.tags : [],
+			};
+		}
+		return Array.isArray(res) ? res : [];
 	}
 
 	async getPostCount(userId) {

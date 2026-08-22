@@ -944,7 +944,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 		if (!approval || Number(approval.userId) !== Number(userId)) return null;
 		if (approval.status !== 'pending') return { ...approval };
 		const stored = this.loginApprovals.get(String(id));
-		stored.status = decision === 'approve' ? 'approved' : 'denied';
+		stored.status = (decision === 'approve' || decision === 'approved') ? 'approved' : 'denied';
 		stored.decidedAt = new Date();
 		return { ...stored };
 	}

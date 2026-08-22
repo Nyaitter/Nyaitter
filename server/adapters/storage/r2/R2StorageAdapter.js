@@ -23,10 +23,10 @@ class R2StorageAdapter extends StorageAdapter {
   constructor(options = {}) {
     super();
 
-    const r2Config = options.r2 || {};
+    const r2Config = options.r2 || options || {};
 
-    this.bucket = r2Config.bucket || process.env.R2_BUCKET;
-    this.publicDomain = r2Config.publicDomain || process.env.R2_PUBLIC_DOMAIN;
+    this.bucket = r2Config.bucket || options.bucket || process.env.R2_BUCKET;
+    this.publicDomain = r2Config.publicDomain || options.publicDomain || options.publicUrl || process.env.R2_PUBLIC_DOMAIN;
     this.publicBaseUrl = this.publicDomain
       ? String(this.publicDomain).trim().replace(/\/+$/, '')
       : null;

@@ -1499,7 +1499,7 @@ class PostgresAdapter extends DatabaseAdapter {
 	}
 
 	async decideLoginApproval(userId, id, decision) {
-		const status = decision === 'approve' ? 'approved' : 'denied';
+		const status = (decision === 'approve' || decision === 'approved') ? 'approved' : 'denied';
 		const now = new Date().toISOString();
 		const { rows } = await this.pool.query(
 			`UPDATE login_approvals SET status = $3, decided_at = $4

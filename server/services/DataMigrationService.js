@@ -93,7 +93,9 @@ function normalizeRow(table, input) {
   const value = { ...row };
 
   for (const key of Object.keys(value)) {
-    if (value[key] instanceof Date) value[key] = value[key].toISOString();
+    if (value[key] instanceof Date) {
+      value[key] = isNaN(value[key].getTime()) ? null : value[key].toISOString();
+    }
   }
 
   if (table === 'users') {
