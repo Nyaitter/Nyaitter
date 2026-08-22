@@ -22,6 +22,7 @@ const {
     requestId,
     applyTrustProxy,
     requestLogger,
+    httpCompression,
 } = require('./middleware/system');
 const { generalLimiter, authLimiter } = require('./middleware/rateLimit');
 const ConnectionManager = require('./services/realtime/ConnectionManager');
@@ -101,6 +102,7 @@ applyTrustProxy(app);
 
 // ── Middleware Pipeline ────────────────────────────────────────────────────────
 // API routes parse body and attach tracking headers; static files bypass body parser for low CPU/memory
+app.use(httpCompression);
 app.use(API_ENDPOINT, express.json({ limit: config.server.jsonBodyLimit }));
 app.use(
     API_ENDPOINT,

@@ -56,8 +56,72 @@ function requestLogger(req, res, next) {
   next();
 }
 
+const zlib = require('zlib');
+
+/**
+ * High-performance built-in response compression middleware (gzip / deflate)
+ * Reduces large JSON timeline/post payloads by up to 90%
+ */
+function httpCompression(req, res, next) {
+  const acceptEncoding = req.headers['accept-encoding'] || '';
+  if (!acceptEncoding || req.method === 'HEAD') {
+    return next();
+  }
+
+  const useGzip = acceptEncoding.includes('gzip');
+  const useDeflate = !useGzip && acceptEncoding.includes('deflate');
+  if (!useGzip && !useDeflate) {
+    return next();
+  }
+
+  const originalSend = res.send;
+  res.send = function (body) {
+    if (res.headersSent) {
+      return originalSend.call(this, body);
+    }
+
+    // Only compress text and JSON payloads larger than 1KB
+    const contentType = res.getHeader('Content-Type') || '';
+    const isCompressible = typeof contentType === 'string' && (
+      contentType.includes('application/json') ||
+      contentType.includes('text/') ||
+      contentType.includes('application/javascript')
+    );
+
+    let buffer;
+    if (typeof body === 'string') {
+      buffer = Buffer.from(body);
+    } else if (Buffer.isBuffer(body)) {
+      buffer = body;
+    } else if (body && typeof body === 'object') {
+      buffer = Buffer.from(JSON.stringify(body));
+      if (!contentType) res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    }
+
+    if (!buffer || buffer.length < 1024 || (contentType && !isCompressible)) {
+      return originalSend.call(this, body);
+    }
+
+    const encoding = useGzip ? 'gzip' : 'deflate';
+    const compressFn = useGzip ? zlib.gzipSync : zlib.deflateSync;
+
+    try {
+      const compressed = compressFn(buffer, { level: 4 });
+      res.setHeader('Content-Encoding', encoding);
+      res.removeHeader('Content-Length');
+      res.setHeader('Vary', 'Accept-Encoding');
+      return originalSend.call(this, compressed);
+    } catch (_) {
+      return originalSend.call(this, body);
+    }
+  };
+
+  next();
+}
+
 module.exports = {
   requestId,
   applyTrustProxy,
   requestLogger,
+  httpCompression,
 };

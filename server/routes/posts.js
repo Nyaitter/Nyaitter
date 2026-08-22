@@ -336,10 +336,10 @@ router.get('/', optionalAuth, async (req, res) => {
 				const enriched = await serializePostsBatch(
 					db,
 					discoverablePosts,
-
 					currentUserId,
 					getPublicUrl(req),
 					knownViewer,
+					visibilityContext,
 				);
 			res.json({ posts: enriched });
 
@@ -379,10 +379,10 @@ router.get('/trending', optionalAuth, async (req, res) => {
 			const hydrated = await serializePostsBatch(
 				db,
 				discoverablePosts,
-
 				currentUserId,
 				getPublicUrl(req),
 				knownViewer,
+				visibilityContext,
 			);
 			res.json({ posts: hydrated });
 
