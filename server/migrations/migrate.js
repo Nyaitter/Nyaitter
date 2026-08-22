@@ -9,6 +9,98 @@ const migrationsDir = __dirname;
 const migrationFiles = fs.readdirSync(migrationsDir)
   .filter((file) => /^\d+_.+\.sql$/.test(file))
   .sort();
+
+function resolveMigrationFile(input) {
+  if (!input) return null;
+  const cleaned = String(input).trim().replace(/^[\\/]+/, '').replace(/^.*[\\/]/, '');
+  if (migrationFiles.includes(cleaned)) return cleaned;
+
+  // Match by numeric prefix, e.g. "13" -> "013_add_post_counters.sql"
+  const numMatch = cleaned.match(/^0*(\d+)$/);
+  if (numMatch) {
+    const num = parseInt(numMatch[1], 10);
+    const matched = migrationFiles.find((f) => parseInt(f.split('_')[0], 10) === num);
+    if (matched) return matched;
+  }
+
+  // Match by partial name / prefix
+  const partial = migrationFiles.find((f) => f.toLowerCase().includes(cleaned.toLowerCase()));
+  if (partial) return partial;
+
+  return null;
+}
+
+function parseCliArgs() {
+  const args = process.argv.slice(2);
+  const options = {
+    targetFirst: [],
+    only: [],
+    upTo: null,
+    help: false,
+  };
+
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === '--help' || arg === '-h') {
+      options.help = true;
+    } else if (arg === '--only') {
+      const next = args[i + 1];
+      if (next && !next.startsWith('--')) {
+        const file = resolveMigrationFile(next);
+        if (!file) throw new Error(`Unknown migration file for --only: "${next}"`);
+        options.only.push(file);
+        i += 1;
+      }
+    } else if (arg === '--target' || arg === '--file' || arg === '--first') {
+      const next = args[i + 1];
+      if (next && !next.startsWith('--')) {
+        const file = resolveMigrationFile(next);
+        if (!file) throw new Error(`Unknown migration file for ${arg}: "${next}"`);
+        options.targetFirst.push(file);
+        i += 1;
+      }
+    } else if (arg === '--up-to' || arg === '--until') {
+      const next = args[i + 1];
+      if (next && !next.startsWith('--')) {
+        const file = resolveMigrationFile(next);
+        if (!file) throw new Error(`Unknown migration file for ${arg}: "${next}"`);
+        options.upTo = file;
+        i += 1;
+      }
+    } else if (!arg.startsWith('--')) {
+      // Positional argument: prioritize this migration first
+      const file = resolveMigrationFile(arg);
+      if (!file) throw new Error(`Unknown migration file: "${arg}"`);
+      options.targetFirst.push(file);
+    }
+  }
+  return options;
+}
+
+let cliOptions;
+try {
+  cliOptions = parseCliArgs();
+} catch (err) {
+  console.error(`Migration CLI error: ${err.message}`);
+  process.exit(1);
+}
+
+if (cliOptions.help) {
+  console.log(`Nyaitter Migration Runner
+
+Usage:
+  npm run migrate                           Run all pending migrations in sequential order
+  npm run migrate -- <file|number>          Prioritize and run the specified migration first
+  npm run migrate -- --target <file|num>    Prioritize and run the specified migration first
+  npm run migrate -- --only <file|num>      Run ONLY the specified migration
+  npm run migrate -- --up-to <file|num>     Run migrations up to the specified migration
+
+Available migrations:
+${migrationFiles.map((f) => `  - ${f}`).join('\n')}
+`);
+  process.exit(0);
+}
+
 const databaseAdapter = String(
   process.env.DB_ADAPTER || config.database.adapter || 'memory',
 ).toLowerCase();
@@ -153,14 +245,40 @@ async function run() {
       'SELECT filename FROM nyaitter_schema_migrations',
     );
     const applied = new Set(appliedResult.rows.map((row) => row.filename));
-    const totalCount = migrationFiles.length;
-    const pendingCount = migrationFiles.filter((f) => !applied.has(f)).length;
 
-    console.log(`Discovered ${totalCount} migration(s) (Applied: ${totalCount - pendingCount}, Pending: ${pendingCount})\n`);
+    let executionPlan = [];
+    if (cliOptions.only.length > 0) {
+      executionPlan = [...new Set(cliOptions.only)];
+    } else if (cliOptions.upTo) {
+      const upToIndex = migrationFiles.indexOf(cliOptions.upTo);
+      const scoped = migrationFiles.slice(0, upToIndex + 1);
+      const prioritized = cliOptions.targetFirst.filter((f) => scoped.includes(f));
+      const remaining = scoped.filter((f) => !prioritized.includes(f));
+      executionPlan = [...new Set([...prioritized, ...remaining])];
+    } else if (cliOptions.targetFirst.length > 0) {
+      const prioritized = [...new Set(cliOptions.targetFirst)];
+      const remaining = migrationFiles.filter((f) => !prioritized.includes(f));
+      executionPlan = [...prioritized, ...remaining];
+    } else {
+      executionPlan = [...migrationFiles];
+    }
+
+    const totalCount = executionPlan.length;
+    const pendingCount = executionPlan.filter((f) => !applied.has(f)).length;
+
+    if (cliOptions.only.length > 0) {
+      console.log(`Execution mode: ONLY specified migration(s) [${cliOptions.only.join(', ')}]`);
+    } else if (cliOptions.targetFirst.length > 0) {
+      console.log(`Execution mode: PRIORITIZING [${cliOptions.targetFirst.join(', ')}] first`);
+    } else if (cliOptions.upTo) {
+      console.log(`Execution mode: UP TO [${cliOptions.upTo}]`);
+    }
+
+    console.log(`Discovered ${totalCount} migration(s) in queue (Applied: ${totalCount - pendingCount}, Pending: ${pendingCount})\n`);
 
     let appliedCount = 0;
     for (let index = 0; index < totalCount; index += 1) {
-      const file = migrationFiles[index];
+      const file = executionPlan[index];
       const stepIndex = index + 1;
       const stepPrefix = `[${String(stepIndex).padStart(String(totalCount).length, ' ')}/${totalCount}] ${formatProgressBar(stepIndex, totalCount)}`;
 
@@ -187,7 +305,7 @@ async function run() {
     if (appliedCount > 0) {
       console.log(`✨ Successfully applied ${appliedCount} pending migration(s) in ${totalDuration}ms.`);
     } else {
-      console.log(`✅ All migrations are already up to date (${totalCount}/${totalCount} verified in ${totalDuration}ms).`);
+      console.log(`✅ All target migrations are up to date (${totalCount}/${totalCount} verified in ${totalDuration}ms).`);
     }
   } finally {
     await client.end();
