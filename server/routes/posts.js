@@ -32,7 +32,6 @@ const {
 	processCreatePostAction,
 	processDeletePostAction,
 } = require('../services/PostActionProcessor');
-const timelineCacheManager = require('../utils/TimelineCacheManager');
 const path = require('path');
 const fs = require('fs');
 const { isCrawler, generatePostOgpTags, generatePostHtml } = require('../services/OgpService');
@@ -499,61 +498,51 @@ router.get('/page', optionalAuth, async (req, res) => {
 	const currentUserId = req.user ? req.user.id : null;
 	const knownViewer = req.user?.visibilityUser || null;
 
-	const cacheKey = `${mode}:${tab}:${req.query.q || ''}:${currentUserId || 0}:${limit}:${offset}:${beforeId || 0}`;
-	const cachedResult = timelineCacheManager.getIds(cacheKey);
-
-		try {
-			let result;
-			if (cachedResult) {
-				result = cachedResult;
+	try {
+		let result;
+		if (isDiscoverableMode) {
+			result = await getDiscoverableModePage(db, {
+				mode,
+				tab,
+				query: String(req.query.q || ''),
+				viewerId: currentUserId,
+				knownViewer,
+				limit,
+				offset,
+				beforeId,
+			});
+		} else if (mode === 'profile') {
+			const userId = safeParsePostId(req.query.user_id);
+			if (!userId) return res.status(400).json({ error: 'user_id is required' });
+			const subType = ['all', 'posts_only', 'replies_only'].includes(req.query.sub_type)
+				? req.query.sub_type
+				: 'all';
+			if (db.getProfilePostIds) {
+				result = await db.getProfilePostIds({ userId, subType, limit, offset, beforeId });
 			} else {
-				if (isDiscoverableMode) {
-					result = await getDiscoverableModePage(db, {
-						mode,
-						tab,
-						query: String(req.query.q || ''),
-						viewerId: currentUserId,
-						knownViewer,
-						limit,
-						offset,
-						beforeId,
-					});
-					if (result?.ids) {
-						timelineCacheManager.setIds(cacheKey, result);
-					}
-				} else if (mode === 'profile') {
-					const userId = safeParsePostId(req.query.user_id);
-					if (!userId) return res.status(400).json({ error: 'user_id is required' });
-					const subType = ['all', 'posts_only', 'replies_only'].includes(req.query.sub_type)
-						? req.query.sub_type
-						: 'all';
-					if (db.getProfilePostIds) {
-						result = await db.getProfilePostIds({ userId, subType, limit, offset, beforeId });
-					} else {
-						const posts = await db.getPostsByUserId(userId, offset + limit + 1, currentUserId);
-						const filtered = posts.filter((post) => (
-							(beforeId == null || Number(post.id) < beforeId) &&
-							(subType === 'posts_only' ? post.replyTo == null
-								: subType === 'replies_only' ? post.replyTo != null : true)
-						));
-						result = {
-							ids: filtered.slice(offset, offset + limit).map((post) => post.id),
-							has_more: filtered.length > offset + limit,
-						};
-					}
-					const pinId = safeParsePostId(req.query.pin_id);
-					if (beforeId == null && offset === 0 && pinId && !result.ids.includes(pinId)) result.ids.push(pinId);
-				} else if (mode === 'ids') {
-					const ids = String(req.query.ids || '')
-						.split(',')
-						.map(safeParsePostId)
-						.filter(Boolean)
-						.slice(offset, offset + limit);
-					result = { ids, has_more: false };
-				} else {
-					return res.status(400).json({ error: 'Unsupported post page mode' });
-				}
+				const posts = await db.getPostsByUserId(userId, offset + limit + 1, currentUserId);
+				const filtered = posts.filter((post) => (
+					(beforeId == null || Number(post.id) < beforeId) &&
+					(subType === 'posts_only' ? post.replyTo == null
+						: subType === 'replies_only' ? post.replyTo != null : true)
+				));
+				result = {
+					ids: filtered.slice(offset, offset + limit).map((post) => post.id),
+					has_more: filtered.length > offset + limit,
+				};
 			}
+			const pinId = safeParsePostId(req.query.pin_id);
+			if (beforeId == null && offset === 0 && pinId && !result.ids.includes(pinId)) result.ids.push(pinId);
+		} else if (mode === 'ids') {
+			const ids = String(req.query.ids || '')
+				.split(',')
+				.map(safeParsePostId)
+				.filter(Boolean)
+				.slice(offset, offset + limit);
+			result = { ids, has_more: false };
+		} else {
+			return res.status(400).json({ error: 'Unsupported post page mode' });
+		}
 
 			const nextCursor = result.next_cursor ?? (
 				!result.use_offset_pagination && result.has_more && result.ids?.length > 0
@@ -1132,7 +1121,6 @@ router.put('/:id', requireAuth, postWriteLimiter, async (req, res) => {
 				lock: !!lock,
 			});
 		const moderatedPost = updated || post;
-		timelineCacheManager.onPostUpdated(postId, moderatedPost);
 		enqueueGeminiModeration(req, moderatedPost);
 		res.json({
 			success: true,
