@@ -1101,6 +1101,7 @@ router.put('/:id', requireAuth, postWriteLimiter, async (req, res) => {
 				lock: !!lock,
 			});
 		const moderatedPost = updated || post;
+		if (global._timelinePageCache) global._timelinePageCache.clear();
 		enqueueGeminiModeration(req, moderatedPost);
 		res.json({
 			success: true,

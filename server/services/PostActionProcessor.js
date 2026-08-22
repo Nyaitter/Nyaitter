@@ -322,6 +322,7 @@ async function processCreatePostAction(context, payload) {
 
   if (groupAnnouncement && group) await notifyGroupAnnouncement(context, group, post);
   await publishNewTimelinePost(context, post);
+  if (global._timelinePageCache) global._timelinePageCache.clear();
   enqueueGeminiModeration(context, post);
   return post;
 }
@@ -337,6 +338,7 @@ async function processDeletePostAction(context, { postId, userId, admin = false 
     throw new Error(admin ? 'Post not found' : 'You do not have permission to delete this post');
   }
 
+  if (global._timelinePageCache) global._timelinePageCache.clear();
   await deleteStoredAttachments(
     context.storage,
     postToDelete.attachments,
