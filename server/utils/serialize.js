@@ -283,37 +283,61 @@ async function fetchPostsByIds(db, postIds) {
 	return (await Promise.all(ids.map((id) => db.getPostById(id)))).filter(Boolean);
 }
 
+const userGroupBadgesCache = new Map();
+const BADGES_CACHE_TTL_MS = 60000;
+
 async function attachGroupBadgesToUsers(db, users) {
 	if (!Array.isArray(users) || users.length === 0) return users;
+	const now = Date.now();
 	const ids = [...new Set(users.map((u) => Number(u?.id)).filter(Number.isInteger))];
 	if (ids.length === 0) return users;
 
-	let badgesMap = new Map();
-	if (typeof db.getUsersGroupBadgesBatch === 'function') {
-		try {
-			badgesMap = await db.getUsersGroupBadgesBatch(ids);
-		} catch (_) {}
-	} else if (typeof db.getUserGroups === 'function') {
-		await Promise.all(ids.map(async (uid) => {
+	const missingIds = [];
+	const badgesMap = new Map();
+
+	for (const uid of ids) {
+		const cached = userGroupBadgesCache.get(uid);
+		if (cached && cached.expiresAt > now) {
+			badgesMap.set(uid, cached.badges);
+		} else {
+			missingIds.push(uid);
+		}
+	}
+
+	if (missingIds.length > 0) {
+		let fetchedMap = new Map();
+		if (typeof db.getUsersGroupBadgesBatch === 'function') {
 			try {
-				const groups = await db.getUserGroups(uid, { status: 'active', limit: 20 });
-				const badges = (groups || [])
-					.filter((g) => Boolean(g.icon_data || g.iconData) && (g.visibility === 'open' || g.visibility === 'open_invite'))
-					.slice(0, 3)
-					.map((g) => ({
-						id: String(g.id),
-						name: String(g.name || ''),
-						icon_data: g.icon_data || g.iconData,
-					}));
-				badgesMap.set(uid, badges);
+				fetchedMap = await db.getUsersGroupBadgesBatch(missingIds);
 			} catch (_) {}
-		}));
+		} else if (typeof db.getUserGroups === 'function') {
+			await Promise.all(missingIds.map(async (uid) => {
+				try {
+					const groups = await db.getUserGroups(uid, { status: 'active', limit: 20 });
+					const badges = (groups || [])
+						.filter((g) => Boolean(g.icon_data || g.iconData) && (g.visibility === 'open' || g.visibility === 'open_invite'))
+						.slice(0, 3)
+						.map((g) => ({
+							id: String(g.id),
+							name: String(g.name || ''),
+							icon_data: g.icon_data || g.iconData,
+						}));
+					fetchedMap.set(uid, badges);
+				} catch (_) {}
+			}));
+		}
+
+		for (const uid of missingIds) {
+			const badges = (fetchedMap instanceof Map ? fetchedMap.get(uid) : fetchedMap?.[uid]) || [];
+			userGroupBadgesCache.set(uid, { badges, expiresAt: now + BADGES_CACHE_TTL_MS });
+			badgesMap.set(uid, badges);
+		}
 	}
 
 	for (const user of users) {
 		if (!user) continue;
 		const uid = Number(user.id);
-		const badges = badgesMap instanceof Map ? badgesMap.get(uid) : badgesMap?.[uid];
+		const badges = badgesMap.get(uid);
 		user.group_badges = Array.isArray(badges)
 			? badges.slice(0, 3)
 			: (Array.isArray(user.group_badges) ? user.group_badges.slice(0, 3) : []);

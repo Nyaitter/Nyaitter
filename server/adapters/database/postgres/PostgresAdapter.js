@@ -2246,27 +2246,43 @@ class PostgresAdapter extends DatabaseAdapter {
 		const normalizedMaxDepth = Math.min(4, Math.max(0, Number(maxDepth) || 0));
 		if (rootIds.length === 0) return [];
 
+		const cache = this._getPostCache();
 		const resolved = new Map();
 		let currentIds = rootIds;
 		let depth = 0;
 
 		while (currentIds.length > 0 && depth <= normalizedMaxDepth) {
-			const fetchIds = currentIds.filter((id) => !resolved.has(id));
-			if (fetchIds.length === 0) break;
-
-			const { rows } = await this.pool.query(
-				'SELECT * FROM posts WHERE id = ANY($1::int[])',
-				[fetchIds],
-			);
-
 			const nextIds = new Set();
-			for (const row of rows) {
-				const post = normalizePostRow(row);
-				if (post) {
-					resolved.set(post.id, post);
+			const uncachedIds = [];
+
+			for (const id of currentIds) {
+				if (resolved.has(id)) continue;
+				const cached = cache?.get(id);
+				if (cached) {
+					resolved.set(cached.id, cached);
 					if (depth < normalizedMaxDepth) {
-						if (post.replyTo && !resolved.has(post.replyTo)) nextIds.add(post.replyTo);
-						if (post.repostTo && !resolved.has(post.repostTo)) nextIds.add(post.repostTo);
+						if (cached.replyTo && !resolved.has(cached.replyTo)) nextIds.add(cached.replyTo);
+						if (cached.repostTo && !resolved.has(cached.repostTo)) nextIds.add(cached.repostTo);
+					}
+				} else {
+					uncachedIds.push(id);
+				}
+			}
+
+			if (uncachedIds.length > 0) {
+				const { rows } = await this.pool.query(
+					'SELECT * FROM posts WHERE id = ANY($1::int[])',
+					[uncachedIds],
+				);
+				for (const row of rows) {
+					const post = normalizePostRow(row);
+					if (post) {
+						cache?.set(post.id, post);
+						resolved.set(post.id, post);
+						if (depth < normalizedMaxDepth) {
+							if (post.replyTo && !resolved.has(post.replyTo)) nextIds.add(post.replyTo);
+							if (post.repostTo && !resolved.has(post.repostTo)) nextIds.add(post.repostTo);
+						}
 					}
 				}
 			}
