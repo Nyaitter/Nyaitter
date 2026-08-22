@@ -584,8 +584,26 @@ class PostgresAdapter extends DatabaseAdapter {
 	}
 
 	_invalidateUserCache(userId) {
-		if (this._userCache && userId != null) {
-			this._userCache.delete(Number(userId));
+		if (this._userCache) {
+			if (userId != null) {
+				this._userCache.delete(Number(userId));
+			} else {
+				this._userCache.clear();
+			}
+		}
+		if (this._affinityCache) {
+			if (userId != null) {
+				this._affinityCache.delete(Number(userId));
+			} else {
+				this._affinityCache.clear();
+			}
+		}
+		if (this._followCache) {
+			if (userId != null) {
+				this._followCache.delete(Number(userId));
+			} else {
+				this._followCache.clear();
+			}
 		}
 	}
 
@@ -697,6 +715,7 @@ class PostgresAdapter extends DatabaseAdapter {
 				[normUserId, targetId],
 			);
 		}
+		this._invalidateUserCache(targetId);
 
 		const r = rows[0];
 		return {
@@ -739,6 +758,7 @@ class PostgresAdapter extends DatabaseAdapter {
 				[targetId],
 			);
 		}
+		this._invalidateUserCache(targetId);
 
 		return { success: true };
 	}
@@ -913,6 +933,7 @@ class PostgresAdapter extends DatabaseAdapter {
 
 	async beginAccountOperation(userId, operation) {
 		if (!['reassigning', 'deleting'].includes(operation)) throw new Error('Invalid account operation');
+		this._invalidateUserCache(userId);
 		const { rows } = await this.pool.query(
 			`UPDATE users
 			 SET account_operation = $2
@@ -926,6 +947,7 @@ class PostgresAdapter extends DatabaseAdapter {
 	}
 
 	async finishAccountOperation(userId, operation) {
+		this._invalidateUserCache(userId);
 		const { rows } = await this.pool.query(
 			`UPDATE users SET account_operation = NULL
 			 WHERE id = $1 AND account_operation = $2
@@ -1065,11 +1087,16 @@ class PostgresAdapter extends DatabaseAdapter {
 				);
 			}
 
+			this._invalidateUserCache(previousId);
+			this._invalidateUserCache(nextId);
+			this._invalidateUserCache(null); // Clear overall maps
+
 			return normalizeUserRow(rows[0] || null);
 		});
 	}
 
 	async deleteAccount(userId) {
+		this._invalidateUserCache(userId);
 		return this._withTransaction(async (client) => {
 			const { rows: userRows } = await client.query(
 				`SELECT id FROM users WHERE id = $1 AND account_operation = 'deleting' FOR UPDATE`,
