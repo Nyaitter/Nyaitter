@@ -141,6 +141,14 @@ class ConnectionManager {
     });
   }
 
+  publishDmRead(userId, dmId, readerId) {
+    return this.sendToUser(userId, {
+      type: 'dm_read',
+      dm_id: String(dmId),
+      reader_id: Number(readerId),
+    });
+  }
+
   async publishDmUnreadCount(userId, dbAdapter, dmId = null) {
     const unreadCount = await getVisibleDmUnreadCount(dbAdapter, userId);
     this.sendToUser(userId, {

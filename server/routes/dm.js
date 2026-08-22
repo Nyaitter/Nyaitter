@@ -53,6 +53,28 @@ async function publishDmUnreadCounts(req, userIds, dmId = null) {
 	}
 }
 
+async function publishDmReadEvent(req, userIds, dmId, readerId) {
+	const realtime = req.app.locals.realtime;
+	if (!realtime) return;
+
+	for (const userId of new Set((userIds || []).map(Number))) {
+		if (!Number.isInteger(userId) || userId < 0) continue;
+		try {
+			if (typeof realtime.publishDmRead === 'function') {
+				realtime.publishDmRead(userId, dmId, readerId);
+			} else if (typeof realtime.sendToUser === 'function') {
+				realtime.sendToUser(userId, {
+					type: 'dm_read',
+					dm_id: String(dmId),
+					reader_id: Number(readerId),
+				});
+			}
+		} catch (error) {
+			console.warn('[dm] read realtime delivery failed:', error.message);
+		}
+	}
+}
+
 function serializeDmMember(user) {
 	return {
 		id: user.id,
@@ -234,12 +256,34 @@ async function hasBlockedDmMemberPair(db, memberIds) {
 
 async function serializeGroupDm(db, dm, userId, { includePosts = true } = {}) {
 	const blockedMemberIds = await getBlockedDmMemberIds(db, userId, dm.member || []);
-	const messages = (dm.post ? dm.post.slice() : [])
+	const rawMessages = dm.post ? dm.post.slice() : [];
+	const unreadMap = dm.unread || {};
+	const totalRawCount = rawMessages.length;
+
+	const messages = rawMessages
 		.filter((message) => !blockedMemberIds.has(Number(message?.userid)))
-		.map((message) => {
-		const { time, createdAt, ...rest } = message || {};
-		return { ...rest, created_at: message?.created_at || createdAt || time || null };
-	});
+		.map((message, index) => {
+			const { time, createdAt, ...rest } = message || {};
+			let readCount = typeof message.read_count === 'number' ? message.read_count : 0;
+			if (message.read_count === undefined) {
+				const senderId = Number(message.userid);
+				const recipients = (dm.member || []).map(Number).filter((id) => id !== senderId);
+				let readers = 0;
+				for (const recipientId of recipients) {
+					const unreadForRecipient = Number(unreadMap[recipientId] ?? unreadMap[String(recipientId)] ?? 0);
+					const unreadStartIndex = Math.max(0, totalRawCount - unreadForRecipient);
+					if (index < unreadStartIndex) {
+						readers += 1;
+					}
+				}
+				readCount = readers;
+			}
+			return {
+				...rest,
+				created_at: message?.created_at || createdAt || time || null,
+				read_count: readCount,
+			};
+		});
 	const latestMessage = messages.length > 0 ? messages[messages.length - 1] : null;
 	const unreadCount = Number(
 		dm.unread?.[userId] ?? dm.unread?.[String(userId)] ?? dm.unread_count ?? 0,
@@ -492,6 +536,8 @@ router.get('/:dmId', requireAuth, async (req, res) => {
 					// 未読表示更新と競合して再読込ループを起こすため、状態変化時だけ通知する。
 					if (unreadBefore > 0) {
 						await publishDmUnreadCounts(req, [userId], dmId);
+						const otherMembers = (dm.member || []).filter((id) => Number(id) !== Number(userId));
+						await publishDmReadEvent(req, otherMembers, dmId, userId);
 					}
 					const refreshed = await db.getGroupDm(dmId);
 				return res.json(await buildDmPayload(db, [refreshed || dm], userId));
