@@ -1,10 +1,10 @@
-# Nyaitter Server 設定・運用ガイド
+# Nyaitter サーバー設定ガイド
 
 Nyaitter のデータ保存、アカウント管理、通知、投稿配信を行うサーバーです。
 
-## 起動手順
+## すぐに動かす手順
 
-1. 必要なパッケージをインストールし、設定ファイルを用意します。
+1. 必要なファイルを準備します。
 ```bash
 npm install
 cp server/.env.example server/.env
@@ -15,101 +15,66 @@ cp server/.env.example server/.env
 npm start
 ```
 
-ブラウザで <http://localhost:3000/> を開きます。
-初期状態ではデータが一時保存（メモリ）のため、サーバーを再起動すると消えます。
+ブラウザで `http://localhost:3000/` を開くと使えます。
 
-## データの保存先（データベース）の設定
+---
 
-本番運用ではデータを保存するために PostgreSQL または Cloudflare D1 を使用します。
-`server/.env` に保存先を設定し、データベースの初期化を実行してください。
+## 主な設定 (`server/.env`)
 
-```bash
-# データベースの初期化・更新
-npm run migrate
+設定を変更したい場合は `server/.env` の文字を書き換えて、サーバーを再起動します。
+
+### 1. Discord や SNS で投稿を見やすく表示する (共有リンク)
+Discord などに投稿リンクを貼ったとき、投稿の文章や画像がカード形式で綺麗に表示されるようにします。
+
+```dotenv
+# サーバーが動いているポート番号（通常は 3000）
+POST_SHARE_PORT=3000
 ```
 
-### PostgreSQL を使う場合（おすすめ）
+### 2. データをずっと保存する (データベース)
+初期状態（memory）ではサーバーを止めるとデータが消えます。ずっと残すには PostgreSQL を使います。
 
 ```dotenv
 DB_ADAPTER=postgres
-DATABASE_URL=postgres://ユーザー名:パスワード@ホスト名:5432/データベース名?sslmode=require
+DATABASE_URL=postgresql://ユーザー名:パスワード@ホスト名:5432/データベース名?sslmode=require
 ```
 
-### Cloudflare D1 を使う場合
+設定したら、次のコマンドでデータを保存する準備をします。
+```bash
+npm run migrate
+```
 
+### 3. 画像やファイルの保存先
 ```dotenv
-DB_ADAPTER=d1
-D1_WORKER_URL=https://あなたのWorker名.workers.dev
-D1_WORKER_TOKEN=安全なランダム文字列
+# サーバー本体に保存する場合
+STORAGE_ADAPTER=local
+
+# 1人あたりの画像保存上限（MB単位、512 なら 512MB）
+STORAGE_USER_QUOTA_MB=512
 ```
 
-## 画像・ファイルの保存先
+### 4. ログイン方法の切り替え
+使いたいログイン方法を `true`、使わないものを `false` にします。
 
-添付画像やアイコンの保存先を設定します。
-
-| 設定値 | 保存先 | 用途 |
-|---|---|---|
-| `STORAGE_ADAPTER=local` | サーバー本体のディスク | 1台のサーバーでシンプルに動かす場合（既定値: `./uploads`） |
-| `STORAGE_ADAPTER=r2` | Cloudflare R2 | 複数サーバー構成や大量の画像を扱う場合 |
-
-### 画像保存の上限設定
-ユーザー1人あたりの最大保存容量（メガバイト単位）を指定できます。
-```dotenv
-STORAGE_USER_QUOTA_MB=1024 # 1GB
-```
-
-## 主な機能と環境設定
-
-設定は `server/.env` に記述します。
-
-### 1. ログイン方法の有効化
 ```dotenv
 AUTH_METHOD_SCRATCH_ENABLED=true  # Scratch認証
-AUTH_METHOD_EMAIL_ENABLED=true    # メールアドレス認証
-AUTH_METHOD_PASSKEY_ENABLED=true  # パスキー（生体認証）
-```
-※詳細は [認証設定ガイド](./help/auth-providers.md) をご覧ください。
-
-### 2. プッシュ通知 (Web Push)
-```dotenv
-VAPID_SUBJECT=mailto:admin@example.com
-VAPID_PUBLIC_KEY=公開キー
-VAPID_PRIVATE_KEY=秘密キー
+AUTH_METHOD_PASSKEY_ENABLED=true  # パスキー（指紋・顔認証）
+AUTH_METHOD_EMAIL_ENABLED=false   # メール認証
 ```
 
-### 3. AI自動モデレーション (Google Gemini)
-投稿内容をAIで自動判定して不適切な投稿を防ぎます。
+### 5. AI による不適切な投稿の自動チェック
+Google Gemini を使って、ルール違反の投稿を自動で見分けます。
+
 ```dotenv
 GEMINI_API_KEY=あなたのAPIキー
-GEMINI_MODEL=gemini-2.0-flash
-GEMINI_MOD_PROMPT=投稿をコミュニティルールに基づいて判定してください。
+GEMINI_MODEL=gemini-2.5-flash-lite
 ```
 
-### 4. 設定の自己診断
-設定に誤りがないか自動で検査できます。
+---
+
+## 設定に間違いがないか確認する
+次のコマンドを実行すると、設定が正しくできているか自動でチェックできます。
+
 ```bash
 npm run check:config
 ```
-
-## データのバックアップと移行
-
-別のデータベースへデータを移す場合は次のコマンドを使います。
-
-```bash
-# バックアップの書き出し
-npm run migrate:data -- --from postgres --output backup.json
-
-# バックアップからの復元
-npm run migrate:data -- --to postgres --input backup.json --replace
-```
-
-## ドキュメント一覧
-
-- [保存先の選び方](./help/adapters-overview.md)
-- [PostgreSQL 設定ガイド](./help/database-postgres.md)
-- [Cloudflare D1 設定ガイド](./help/database-d1-worker.md)
-- [Cloudflare R2 設定ガイド](./help/storage-r2.md)
-- [ローカル保存 設定ガイド](./help/storage-local.md)
-- [認証プロバイダー設定](./help/auth-providers.md)
-- [NyaitterAuth 外部連携ガイド](./help/nyaitter-auth.md)
-- [本番公開前チェックリスト](./help/production-checklist.md)
