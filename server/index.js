@@ -36,6 +36,7 @@ const { serializeNotification } = require('./utils/serialize');
 const { getPublicUrl } = require('./utils/nyaitterAddress');
 const { startOperatorControlServer } = require('./utils/operatorControl');
 const { getEmbeddedMailServer } = require('./services/mail/EmbeddedMailServer');
+const { isCrawler, generatePostOgpTags } = require('./services/OgpService');
 
 let embeddedMailServer = null;
 
@@ -306,6 +307,7 @@ const restRoutes = [
     ['rule', require('./routes/rules')],
     ['auth/nyaitter-auth', require('./routes/nyaitterAuth')],
     ['nyaitter-auth', require('./routes/nyaitterAuth')],
+    ['oembed', require('./routes/oembed')],
 ];
 
 for (const [resourcePath, router] of restRoutes) {
@@ -349,6 +351,39 @@ if (hasStaticPage) {
             const query = new URLSearchParams(rawQuery);
             query.set('external_confirm', '1');
             return res.redirect(302, `/?${query.toString()}`);
+        }
+
+        // ── Dynamic OGP Rendering for Post URLs & Bot Crawlers ──
+        let targetPostId = null;
+        const postPathMatch = cleanPath.match(/^(?:\/@[^/]+)?\/posts\/(\d+)$/i);
+        if (postPathMatch) {
+            targetPostId = Number(postPathMatch[1]);
+        } else if (req.query.post) {
+            targetPostId = Number(req.query.post);
+        }
+
+        if (targetPostId && Number.isInteger(targetPostId) && targetPostId > 0) {
+            const indexPath = path.join(pageDir, 'index.html');
+            if (fs.existsSync(indexPath)) {
+                return (async () => {
+                    try {
+                        const db = app.locals.dbAdapter;
+                        const post = await db?.getPostById?.(targetPostId);
+                        if (post) {
+                            const author = await db?.getUserById?.(post.userId ?? post.user_id);
+                            const publicUrl = getPublicUrl(req);
+                            const ogpTags = generatePostOgpTags({ post, author, publicUrl });
+                            let html = fs.readFileSync(indexPath, 'utf8');
+                            html = html.replace(/<title>.*?<\/title>/i, ogpTags);
+                            res.setHeader('Content-Type', 'text/html; charset=utf-8');
+                            return res.send(html);
+                        }
+                    } catch (err) {
+                        console.warn('[ogp] Failed to render post embed:', err.message);
+                    }
+                    return res.sendFile(indexPath);
+                })();
+            }
         }
 
         if (cleanPath.endsWith('.html')) {
