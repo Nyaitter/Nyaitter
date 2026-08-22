@@ -1071,8 +1071,11 @@ class D1Adapter extends DatabaseAdapter {
 		return Array.isArray(posts) ? posts.map(normalizePost) : [];
 	}
 
-	async getTrendingHashtags(limit = 10) {
-		const list = await this._read(this._query('/posts/trending-hashtags', { limit: this._limit(limit, 10, 50) }), { cacheSeconds: 0 });
+	async getTrendingHashtags(limit = 10, options = {}) {
+		const type = typeof options === 'string' ? options : options?.type;
+		const queryParams = { limit: this._limit(limit, 10, 50) };
+		if (type) queryParams.type = type;
+		const list = await this._read(this._query('/posts/trending-hashtags', queryParams), { cacheSeconds: 0 });
 		return Array.isArray(list) ? list : [];
 	}
 

@@ -77,7 +77,7 @@ function normalizePostTags(value) {
 	return [...new Set(rawTags
 		.map((tag) => String(tag || '').trim().toLocaleLowerCase('ja-JP'))
 		.filter((tag) => tag.length > 0 && tag.length <= 48))]
-		.slice(0, 4);
+		.slice(0, 5);
 }
 
 function normalizePostRow(row) {
@@ -962,7 +962,16 @@ class PostgresAdapter extends DatabaseAdapter {
 			}
 			if (nextId == null) throw new Error('Could not allocate a unique Nyaitter ID');
 
-			// Simple foreign keys
+			// Update users table first so ON UPDATE CASCADE foreign keys cascade automatically
+			const { rows } = await client.query(
+				`UPDATE users
+				 SET id = $2, handle = $3
+				 WHERE id = $1
+				 RETURNING *`,
+				[previousId, nextId, formatNyaitterId(nextId)],
+			);
+
+			// Fallback updates for non-cascading or legacy constraints
 			await client.query('UPDATE sessions SET user_id = $2 WHERE user_id = $1', [previousId, nextId]);
 			await client.query('UPDATE trusted_login_ips SET user_id = $2 WHERE user_id = $1', [previousId, nextId]);
 			await client.query('UPDATE login_approvals SET user_id = $2 WHERE user_id = $1', [previousId, nextId]);
@@ -1056,13 +1065,6 @@ class PostgresAdapter extends DatabaseAdapter {
 				);
 			}
 
-			const { rows } = await client.query(
-				`UPDATE users
-				 SET id = $2, handle = $3
-				 WHERE id = $1
-				 RETURNING *`,
-				[previousId, nextId, formatNyaitterId(nextId)],
-			);
 			return normalizeUserRow(rows[0] || null);
 		});
 	}
@@ -2856,7 +2858,7 @@ class PostgresAdapter extends DatabaseAdapter {
 		return rows.map(normalizePostRow);
 	}
 
-	async getTrendingHashtags(limit = 10) {
+	async getTrendingHashtags(limit = 10, options = {}) {
 		const normalizedLimit = Math.max(1, Math.min(Number(limit) || 10, 50));
 		const { rows } = await this.pool.query(
 			`SELECT content, tags
@@ -2866,7 +2868,9 @@ class PostgresAdapter extends DatabaseAdapter {
 			 ORDER BY created_at DESC
 			 LIMIT 500`,
 		);
-		const counts = new Map();
+		const hashtagCounts = new Map();
+		const tagCounts = new Map();
+
 		for (const row of rows) {
 			const content = row.content || '';
 			const hashtagMatches = content.match(/(?:#|＃)([\p{L}\p{N}_-]{1,48})/gu) || [];
@@ -2876,33 +2880,55 @@ class PostgresAdapter extends DatabaseAdapter {
 					.filter((tag) => tag.length > 2)
 			);
 
-			const uniqueItems = new Set();
 			for (const tag of postHashtags) {
-				uniqueItems.add(`#${tag}`);
+				const fullTag = `#${tag}`;
+				hashtagCounts.set(fullTag, (hashtagCounts.get(fullTag) || 0) + 1);
 			}
 
 			const rawTags = Array.isArray(row.tags)
 				? row.tags
 				: (typeof row.tags === 'string' ? parseJsonSafe(row.tags, []) : []);
-			for (const rawTag of rawTags) {
-				const tag = String(rawTag || '').trim().toLowerCase().replace(/^[#＃]/, '');
-				if (tag.length > 2 && !postHashtags.has(tag)) {
-					uniqueItems.add(tag);
-				}
-			}
+			const postTags = new Set(
+				rawTags
+					.map((rawTag) => String(rawTag || '').trim().toLowerCase().replace(/^[#＃]/, ''))
+					.filter((tag) => tag.length > 2 && !postHashtags.has(tag))
+			);
 
-			for (const item of uniqueItems) {
-				counts.set(item, (counts.get(item) || 0) + 1);
+			for (const tag of postTags) {
+				tagCounts.set(tag, (tagCounts.get(tag) || 0) + 1);
 			}
 		}
 
-		return Array.from(counts.entries())
-			.sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], 'ja'))
-			.slice(0, normalizedLimit)
-			.map(([tag_name, occurrence_count]) => ({
-				tag_name,
-				occurrence_count,
-			}));
+		const mapToSortedList = (map) =>
+			Array.from(map.entries())
+				.sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], 'ja'))
+				.slice(0, normalizedLimit)
+				.map(([tag_name, occurrence_count]) => ({
+					tag_name,
+					occurrence_count,
+				}));
+
+		const hashtagsList = mapToSortedList(hashtagCounts);
+		const tagsList = mapToSortedList(tagCounts);
+
+		const type = typeof options === 'string' ? options : options?.type;
+		if (type === 'hashtags') return hashtagsList;
+		if (type === 'tags') return tagsList;
+
+		const mergedCounts = new Map();
+		for (const [k, v] of hashtagCounts) mergedCounts.set(k, v);
+		for (const [k, v] of tagCounts) mergedCounts.set(k, v);
+		const trendsList = mapToSortedList(mergedCounts);
+
+		if (options?.summary || options?.detailed) {
+			return {
+				trends: trendsList,
+				hashtags: hashtagsList,
+				tags: tagsList,
+			};
+		}
+
+		return trendsList;
 	}
 
 	async getPostCount(userId) {

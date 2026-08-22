@@ -22,6 +22,7 @@ const config = require('../config');
 const { isWithinRange } = require('../utils/settingFormats');
 const { serializeUser, serializeNotification } = require('../utils/serialize');
 const {
+  isImposter,
   getImposterRole,
   canOperateImposter,
   listAccessibleImposters,
@@ -299,6 +300,9 @@ router.post('/:provider/verify', async (req, res) => {
  * ログイン中ユーザーに紐づけられている認証プロバイダー一覧を取得
  */
 router.get('/linked-providers', requireAuth, async (req, res) => {
+  if (isImposter(req.user)) {
+    return res.json({ linked_providers: [] });
+  }
   const db = getDbAdapter(req);
   try {
     const providers = await authService.getLinkedProviders(req.user.id, db);
@@ -319,6 +323,9 @@ router.get('/linked-providers', requireAuth, async (req, res) => {
  * 既存アカウントへの新しい認証プロバイダー紐づけ認証を開始
  */
 router.post('/link/:provider/initiate', requireAuth, async (req, res) => {
+  if (isImposter(req.user)) {
+    return res.status(403).json({ error: 'インポスターアカウントでは認証プロバイダーの連携を行えません。' });
+  }
   const provider = String(req.params.provider || '').toLowerCase();
   try {
     const data = await authService.initiate(provider, req, req.body, {
@@ -340,6 +347,9 @@ router.post('/link/:provider/initiate', requireAuth, async (req, res) => {
  * 既存アカウントへ新しい認証プロバイダーを紐づけ
  */
 router.post('/link/:provider/verify', requireAuth, async (req, res) => {
+  if (isImposter(req.user)) {
+    return res.status(403).json({ error: 'インポスターアカウントでは認証プロバイダーの連携を行えません。' });
+  }
   const provider = String(req.params.provider || '').toLowerCase();
   const db = getDbAdapter(req);
   try {
@@ -366,6 +376,9 @@ router.post('/link/:provider/verify', requireAuth, async (req, res) => {
  * 既存アカウントから認証プロバイダーの紐づけを解除
  */
 router.delete('/link/:provider', requireAuth, async (req, res) => {
+  if (isImposter(req.user)) {
+    return res.status(403).json({ error: 'インポスターアカウントでは認証プロバイダーの連携を行えません。' });
+  }
   const provider = String(req.params.provider || '').toLowerCase();
   const providerUserId = req.body?.provider_user_id || req.query?.provider_user_id || null;
   const db = getDbAdapter(req);
@@ -378,7 +391,7 @@ router.delete('/link/:provider', requireAuth, async (req, res) => {
   } catch (error) {
     const status = error.status || 500;
     res.status(status).json({
-      error: error.message || '認証方法の解除に失敗しました。',
+      error: error.message || '認証方法の連携解除に失敗しました。',
       code: error.code || undefined,
     });
   }
@@ -553,6 +566,9 @@ function serializeSessionForOwner(session, currentToken) {
  * 未知IP拒否を有効化する現在のログイン端末を信頼済みIPとして登録する。
  */
 router.post('/login-security/trust-current-ip', requireAuth, requireInteractiveSession, async (req, res) => {
+  if (isImposter(req.user)) {
+    return res.status(403).json({ error: 'インポスターアカウントではこの操作を行えません。' });
+  }
   const db = getDbAdapter(req);
   const metadata = getRequestLoginMetadata(req);
   await db.trustLoginIp(req.user.id, metadata);
@@ -564,6 +580,9 @@ router.post('/login-security/trust-current-ip', requireAuth, requireInteractiveS
  * 現在有効なセッションを、トークンや生IPを露出せずに返す。
  */
 router.get('/sessions', requireAuth, requireInteractiveSession, async (req, res) => {
+  if (isImposter(req.user)) {
+    return res.json({ sessions: [] });
+  }
   const db = getDbAdapter(req);
   const currentToken = getCookieValue(req, 'nyaitter_session');
   const sessions = await db.getUserSessions(req.user.id);
@@ -576,6 +595,9 @@ router.get('/sessions', requireAuth, requireInteractiveSession, async (req, res)
  * 自分の指定セッションだけを無効化する。現在のセッションの場合はCookieも解除する。
  */
 router.delete('/sessions/:sessionId', requireAuth, requireInteractiveSession, async (req, res) => {
+  if (isImposter(req.user)) {
+    return res.status(403).json({ error: 'インポスターアカウントではセッションの管理を行えません。' });
+  }
   const db = getDbAdapter(req);
   let targetToken;
   if (typeof db.invalidateUserSessionById === 'function') {
@@ -604,6 +626,9 @@ router.delete('/sessions/:sessionId', requireAuth, requireInteractiveSession, as
  * 対象セッションと同一IPの全セッションを無効化し、そのIPを未知IPへ戻す。
  */
 router.post('/sessions/:sessionId/revoke-ip', requireAuth, requireInteractiveSession, async (req, res) => {
+  if (isImposter(req.user)) {
+    return res.status(403).json({ error: 'インポスターアカウントではセッションの管理を行えません。' });
+  }
   const db = getDbAdapter(req);
   let affectedTokens;
   let revokedTrust;
@@ -761,6 +786,11 @@ router.delete('/accounts/:userId', async (req, res) => {
       return res.status(404).json({ error: '記憶済みアカウントが見つかりません' });
     }
 
+    const selectedUser = await db.getUserById(selected.userId);
+    if (selectedUser && isImposter(selectedUser)) {
+      return res.status(403).json({ error: 'インポスターアカウントは個別に解除できません。' });
+    }
+
     const sessionManager = new SessionManager({ dbAdapter: db });
     await sessionManager.invalidateSession(selected.userId, selected.token);
 
@@ -808,6 +838,10 @@ router.delete('/accounts/:userId', async (req, res) => {
  */
 router.post('/logout', optionalAuth, async (req, res) => {
   const db = getDbAdapter(req);
+
+  if (req.user && isImposter(req.user)) {
+    return res.status(403).json({ error: 'インポスターアカウントから直接ログアウトすることはできません。アカウント切替をご利用ください。' });
+  }
 
   const cookieToken = getCookieValue(req, 'nyaitter_session');
 

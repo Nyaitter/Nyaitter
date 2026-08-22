@@ -3,7 +3,7 @@
 const path = require('path');
 const kuromoji = require('kuromoji');
 
-const MAX_POST_TAGS = 4;
+const MAX_POST_TAGS = 5;
 const MAX_CANDIDATE_LENGTH = 48;
 
 const STOP_WORDS = new Set([

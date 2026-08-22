@@ -133,7 +133,7 @@ function normalizeRow(table, input) {
       announcement: normalizeBoolean(value.announcement),
       reply_to: normalizeInteger(value.reply_to ?? value.replyTo),
       repost_to: normalizeInteger(value.repost_to ?? value.repostTo),
-      tags: parseJson(value.tags, []).map((tag) => String(tag || '').trim().toLocaleLowerCase('ja-JP')).filter((tag) => tag.length > 0 && tag.length <= 48).slice(0, 4),
+      tags: parseJson(value.tags, []).map((tag) => String(tag || '').trim().toLocaleLowerCase('ja-JP')).filter((tag) => tag.length > 0 && tag.length <= 48).slice(0, 5),
       tags_generated_at: normalizeDate(value.tags_generated_at ?? value.tagsGeneratedAt),
       group_id: value.group_id ?? value.groupId ?? null,
       group_announcement: normalizeBoolean(value.group_announcement ?? value.groupAnnouncement),

@@ -648,10 +648,21 @@ router.get('/ids', optionalAuth, async (req, res) => {
 router.get('/trending-hashtags', optionalAuth, async (req, res) => {
 	const db = getDbAdapter(req);
 	const limit = Math.min(parseInt(req.query.limit, 10) || 10, 50);
+	const type = String(req.query.type || '').trim().toLowerCase();
 
 	try {
-		const trends = await db.getTrendingHashtags(limit);
-		res.json({ trends });
+		const result = await db.getTrendingHashtags(limit, { type, detailed: true });
+		if (Array.isArray(result)) {
+			const hashtags = result.filter((item) => String(item.tag_name || '').startsWith('#'));
+			const tags = result.filter((item) => !String(item.tag_name || '').startsWith('#'));
+			res.json({ trends: result, hashtags, tags });
+		} else {
+			res.json({
+				trends: result.trends || [],
+				hashtags: result.hashtags || [],
+				tags: result.tags || [],
+			});
+		}
 	} catch (err) {
 		console.error('[posts] trending-hashtags error:', err);
 		res.status(500).json({ error: 'トレンドの取得に失敗しました' });

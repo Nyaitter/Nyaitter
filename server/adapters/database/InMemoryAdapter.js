@@ -1464,7 +1464,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 			id,
 			userId: postData.userId,
 				content: postData.content,
-				tags: Array.isArray(postData.tags) ? [...new Set(postData.tags.map((tag) => String(tag || '').trim().toLowerCase()).filter(Boolean))].slice(0, 4) : [],
+				tags: Array.isArray(postData.tags) ? [...new Set(postData.tags.map((tag) => String(tag || '').trim().toLowerCase()).filter(Boolean))].slice(0, 5) : [],
 				tagsGeneratedAt: postData.tagsGeneratedAt || null,
 				attachments: postData.attachments || null,
 			mask: !!postData.mask,
@@ -1540,7 +1540,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 		if (!post) return null;
 		const previousTags = Array.isArray(post.tags) ? [...post.tags] : [];
 			if (fields.content !== undefined) post.content = fields.content;
-			if (fields.tags !== undefined) post.tags = Array.isArray(fields.tags) ? [...new Set(fields.tags.map((tag) => String(tag || '').trim().toLowerCase()).filter(Boolean))].slice(0, 4) : [];
+			if (fields.tags !== undefined) post.tags = Array.isArray(fields.tags) ? [...new Set(fields.tags.map((tag) => String(tag || '').trim().toLowerCase()).filter(Boolean))].slice(0, 5) : [];
 			if (fields.tagsGeneratedAt !== undefined) post.tagsGeneratedAt = fields.tagsGeneratedAt || null;
 			if (fields.attachments !== undefined) post.attachments = fields.attachments;
 					if (fields.mask !== undefined) post.mask = !!fields.mask;
@@ -2887,10 +2887,12 @@ class InMemoryAdapter extends DatabaseAdapter {
 			};
 		}
 
-	
-	async getTrendingHashtags(limit = 10) {
-		const counts = new Map();
+	async getTrendingHashtags(limit = 10, options = {}) {
+		const normalizedLimit = Math.max(1, Math.min(Number(limit) || 10, 50));
+		const hashtagCounts = new Map();
+		const tagCounts = new Map();
 		const threeDaysAgo = Date.now() - 3 * 24 * 60 * 60 * 1000;
+
 		for (const post of this.posts.values()) {
 			if (post.groupId || post.group_id) continue;
 			const createdAtTime = new Date(post.createdAt || post.created_at || 0).getTime();
@@ -2904,30 +2906,54 @@ class InMemoryAdapter extends DatabaseAdapter {
 					.filter((tag) => tag.length > 2)
 			);
 
-			const uniqueItems = new Set();
 			for (const tag of postHashtags) {
-				uniqueItems.add(`#${tag}`);
+				const fullTag = `#${tag}`;
+				hashtagCounts.set(fullTag, (hashtagCounts.get(fullTag) || 0) + 1);
 			}
 
 			const rawTags = Array.isArray(post.tags) ? post.tags : [];
-			for (const rawTag of rawTags) {
-				const tag = String(rawTag || '').trim().toLowerCase().replace(/^[#＃]/, '');
-				if (tag.length > 2 && !postHashtags.has(tag)) {
-					uniqueItems.add(tag);
-				}
-			}
+			const postTags = new Set(
+				rawTags
+					.map((rawTag) => String(rawTag || '').trim().toLowerCase().replace(/^[#＃]/, ''))
+					.filter((tag) => tag.length > 2 && !postHashtags.has(tag))
+			);
 
-			for (const item of uniqueItems) {
-				counts.set(item, (counts.get(item) || 0) + 1);
+			for (const tag of postTags) {
+				tagCounts.set(tag, (tagCounts.get(tag) || 0) + 1);
 			}
 		}
-		return Array.from(counts.entries())
-			.sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], 'ja'))
-			.slice(0, limit)
-			.map(([tag_name, occurrence_count]) => ({
-				tag_name,
-				occurrence_count,
-			}));
+
+		const mapToSortedList = (map) =>
+			Array.from(map.entries())
+				.sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], 'ja'))
+				.slice(0, normalizedLimit)
+				.map(([tag_name, occurrence_count]) => ({
+					tag_name,
+					occurrence_count,
+				}));
+
+		const hashtagsList = mapToSortedList(hashtagCounts);
+		const tagsList = mapToSortedList(tagCounts);
+
+		const type = typeof options === 'string' ? options : options?.type;
+		if (type === 'hashtags') return hashtagsList;
+		if (type === 'tags') return tagsList;
+
+		// 全体マージソート（互換用）
+		const mergedCounts = new Map();
+		for (const [k, v] of hashtagCounts) mergedCounts.set(k, v);
+		for (const [k, v] of tagCounts) mergedCounts.set(k, v);
+		const trendsList = mapToSortedList(mergedCounts);
+
+		if (options?.summary || options?.detailed) {
+			return {
+				trends: trendsList,
+				hashtags: hashtagsList,
+				tags: tagsList,
+			};
+		}
+
+		return trendsList;
 	}
 
 	

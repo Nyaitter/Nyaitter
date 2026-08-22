@@ -617,7 +617,7 @@ class DatabaseAdapter {
 		throw new Error('getUserRanking() must be implemented');
 	}
 
-	async getTrendingHashtags(limit = 10) {
+	async getTrendingHashtags(limit = 10, options = {}) {
 		throw new Error('getTrendingHashtags() must be implemented');
 	}
 
