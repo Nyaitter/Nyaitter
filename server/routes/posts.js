@@ -808,6 +808,7 @@ router.get('/:id', optionalAuth, async (req, res) => {
 		if (wantsHtml) {
 			const author = await db.getUserById(post.userId ?? post.user_id);
 			const publicUrl = getPublicUrl(req);
+			const frontendUrl = config.frontendUrl || null;
 			const pageDir = path.join(__dirname, '../../page');
 			const indexPath = path.join(pageDir, 'index.html');
 			let html = '';
@@ -815,7 +816,7 @@ router.get('/:id', optionalAuth, async (req, res) => {
 				const ogpTags = generatePostOgpTags({ post, author, publicUrl });
 				html = fs.readFileSync(indexPath, 'utf8').replace(/<title>.*?<\/title>/i, ogpTags);
 			} else {
-				html = generatePostHtml({ post, author, publicUrl });
+				html = generatePostHtml({ post, author, publicUrl, frontendUrl });
 			}
 			res.setHeader('Content-Type', 'text/html; charset=utf-8');
 			return res.send(html);
