@@ -2997,46 +2997,44 @@ class PostgresAdapter extends DatabaseAdapter {
 		const pId = Number(postId);
 		const now = new Date().toISOString();
 
-		const query = `
-			WITH existing AS (
-				DELETE FROM likes
-				WHERE user_id = $1 AND post_id = $2
-				RETURNING 1
-			),
-			inserted AS (
-				INSERT INTO likes (user_id, post_id, created_at)
-				SELECT $1, $2, $3
-				WHERE NOT EXISTS (SELECT 1 FROM existing)
-				ON CONFLICT DO NOTHING
-				RETURNING 1
-			),
-			updated_post AS (
-				UPDATE posts
-				SET like_count = CASE
-					WHEN EXISTS (SELECT 1 FROM existing) THEN GREATEST(0, like_count - 1)
-					ELSE like_count + 1
-				END
-				WHERE id = $2
-				RETURNING like_count, tags
-			)
-			SELECT 
-				NOT EXISTS (SELECT 1 FROM existing) AS liked,
-				COALESCE((SELECT like_count FROM updated_post), 0)::int AS count,
-				(SELECT tags FROM updated_post) AS tags`;
+		return this._withTransaction(async (client) => {
+			const delResult = await client.query(
+				'DELETE FROM likes WHERE user_id = $1 AND post_id = $2 RETURNING 1',
+				[uId, pId],
+			);
+			let liked = false;
+			let count = 0;
+			let tags = null;
 
-		const { rows } = await this.pool.query(query, [uId, pId, now]);
-		const result = rows[0] || { liked: false, count: 0, tags: [] };
+			if (delResult.rowCount > 0) {
+				const { rows } = await client.query(
+					'UPDATE posts SET like_count = GREATEST(0, like_count - 1) WHERE id = $1 RETURNING like_count, tags',
+					[pId],
+				);
+				liked = false;
+				count = Math.max(0, Number(rows[0]?.like_count) || 0);
+				tags = rows[0]?.tags;
+			} else {
+				await client.query(
+					'INSERT INTO likes (user_id, post_id, created_at) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
+					[uId, pId, now],
+				);
+				const { rows } = await client.query(
+					'UPDATE posts SET like_count = like_count + 1 WHERE id = $1 RETURNING like_count, tags',
+					[pId],
+				);
+				liked = true;
+				count = Math.max(0, Number(rows[0]?.like_count) || 0);
+				tags = rows[0]?.tags;
+			}
 
-		// Adjust keyword affinity asynchronously without blocking response
-		if (result.tags) {
-			const delta = result.liked ? 1 : -1;
-			this._adjustUserKeywordAffinitiesForTags(this.pool, uId, result.tags, delta).catch(() => {});
-		}
+			if (tags) {
+				const delta = liked ? 1 : -1;
+				this._adjustUserKeywordAffinitiesForTags(client, uId, tags, delta).catch(() => {});
+			}
 
-		return {
-			liked: Boolean(result.liked),
-			count: Math.max(0, Number(result.count) || 0),
-		};
+			return { liked, count };
+		});
 	}
 
 	async getLikeCount(postId) {
@@ -3068,46 +3066,44 @@ class PostgresAdapter extends DatabaseAdapter {
 		const pId = Number(postId);
 		const now = new Date().toISOString();
 
-		const query = `
-			WITH existing AS (
-				DELETE FROM stars
-				WHERE user_id = $1 AND post_id = $2
-				RETURNING 1
-			),
-			inserted AS (
-				INSERT INTO stars (user_id, post_id, created_at)
-				SELECT $1, $2, $3
-				WHERE NOT EXISTS (SELECT 1 FROM existing)
-				ON CONFLICT DO NOTHING
-				RETURNING 1
-			),
-			updated_post AS (
-				UPDATE posts
-				SET star_count = CASE
-					WHEN EXISTS (SELECT 1 FROM existing) THEN GREATEST(0, star_count - 1)
-					ELSE star_count + 1
-				END
-				WHERE id = $2
-				RETURNING star_count, tags
-			)
-			SELECT 
-				NOT EXISTS (SELECT 1 FROM existing) AS starred,
-				COALESCE((SELECT star_count FROM updated_post), 0)::int AS count,
-				(SELECT tags FROM updated_post) AS tags`;
+		return this._withTransaction(async (client) => {
+			const delResult = await client.query(
+				'DELETE FROM stars WHERE user_id = $1 AND post_id = $2 RETURNING 1',
+				[uId, pId],
+			);
+			let starred = false;
+			let count = 0;
+			let tags = null;
 
-		const { rows } = await this.pool.query(query, [uId, pId, now]);
-		const result = rows[0] || { starred: false, count: 0, tags: [] };
+			if (delResult.rowCount > 0) {
+				const { rows } = await client.query(
+					'UPDATE posts SET star_count = GREATEST(0, star_count - 1) WHERE id = $1 RETURNING star_count, tags',
+					[pId],
+				);
+				starred = false;
+				count = Math.max(0, Number(rows[0]?.star_count) || 0);
+				tags = rows[0]?.tags;
+			} else {
+				await client.query(
+					'INSERT INTO stars (user_id, post_id, created_at) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
+					[uId, pId, now],
+				);
+				const { rows } = await client.query(
+					'UPDATE posts SET star_count = star_count + 1 WHERE id = $1 RETURNING star_count, tags',
+					[pId],
+				);
+				starred = true;
+				count = Math.max(0, Number(rows[0]?.star_count) || 0);
+				tags = rows[0]?.tags;
+			}
 
-		// Adjust keyword affinity asynchronously without blocking response
-		if (result.tags) {
-			const delta = result.starred ? 3 : -3;
-			this._adjustUserKeywordAffinitiesForTags(this.pool, uId, result.tags, delta).catch(() => {});
-		}
+			if (tags) {
+				const delta = starred ? 3 : -3;
+				this._adjustUserKeywordAffinitiesForTags(client, uId, tags, delta).catch(() => {});
+			}
 
-		return {
-			starred: Boolean(result.starred),
-			count: Math.max(0, Number(result.count) || 0),
-		};
+			return { starred, count };
+		});
 	}
 
 	async getStarCount(postId) {
@@ -3596,23 +3592,20 @@ class PostgresAdapter extends DatabaseAdapter {
 		}
 
 		const now = new Date().toISOString();
-		const query = `
-			WITH existing AS (
-				DELETE FROM follows
-				WHERE follower_id = $1 AND following_id = $2
-				RETURNING 1
-			),
-			inserted AS (
-				INSERT INTO follows (follower_id, following_id, created_at)
-				SELECT $1, $2, $3
-				WHERE NOT EXISTS (SELECT 1 FROM existing)
-				ON CONFLICT DO NOTHING
-				RETURNING 1
-			)
-			SELECT NOT EXISTS (SELECT 1 FROM existing) AS following`;
-
-		const { rows } = await this.pool.query(query, [u1, u2, now]);
-		return { following: Boolean(rows[0]?.following) };
+		return this._withTransaction(async (client) => {
+			const delResult = await client.query(
+				'DELETE FROM follows WHERE follower_id = $1 AND following_id = $2 RETURNING 1',
+				[u1, u2],
+			);
+			if (delResult.rowCount > 0) {
+				return { following: false };
+			}
+			await client.query(
+				'INSERT INTO follows (follower_id, following_id, created_at) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
+				[u1, u2, now],
+			);
+			return { following: true };
+		});
 	}
 
 	async isFollowing(followerId, followingId) {
