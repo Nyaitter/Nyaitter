@@ -12,7 +12,7 @@ function buildContentSecurityPolicy() {
     "frame-ancestors 'none'",
     "form-action 'self'",
     "script-src 'self' https://cdn.jsdelivr.net https://challenges.cloudflare.com",
-    "frame-src https://challenges.cloudflare.com",
+    "frame-src 'self' https://challenges.cloudflare.com",
     "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com",
     "img-src 'self' data: https:",
     "font-src 'self' data: https://fonts.gstatic.com",
@@ -20,16 +20,6 @@ function buildContentSecurityPolicy() {
     "worker-src 'self'",
     "manifest-src 'self'",
   ];
-
-  // Cloudflare Turnstileチャレンジを有効にした場合だけ、widgetのスクリプトと
-  // iframeの読み込み元をCSPに追加する。
-  if (config.turnstile?.enabled) {
-    const scriptIndex = csp.findIndex((directive) => directive.startsWith('script-src '));
-    if (scriptIndex !== -1) {
-      csp[scriptIndex] = `${csp[scriptIndex]} https://challenges.cloudflare.com`;
-    }
-    csp.push('frame-src https://challenges.cloudflare.com');
-  }
 
   return csp.join('; ');
 }
