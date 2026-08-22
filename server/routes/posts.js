@@ -820,7 +820,9 @@ router.get('/:id', optionalAuth, async (req, res) => {
 				} else {
 					const host = req.get('host') || 'nyaitter.jp';
 					const cleanHost = host.replace(/^(?:link|api)\./i, '');
-					const proto = (req.protocol === 'https' || req.get('x-forwarded-proto') === 'https') ? 'https' : 'http';
+					const forwardedProto = req.get('x-forwarded-proto') || req.get('x-forwarded-protocol');
+					const isLocal = cleanHost.startsWith('localhost') || cleanHost.startsWith('127.0.0.1');
+					const proto = (forwardedProto || (isLocal ? 'http' : 'https')).toLowerCase();
 					redirectUrl = `${proto}://${cleanHost}/#post/${post.id}`;
 				}
 				return res.redirect(302, redirectUrl);
