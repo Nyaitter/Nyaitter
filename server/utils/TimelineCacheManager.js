@@ -70,6 +70,14 @@ class TimelineCacheManager {
 		}
 	}
 
+	onPostUpdated() {
+		// Post object is updated in unified MemoryBoundedCache directly.
+	}
+
+	onReactionUpdated() {
+		// Reactions are handled in unified MemoryBoundedCache directly.
+	}
+
 	clear() {
 		this.cache.clear();
 	}

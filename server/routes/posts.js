@@ -889,7 +889,6 @@ router.post('/:id/like', requireAuth, postWriteLimiter, async (req, res) => {
 		}
 
 		const updatedLikes = await db.getLikeIds(userId);
-		timelineCacheManager.onReactionUpdated(postId, { likeCount: result.count });
 
 		res.json({
 			success: true,
@@ -923,7 +922,6 @@ router.post('/:id/star', requireAuth, postWriteLimiter, async (req, res) => {
 		const result = await postService.toggleStar(userId, postId);
 
 		const updatedStars = await db.getStarIds(userId);
-		timelineCacheManager.onReactionUpdated(postId, { starCount: result.count });
 
 		res.json({
 			success: true,
