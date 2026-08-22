@@ -34,7 +34,7 @@ class EmailAuthProvider extends BaseAuthProvider {
   }
 
   async initiate(req, payload = {}, context = {}) {
-    const { email, turnstileToken } = payload;
+    const { email, turnstile_token } = payload;
     const { config, verifyTurnstile } = context;
 
     if (!email || typeof email !== 'string') {
@@ -50,7 +50,7 @@ class EmailAuthProvider extends BaseAuthProvider {
     }
 
     if (config?.turnstile?.enabled && typeof verifyTurnstile === 'function') {
-      const turnstileResult = await verifyTurnstile(turnstileToken);
+      const turnstileResult = await verifyTurnstile(turnstile_token);
       if (turnstileResult.success !== true) {
         const err = new Error('Turnstileチャレンジを完了してください。');
         err.status = 403;

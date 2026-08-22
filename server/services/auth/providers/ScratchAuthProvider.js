@@ -50,7 +50,7 @@ class ScratchAuthProvider extends BaseAuthProvider {
   }
 
   async initiate(req, payload = {}, context = {}) {
-    const { username, turnstileToken } = payload;
+    const { username, turnstile_token } = payload;
     const { config, verifyTurnstile } = context;
 
     if (!username || typeof username !== 'string') {
@@ -66,7 +66,7 @@ class ScratchAuthProvider extends BaseAuthProvider {
     }
 
     if (config?.turnstile?.enabled && typeof verifyTurnstile === 'function') {
-      const turnstileResult = await verifyTurnstile(turnstileToken);
+      const turnstileResult = await verifyTurnstile(turnstile_token);
       if (turnstileResult.success !== true) {
         const err = new Error('Turnstileチャレンジを完了してください。');
         err.status = 403;

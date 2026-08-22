@@ -75,12 +75,11 @@ class NyaitterAuthProvider extends BaseAuthProvider {
   }
 
   async initiate(req, payload = {}, context = {}) {
-    const { turnstileToken, turnstile_token } = payload;
+    const { turnstile_token } = payload;
     const { config, verifyTurnstile } = context;
 
     if (config?.turnstile?.enabled && typeof verifyTurnstile === 'function') {
-      const token = turnstileToken || turnstile_token;
-      const turnstileResult = await verifyTurnstile(token);
+      const turnstileResult = await verifyTurnstile(turnstile_token);
       if (turnstileResult.success !== true) {
         const err = new Error('Turnstileチャレンジを完了してください。');
         err.status = 400;

@@ -83,12 +83,14 @@ async function verifyTurnstileToken(token) {
 
     const data = await verifyRes.json();
     if (data?.success) return { success: true };
+    console.warn('[turnstile] siteverify failed:', data);
     return {
       success: false,
       code: 'invalid',
       errorCodes: Array.isArray(data?.['error-codes']) ? data['error-codes'] : null,
     };
   } catch (error) {
+    console.error('[turnstile] siteverify network error:', error);
     return { success: false, code: 'error', error };
   }
 }
@@ -401,7 +403,7 @@ router.post('/scratch/generate', async (req, res) => {
   try {
     const data = await authService.initiate('scratch', req, {
       username: req.body?.username,
-      turnstileToken: req.body?.turnstile_token,
+      turnstile_token: req.body?.turnstile_token,
     }, {
       config,
       verifyTurnstile: verifyTurnstileToken,

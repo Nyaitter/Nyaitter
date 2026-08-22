@@ -1,16 +1,76 @@
 'use strict';
 
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 
-const fallbackSecret = crypto.randomBytes(32).toString('base64url');
-const ipHashSecret = process.env.LOGIN_SECURITY_HMAC_SECRET
-  || process.env.MULTI_ACCOUNT_COOKIE_SECRET
-  || fallbackSecret;
+function getOrPersistHmacSecret() {
+  if (process.env.LOGIN_SECURITY_HMAC_SECRET) {
+    return process.env.LOGIN_SECURITY_HMAC_SECRET;
+  }
+  if (process.env.MULTI_ACCOUNT_COOKIE_SECRET) {
+    return process.env.MULTI_ACCOUNT_COOKIE_SECRET;
+  }
+  if (process.env.SESSION_SECRET) {
+    return process.env.SESSION_SECRET;
+  }
 
+  // 永続化ファイルから読み込み、なければ自動生成して保存
+  const dataDir = process.env.DATA_DIR || path.join(process.cwd(), 'data');
+  const secretPath = path.join(dataDir, '.auth_hmac_secret');
+
+  try {
+    if (!fs.existsSync(dataDir)) {
+      fs.mkdirSync(dataDir, { recursive: true });
+    }
+    if (fs.existsSync(secretPath)) {
+      const stored = fs.readFileSync(secretPath, 'utf8').trim();
+      if (stored && stored.length >= 16) return stored;
+    }
+    const generated = crypto.randomBytes(32).toString('base64url');
+    fs.writeFileSync(secretPath, generated, { encoding: 'utf8', mode: 0o600 });
+    return generated;
+  } catch (_) {
+    // ファイルシステムへの書き込みが制限されている場合のフォールバック
+    return 'nyaitter-auth-default-secure-hmac-secret-salt';
+  }
+}
+
+const ipHashSecret = getOrPersistHmacSecret();
+
+/**
+ * IPアドレスを正規化します。
+ * IPv6の一時アドレス（RFC 4941 Privacy Extensions）による下位64ビットの頻繁なローテーションに対応するため、
+ * IPv6の場合は /64 プレフィックス（上位4ブロック）に正規化します。
+ * @param {string} ip
+ * @returns {string}
+ */
 function normalizeIp(ip) {
-  const value = String(ip || '').trim();
+  let value = String(ip || '').trim();
   if (!value) return 'unknown';
-  return value.startsWith('::ffff:') ? value.slice(7) : value;
+
+  // IPv4-mapped IPv6 (e.g. ::ffff:192.168.1.1)
+  if (value.startsWith('::ffff:')) {
+    value = value.slice(7);
+  }
+
+  // IPv4 with port (e.g. 192.168.1.1:8080)
+  if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(:\d+)?$/.test(value)) {
+    return value.split(':')[0];
+  }
+
+  // IPv6
+  if (value.includes(':')) {
+    // 展開またはプレフィックス抽出
+    const cleanIpv6 = value.replace(/^\[|\]$/g, '').split('%')[0]; // スコープIDやブラケット除去
+    const parts = cleanIpv6.split(':').filter(Boolean);
+    if (parts.length >= 4) {
+      return `${parts.slice(0, 4).join(':')}::/64`;
+    }
+    return cleanIpv6;
+  }
+
+  return value;
 }
 
 function hashIp(ip) {
@@ -27,8 +87,12 @@ function maskIp(ip) {
     const parts = normalized.split('.');
     return parts.length === 4 ? `${parts[0]}.${parts[1]}.${parts[2]}.*` : 'IPv4アドレス';
   }
+  if (normalized.includes('::/64')) {
+    const prefix = normalized.replace('::/64', '');
+    return `${prefix}::/64`;
+  }
   const parts = normalized.split(':').filter(Boolean);
-  return parts.length > 0 ? `${parts.slice(0, 3).join(':')}::/48` : 'IPv6アドレス';
+  return parts.length > 0 ? `${parts.slice(0, 4).join(':')}::/64` : 'IPv6アドレス';
 }
 
 function normalizeUserAgent(userAgent) {
