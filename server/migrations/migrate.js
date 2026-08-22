@@ -66,7 +66,7 @@ if (!usePostgres) {
 }
 
 console.log('Nyaitter Migration Runner (PostgreSQL)');
-console.log('---------------------------');
+console.log('==================================================');
 
 if (!connectionString) {
   console.log('No DATABASE_URL found.');
@@ -89,6 +89,14 @@ function quoteSqlLiteral(value) {
   return `'${String(value).replace(/'/g, "''")}'`;
 }
 
+function formatProgressBar(current, total, width = 18) {
+  const ratio = total > 0 ? Math.min(1, Math.max(0, current / total)) : 1;
+  const filled = Math.round(ratio * width);
+  const empty = width - filled;
+  const percent = String(Math.round(ratio * 100)).padStart(3, ' ');
+  return `[${'█'.repeat(filled)}${'░'.repeat(empty)}] ${percent}%`;
+}
+
 async function applyMigration(client, file) {
   const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf8');
   const transactionSql = [
@@ -101,8 +109,6 @@ async function applyMigration(client, file) {
   for (let attempt = 0; attempt <= transactionRetries; attempt += 1) {
     let started = false;
     try {
-      // パラメーターを使わない単純クエリでは複数文を1往復で送信できる。
-      // Migrationごとの原子性を保ちつつ、リモートDBへの4回の往復を1回へ削減する。
       started = true;
       await client.query(transactionSql);
       return;
@@ -110,9 +116,7 @@ async function applyMigration(client, file) {
       if (started) {
         try {
           await client.query('ROLLBACK');
-        } catch (_) {
-          // Preserve the original migration error for the caller.
-        }
+        } catch (_) {}
       }
       if (!isRetryableTransactionError(error) || attempt >= transactionRetries) {
         throw new Error(`${file}: ${error.message}`);
@@ -135,6 +139,7 @@ async function run() {
   }
   const client = new Client(clientOptions);
 
+  const startTime = Date.now();
   await client.connect();
   try {
     await client.query(`
@@ -148,20 +153,48 @@ async function run() {
       'SELECT filename FROM nyaitter_schema_migrations',
     );
     const applied = new Set(appliedResult.rows.map((row) => row.filename));
+    const totalCount = migrationFiles.length;
+    const pendingCount = migrationFiles.filter((f) => !applied.has(f)).length;
 
-    for (const file of migrationFiles) {
-      if (applied.has(file)) continue;
-      console.log(`Applying ${file}...`);
-      await applyMigration(client, file);
+    console.log(`Discovered ${totalCount} migration(s) (Applied: ${totalCount - pendingCount}, Pending: ${pendingCount})\n`);
+
+    let appliedCount = 0;
+    for (let index = 0; index < totalCount; index += 1) {
+      const file = migrationFiles[index];
+      const stepIndex = index + 1;
+      const stepPrefix = `[${String(stepIndex).padStart(String(totalCount).length, ' ')}/${totalCount}] ${formatProgressBar(stepIndex, totalCount)}`;
+
+      if (applied.has(file)) {
+        console.log(`${stepPrefix} ⏩  ${file} (already applied)`);
+        continue;
+      }
+
+      process.stdout.write(`${stepPrefix} 🚀 Applying ${file}... `);
+      const stepStart = Date.now();
+      try {
+        await applyMigration(client, file);
+        const stepDuration = Date.now() - stepStart;
+        appliedCount += 1;
+        process.stdout.write(`✓ [${stepDuration}ms]\n`);
+      } catch (error) {
+        process.stdout.write(`✗ FAILED\n`);
+        throw error;
+      }
     }
 
-    console.log('All pending migrations applied successfully.');
+    const totalDuration = Date.now() - startTime;
+    console.log('--------------------------------------------------');
+    if (appliedCount > 0) {
+      console.log(`✨ Successfully applied ${appliedCount} pending migration(s) in ${totalDuration}ms.`);
+    } else {
+      console.log(`✅ All migrations are already up to date (${totalCount}/${totalCount} verified in ${totalDuration}ms).`);
+    }
   } finally {
     await client.end();
   }
 }
 
 run().catch((error) => {
-  console.error('Migration failed:', error.message);
+  console.error('\n❌ Migration failed:', error.message);
   process.exit(1);
 });
