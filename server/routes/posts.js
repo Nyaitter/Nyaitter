@@ -35,7 +35,7 @@ const {
 const timelineCacheManager = require('../utils/TimelineCacheManager');
 const path = require('path');
 const fs = require('fs');
-const { isCrawler, generatePostOgpTags } = require('../services/OgpService');
+const { isCrawler, generatePostOgpTags, generatePostHtml } = require('../services/OgpService');
 
 const router = express.Router();
 const { createRateLimiter } = require('../middleware/rateLimit');
@@ -806,17 +806,19 @@ router.get('/:id', optionalAuth, async (req, res) => {
 		const wantsHtml = !isApiRequest && (isCrawler(userAgent) || req.accepts(['html', 'json']) === 'html');
 
 		if (wantsHtml) {
+			const author = await db.getUserById(post.userId ?? post.user_id);
+			const publicUrl = getPublicUrl(req);
 			const pageDir = path.join(__dirname, '../../page');
 			const indexPath = path.join(pageDir, 'index.html');
+			let html = '';
 			if (fs.existsSync(indexPath)) {
-				const author = await db.getUserById(post.userId ?? post.user_id);
-				const publicUrl = getPublicUrl(req);
 				const ogpTags = generatePostOgpTags({ post, author, publicUrl });
-				let html = fs.readFileSync(indexPath, 'utf8');
-				html = html.replace(/<title>.*?<\/title>/i, ogpTags);
-				res.setHeader('Content-Type', 'text/html; charset=utf-8');
-				return res.send(html);
+				html = fs.readFileSync(indexPath, 'utf8').replace(/<title>.*?<\/title>/i, ogpTags);
+			} else {
+				html = generatePostHtml({ post, author, publicUrl });
 			}
+			res.setHeader('Content-Type', 'text/html; charset=utf-8');
+			return res.send(html);
 		}
 
 		const serializedPost = await serializePost(

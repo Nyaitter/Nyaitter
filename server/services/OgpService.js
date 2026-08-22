@@ -133,9 +133,41 @@ function generateOembedJson({ post, author, publicUrl, postUrl }) {
 	return json;
 }
 
+function generatePostHtml({ post, author, publicUrl }) {
+	const ogpTags = generatePostOgpTags({ post, author, publicUrl });
+	const authorName = author?.name || 'Unknown User';
+	const content = post?.mask ? '🔒 [この投稿はマスクされています]' : (post?.content || '');
+	const safeContent = escapeHtml(content);
+	const safeAuthor = escapeHtml(authorName);
+
+	return `<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    ${ogpTags}
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px; color: #333; line-height: 1.6; background-color: #f7f9fa; }
+        .card { border: 1px solid #e1e8ed; border-radius: 12px; padding: 24px; background: #fff; box-shadow: 0 2px 8px rgba(0,0,0,0.05); }
+        .author { font-weight: bold; font-size: 1.1em; margin-bottom: 8px; }
+        .content { font-size: 1.05em; white-space: pre-wrap; word-break: break-word; }
+        .footer { margin-top: 16px; font-size: 0.9em; color: #888; border-top: 1px solid #eee; padding-top: 12px; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <div class="author">${safeAuthor}</div>
+        <div class="content">${safeContent}</div>
+        <div class="footer">Nyaitter • <a href="${escapeHtml(publicUrl || '')}">Nyaitterで開く</a></div>
+    </div>
+</body>
+</html>`;
+}
+
 module.exports = {
 	isCrawler,
 	generatePostOgpTags,
+	generatePostHtml,
 	generateOembedJson,
 	escapeHtml,
 };
