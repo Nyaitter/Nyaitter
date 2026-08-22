@@ -33,6 +33,9 @@ const {
 	processDeletePostAction,
 } = require('../services/PostActionProcessor');
 const timelineCacheManager = require('../utils/TimelineCacheManager');
+const path = require('path');
+const fs = require('fs');
+const { isCrawler, generatePostOgpTags } = require('../services/OgpService');
 
 const router = express.Router();
 const { createRateLimiter } = require('../middleware/rateLimit');
@@ -797,14 +800,33 @@ router.get('/:id', optionalAuth, async (req, res) => {
 		if (!post) {
 			return res.status(404).json({ error: 'Post not found' });
 		}
-			const serializedPost = await serializePost(
-				db,
-				post,
-				currentUserId,
-				0,
-				getPublicUrl(req),
-				knownViewer,
-			);
+
+		const userAgent = req.headers['user-agent'] || '';
+		const isApiRequest = req.originalUrl.startsWith('/api/') || req.originalUrl.startsWith('/server/api/');
+		const wantsHtml = !isApiRequest && (isCrawler(userAgent) || req.accepts(['html', 'json']) === 'html');
+
+		if (wantsHtml) {
+			const pageDir = path.join(__dirname, '../../page');
+			const indexPath = path.join(pageDir, 'index.html');
+			if (fs.existsSync(indexPath)) {
+				const author = await db.getUserById(post.userId ?? post.user_id);
+				const publicUrl = getPublicUrl(req);
+				const ogpTags = generatePostOgpTags({ post, author, publicUrl });
+				let html = fs.readFileSync(indexPath, 'utf8');
+				html = html.replace(/<title>.*?<\/title>/i, ogpTags);
+				res.setHeader('Content-Type', 'text/html; charset=utf-8');
+				return res.send(html);
+			}
+		}
+
+		const serializedPost = await serializePost(
+			db,
+			post,
+			currentUserId,
+			0,
+			getPublicUrl(req),
+			knownViewer,
+		);
 		if (!serializedPost) {
 			return res.status(404).json({ error: 'Post not found' });
 		}
