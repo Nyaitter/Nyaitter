@@ -994,7 +994,7 @@ class PostgresAdapter extends DatabaseAdapter {
 
 			// dm_channels participants
 			const { rows: channels } = await client.query(
-				'SELECT id, participants FROM dm_channels WHERE $1 = ANY(participants)',
+				'SELECT id, participants FROM dm_channels WHERE $1::int = ANY(participants)',
 				[previousId],
 			);
 			for (const channel of channels) {
@@ -1004,7 +1004,7 @@ class PostgresAdapter extends DatabaseAdapter {
 
 			// group_dms
 			const { rows: groups } = await client.query(
-				'SELECT id, host_id, member, post, unread FROM group_dms WHERE host_id = $1 OR $1 = ANY(member)',
+				'SELECT id, host_id, member, post, unread FROM group_dms WHERE host_id = $1::int OR $1::int = ANY(member)',
 				[previousId],
 			);
 			for (const group of groups) {
@@ -3266,7 +3266,7 @@ class PostgresAdapter extends DatabaseAdapter {
 
 	async getDmList(userId) {
 		const { rows } = await this.pool.query(
-			'SELECT * FROM dm_channels WHERE $1 = ANY(participants)',
+			'SELECT * FROM dm_channels WHERE $1::int = ANY(participants)',
 			[Number(userId)],
 		);
 		return rows.map((r) => ({
@@ -3357,7 +3357,7 @@ class PostgresAdapter extends DatabaseAdapter {
 		const { rows } = await this.pool.query(
 			`SELECT COUNT(*)::int as count FROM dm_messages m
 			 JOIN dm_channels c ON c.id = m.channel_id
-			 WHERE $1 = ANY(c.participants)
+			 WHERE $1::int = ANY(c.participants)
 			   AND m.sender_id != $1
 			   AND m.read_at IS NULL`,
 			[Number(userId)],
@@ -3512,7 +3512,7 @@ class PostgresAdapter extends DatabaseAdapter {
 
 	async getGroupDmUnreadCounts(userId) {
 		const { rows } = await this.pool.query(
-			'SELECT id, member, unread FROM group_dms WHERE $1 = ANY(member)',
+			'SELECT id, member, unread FROM group_dms WHERE $1::int = ANY(member)',
 			[Number(userId)],
 		);
 		const counts = [];
@@ -3525,7 +3525,7 @@ class PostgresAdapter extends DatabaseAdapter {
 
 	async getGroupDmUnreadTotal(userId) {
 		const { rows } = await this.pool.query(
-			'SELECT member, unread FROM group_dms WHERE $1 = ANY(member)',
+			'SELECT member, unread FROM group_dms WHERE $1::int = ANY(member)',
 			[Number(userId)],
 		);
 		let total = 0;
