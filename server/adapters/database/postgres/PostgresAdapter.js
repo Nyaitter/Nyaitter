@@ -2120,34 +2120,41 @@ class PostgresAdapter extends DatabaseAdapter {
 	}
 
 	async getPostReferencesByIds(postIds, maxDepth = 2) {
-		const ids = [...new Set((postIds || []).map(Number)
+		const rootIds = [...new Set((postIds || []).map(Number)
 			.filter((id) => Number.isSafeInteger(id) && id > 0))];
 		const normalizedMaxDepth = Math.min(4, Math.max(0, Number(maxDepth) || 0));
-		if (ids.length === 0) return [];
-		const { rows } = await this.pool.query(
-			`WITH RECURSIVE post_refs AS (
-				SELECT id, reply_to, repost_to, 0 AS depth, ARRAY[id] AS path
-				FROM posts
-				WHERE id = ANY($1::int[])
-				UNION ALL
-				(
-					SELECT p.id, p.reply_to, p.repost_to, refs.depth + 1, refs.path || p.id
-					FROM post_refs refs
-					JOIN posts p ON p.id = refs.reply_to
-					WHERE refs.depth < $2 AND refs.reply_to IS NOT NULL AND NOT (p.id = ANY(refs.path))
-					UNION
-					SELECT p.id, p.reply_to, p.repost_to, refs.depth + 1, refs.path || p.id
-					FROM post_refs refs
-					JOIN posts p ON p.id = refs.repost_to
-					WHERE refs.depth < $2 AND refs.repost_to IS NOT NULL AND NOT (p.id = ANY(refs.path))
-				)
-			)
-			SELECT DISTINCT p.*
-			FROM posts p
-			JOIN post_refs refs ON refs.id = p.id`,
-			[ids, normalizedMaxDepth],
-		);
-		return rows.map(normalizePostRow);
+		if (rootIds.length === 0) return [];
+
+		const resolved = new Map();
+		let currentIds = rootIds;
+		let depth = 0;
+
+		while (currentIds.length > 0 && depth <= normalizedMaxDepth) {
+			const fetchIds = currentIds.filter((id) => !resolved.has(id));
+			if (fetchIds.length === 0) break;
+
+			const { rows } = await this.pool.query(
+				'SELECT * FROM posts WHERE id = ANY($1::int[])',
+				[fetchIds],
+			);
+
+			const nextIds = new Set();
+			for (const row of rows) {
+				const post = normalizePostRow(row);
+				if (post) {
+					resolved.set(post.id, post);
+					if (depth < normalizedMaxDepth) {
+						if (post.replyTo && !resolved.has(post.replyTo)) nextIds.add(post.replyTo);
+						if (post.repostTo && !resolved.has(post.repostTo)) nextIds.add(post.repostTo);
+					}
+				}
+			}
+
+			currentIds = [...nextIds];
+			depth += 1;
+		}
+
+		return Array.from(resolved.values());
 	}
 
 	async getPostMetricsBatch(postIds, currentUserId = null) {

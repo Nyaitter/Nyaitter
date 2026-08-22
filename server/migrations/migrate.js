@@ -189,20 +189,122 @@ function formatProgressBar(current, total, width = 18) {
   return `[${'█'.repeat(filled)}${'░'.repeat(empty)}] ${percent}%`;
 }
 
+function splitSqlStatements(sql) {
+  const statements = [];
+  let current = '';
+  let inSingleQuote = false;
+  let inLineComment = false;
+  let inBlockComment = false;
+  let inDollarQuote = false;
+  let dollarTag = '';
+
+  for (let i = 0; i < sql.length; i += 1) {
+    const char = sql[i];
+    const nextChar = sql[i + 1];
+
+    if (inLineComment) {
+      current += char;
+      if (char === '\n') inLineComment = false;
+      continue;
+    }
+
+    if (inBlockComment) {
+      current += char;
+      if (char === '*' && nextChar === '/') {
+        current += nextChar;
+        i += 1;
+        inBlockComment = false;
+      }
+      continue;
+    }
+
+    if (inSingleQuote) {
+      current += char;
+      if (char === "'") {
+        if (nextChar === "'") {
+          current += nextChar;
+          i += 1;
+        } else {
+          inSingleQuote = false;
+        }
+      }
+      continue;
+    }
+
+    if (inDollarQuote) {
+      current += char;
+      if (char === '$' && sql.slice(i, i + dollarTag.length) === dollarTag) {
+        current += dollarTag.slice(1);
+        i += dollarTag.length - 1;
+        inDollarQuote = false;
+        dollarTag = '';
+      }
+      continue;
+    }
+
+    if (char === '-' && nextChar === '-') {
+      inLineComment = true;
+      current += char + nextChar;
+      i += 1;
+      continue;
+    }
+
+    if (char === '/' && nextChar === '*') {
+      inBlockComment = true;
+      current += char + nextChar;
+      i += 1;
+      continue;
+    }
+
+    if (char === "'") {
+      inSingleQuote = true;
+      current += char;
+      continue;
+    }
+
+    if (char === '$') {
+      const match = sql.slice(i).match(/^(\$[a-zA-Z0-9_]*\$)/);
+      if (match) {
+        dollarTag = match[1];
+        inDollarQuote = true;
+        current += dollarTag;
+        i += dollarTag.length - 1;
+        continue;
+      }
+    }
+
+    if (char === ';') {
+      const trimmed = current.trim();
+      if (trimmed) statements.push(trimmed);
+      current = '';
+      continue;
+    }
+
+    current += char;
+  }
+
+  const trailing = current.trim();
+  if (trailing) statements.push(trailing);
+
+  return statements;
+}
+
 async function applyMigration(client, file) {
   const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf8');
-  const transactionSql = [
-    'BEGIN;',
-    sql,
-    `INSERT INTO nyaitter_schema_migrations (filename) VALUES (${quoteSqlLiteral(file)});`,
-    'COMMIT;',
-  ].join('\n');
+  const statements = splitSqlStatements(sql);
 
   for (let attempt = 0; attempt <= transactionRetries; attempt += 1) {
     let started = false;
     try {
       started = true;
-      await client.query(transactionSql);
+      await client.query('BEGIN');
+      for (const statement of statements) {
+        await client.query(statement);
+      }
+      await client.query(
+        `INSERT INTO nyaitter_schema_migrations (filename) VALUES (${quoteSqlLiteral(file)})`,
+      );
+      await client.query('COMMIT');
       return;
     } catch (error) {
       if (started) {
