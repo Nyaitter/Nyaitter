@@ -338,8 +338,8 @@ async function handleUserIcon(req, res) {
 				return res.redirect(302, '/logo.png');
 			}
 
-				if (user && user.scid) {
-					if (await sendScratchFallbackIcon(req, res, user.scid)) return;
+				if (user && user.scid != null && String(user.scid).trim() !== '') {
+					if (await sendScratchFallbackIcon(req, res, String(user.scid).trim())) return;
 					res.setHeader('Cache-Control', 'public, max-age=60');
 					return res.redirect(302, '/logo.png');
 				}
