@@ -2577,23 +2577,44 @@ class PostgresAdapter extends DatabaseAdapter {
 			? [normalizedBeforeId, candidateLimit, normalizedOffset]
 			: [candidateLimit, normalizedOffset];
 
-		const [candidatesResult, viewerKeywords, viewerFollows] = await Promise.all([
-			this.pool.query(query, params),
-			validViewerId != null
-				? this.pool.query('SELECT keyword, score FROM user_keyword_affinities WHERE user_id = $1 ORDER BY score DESC LIMIT 25', [validViewerId])
-				: Promise.resolve({ rows: [] }),
-			validViewerId != null
-				? this.pool.query('SELECT following_id FROM follows WHERE follower_id = $1 LIMIT 100', [validViewerId])
-				: Promise.resolve({ rows: [] }),
-		]);
+		if (!this._affinityCache) this._affinityCache = new Map();
+		if (!this._followCache) this._followCache = new Map();
+		const now = Date.now();
 
-		const rows = candidatesResult.rows;
+		let keywordProfile = new Map();
+		let directFollows = new Set();
+
+		if (validViewerId != null) {
+			const cachedAffinity = this._affinityCache.get(validViewerId);
+			if (cachedAffinity && cachedAffinity.expiresAt > now) {
+				keywordProfile = cachedAffinity.profile;
+			} else {
+				this.pool.query(
+					'SELECT keyword, score FROM user_keyword_affinities WHERE user_id = $1 ORDER BY score DESC LIMIT 25',
+					[validViewerId],
+				).then(({ rows }) => {
+					const prof = new Map(rows.map((r) => [String(r.keyword).toLowerCase(), Number(r.score) || 0]));
+					this._affinityCache.set(validViewerId, { profile: prof, expiresAt: Date.now() + 60000 });
+				}).catch(() => {});
+			}
+
+			const cachedFollows = this._followCache.get(validViewerId);
+			if (cachedFollows && cachedFollows.expiresAt > now) {
+				directFollows = cachedFollows.follows;
+			} else {
+				this.pool.query(
+					'SELECT following_id FROM follows WHERE follower_id = $1 LIMIT 100',
+					[validViewerId],
+				).then(({ rows }) => {
+					const fset = new Set(rows.map((r) => Number(r.following_id)));
+					this._followCache.set(validViewerId, { follows: fset, expiresAt: Date.now() + 60000 });
+				}).catch(() => {});
+			}
+		}
+
+		const { rows } = await this.pool.query(query, params);
 		const hasMore = rows.length >= candidateLimit;
 		const candidateRows = rows.slice(0, candidateLimit - 1);
-
-		const keywordProfile = new Map(viewerKeywords.rows.map((r) => [String(r.keyword).toLowerCase(), Number(r.score) || 0]));
-		const directFollows = new Set(viewerFollows.rows.map((r) => Number(r.following_id)));
-		const now = Date.now();
 
 		// Fast in-memory scoring on Node.js server
 		const scored = candidateRows.map((post) => {
