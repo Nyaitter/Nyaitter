@@ -32,6 +32,7 @@ const {
 	processCreatePostAction,
 	processDeletePostAction,
 } = require('../services/PostActionProcessor');
+const timelineCacheManager = require('../utils/TimelineCacheManager');
 
 const router = express.Router();
 const { createRateLimiter } = require('../middleware/rateLimit');
@@ -491,11 +492,9 @@ router.get('/page', optionalAuth, async (req, res) => {
 	const knownViewer = req.user?.visibilityUser || null;
 
 	const cacheKey = `${mode}:${tab}:${req.query.q || ''}:${currentUserId || 0}:${limit}:${offset}:${beforeId || 0}`;
-	const now = Date.now();
-	if (!global._timelinePageCache) global._timelinePageCache = new Map();
-	const cachedPage = global._timelinePageCache.get(cacheKey);
-	if (cachedPage && cachedPage.expiresAt > now) {
-		return res.json(cachedPage.data);
+	const cachedData = timelineCacheManager.get(cacheKey);
+	if (cachedData) {
+		return res.json(cachedData);
 	}
 
 		try {
@@ -611,9 +610,7 @@ router.get('/page', optionalAuth, async (req, res) => {
 			},
 		};
 
-		if (global._timelinePageCache) {
-			global._timelinePageCache.set(cacheKey, { data: payload, expiresAt: Date.now() + 4000 });
-		}
+		timelineCacheManager.set(cacheKey, payload);
 
 		res.json(payload);
 	} catch (err) {
@@ -890,6 +887,7 @@ router.post('/:id/like', requireAuth, postWriteLimiter, async (req, res) => {
 		}
 
 		const updatedLikes = await db.getLikeIds(userId);
+		timelineCacheManager.onReactionUpdated(postId, { likeCount: result.count });
 
 		res.json({
 			success: true,
@@ -923,6 +921,7 @@ router.post('/:id/star', requireAuth, postWriteLimiter, async (req, res) => {
 		const result = await postService.toggleStar(userId, postId);
 
 		const updatedStars = await db.getStarIds(userId);
+		timelineCacheManager.onReactionUpdated(postId, { starCount: result.count });
 
 		res.json({
 			success: true,
@@ -1101,7 +1100,7 @@ router.put('/:id', requireAuth, postWriteLimiter, async (req, res) => {
 				lock: !!lock,
 			});
 		const moderatedPost = updated || post;
-		if (global._timelinePageCache) global._timelinePageCache.clear();
+		timelineCacheManager.onPostUpdated(postId, moderatedPost);
 		enqueueGeminiModeration(req, moderatedPost);
 		res.json({
 			success: true,
