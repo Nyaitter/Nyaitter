@@ -78,17 +78,59 @@ function rememberAccountSession(req, res, session) {
   ]);
 }
 
+const rememberedAccountCache = new Map();
+const REMEMBERED_CACHE_TTL_MS = 15000;
+
 async function getValidRememberedAccounts(req, db) {
   const remembered = readRememberedAccounts(req);
-  const valid = [];
-  for (const account of remembered) {
-    const session = await db.getSessionByToken(SessionManager.hashToken(account.token));
-    if (!session) continue;
-    const userId = Number(session.userId);
-    const user = await db.getUserById(userId);
-    if (!user) continue;
-    valid.push({ token: account.token, userId, session, user });
+  if (remembered.length === 0) return [];
+
+  const tokenHashes = remembered.map((acc) => SessionManager.hashToken(acc.token));
+  const cacheKey = tokenHashes.join(':');
+  const now = Date.now();
+  const cached = rememberedAccountCache.get(cacheKey);
+  if (cached && cached.expiresAt > now) {
+    return cached.accounts;
   }
+
+  const valid = [];
+  if (typeof db.getUsersAndSessionsByTokens === 'function') {
+    const rawPairs = await db.getUsersAndSessionsByTokens(tokenHashes);
+    const pairMap = new Map(rawPairs.map((p) => [p.session.token, p]));
+    for (const account of remembered) {
+      const hash = SessionManager.hashToken(account.token);
+      const pair = pairMap.get(hash);
+      if (pair && pair.user) {
+        valid.push({
+          token: account.token,
+          userId: Number(pair.user.id),
+          session: pair.session,
+          user: pair.user,
+        });
+      }
+    }
+  } else {
+    // Parallel fallback for adapters without batch support
+    const results = await Promise.all(
+      remembered.map(async (account) => {
+        const session = await db.getSessionByToken(SessionManager.hashToken(account.token));
+        if (!session) return null;
+        const userId = Number(session.userId);
+        const user = await db.getUserById(userId);
+        if (!user) return null;
+        return { token: account.token, userId, session, user };
+      }),
+    );
+    for (const item of results) {
+      if (item) valid.push(item);
+    }
+  }
+
+  rememberedAccountCache.set(cacheKey, {
+    accounts: valid,
+    expiresAt: now + REMEMBERED_CACHE_TTL_MS,
+  });
+
   return valid;
 }
 

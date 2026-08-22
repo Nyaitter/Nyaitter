@@ -524,11 +524,67 @@ class PostgresAdapter extends DatabaseAdapter {
 
 	async getUserById(id) {
 		if (id == null) return null;
+		const userId = Number(id);
+		if (!Number.isSafeInteger(userId) || userId <= 0) return null;
+
+		if (!this._userCache) this._userCache = new Map();
+		const now = Date.now();
+		const cached = this._userCache.get(userId);
+		if (cached && cached.expiresAt > now) {
+			return cached.user;
+		}
+
 		const { rows } = await this.pool.query(
 			'SELECT * FROM users WHERE id = $1 LIMIT 1',
-			[Number(id)],
+			[userId],
 		);
-		return normalizeUserRow(rows[0]);
+		const user = normalizeUserRow(rows[0]);
+		if (user) {
+			this._userCache.set(userId, { user, expiresAt: now + 10000 });
+		}
+		return user;
+	}
+
+	async getUsersByIds(userIds) {
+		const ids = [...new Set((userIds || []).map(Number)
+			.filter((id) => Number.isSafeInteger(id) && id > 0))];
+		if (ids.length === 0) return [];
+
+		if (!this._userCache) this._userCache = new Map();
+		const now = Date.now();
+		const result = [];
+		const missingIds = [];
+
+		for (const id of ids) {
+			const cached = this._userCache.get(id);
+			if (cached && cached.expiresAt > now) {
+				result.push(cached.user);
+			} else {
+				missingIds.push(id);
+			}
+		}
+
+		if (missingIds.length > 0) {
+			const { rows } = await this.pool.query(
+				'SELECT * FROM users WHERE id = ANY($1::int[])',
+				[missingIds],
+			);
+			for (const row of rows) {
+				const user = normalizeUserRow(row);
+				if (user) {
+					this._userCache.set(user.id, { user, expiresAt: now + 10000 });
+					result.push(user);
+				}
+			}
+		}
+
+		return result;
+	}
+
+	_invalidateUserCache(userId) {
+		if (this._userCache && userId != null) {
+			this._userCache.delete(Number(userId));
+		}
 	}
 
 	async getUserByExternalId(authProvider, externalId) {
@@ -751,16 +807,6 @@ class PostgresAdapter extends DatabaseAdapter {
 		return rows.map(normalizeUserRow);
 	}
 
-	async getUsersByIds(userIds) {
-		const ids = [...new Set((userIds || []).map(Number).filter(Number.isSafeInteger))];
-		if (ids.length === 0) return [];
-		const { rows } = await this.pool.query(
-			'SELECT * FROM users WHERE id = ANY($1::int[])',
-			[ids],
-		);
-		return rows.map(normalizeUserRow);
-	}
-
 	async getAllUsers() {
 		const { rows } = await this.pool.query('SELECT * FROM users ORDER BY id ASC');
 		return rows.map(normalizeUserRow);
@@ -794,6 +840,7 @@ class PostgresAdapter extends DatabaseAdapter {
 	}
 
 	async setUserStatus(userId, status) {
+		this._invalidateUserCache(userId);
 		const shadow = Boolean(status && status.shadow);
 		const { rows } = await this.pool.query(
 			'UPDATE users SET shadow = $2 WHERE id = $1 RETURNING shadow',
@@ -804,6 +851,7 @@ class PostgresAdapter extends DatabaseAdapter {
 	}
 
 	async updateUserProfile(userId, profileData) {
+		this._invalidateUserCache(userId);
 		const fields = [];
 		const values = [];
 		let idx = 1;
@@ -1196,18 +1244,40 @@ class PostgresAdapter extends DatabaseAdapter {
 		if (!token) return null;
 		const now = new Date().toISOString();
 		const { rows } = await this.pool.query(
-			`SELECT u.*
+			`SELECT u.*, s.token AS session_token, s.expires_at AS session_expires_at, s.session_id, s.ip_hash, s.ip_masked, s.user_agent
 			 FROM sessions AS s
 			 INNER JOIN users AS u ON u.id = s.user_id
 			 WHERE s.token = $1 AND s.expires_at > $2
 			 LIMIT 1`,
 			[String(token), now],
 		);
-		if (!rows[0]) {
-			await this.pool.query('DELETE FROM sessions WHERE token = $1 AND expires_at <= $2', [String(token), now]);
-			return null;
-		}
+		if (!rows[0]) return null;
 		return normalizeUserRow(rows[0]);
+	}
+
+	async getUsersAndSessionsByTokens(tokens) {
+		const safeTokens = [...new Set((tokens || []).map(String).filter(Boolean))];
+		if (safeTokens.length === 0) return [];
+		const now = new Date().toISOString();
+		const { rows } = await this.pool.query(
+			`SELECT u.*, s.token AS session_token, s.expires_at AS session_expires_at, s.session_id, s.ip_hash, s.ip_masked, s.user_agent
+			 FROM sessions AS s
+			 INNER JOIN users AS u ON u.id = s.user_id
+			 WHERE s.token = ANY($1::text[]) AND s.expires_at > $2`,
+			[safeTokens, now],
+		);
+		return rows.map((row) => ({
+			session: {
+				id: row.session_id,
+				token: row.session_token,
+				userId: Number(row.id),
+				expiresAt: toIsoString(row.session_expires_at),
+				ipHash: row.ip_hash || null,
+				ipMasked: row.ip_masked || '不明なIPアドレス',
+				userAgent: row.user_agent || '不明な端末',
+			},
+			user: normalizeUserRow(row),
+		}));
 	}
 
 	async invalidateSession(token) {
@@ -2844,41 +2914,50 @@ class PostgresAdapter extends DatabaseAdapter {
 	}
 
 	async toggleLike(userId, postId) {
-		return this._withTransaction(async (client) => {
-			const existing = await client.query(
-				'SELECT 1 FROM likes WHERE user_id = $1 AND post_id = $2',
-				[Number(userId), Number(postId)],
-			);
-			let newCount = 0;
-			if (existing.rows.length > 0) {
-				await client.query(
-					'DELETE FROM likes WHERE user_id = $1 AND post_id = $2',
-					[Number(userId), Number(postId)],
-				);
-				const { rows } = await client.query(
-					'UPDATE posts SET like_count = GREATEST(0, like_count - 1) WHERE id = $1 RETURNING like_count',
-					[Number(postId)],
-				);
-				newCount = Math.max(0, Number(rows[0]?.like_count) || 0);
-				await this._adjustUserKeywordAffinities(client, userId, postId, -1);
-			} else {
-				const now = new Date().toISOString();
-				await client.query(
-					'INSERT INTO likes (user_id, post_id, created_at) VALUES ($1, $2, $3)',
-					[Number(userId), Number(postId), now],
-				);
-				const { rows } = await client.query(
-					'UPDATE posts SET like_count = like_count + 1 WHERE id = $1 RETURNING like_count',
-					[Number(postId)],
-				);
-				newCount = Math.max(0, Number(rows[0]?.like_count) || 0);
-				await this._adjustUserKeywordAffinities(client, userId, postId, 1);
-			}
-			return {
-				liked: existing.rows.length === 0,
-				count: newCount,
-			};
-		});
+		const uId = Number(userId);
+		const pId = Number(postId);
+		const now = new Date().toISOString();
+
+		const query = `
+			WITH existing AS (
+				DELETE FROM likes
+				WHERE user_id = $1 AND post_id = $2
+				RETURNING 1
+			),
+			inserted AS (
+				INSERT INTO likes (user_id, post_id, created_at)
+				SELECT $1, $2, $3
+				WHERE NOT EXISTS (SELECT 1 FROM existing)
+				ON CONFLICT DO NOTHING
+				RETURNING 1
+			),
+			updated_post AS (
+				UPDATE posts
+				SET like_count = CASE
+					WHEN EXISTS (SELECT 1 FROM existing) THEN GREATEST(0, like_count - 1)
+					ELSE like_count + 1
+				END
+				WHERE id = $2
+				RETURNING like_count, tags
+			)
+			SELECT 
+				NOT EXISTS (SELECT 1 FROM existing) AS liked,
+				COALESCE((SELECT like_count FROM updated_post), 0)::int AS count,
+				(SELECT tags FROM updated_post) AS tags`;
+
+		const { rows } = await this.pool.query(query, [uId, pId, now]);
+		const result = rows[0] || { liked: false, count: 0, tags: [] };
+
+		// Adjust keyword affinity asynchronously without blocking response
+		if (result.tags) {
+			const delta = result.liked ? 1 : -1;
+			this._adjustUserKeywordAffinitiesForTags(this.pool, uId, result.tags, delta).catch(() => {});
+		}
+
+		return {
+			liked: Boolean(result.liked),
+			count: Math.max(0, Number(result.count) || 0),
+		};
 	}
 
 	async getLikeCount(postId) {
@@ -2906,41 +2985,50 @@ class PostgresAdapter extends DatabaseAdapter {
 	}
 
 	async toggleStar(userId, postId) {
-		return this._withTransaction(async (client) => {
-			const existing = await client.query(
-				'SELECT 1 FROM stars WHERE user_id = $1 AND post_id = $2',
-				[Number(userId), Number(postId)],
-			);
-			let newCount = 0;
-			if (existing.rows.length > 0) {
-				await client.query(
-					'DELETE FROM stars WHERE user_id = $1 AND post_id = $2',
-					[Number(userId), Number(postId)],
-				);
-				const { rows } = await client.query(
-					'UPDATE posts SET star_count = GREATEST(0, star_count - 1) WHERE id = $1 RETURNING star_count',
-					[Number(postId)],
-				);
-				newCount = Math.max(0, Number(rows[0]?.star_count) || 0);
-				await this._adjustUserKeywordAffinities(client, userId, postId, -3);
-			} else {
-				const now = new Date().toISOString();
-				await client.query(
-					'INSERT INTO stars (user_id, post_id, created_at) VALUES ($1, $2, $3)',
-					[Number(userId), Number(postId), now],
-				);
-				const { rows } = await client.query(
-					'UPDATE posts SET star_count = star_count + 1 WHERE id = $1 RETURNING star_count',
-					[Number(postId)],
-				);
-				newCount = Math.max(0, Number(rows[0]?.star_count) || 0);
-				await this._adjustUserKeywordAffinities(client, userId, postId, 3);
-			}
-			return {
-				starred: existing.rows.length === 0,
-				count: newCount,
-			};
-		});
+		const uId = Number(userId);
+		const pId = Number(postId);
+		const now = new Date().toISOString();
+
+		const query = `
+			WITH existing AS (
+				DELETE FROM stars
+				WHERE user_id = $1 AND post_id = $2
+				RETURNING 1
+			),
+			inserted AS (
+				INSERT INTO stars (user_id, post_id, created_at)
+				SELECT $1, $2, $3
+				WHERE NOT EXISTS (SELECT 1 FROM existing)
+				ON CONFLICT DO NOTHING
+				RETURNING 1
+			),
+			updated_post AS (
+				UPDATE posts
+				SET star_count = CASE
+					WHEN EXISTS (SELECT 1 FROM existing) THEN GREATEST(0, star_count - 1)
+					ELSE star_count + 1
+				END
+				WHERE id = $2
+				RETURNING star_count, tags
+			)
+			SELECT 
+				NOT EXISTS (SELECT 1 FROM existing) AS starred,
+				COALESCE((SELECT star_count FROM updated_post), 0)::int AS count,
+				(SELECT tags FROM updated_post) AS tags`;
+
+		const { rows } = await this.pool.query(query, [uId, pId, now]);
+		const result = rows[0] || { starred: false, count: 0, tags: [] };
+
+		// Adjust keyword affinity asynchronously without blocking response
+		if (result.tags) {
+			const delta = result.starred ? 3 : -3;
+			this._adjustUserKeywordAffinitiesForTags(this.pool, uId, result.tags, delta).catch(() => {});
+		}
+
+		return {
+			starred: Boolean(result.starred),
+			count: Math.max(0, Number(result.count) || 0),
+		};
 	}
 
 	async getStarCount(postId) {
@@ -3428,25 +3516,24 @@ class PostgresAdapter extends DatabaseAdapter {
 			throw new Error('Cannot follow yourself');
 		}
 
-		return this._withTransaction(async (client) => {
-			const existing = await client.query(
-				'SELECT 1 FROM follows WHERE follower_id = $1 AND following_id = $2',
-				[u1, u2],
-			);
-			if (existing.rows.length > 0) {
-				await client.query(
-					'DELETE FROM follows WHERE follower_id = $1 AND following_id = $2',
-					[u1, u2],
-				);
-				return { following: false };
-			}
-			const now = new Date().toISOString();
-			await client.query(
-				'INSERT INTO follows (follower_id, following_id, created_at) VALUES ($1, $2, $3)',
-				[u1, u2, now],
-			);
-			return { following: true };
-		});
+		const now = new Date().toISOString();
+		const query = `
+			WITH existing AS (
+				DELETE FROM follows
+				WHERE follower_id = $1 AND following_id = $2
+				RETURNING 1
+			),
+			inserted AS (
+				INSERT INTO follows (follower_id, following_id, created_at)
+				SELECT $1, $2, $3
+				WHERE NOT EXISTS (SELECT 1 FROM existing)
+				ON CONFLICT DO NOTHING
+				RETURNING 1
+			)
+			SELECT NOT EXISTS (SELECT 1 FROM existing) AS following`;
+
+		const { rows } = await this.pool.query(query, [u1, u2, now]);
+		return { following: Boolean(rows[0]?.following) };
 	}
 
 	async isFollowing(followerId, followingId) {
