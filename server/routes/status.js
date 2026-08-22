@@ -81,6 +81,7 @@ router.get('/status', async (req, res) => {
 		database: dbStatus,
 		identity: {
 			public_url: publicUrl,
+			post_share_url: config.postShareUrl || publicUrl,
 			nyaitter_id_format: '#{localId}',
 		},
 		auth_methods: authProviderRegistry.listEnabledProviderNames(config, req),

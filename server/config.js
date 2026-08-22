@@ -843,6 +843,8 @@ const config = {
     enabled: Boolean(turnstileSecretKey),
   },
 
+  postShareUrl: process.env.POST_SHARE_URL || get('postShareUrl', get('posts.shareUrl', '')),
+
   raw: rawConfig,
 };
 
