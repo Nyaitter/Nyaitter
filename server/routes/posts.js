@@ -816,7 +816,7 @@ router.get('/:id', optionalAuth, async (req, res) => {
 				if (config.frontendUrl) {
 					redirectUrl = `${config.frontendUrl.replace(/\/+$/, '')}/#post/${post.id}`;
 				} else {
-					const host = req.get('host') || 'nyaitter.jp';
+					const host = req.get('host') || req.hostname || 'localhost';
 					const cleanHost = host.replace(/^(?:link|api)\./i, '');
 					const forwardedProto = req.get('x-forwarded-proto') || req.get('x-forwarded-protocol');
 					const isLocal = cleanHost.startsWith('localhost') || cleanHost.startsWith('127.0.0.1');
