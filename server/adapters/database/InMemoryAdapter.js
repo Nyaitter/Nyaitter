@@ -1494,6 +1494,32 @@ class InMemoryAdapter extends DatabaseAdapter {
 				.filter(Boolean);
 		}
 
+		async getPostReferencesByIds(postIds, maxDepth = 2) {
+			const ids = [...new Set((postIds || []).map(Number).filter(Number.isInteger))];
+			const normalizedMaxDepth = Math.min(4, Math.max(0, Number(maxDepth) || 0));
+			if (ids.length === 0) return [];
+
+			const result = new Map();
+			let currentIds = ids;
+			for (let depth = 0; depth <= normalizedMaxDepth && currentIds.length > 0; depth += 1) {
+				const nextIds = [];
+				for (const id of currentIds) {
+					const post = this.posts.get(id);
+					if (post) {
+						result.set(id, post);
+						if (post.replyTo != null && !result.has(Number(post.replyTo))) {
+							nextIds.push(Number(post.replyTo));
+						}
+						if (post.repostTo != null && !result.has(Number(post.repostTo))) {
+							nextIds.push(Number(post.repostTo));
+						}
+					}
+				}
+				currentIds = [...new Set(nextIds)];
+			}
+			return Array.from(result.values());
+		}
+
 		async getPostMetricsBatch(postIds, currentUserId = null) {
 			const ids = [...new Set((postIds || []).map(Number).filter(Number.isInteger))];
 			return ids.map((id) => ({
@@ -2470,24 +2496,25 @@ class InMemoryAdapter extends DatabaseAdapter {
 
 	async getTrendingPosts(limit = 20) {
 		const normalizedLimit = Math.max(1, Number(limit) || 20);
-		const top = [];
-			for (const postId of this.postIdsNewest) {
-				const post = this.posts.get(postId);
-				if (!post || post.groupId || post.group_id || post.replyTo != null) continue;
-				const score = (this.likeCountByPost.get(postId) || 0)
+		const candidates = [];
+		let scanned = 0;
+		const cutoff = Date.now() - 3 * 24 * 60 * 60 * 1000;
+
+		for (const postId of this.postIdsNewest) {
+			scanned += 1;
+			if (scanned > 500) break;
+			const post = this.posts.get(postId);
+			if (!post || post.groupId || post.group_id || post.replyTo != null) continue;
+			if (post.createdAt && new Date(post.createdAt).getTime() < cutoff) continue;
+
+			const score = (this.likeCountByPost.get(postId) || 0)
 				+ (this.starCountByPost.get(postId) || 0) * 2
 				+ (this.repostCountByPost.get(postId) || 0) * 3;
-			const item = { post, score };
-			let insertAt = top.findIndex((candidate) => (
-				candidate.score < score || (candidate.score === score && candidate.post.id < post.id)
-			));
-			if (insertAt < 0) insertAt = top.length;
-			if (insertAt < normalizedLimit) {
-				top.splice(insertAt, 0, item);
-				if (top.length > normalizedLimit) top.pop();
-			}
+			candidates.push({ post, score });
 		}
-		return top.map((item) => item.post);
+
+		candidates.sort((a, b) => b.score - a.score || b.post.id - a.post.id);
+		return candidates.slice(0, normalizedLimit).map((item) => item.post);
 	}
 
 	async updateUserProfile(userId, profileData) {
@@ -2576,20 +2603,30 @@ class InMemoryAdapter extends DatabaseAdapter {
 		const metricField = fieldByType[type];
 		if (!metricField) throw new Error('Invalid ranking type');
 
-		const rows = [];
-		for (const user of this.users.values()) {
-			let value = 0;
-			if (type === 'followers') value = await this.getFollowerCount(user.id);
-			if (type === 'posts') value = await this.getPostCount(user.id);
-			if (type === 'likes' || type === 'stars') {
-				const reactions = type === 'likes' ? this.likes : this.stars;
-				for (const key of reactions.keys()) {
-					const [, postId] = key.split(':').map(Number);
-					if (this.posts.get(postId)?.userId === user.id) value += 1;
+		const safeLimit = Math.min(Math.max(Number(limit) || 50, 1), 100);
+		const reactionMap = new Map();
+		if (type === 'likes' || type === 'stars') {
+			const reactions = type === 'likes' ? this.likes : this.stars;
+			for (const key of reactions.keys()) {
+				const [, postId] = key.split(':').map(Number);
+				const authorId = this.posts.get(postId)?.userId;
+				if (authorId != null) {
+					const normAuthor = Number(authorId);
+					reactionMap.set(normAuthor, (reactionMap.get(normAuthor) || 0) + 1);
 				}
 			}
+		}
+
+		const rows = [];
+		for (const user of this.users.values()) {
+			const uid = Number(user.id);
+			let value = 0;
+			if (type === 'followers') value = (this.followerIdsByUser.get(uid) || new Set()).size;
+			else if (type === 'posts') value = (this.postIdsByUser.get(uid) || []).length;
+			else value = reactionMap.get(uid) || 0;
+
 			rows.push({
-				user_id: user.id,
+				user_id: uid,
 				name: user.name,
 				scid: user.scid,
 				icon_data: user.icon_data,
@@ -2599,7 +2636,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 
 		return rows
 			.sort((a, b) => b[metricField] - a[metricField] || a.user_id - b.user_id)
-			.slice(0, limit);
+			.slice(0, safeLimit);
 	}
 
 	async getUserRanking(type, userId) {
@@ -2612,11 +2649,46 @@ class InMemoryAdapter extends DatabaseAdapter {
 		const metricField = fieldByType[type];
 		if (!metricField) throw new Error('Invalid ranking type');
 
-		const rows = await this.getRanking(type, this.users.size);
-		const index = rows.findIndex((row) => row.user_id === userId);
+		const targetId = Number(userId);
+		if (!this.users.has(targetId)) {
+			return { rank: null, [metricField]: 0 };
+		}
+
+		const reactionMap = new Map();
+		if (type === 'likes' || type === 'stars') {
+			const reactions = type === 'likes' ? this.likes : this.stars;
+			for (const key of reactions.keys()) {
+				const [, postId] = key.split(':').map(Number);
+				const authorId = this.posts.get(postId)?.userId;
+				if (authorId != null) {
+					const normAuthor = Number(authorId);
+					reactionMap.set(normAuthor, (reactionMap.get(normAuthor) || 0) + 1);
+				}
+			}
+		}
+
+		let myValue = 0;
+		if (type === 'followers') myValue = (this.followerIdsByUser.get(targetId) || new Set()).size;
+		else if (type === 'posts') myValue = (this.postIdsByUser.get(targetId) || []).length;
+		else myValue = reactionMap.get(targetId) || 0;
+
+		let higherCount = 0;
+		for (const user of this.users.values()) {
+			const uid = Number(user.id);
+			if (uid === targetId) continue;
+			let userValue = 0;
+			if (type === 'followers') userValue = (this.followerIdsByUser.get(uid) || new Set()).size;
+			else if (type === 'posts') userValue = (this.postIdsByUser.get(uid) || []).length;
+			else userValue = reactionMap.get(uid) || 0;
+
+			if (userValue > myValue || (userValue === myValue && uid < targetId)) {
+				higherCount += 1;
+			}
+		}
+
 		return {
-			rank: index >= 0 ? index + 1 : null,
-			[metricField]: index >= 0 ? rows[index][metricField] : 0,
+			rank: higherCount + 1,
+			[metricField]: myValue,
 		};
 	}
 

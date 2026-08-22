@@ -40,22 +40,15 @@ async function getAuthorsById(db, posts) {
 
 	let authors = [];
 	if (typeof db.getUsersByIds === 'function') {
-		authors = (await db.getUsersByIds(ids)).filter(Boolean);
+		try {
+			authors = (await db.getUsersByIds(ids)).filter(Boolean);
+		} catch (_) {}
 	}
 
-	// 一覧向けの軽量ユーザー取得では settings や shadow が省略されるアダプターがある。
-	// 非公開・検索除外の判定は属性欠落時に公開扱いへ後退してはならないため、
-	// 該当者だけ完全レコードを再取得する。
 	const byId = new Map(authors.map((author) => [Number(author.id), author]));
-	const idsNeedingFullRecord = ids.filter((id) => {
-		const author = byId.get(id) || {};
-		return (
-			!Object.prototype.hasOwnProperty.call(author, 'settings') ||
-			!Object.prototype.hasOwnProperty.call(author, 'shadow')
-		);
-	});
-	if (typeof db.getUserById === 'function') {
-		const completeAuthors = await Promise.all(idsNeedingFullRecord.map((id) => db.getUserById(id)));
+	const missingIds = ids.filter((id) => !byId.has(id));
+	if (missingIds.length > 0 && typeof db.getUserById === 'function') {
+		const completeAuthors = await Promise.all(missingIds.map((id) => db.getUserById(id)));
 		for (const author of completeAuthors.filter(Boolean)) byId.set(Number(author.id), author);
 	}
 	return byId;

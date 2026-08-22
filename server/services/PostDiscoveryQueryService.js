@@ -67,15 +67,21 @@ async function getDiscoverablePostPage({
 			continue;
 		}
 
-		const postsById = new Map(
-			(await db.getPostsByIds(candidateIds)).filter(Boolean).map((post) => [
-				Number(post.id),
-				post,
-			]),
-		);
-		const orderedPosts = candidateIds
-			.map((id) => postsById.get(id))
-			.filter(Boolean);
+		let orderedPosts;
+		if (Array.isArray(candidatePage?.posts) && candidatePage.posts.length > 0) {
+			const candidatePostsMap = new Map(candidatePage.posts.map((p) => [Number(p.id), p]));
+			orderedPosts = candidateIds.map((id) => candidatePostsMap.get(id)).filter(Boolean);
+		} else {
+			const postsById = new Map(
+				(await db.getPostsByIds(candidateIds)).filter(Boolean).map((post) => [
+					Number(post.id),
+					post,
+				]),
+			);
+			orderedPosts = candidateIds
+				.map((id) => postsById.get(id))
+				.filter(Boolean);
+		}
 			const candidateVisibilityContext = await createPostVisibilityContext(
 				db,
 				orderedPosts,

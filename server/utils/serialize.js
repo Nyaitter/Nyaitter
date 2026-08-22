@@ -345,20 +345,20 @@ async function fetchUsersByIds(db, userIds) {
 	if (ids.length === 0) return [];
 
 	let users = [];
-	try {
-		const batch = await db.getUsersByIds(ids);
-		if (Array.isArray(batch)) users = batch.filter(Boolean);
-	} catch (_) {
-		// Fall through to the safe per-user lookup.
+	if (typeof db.getUsersByIds === 'function') {
+		try {
+			const batch = await db.getUsersByIds(ids);
+			if (Array.isArray(batch)) users = batch.filter(Boolean);
+		} catch (_) {
+			// Fall through to the safe per-user lookup.
+		}
 	}
 
 	const usersById = new Map(users.map((user) => [Number(user.id), user]));
-	// 非公開判定には settings.lock が必須。軽量バッチ取得が設定を省略する場合は、
-	// そのユーザーだけ完全レコードを取得し、設定欠落を公開扱いにしない。
-	const idsNeedingFullRecord = ids.filter((id) => !Object.prototype.hasOwnProperty.call(usersById.get(id) || {}, 'settings'));
-	if (typeof db.getUserById === 'function') {
-		const completeUsers = await Promise.all(idsNeedingFullRecord.map((id) => db.getUserById(id)));
-		for (const user of completeUsers.filter(Boolean)) usersById.set(Number(user.id), user);
+	const missingIds = ids.filter((id) => !usersById.has(id));
+	if (missingIds.length > 0 && typeof db.getUserById === 'function') {
+		const fetched = await Promise.all(missingIds.map((id) => db.getUserById(id)));
+		for (const user of fetched.filter(Boolean)) usersById.set(Number(user.id), user);
 	}
 	const resultUsers = ids.map((id) => usersById.get(id)).filter(Boolean);
 	await attachGroupBadgesToUsers(db, resultUsers);

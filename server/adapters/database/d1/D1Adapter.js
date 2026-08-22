@@ -921,6 +921,44 @@ class D1Adapter extends DatabaseAdapter {
 		return Array.isArray(posts) ? posts.map(normalizePost) : [];
 	}
 
+	async getPostReferencesByIds(postIds, maxDepth = 2) {
+		const ids = this._normalizeIds(postIds, { fieldName: 'postId', minimum: 1 });
+		const normalizedMaxDepth = Math.min(4, Math.max(0, Number(maxDepth) || 0));
+		if (ids.length === 0) return [];
+
+		try {
+			const res = await this._read('/posts/references/batch', {
+				body: { ids, maxDepth: normalizedMaxDepth },
+			});
+			if (Array.isArray(res)) return res.map(normalizePost);
+		} catch (_) {
+			// Fallback: breadth-first resolution using getPostsByIds in bounded iterations
+		}
+
+		const postsById = new Map();
+		let currentIds = ids;
+		for (let depth = 0; depth <= normalizedMaxDepth && currentIds.length > 0; depth += 1) {
+			const missingIds = currentIds.filter((id) => !postsById.has(id));
+			if (missingIds.length === 0) break;
+			const fetched = await this.getPostsByIds(missingIds);
+			const nextIds = [];
+			for (const post of fetched) {
+				if (post && post.id) {
+					const pid = Number(post.id);
+					postsById.set(pid, post);
+					if (post.replyTo != null && !postsById.has(Number(post.replyTo))) {
+						nextIds.push(Number(post.replyTo));
+					}
+					if (post.repostTo != null && !postsById.has(Number(post.repostTo))) {
+						nextIds.push(Number(post.repostTo));
+					}
+				}
+			}
+			currentIds = [...new Set(nextIds)];
+		}
+		return Array.from(postsById.values());
+	}
+
 	async getPostMetricsBatch(postIds, currentUserId = null) {
 		const ids = this._normalizeIds(postIds, { fieldName: 'postId', minimum: 1 });
 		if (ids.length === 0) return [];

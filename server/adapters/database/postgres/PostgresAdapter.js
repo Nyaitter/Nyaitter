@@ -2093,11 +2093,17 @@ class PostgresAdapter extends DatabaseAdapter {
 				FROM posts
 				WHERE id = ANY($1::int[])
 				UNION ALL
-				SELECT p.id, p.reply_to, p.repost_to, refs.depth + 1, refs.path || p.id
-				FROM posts p
-				JOIN post_refs refs ON (p.id = refs.reply_to OR p.id = refs.repost_to)
-				WHERE refs.depth < $2
-				  AND NOT (p.id = ANY(refs.path))
+				(
+					SELECT p.id, p.reply_to, p.repost_to, refs.depth + 1, refs.path || p.id
+					FROM post_refs refs
+					JOIN posts p ON p.id = refs.reply_to
+					WHERE refs.depth < $2 AND refs.reply_to IS NOT NULL AND NOT (p.id = ANY(refs.path))
+					UNION
+					SELECT p.id, p.reply_to, p.repost_to, refs.depth + 1, refs.path || p.id
+					FROM post_refs refs
+					JOIN posts p ON p.id = refs.repost_to
+					WHERE refs.depth < $2 AND refs.repost_to IS NOT NULL AND NOT (p.id = ANY(refs.path))
+				)
 			)
 			SELECT DISTINCT p.*
 			FROM posts p
@@ -2286,37 +2292,40 @@ class PostgresAdapter extends DatabaseAdapter {
 
 		if (tab === 'following') {
 			const ids = [...new Set((followIds || []).map(Number).filter(Number.isSafeInteger))];
-			if (ids.length === 0) return { ids: [], has_more: false, next_cursor: null };
+			if (ids.length === 0) return { ids: [], posts: [], has_more: false, next_cursor: null };
 			if (normalizedBeforeId != null) {
-				query = `SELECT id FROM posts WHERE user_id = ANY($1::int[]) AND group_id IS NULL AND reply_to IS NULL AND id < $2
+				query = `SELECT * FROM posts WHERE user_id = ANY($1::int[]) AND group_id IS NULL AND reply_to IS NULL AND id < $2
 					ORDER BY created_at DESC, id DESC LIMIT $3`;
 				values = [ids, normalizedBeforeId, normalizedLimit + 1];
 			} else {
-				query = `SELECT id FROM posts WHERE user_id = ANY($1::int[]) AND group_id IS NULL AND reply_to IS NULL
+				query = `SELECT * FROM posts WHERE user_id = ANY($1::int[]) AND group_id IS NULL AND reply_to IS NULL
 					ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3`;
 				values = [ids, normalizedLimit + 1, normalizedOffset];
 			}
 		} else if (tab === 'announce') {
 			if (normalizedBeforeId != null) {
-				query = `SELECT id FROM posts WHERE group_id IS NULL AND announcement = TRUE AND reply_to IS NULL
+				query = `SELECT * FROM posts WHERE group_id IS NULL AND announcement = TRUE AND reply_to IS NULL
 					AND id < $1 ORDER BY created_at DESC, id DESC LIMIT $2`;
 				values = [normalizedBeforeId, normalizedLimit + 1];
 			} else {
-				query = `SELECT id FROM posts WHERE group_id IS NULL AND announcement = TRUE AND reply_to IS NULL
+				query = `SELECT * FROM posts WHERE group_id IS NULL AND announcement = TRUE AND reply_to IS NULL
 					ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2`;
 				values = [normalizedLimit + 1, normalizedOffset];
 			}
 		} else if (normalizedBeforeId != null) {
-			query = `SELECT id FROM posts WHERE group_id IS NULL AND reply_to IS NULL AND id < $1 ORDER BY created_at DESC, id DESC LIMIT $2`;
+			query = `SELECT * FROM posts WHERE group_id IS NULL AND reply_to IS NULL AND id < $1 ORDER BY created_at DESC, id DESC LIMIT $2`;
 			values = [normalizedBeforeId, normalizedLimit + 1];
 		} else {
-			query = `SELECT id FROM posts WHERE group_id IS NULL AND reply_to IS NULL ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2`;
+			query = `SELECT * FROM posts WHERE group_id IS NULL AND reply_to IS NULL ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2`;
 			values = [normalizedLimit + 1, normalizedOffset];
 		}
 		const { rows } = await this.pool.query(query, values);
-		const ids = rows.slice(0, normalizedLimit).map((row) => Number(row.id));
+		const normalizedRows = rows.map(normalizePostRow);
+		const posts = normalizedRows.slice(0, normalizedLimit);
+		const ids = posts.map((post) => Number(post.id));
 		return {
 			ids,
+			posts,
 			has_more: rows.length > normalizedLimit,
 			next_cursor: rows.length > normalizedLimit && ids.length > 0 ? ids[ids.length - 1] : null,
 		};
@@ -2329,10 +2338,10 @@ class PostgresAdapter extends DatabaseAdapter {
 			? Number(beforeId)
 			: null;
 		const normalizedViewerId = Number.isInteger(Number(viewerId)) ? Number(viewerId) : null;
-		const scoringBlockSize = Math.max(240, normalizedLimit * 8);
+		const scoringBlockSize = Math.max(60, normalizedLimit * 2);
 		const candidateLimit = scoringBlockSize + 1;
 		const values = [];
-			const candidateClauses = ['p.group_id IS NULL', 'p.reply_to IS NULL'];
+		const candidateClauses = ['p.group_id IS NULL', 'p.reply_to IS NULL'];
 		if (normalizedBeforeId != null) {
 			values.push(normalizedBeforeId);
 			candidateClauses.push(`p.id < $${values.length}`);
@@ -2344,62 +2353,48 @@ class PostgresAdapter extends DatabaseAdapter {
 		values.push(scoringBlockSize);
 		const scoringBlockSizeParam = values.length;
 		const personalScoreCtes = [];
-			if (normalizedViewerId != null) {
-				values.push(normalizedViewerId);
-				const keywordViewerParam = values.length;
-				values.push(normalizedViewerId);
-				const directViewerParam = values.length;
-				values.push(normalizedViewerId);
-				const secondDegreeViewerParam = values.length;
-				values.push(normalizedViewerId);
-				const secondDegreeExcludeParam = values.length;
-				personalScoreCtes.push(
-					`viewer_keyword_profile AS (
-						SELECT keyword, score
-						FROM user_keyword_affinities
-						WHERE user_id = $${keywordViewerParam}
-						ORDER BY score DESC, keyword ASC
-						LIMIT 80
-					), viewer_keyword_affinity AS (
-						SELECT c.id AS post_id,
-							SUM(profile.score * CASE
-								WHEN profile.keyword = post_tag.keyword THEN 1::numeric
-								ELSE LEAST(char_length(profile.keyword), char_length(post_tag.keyword))::numeric
-									/ GREATEST(char_length(profile.keyword), char_length(post_tag.keyword))::numeric
-							END)::numeric AS score
-						FROM candidates c
-						CROSS JOIN LATERAL jsonb_array_elements_text(COALESCE(c.tags, '[]'::jsonb)) AS post_tag(keyword)
-						CROSS JOIN viewer_keyword_profile profile
-						WHERE profile.keyword = post_tag.keyword
-							OR (
-								char_length(profile.keyword) >= 3
-								AND char_length(post_tag.keyword) >= 3
-								AND (
-									position(profile.keyword in post_tag.keyword) > 0
-									OR position(post_tag.keyword in profile.keyword) > 0
-								)
-							)
-						GROUP BY c.id
-					), direct_follows AS (
-						SELECT following_id AS user_id FROM follows WHERE follower_id = $${directViewerParam}
-					), second_degree_follows AS (
-						SELECT DISTINCT f2.following_id AS user_id
-						FROM follows f1 JOIN follows f2 ON f2.follower_id = f1.following_id
-						WHERE f1.follower_id = $${secondDegreeViewerParam}
-							AND f2.following_id <> $${secondDegreeExcludeParam}
-					)`,
-				);
-			}
+		if (normalizedViewerId != null) {
+			values.push(normalizedViewerId);
+			const keywordViewerParam = values.length;
+			values.push(normalizedViewerId);
+			const directViewerParam = values.length;
+			values.push(normalizedViewerId);
+			const secondDegreeViewerParam = values.length;
+			personalScoreCtes.push(
+				`viewer_keyword_profile AS (
+					SELECT keyword, score
+					FROM user_keyword_affinities
+					WHERE user_id = $${keywordViewerParam}
+					ORDER BY score DESC, keyword ASC
+					LIMIT 25
+				), viewer_keyword_affinity AS (
+					SELECT c.id AS post_id,
+						SUM(profile.score)::numeric AS score
+					FROM candidates c
+					CROSS JOIN LATERAL jsonb_array_elements_text(COALESCE(c.tags, '[]'::jsonb)) AS post_tag(keyword)
+					JOIN viewer_keyword_profile profile ON profile.keyword = post_tag.keyword
+					GROUP BY c.id
+				), direct_follows AS (
+					SELECT following_id AS user_id FROM follows WHERE follower_id = $${directViewerParam} LIMIT 100
+				), second_degree_follows AS (
+					SELECT DISTINCT f2.following_id AS user_id
+					FROM (SELECT following_id FROM follows WHERE follower_id = $${secondDegreeViewerParam} LIMIT 30) f1
+					JOIN follows f2 ON f2.follower_id = f1.following_id
+					WHERE f2.following_id <> $${secondDegreeViewerParam}
+					LIMIT 100
+				)`,
+			);
+		}
 		const { rows } = await this.pool.query(
 			`WITH candidate_source AS (
-					SELECT p.id, p.user_id, p.created_at, p.tags
-					FROM posts p
+				SELECT p.id, p.user_id, p.created_at, p.tags
+				FROM posts p
 				WHERE ${candidateClauses.join(' AND ')}
 				ORDER BY p.created_at DESC, p.id DESC
 				LIMIT $${candidateLimitParam} OFFSET $${candidateOffsetParam}
 			), candidates AS (
-					SELECT id, user_id, created_at, tags
-					FROM candidate_source
+				SELECT id, user_id, created_at, tags
+				FROM candidate_source
 				ORDER BY created_at DESC, id DESC
 				LIMIT $${scoringBlockSizeParam}
 			), like_counts AS (
@@ -2424,10 +2419,9 @@ class PostgresAdapter extends DatabaseAdapter {
 					)
 					+ LEAST(
 						22::DECIMAL,
-								/* Keep simple like and star scores below the repost score. */
-								COALESCE(l.count, 0)::DECIMAL * 2::DECIMAL / (COALESCE(l.count, 0)::DECIMAL + 4::DECIMAL)
-								+ COALESCE(s.count, 0)::DECIMAL * 4::DECIMAL / (COALESCE(s.count, 0)::DECIMAL + 2::DECIMAL)
-								+ COALESCE(r.count, 0)::DECIMAL * 10::DECIMAL / (COALESCE(r.count, 0)::DECIMAL + 2::DECIMAL)
+						COALESCE(l.count, 0)::DECIMAL * 2::DECIMAL / (COALESCE(l.count, 0)::DECIMAL + 4::DECIMAL)
+						+ COALESCE(s.count, 0)::DECIMAL * 4::DECIMAL / (COALESCE(s.count, 0)::DECIMAL + 2::DECIMAL)
+						+ COALESCE(r.count, 0)::DECIMAL * 10::DECIMAL / (COALESCE(r.count, 0)::DECIMAL + 2::DECIMAL)
 					)
 					${normalizedViewerId != null ? `+ CASE
 						WHEN df.user_id IS NOT NULL THEN 24::DECIMAL
@@ -2439,8 +2433,8 @@ class PostgresAdapter extends DatabaseAdapter {
 				LEFT JOIN like_counts l ON l.post_id = c.id
 				LEFT JOIN star_counts s ON s.post_id = c.id
 				LEFT JOIN repost_counts r ON r.post_id = c.id
-					${normalizedViewerId != null ? `LEFT JOIN viewer_keyword_affinity vka ON vka.post_id = c.id
-					LEFT JOIN direct_follows df ON df.user_id = c.user_id
+				${normalizedViewerId != null ? `LEFT JOIN viewer_keyword_affinity vka ON vka.post_id = c.id
+				LEFT JOIN direct_follows df ON df.user_id = c.user_id
 				LEFT JOIN second_degree_follows sdf ON sdf.user_id = c.user_id` : ''}
 			), score_stats AS (
 				SELECT AVG(score) AS average_score FROM scored

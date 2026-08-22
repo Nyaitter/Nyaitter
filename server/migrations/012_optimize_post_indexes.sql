@@ -37,3 +37,16 @@ CREATE INDEX IF NOT EXISTS idx_likes_post_created_desc
 
 CREATE INDEX IF NOT EXISTS idx_stars_post_created_desc
     ON stars (post_id, created_at DESC);
+
+-- 8. Notifications list and unread queries
+CREATE INDEX IF NOT EXISTS idx_notifications_user_created
+    ON notifications (user_id, created_at DESC, id DESC);
+
+-- 9. Group memberships for user group badges
+CREATE INDEX IF NOT EXISTS idx_group_memberships_user_active_joined
+    ON group_memberships (user_id, status, joined_at DESC);
+
+-- 10. Keyword affinities for recommendation scoring
+CREATE INDEX IF NOT EXISTS idx_user_keyword_affinities_user_score
+    ON user_keyword_affinities (user_id, score DESC, keyword ASC);
+
