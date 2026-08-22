@@ -490,6 +490,14 @@ router.get('/page', optionalAuth, async (req, res) => {
 	const currentUserId = req.user ? req.user.id : null;
 	const knownViewer = req.user?.visibilityUser || null;
 
+	const cacheKey = `${mode}:${tab}:${req.query.q || ''}:${currentUserId || 0}:${limit}:${offset}:${beforeId || 0}`;
+	const now = Date.now();
+	if (!global._timelinePageCache) global._timelinePageCache = new Map();
+	const cachedPage = global._timelinePageCache.get(cacheKey);
+	if (cachedPage && cachedPage.expiresAt > now) {
+		return res.json(cachedPage.data);
+	}
+
 		try {
 			let result = { ids: [], has_more: false };
 			const isDiscoverableMode = [
@@ -582,11 +590,11 @@ router.get('/page', optionalAuth, async (req, res) => {
 			...(mentionUsers || []),
 		];
 		
-		res.json({
-				posts,
-				has_more: !!result.has_more,
-				next_cursor: nextCursor,
-				context: {
+		const payload = {
+			posts,
+			has_more: !!result.has_more,
+			next_cursor: nextCursor,
+			context: {
 				users: (contextUsers || []).map((user) => ({
 					id: user.id,
 					name: user.name || '',
@@ -601,7 +609,13 @@ router.get('/page', optionalAuth, async (req, res) => {
 				post_count: posts.length,
 				includes_metrics: true,
 			},
-		});
+		};
+
+		if (global._timelinePageCache) {
+			global._timelinePageCache.set(cacheKey, { data: payload, expiresAt: Date.now() + 4000 });
+		}
+
+		res.json(payload);
 	} catch (err) {
 		console.error('[posts] page error:', err);
 		res.status(500).json({ error: '投稿ページの取得に失敗しました' });
