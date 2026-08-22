@@ -680,9 +680,10 @@ router.post('/:dmId/messages', requireAuth, dmSendLimiter, async (req, res) => {
 			await db.updateGroupDm(dmId, { accepted: currentAccepted });
 		}
 
-		const updated = await db.appendToGroupDm(dmId, msg, userId);
 		const sender = await db.getUserById(userId);
-		await publishDmMessage(req, updated.member || [], dmId, msg, sender ? serializeDmMember(sender) : null);
+		await publishDmMessage(req, dm.member || [], dmId, msg, sender ? serializeDmMember(sender) : null);
+
+		const updated = await db.appendToGroupDm(dmId, msg, userId);
 		await publishDmUnreadCounts(
 			req,
 			(updated.member || []).filter((memberId) => Number(memberId) !== Number(userId)),
