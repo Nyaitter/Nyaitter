@@ -10,6 +10,7 @@ const {
 	createAttachmentReplacementMap,
 	rewriteAttachmentReferences,
 } = require('../../utils/attachmentKeys');
+const { scoreRecommendedPosts } = require('../../utils/recommendation');
 
 class InMemoryAdapter extends DatabaseAdapter {
 	constructor() {
@@ -2828,23 +2829,6 @@ class InMemoryAdapter extends DatabaseAdapter {
 					}
 				}
 			}
-				const affinityByAuthor = new Map();
-				/* Temporarily disabled: simple author affinity from likes and stars.
-				const addAffinity = (postIds, field) => {
-					for (const postId of postIds) {
-						const reactedPost = this.posts.get(postId);
-						if (!reactedPost) continue;
-						const authorId = Number(reactedPost.userId);
-						const affinity = affinityByAuthor.get(authorId) || { likes: 0, stars: 0 };
-						affinity[field] += 1;
-						affinityByAuthor.set(authorId, affinity);
-					}
-				};
-				if (normalizedViewerId != null) {
-					addAffinity(this.likedPostIdsByUser.get(normalizedViewerId) || [], 'likes');
-					addAffinity(this.starredPostIdsByUser.get(normalizedViewerId) || [], 'stars');
-				}
-				*/
 
 			const candidateSource = [];
 			for (const id of this.postIdsNewest) {
@@ -2858,70 +2842,19 @@ class InMemoryAdapter extends DatabaseAdapter {
 				normalizedOffset + scoringBlockSize + 1,
 			);
 			const candidates = blockWithSentinel.slice(0, scoringBlockSize);
-				const now = Date.now();
-				const keywordAffinities = normalizedViewerId == null
-					? new Map()
-					: (this.userKeywordAffinityByUser.get(normalizedViewerId) || new Map());
-				const keywordAffinityEntries = [...keywordAffinities.entries()]
-					.sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0], 'ja'))
-					.slice(0, 80);
-				const keywordSimilarity = (postKeyword, profileKeyword) => {
-					const left = String(postKeyword || '').toLowerCase();
-					const right = String(profileKeyword || '').toLowerCase();
-					if (!left || !right) return 0;
-					if (left === right) return 1;
-					if (left.length < 3 || right.length < 3) return 0;
-					if (!left.includes(right) && !right.includes(left)) return 0;
-					return Math.min(left.length, right.length) / Math.max(left.length, right.length);
-				};
-				const scored = candidates.map((post) => {
-				const authorId = Number(post.userId);
-				const ageHours = Math.max(0, (now - new Date(post.createdAt || post.created_at).getTime()) / 3600000);
-				const recencyScore = 48 / (1 + ageHours / 6);
-					// Temporarily disabled: simple author affinity from likes and stars.
-					// const affinity = affinityByAuthor.get(authorId) || { likes: 0, stars: 0 };
-					// const affinityScore = Math.min(20, affinity.likes * 4) + Math.min(32, affinity.stars * 8);
-					const affinityScore = 0;
-				const graphScore = directFollowIds.has(authorId)
-					? 24
-					: secondDegreeFollowIds.has(authorId)
-						? 10
-						: 0;
-					const keywordScore = Math.min(
-						30,
-						(Array.isArray(post.tags) ? post.tags : []).reduce(
-							(total, keyword) => total + keywordAffinityEntries.reduce(
-								(matchScore, [profileKeyword, profileScore]) => (
-									matchScore + Number(profileScore || 0) * keywordSimilarity(keyword, profileKeyword)
-								),
-								0,
-							) * 2,
-							0,
-						),
-					);
-					const likeCount = this.likeCountByPost.get(Number(post.id)) || 0;
-					const starCount = this.starCountByPost.get(Number(post.id)) || 0;
-					const repostCount = this.repostCountByPost.get(Number(post.id)) || 0;
-					const engagementScore = Math.min(
-						22,
-						// Keep simple like and star scores below the repost score.
-						Math.log1p(likeCount)
-							+ Math.log1p(starCount) * 2
-							+ Math.log1p(repostCount) * 5,
-					);
-					return { post, score: recencyScore + graphScore + affinityScore + keywordScore + engagementScore };
+			const keywordAffinities = normalizedViewerId == null
+				? new Map()
+				: (this.userKeywordAffinityByUser.get(normalizedViewerId) || new Map());
+
+			const scored = scoreRecommendedPosts(candidates, {
+				viewerId: normalizedViewerId,
+				keywordProfile: keywordAffinities,
+				directFollows: directFollowIds,
+				limit: normalizedLimit,
 			});
-			const averageScore = scored.reduce((total, entry) => total + entry.score, 0) / scored.length;
-			const ids = scored
-				.filter((entry) => entry.score >= averageScore * 0.75)
-				.sort((left, right) => (
-					right.score - left.score
-					|| new Date(right.post.createdAt || right.post.created_at).getTime() - new Date(left.post.createdAt || left.post.created_at).getTime()
-					|| Number(right.post.id) - Number(left.post.id)
-				))
-				.map(({ post }) => post.id);
+
 			return {
-				ids,
+				ids: scored.map((s) => s.id),
 				has_more: blockWithSentinel.length > scoringBlockSize,
 				next_cursor: null,
 				next_offset: normalizedOffset + Math.min(blockWithSentinel.length, scoringBlockSize),

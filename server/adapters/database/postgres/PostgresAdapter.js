@@ -19,6 +19,7 @@ const {
 	importPostgresSnapshot,
 } = require('../../../services/DataMigrationSql');
 const { normalizeSnapshot } = require('../../../services/DataMigrationService');
+const { scoreRecommendedPosts } = require('../../../utils/recommendation');
 
 function parseJsonSafe(value, fallback = null) {
 	if (value === null || value === undefined) return fallback;
@@ -2629,38 +2630,14 @@ class PostgresAdapter extends DatabaseAdapter {
 		}
 
 		// Fast in-memory scoring on Node.js server
-		const scored = candidateRows.map((post) => {
-			const createdAtMs = new Date(post.created_at).getTime();
-			const ageHours = Math.max(0, (now - createdAtMs) / (1000 * 3600));
-			const timeScore = 48 / (1 + (ageHours / 6));
-
-			const lCount = Number(post.like_count) || 0;
-			const sCount = Number(post.star_count) || 0;
-			const rCount = Number(post.repost_count) || 0;
-			const reactionScore = Math.min(22, (lCount * 2 / (lCount + 4)) + (sCount * 4 / (sCount + 2)) + (rCount * 10 / (rCount + 2)));
-
-			let socialScore = 0;
-			if (validViewerId != null) {
-				if (directFollows.has(Number(post.user_id))) {
-					socialScore += 24;
-				}
-				const tags = Array.isArray(post.tags) ? post.tags : parseJsonSafe(post.tags, []);
-				let keywordScore = 0;
-				for (const tag of tags) {
-					const s = keywordProfile.get(String(tag).toLowerCase());
-					if (s) keywordScore += s;
-				}
-				socialScore += Math.min(30, keywordScore * 2);
-			}
-
-			const totalScore = timeScore + reactionScore + socialScore;
-			return { id: Number(post.id), score: totalScore, createdAt: createdAtMs };
+		const scored = scoreRecommendedPosts(candidateRows, {
+			viewerId: validViewerId,
+			keywordProfile,
+			directFollows,
+			limit: normalizedLimit,
 		});
 
-		// Sort by score DESC, createdAt DESC
-		scored.sort((a, b) => b.score - a.score || b.createdAt - a.createdAt || b.id - a.id);
-
-		const selectedIds = scored.slice(0, normalizedLimit).map((s) => s.id);
+		const selectedIds = scored.map((s) => s.id);
 		return {
 			ids: selectedIds,
 			has_more: hasMore,
