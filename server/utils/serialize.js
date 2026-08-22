@@ -439,6 +439,26 @@ async function fetchPostMetrics(db, allPosts, currentUserId, knownViewer = null)
 	})));
 }
 
+function extractPostIdFromText(text, currentPostId = null) {
+	if (!text || typeof text !== 'string') return null;
+
+	const patterns = [
+		/(?:https?:\/\/[^\s/$.?#].[^\s]*)?(?:#post\/|\/posts\/|\?post=)(\d+)/i,
+		/(?:https?:\/\/[^\s/$.?#].[^\s]*\/@[^/\s]+\/posts\/)(\d+)/i,
+	];
+
+	for (const pattern of patterns) {
+		const match = text.match(pattern);
+		if (match && match[1]) {
+			const id = Number(match[1]);
+			if (Number.isInteger(id) && id > 0 && id !== Number(currentPostId)) {
+				return id;
+			}
+		}
+	}
+	return null;
+}
+
 /**
  * Serializes a page of posts in a bounded number of adapter operations.
  * Authors, metrics and up to two levels of reply/repost references are loaded
@@ -457,10 +477,24 @@ async function serializePostsBatch(
 
 	const postsById = new Map(initialPosts.map((post) => [Number(post.id), post]));
 	let loadedReferences = false;
+
+	// Extract embedded post URLs in content
+	const embeddedPostIds = [];
+	for (const post of initialPosts) {
+		if (post.repostTo == null && post.content) {
+			const embId = extractPostIdFromText(post.content, post.id);
+			if (embId && !postsById.has(embId)) embeddedPostIds.push(embId);
+		}
+	}
+
 	if (typeof db.getPostReferencesByIds === 'function') {
 		try {
+			const allIdsToFetch = [
+				...initialPosts.map((post) => post.id),
+				...embeddedPostIds,
+			];
 			const references = await db.getPostReferencesByIds(
-				initialPosts.map((post) => post.id),
+				allIdsToFetch,
 				2,
 			);
 			if (Array.isArray(references)) {
@@ -479,6 +513,10 @@ async function serializePostsBatch(
 			for (const post of frontier) {
 				if (post.replyTo != null && !postsById.has(Number(post.replyTo))) relationIds.push(post.replyTo);
 				if (post.repostTo != null && !postsById.has(Number(post.repostTo))) relationIds.push(post.repostTo);
+				if (post.content && post.repostTo == null) {
+					const embId = extractPostIdFromText(post.content, post.id);
+					if (embId && !postsById.has(embId)) relationIds.push(embId);
+				}
 			}
 			const related = await fetchPostsByIds(db, relationIds);
 			for (const post of related) postsById.set(Number(post.id), post);
@@ -566,9 +604,22 @@ async function serializePostsBatch(
 		const replyToPost = depth < 2 && post.replyTo != null
 			? composeReference(post.replyTo, depth)
 			: null;
-		const repostedPost = depth < 2 && post.repostTo != null
-			? composeReference(post.repostTo, depth)
-			: null;
+
+		let repostedPost = null;
+		let effectiveRepostTo = post.repostTo || null;
+		if (depth < 2) {
+			if (post.repostTo != null) {
+				// Explicit quote repost has top priority
+				repostedPost = composeReference(post.repostTo, depth);
+			} else if (post.content) {
+				// Auto-detect post URL from content
+				const embeddedPostId = extractPostIdFromText(post.content, post.id);
+				if (embeddedPostId) {
+					repostedPost = composeReference(embeddedPostId, depth);
+					if (repostedPost) effectiveRepostTo = embeddedPostId;
+				}
+			}
+		}
 		const brief = getBriefUser(author);
 
 		const serialized = {
@@ -582,7 +633,7 @@ async function serializePostsBatch(
 			private: isPrivatePost(post, author),
 			attachments: post.attachments || [],
 			reply_id: post.replyTo || null,
-			repost_to: post.repostTo || null,
+			repost_to: effectiveRepostTo,
 			created_at: post.createdAt,
 			user: brief,
 			author: brief,
