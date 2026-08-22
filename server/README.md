@@ -62,13 +62,16 @@ AUTH_METHOD_PASSKEY_ENABLED=true  # パスキー（指紋・顔認証）
 AUTH_METHOD_EMAIL_ENABLED=false   # メール認証
 ```
 
-### 5. AI による不適切な投稿の自動チェック
-Google Gemini を使って、ルール違反の投稿を自動で見分けます。
+### 5. AI による不適切な投稿の自動チェック (AutoMod)
+AI（OpenAI 互換 API や Google Gemini）を使って、ルール違反や不適切な投稿を自動で見分けます。
 
 ```dotenv
-GEMINI_API_KEY=あなたのAPIキー
-GEMINI_MODEL=gemini-2.5-flash-lite
+AUTOMOD_API_KEY=あなたのAPIキー
+AUTOMOD_MODEL=gpt-4o-mini
+AUTOMOD_PROMPT=基本的には緩めに判断してください。過度に不適切な場合のみ対応するようにしてください。
 ```
+
+※ コミュニティルール（`rule.nd`）が設定されている場合は、AI が自動でそのルールも読み込んで判定します。詳しい設定は [`server/help/automod.md`](./help/automod.md) を確認してください。
 
 ---
 
