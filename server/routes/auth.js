@@ -281,6 +281,7 @@ router.post('/:provider/verify', async (req, res) => {
       db,
       payload: req.body,
       req,
+      verifyTurnstile: verifyTurnstileToken,
     });
 
     const result = await beginProtectedLogin(req, res, user);
@@ -424,11 +425,13 @@ router.post('/scratch/verify', async (req, res) => {
     const { user } = await authService.verifyAndResolveUser('scratch', req, {
       username: req.body?.username,
       code: req.body?.code,
+      turnstile_token: req.body?.turnstile_token,
     }, {
       config,
       db,
       payload: req.body,
       req,
+      verifyTurnstile: verifyTurnstileToken,
     });
 
     const result = await beginProtectedLogin(req, res, user);

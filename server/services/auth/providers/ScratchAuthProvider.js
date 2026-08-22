@@ -50,8 +50,8 @@ class ScratchAuthProvider extends BaseAuthProvider {
   }
 
   async initiate(req, payload = {}, context = {}) {
-    const { username, turnstile_token } = payload;
-    const { config, verifyTurnstile } = context;
+    const { username } = payload;
+    const { config } = context;
 
     if (!username || typeof username !== 'string') {
       const err = new Error('Scratchユーザー名を入力してください。');
@@ -59,6 +59,33 @@ class ScratchAuthProvider extends BaseAuthProvider {
       throw err;
     }
 
+    if (!isValidScratchUsername(username, config?.limits?.scratchUsernameLength)) {
+      const err = new Error('Scratchユーザー名の形式が無効です。');
+      err.status = 400;
+      throw err;
+    }
+
+    const { ipHash } = getRequestLoginMetadata(req);
+    const { code, expiresAt } = generateVerificationCode(username, ipHash);
+
+    return {
+      code,
+      expiresAt,
+      profileUrl: `https://scratch.mit.edu/users/${encodeURIComponent(username)}/`,
+    };
+  }
+
+  async verify(req, payload = {}, context = {}) {
+    const { username, code, turnstile_token } = payload;
+    const { config, verifyTurnstile } = context;
+    const ip = req.ip || req.socket?.remoteAddress || '127.0.0.1';
+    const { ipHash } = getRequestLoginMetadata(req);
+
+    if (!username || !code) {
+      const err = new Error('ユーザー名と認証コードが必要です。');
+      err.status = 400;
+      throw err;
+    }
     if (!isValidScratchUsername(username, config?.limits?.scratchUsernameLength)) {
       const err = new Error('Scratchユーザー名の形式が無効です。');
       err.status = 400;
@@ -73,33 +100,6 @@ class ScratchAuthProvider extends BaseAuthProvider {
         err.code = 'turnstile_required';
         throw err;
       }
-    }
-
-    const { ipHash } = getRequestLoginMetadata(req);
-    const { code, expiresAt } = generateVerificationCode(username, ipHash);
-
-    return {
-      code,
-      expiresAt,
-      profileUrl: `https://scratch.mit.edu/users/${encodeURIComponent(username)}/`,
-    };
-  }
-
-  async verify(req, payload = {}, context = {}) {
-    const { username, code } = payload;
-    const { config } = context;
-    const ip = req.ip || req.socket?.remoteAddress || '127.0.0.1';
-    const { ipHash } = getRequestLoginMetadata(req);
-
-    if (!username || !code) {
-      const err = new Error('ユーザー名と認証コードが必要です。');
-      err.status = 400;
-      throw err;
-    }
-    if (!isValidScratchUsername(username, config?.limits?.scratchUsernameLength)) {
-      const err = new Error('Scratchユーザー名の形式が無効です。');
-      err.status = 400;
-      throw err;
     }
 
     const bypassAuth = process.env.DEV_BYPASS_AUTH === 'true';

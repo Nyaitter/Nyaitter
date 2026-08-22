@@ -34,8 +34,8 @@ class EmailAuthProvider extends BaseAuthProvider {
   }
 
   async initiate(req, payload = {}, context = {}) {
-    const { email, turnstile_token } = payload;
-    const { config, verifyTurnstile } = context;
+    const { email } = payload;
+    const { config } = context;
 
     if (!email || typeof email !== 'string') {
       const err = new Error('メールアドレスを入力してください。');
@@ -47,16 +47,6 @@ class EmailAuthProvider extends BaseAuthProvider {
       const err = new Error('メールアドレスの形式が正しくありません。');
       err.status = 400;
       throw err;
-    }
-
-    if (config?.turnstile?.enabled && typeof verifyTurnstile === 'function') {
-      const turnstileResult = await verifyTurnstile(turnstile_token);
-      if (turnstileResult.success !== true) {
-        const err = new Error('Turnstileチャレンジを完了してください。');
-        err.status = 403;
-        err.code = 'turnstile_required';
-        throw err;
-      }
     }
 
     const emailConfig = config?.auth?.methods?.email || {};
@@ -83,11 +73,22 @@ class EmailAuthProvider extends BaseAuthProvider {
   }
 
   async verify(req, payload = {}, context = {}) {
-    const { email, code } = payload;
+    const { email, code, turnstile_token } = payload;
+    const { config, verifyTurnstile } = context;
     if (!email || !code) {
       const err = new Error('メールアドレスと認証コードを入力してください。');
       err.status = 400;
       throw err;
+    }
+
+    if (config?.turnstile?.enabled && typeof verifyTurnstile === 'function') {
+      const turnstileResult = await verifyTurnstile(turnstile_token);
+      if (turnstileResult.success !== true) {
+        const err = new Error('Turnstileチャレンジを完了してください。');
+        err.status = 403;
+        err.code = 'turnstile_required';
+        throw err;
+      }
     }
 
     const normalizedEmail = this.emailService.normalizeEmail(email);
