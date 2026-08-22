@@ -389,9 +389,35 @@ async function fetchUsersByIds(db, userIds) {
 	return resultUsers;
 }
 
-async function fetchPostMetrics(db, postIds, currentUserId) {
-	const ids = [...new Set((postIds || []).map(Number).filter(Number.isInteger))];
+async function fetchPostMetrics(db, allPosts, currentUserId, knownViewer = null) {
+	const ids = [...new Set((allPosts || []).map((p) => Number(p?.id ?? p)).filter(Number.isInteger))];
 	if (ids.length === 0) return [];
+
+	// Check if all posts already have denormalized counter columns
+	const hasCounters = Array.isArray(allPosts) && allPosts.length > 0 && typeof allPosts[0] === 'object'
+		&& (allPosts[0].like_count !== undefined || allPosts[0].likeCount !== undefined);
+
+	// If viewer reaction state is known or user is not logged in, assemble purely in-memory
+	const hasViewerReactionState = currentUserId == null || (knownViewer && Array.isArray(knownViewer.like));
+
+	if (hasCounters && hasViewerReactionState) {
+		const likedSet = new Set((knownViewer?.like || []).map(Number));
+		const starredSet = new Set((knownViewer?.star || []).map(Number));
+		return allPosts.map((post) => {
+			const postId = Number(post.id);
+			return {
+				post_id: postId,
+				like_count: Math.max(0, Number(post.like_count ?? post.likeCount) || 0),
+				star_count: Math.max(0, Number(post.star_count ?? post.starCount) || 0),
+				repost_count: Math.max(0, Number(post.repost_count ?? post.repostCount) || 0),
+				reply_count: Math.max(0, Number(post.reply_count ?? post.replyCount) || 0),
+				liked_by_me: currentUserId != null ? likedSet.has(postId) : false,
+				starred_by_me: currentUserId != null ? starredSet.has(postId) : false,
+			};
+		});
+	}
+
+	// Fallback to database batch query if counters or user reaction set are missing
 	try {
 		const metrics = await db.getPostMetricsBatch(ids, currentUserId);
 		if (Array.isArray(metrics)) return metrics;
@@ -470,7 +496,7 @@ async function serializePostsBatch(
 		.filter((authorId) => Number.isInteger(authorId) && !knownAuthorsById.has(authorId)))];
 	const [additionalUsers, metrics] = await Promise.all([
 		fetchUsersByIds(db, missingAuthorIds),
-		fetchPostMetrics(db, allPosts.map((post) => post.id), currentUserId),
+		fetchPostMetrics(db, allPosts, currentUserId, knownViewer),
 	]);
 	const usersById = new Map(knownAuthorsById);
 	for (const user of additionalUsers) usersById.set(Number(user.id), user);
