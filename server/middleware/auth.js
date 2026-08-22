@@ -72,9 +72,63 @@ function extractToken(req) {
   return cookies.nyaitter_session || cookies.session || null;
 }
 
+const SESSION_CACHE_TTL_MS = 30000;
+const MAX_SESSION_CACHE_ENTRIES = 2000;
+const sessionPrincipalCache = new Map(); // tokenHash -> { principal, user, expiresAt }
+
+function pruneSessionPrincipalCache(now = Date.now()) {
+  for (const [key, entry] of sessionPrincipalCache) {
+    if (!entry || entry.expiresAt <= now) {
+      sessionPrincipalCache.delete(key);
+    }
+  }
+  while (sessionPrincipalCache.size > MAX_SESSION_CACHE_ENTRIES) {
+    const oldestKey = sessionPrincipalCache.keys().next().value;
+    if (oldestKey === undefined) break;
+    sessionPrincipalCache.delete(oldestKey);
+  }
+}
+
+const sessionCachePruner = setInterval(() => {
+  pruneSessionPrincipalCache();
+}, 30000);
+sessionCachePruner.unref();
+
+function invalidateSessionPrincipalCache(tokenHashOrUserId = null) {
+  if (!tokenHashOrUserId) {
+    sessionPrincipalCache.clear();
+    return;
+  }
+  if (typeof tokenHashOrUserId === 'string') {
+    sessionPrincipalCache.delete(tokenHashOrUserId);
+    return;
+  }
+  const userId = Number(tokenHashOrUserId);
+  if (Number.isInteger(userId)) {
+    for (const [key, entry] of sessionPrincipalCache) {
+      if (entry?.principal?.id === userId) {
+        sessionPrincipalCache.delete(key);
+      }
+    }
+  }
+}
+
+SessionManager.onInvalidate(invalidateSessionPrincipalCache);
+
 async function getSessionPrincipal(req, token) {
-  const db = req.app.locals.dbAdapter;
   const tokenHash = SessionManager.hashToken(token);
+  const now = Date.now();
+  const cached = sessionPrincipalCache.get(tokenHash);
+  if (cached && cached.expiresAt > now) {
+    const principal = { ...cached.principal };
+    Object.defineProperty(principal, 'visibilityUser', {
+      value: cached.user,
+      enumerable: false,
+    });
+    return principal;
+  }
+
+  const db = req.app.locals.dbAdapter;
   let user = null;
 
   if (typeof db.getUserBySessionToken === 'function') {
@@ -85,7 +139,10 @@ async function getSessionPrincipal(req, token) {
     if (!sessionInfo) return null;
     user = await db.getUserById(sessionInfo.userId);
   }
-  if (!user) return null;
+  if (!user) {
+    sessionPrincipalCache.delete(tokenHash);
+    return null;
+  }
 
   const principal = {
     id: user.id,
@@ -96,6 +153,14 @@ async function getSessionPrincipal(req, token) {
     frozen: Boolean(user.freeze),
     accountOperation: user.account_operation || null,
   };
+
+  pruneSessionPrincipalCache(now);
+  sessionPrincipalCache.set(tokenHash, {
+    principal,
+    user,
+    expiresAt: now + SESSION_CACHE_TTL_MS,
+  });
+
   Object.defineProperty(principal, 'visibilityUser', {
     value: user,
     enumerable: false,
@@ -350,4 +415,5 @@ module.exports = {
   extractToken,
   isSameOriginRequest,
   isCorsOriginAllowed,
+  invalidateSessionPrincipalCache,
 };

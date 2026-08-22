@@ -10,8 +10,13 @@ class PostActionQueue {
   constructor({ maxPendingJobs = 1000 } = {}) {
     this.maxPendingJobs = maxPendingJobs;
     this.queue = [];
+    this.head = 0;
     this.processing = false;
     this.stopped = false;
+  }
+
+  get length() {
+    return this.queue.length - this.head;
   }
 
   enqueue(type, run) {
@@ -23,7 +28,7 @@ class PostActionQueue {
     if (typeof run !== 'function') {
       throw new TypeError('Post action must be a function');
     }
-    if (this.queue.length >= this.maxPendingJobs) {
+    if (this.length >= this.maxPendingJobs) {
       const error = new Error('Post action queue is full');
       error.statusCode = 503;
       throw error;
@@ -38,6 +43,7 @@ class PostActionQueue {
   stop() {
     this.stopped = true;
     this.queue.length = 0;
+    this.head = 0;
   }
 
   _startProcessing() {
@@ -49,21 +55,37 @@ class PostActionQueue {
       })
       .finally(() => {
         this.processing = false;
-        if (!this.stopped && this.queue.length > 0) this._startProcessing();
+        if (!this.stopped && this.length > 0) this._startProcessing();
       });
   }
 
   async _processQueue() {
-    while (!this.stopped && this.queue.length > 0) {
-      const job = this.queue.shift();
-      try {
-        await job.run();
-      } catch (error) {
-        console.error(
-          `[post-actions] ${job.type} action=${job.actionId} failed:`,
-          error.message,
-        );
+    while (!this.stopped && this.head < this.queue.length) {
+      const job = this.queue[this.head];
+      this.queue[this.head] = null; // Clear reference for GC
+      this.head += 1;
+
+      // Periodic compact to release memory
+      if (this.head > 64 && this.head * 2 >= this.queue.length) {
+        this.queue = this.queue.slice(this.head);
+        this.head = 0;
       }
+
+      if (job) {
+        try {
+          await job.run();
+        } catch (error) {
+          console.error(
+            `[post-actions] ${job.type} action=${job.actionId} failed:`,
+            error.message,
+          );
+        }
+      }
+    }
+
+    if (this.head >= this.queue.length) {
+      this.queue.length = 0;
+      this.head = 0;
     }
   }
 }

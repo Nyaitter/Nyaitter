@@ -225,14 +225,24 @@ realtimeServer.on('connection', (webSocket, _request, principal) => {
 });
 
 const realtimeHeartbeat = setInterval(() => {
-    for (const sockets of realtimeConnections.connectionsByUser.values()) {
+    for (const [userId, sockets] of realtimeConnections.connectionsByUser.entries()) {
         for (const webSocket of sockets) {
-            if (webSocket.isAlive === false) {
-                webSocket.terminate();
+            if (webSocket.isAlive === false || webSocket.readyState !== 1) {
+                realtimeConnections.unregister(userId, webSocket);
+                try {
+                    webSocket.terminate();
+                } catch (_) {}
                 continue;
             }
             webSocket.isAlive = false;
-            webSocket.ping();
+            try {
+                webSocket.ping();
+            } catch (_) {
+                realtimeConnections.unregister(userId, webSocket);
+                try {
+                    webSocket.terminate();
+                } catch (_) {}
+            }
         }
     }
 }, 30000);

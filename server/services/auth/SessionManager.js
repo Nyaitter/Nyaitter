@@ -49,9 +49,27 @@ class SessionManager {
     };
   }
 
+  static onInvalidate(listener) {
+    if (typeof listener === 'function') {
+      SessionManager._invalidationListeners.add(listener);
+    }
+  }
+
+  static _notifyInvalidate(tokenHashOrUserId) {
+    for (const listener of SessionManager._invalidationListeners) {
+      try {
+        listener(tokenHashOrUserId);
+      } catch (_) {}
+    }
+  }
+
   async invalidateSession(_userId, token) {
     if (!this.db || !this.db.invalidateSession || !token) return false;
-    return this.db.invalidateSession(hashSessionToken(token));
+    const tokenHash = hashSessionToken(token);
+    const result = await this.db.invalidateSession(tokenHash);
+    SessionManager._notifyInvalidate(tokenHash);
+    if (_userId != null) SessionManager._notifyInvalidate(Number(_userId));
+    return result;
   }
 
   async getUserSessions(userId) {
@@ -61,8 +79,12 @@ class SessionManager {
 
   async invalidateAllSessions(userId) {
     if (!this.db || !this.db.invalidateAllSessions) return 0;
-    return this.db.invalidateAllSessions(userId);
+    const result = await this.db.invalidateAllSessions(userId);
+    SessionManager._notifyInvalidate(Number(userId));
+    return result;
   }
 }
+
+SessionManager._invalidationListeners = new Set();
 
 module.exports = SessionManager;

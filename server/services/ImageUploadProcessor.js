@@ -1,6 +1,10 @@
 const sharp = require('sharp');
 const { normalizeContentType } = require('../adapters/storage/safeStoragePath');
 
+// Bound libvips memory usage and enable SIMD acceleration
+sharp.cache({ memory: 50, files: 20, items: 100 });
+sharp.simd(true);
+
 const SUPPORTED_IMAGE_TYPES = new Set([
   'image/jpeg',
   'image/png',

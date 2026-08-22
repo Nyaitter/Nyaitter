@@ -11,6 +11,19 @@ const CACHE_TTL_MS = 10 * 60 * 1000;
 const MAX_CACHE_ENTRIES = 200;
 const cardCache = new Map();
 
+const urlCardAgent = new https.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 10000,
+  maxSockets: 20,
+  maxFreeSockets: 5,
+  timeout: REQUEST_TIMEOUT_MS,
+});
+
+const cachePruner = setInterval(() => {
+  pruneCardCache(Date.now());
+}, 60000);
+cachePruner.unref();
+
 const OEMBED_JSON_TYPES = new Set([
   'application/json+oembed',
   'application/json',
@@ -337,7 +350,7 @@ function fetchResource(targetUrl, { type, maxBytes, redirectCount = 0 }) {
           port: 443,
           path: `${targetUrl.pathname}${targetUrl.search}`,
           method: 'GET',
-          agent: false,
+          agent: urlCardAgent,
           headers: {
             Accept: type === 'html'
               ? 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.1'

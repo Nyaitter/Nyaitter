@@ -446,13 +446,17 @@ class PostgresAdapter extends DatabaseAdapter {
 	}
 
 	_isRetryableTransactionError(error) {
-		return error?.code === '40001' || /restart transaction/i.test(error?.message || '');
+		if (!error) return false;
+		if (error.code === '40001' || error.code === '40P01') return true;
+		const msg = String(error.message || '');
+		return /restart transaction|transaction retry|retry transaction|could not serialize|deadlock detected/i.test(msg);
 	}
 
 	async _waitForTransactionRetry(attempt) {
+		const jitter = Math.floor(Math.random() * 50);
 		const delay = Math.min(
 			2000,
-			this.retryBaseDelayMs * (2 ** Math.max(0, attempt - 1)),
+			this.retryBaseDelayMs * (2 ** Math.max(0, attempt - 1)) + jitter,
 		);
 		await new Promise((resolve) => setTimeout(resolve, delay));
 	}
@@ -2084,26 +2088,20 @@ class PostgresAdapter extends DatabaseAdapter {
 		const normalizedMaxDepth = Math.min(4, Math.max(0, Number(maxDepth) || 0));
 		if (ids.length === 0) return [];
 		const { rows } = await this.pool.query(
-			`WITH RECURSIVE post_references AS (
-				SELECT p.id, 0 AS depth, ARRAY[p.id] AS path
-				FROM posts p WHERE p.id = ANY($1::int[])
+			`WITH RECURSIVE post_refs AS (
+				SELECT id, reply_to, repost_to, 0 AS depth, ARRAY[id] AS path
+				FROM posts
+				WHERE id = ANY($1::int[])
 				UNION ALL
-				SELECT target_id, refs.depth + 1, refs.path || target_id
-				FROM post_references refs
-				CROSS JOIN LATERAL (VALUES (
-					(SELECT reply_to FROM posts WHERE id = refs.id LIMIT 1),
-					(SELECT repost_to FROM posts WHERE id = refs.id LIMIT 1)
-				)) AS targets(target_id)
+				SELECT p.id, p.reply_to, p.repost_to, refs.depth + 1, refs.path || p.id
+				FROM posts p
+				JOIN post_refs refs ON (p.id = refs.reply_to OR p.id = refs.repost_to)
 				WHERE refs.depth < $2
-					AND target_id IS NOT NULL
-					AND NOT target_id = ANY(refs.path)
-			), collected_ids AS (
-				SELECT DISTINCT ON (id) id
-				FROM post_references
-				ORDER BY id, depth ASC
+				  AND NOT (p.id = ANY(refs.path))
 			)
-			SELECT p.* FROM posts p
-			WHERE p.id = ANY(SELECT id FROM collected_ids)`,
+			SELECT DISTINCT p.*
+			FROM posts p
+			JOIN post_refs refs ON refs.id = p.id`,
 			[ids, normalizedMaxDepth],
 		);
 		return rows.map(normalizePostRow);
@@ -2119,23 +2117,52 @@ class PostgresAdapter extends DatabaseAdapter {
 			? parsedViewerId
 			: null;
 
-		const viewerCols = viewerId != null
-			? `, EXISTS(SELECT 1 FROM likes WHERE post_id = pid.id AND user_id = $2) AS liked_by_me
-			   , EXISTS(SELECT 1 FROM stars WHERE post_id = pid.id AND user_id = $2) AS starred_by_me`
-			: `, FALSE AS liked_by_me, FALSE AS starred_by_me`;
-		const params = viewerId != null ? [ids, viewerId] : [ids];
+		const query = `WITH target_posts AS (
+			SELECT unnest($1::int[]) AS id
+		), like_counts AS (
+			SELECT post_id, COUNT(*)::int AS count
+			FROM likes
+			WHERE post_id = ANY($1::int[])
+			GROUP BY post_id
+		), star_counts AS (
+			SELECT post_id, COUNT(*)::int AS count
+			FROM stars
+			WHERE post_id = ANY($1::int[])
+			GROUP BY post_id
+		), repost_counts AS (
+			SELECT post_id, COUNT(*)::int AS count
+			FROM reposts
+			WHERE post_id = ANY($1::int[])
+			GROUP BY post_id
+		), reply_counts AS (
+			SELECT reply_to AS post_id, COUNT(*)::int AS count
+			FROM posts
+			WHERE reply_to = ANY($1::int[])
+			GROUP BY reply_to
+		)${viewerId != null ? `, my_likes AS (
+			SELECT post_id FROM likes WHERE user_id = $2 AND post_id = ANY($1::int[])
+		), my_stars AS (
+			SELECT post_id FROM stars WHERE user_id = $2 AND post_id = ANY($1::int[])
+		)` : ''}
+		SELECT
+			tp.id AS post_id,
+			COALESCE(lc.count, 0)::int AS like_count,
+			COALESCE(sc.count, 0)::int AS star_count,
+			COALESCE(rc.count, 0)::int AS repost_count,
+			COALESCE(rpc.count, 0)::int AS reply_count
+			${viewerId != null
+				? ', (ml.post_id IS NOT NULL) AS liked_by_me, (ms.post_id IS NOT NULL) AS starred_by_me'
+				: ', FALSE AS liked_by_me, FALSE AS starred_by_me'}
+		FROM target_posts tp
+		LEFT JOIN like_counts lc ON lc.post_id = tp.id
+		LEFT JOIN star_counts sc ON sc.post_id = tp.id
+		LEFT JOIN repost_counts rc ON rc.post_id = tp.id
+		LEFT JOIN reply_counts rpc ON rpc.post_id = tp.id
+		${viewerId != null ? `LEFT JOIN my_likes ml ON ml.post_id = tp.id
+		LEFT JOIN my_stars ms ON ms.post_id = tp.id` : ''}`;
 
-		const { rows } = await this.pool.query(
-			`SELECT
-				pid.id AS post_id,
-				(SELECT COUNT(*)::int FROM likes WHERE post_id = pid.id) AS like_count,
-				(SELECT COUNT(*)::int FROM stars WHERE post_id = pid.id) AS star_count,
-				(SELECT COUNT(*)::int FROM reposts WHERE post_id = pid.id) AS repost_count,
-				(SELECT COUNT(*)::int FROM posts WHERE reply_to = pid.id) AS reply_count
-				${viewerCols}
-			 FROM unnest($1::int[]) AS pid(id)`,
-			params,
-		);
+		const params = viewerId != null ? [ids, viewerId] : [ids];
+		const { rows } = await this.pool.query(query, params);
 		return rows.map((row) => ({
 			post_id: Number(row.post_id),
 			like_count: Math.max(0, Number(row.like_count) || 0),
@@ -2610,31 +2637,42 @@ class PostgresAdapter extends DatabaseAdapter {
 
 	async getTrendingPosts(limit = 20) {
 		const safeLimit = Math.min(Math.max(Number(limit) || 20, 1), 100);
-		// 直近7日以内の投稿のみを対象にすることで、全件スキャンを回避する。
 		const { rows } = await this.pool.query(
-			`SELECT p.*,
-				(COALESCE(l.like_count, 0) + COALESCE(s.star_count, 0) * 2 + COALESCE(r.repost_count, 0) * 3) AS score
-			 FROM posts p
-			 LEFT JOIN (
-			   SELECT post_id, COUNT(*)::int AS like_count FROM likes
-			   WHERE created_at >= NOW() - INTERVAL '3 days'
-			   GROUP BY post_id
-			 ) l ON l.post_id = p.id
-			 LEFT JOIN (
-			   SELECT post_id, COUNT(*)::int AS star_count FROM stars
-			   WHERE created_at >= NOW() - INTERVAL '3 days'
-			   GROUP BY post_id
-			 ) s ON s.post_id = p.id
-			 LEFT JOIN (
-			   SELECT post_id, COUNT(*)::int AS repost_count FROM reposts
-			   WHERE created_at >= NOW() - INTERVAL '3 days'
-			   GROUP BY post_id
-			 ) r ON r.post_id = p.id
-			 WHERE p.group_id IS NULL
-			   AND p.reply_to IS NULL
-			   AND p.created_at >= NOW() - INTERVAL '3 days'
-			 ORDER BY score DESC, p.created_at DESC
-			 LIMIT $1`,
+			`WITH recent_posts AS (
+				SELECT id, user_id, content, attachments, mask, lock, announcement, group_id, group_announcement, reply_to, repost_to, tags, tags_generated_at, created_at
+				FROM posts
+				WHERE group_id IS NULL
+				  AND reply_to IS NULL
+				  AND created_at >= NOW() - INTERVAL '3 days'
+				ORDER BY created_at DESC, id DESC
+				LIMIT 500
+			), like_agg AS (
+				SELECT l.post_id, COUNT(*)::int AS cnt
+				FROM likes l
+				JOIN recent_posts rp ON rp.id = l.post_id
+				WHERE l.created_at >= NOW() - INTERVAL '3 days'
+				GROUP BY l.post_id
+			), star_agg AS (
+				SELECT s.post_id, COUNT(*)::int AS cnt
+				FROM stars s
+				JOIN recent_posts rp ON rp.id = s.post_id
+				WHERE s.created_at >= NOW() - INTERVAL '3 days'
+				GROUP BY s.post_id
+			), repost_agg AS (
+				SELECT r.post_id, COUNT(*)::int AS cnt
+				FROM reposts r
+				JOIN recent_posts rp ON rp.id = r.post_id
+				WHERE r.created_at >= NOW() - INTERVAL '3 days'
+				GROUP BY r.post_id
+			)
+			SELECT rp.*,
+				(COALESCE(la.cnt, 0) + COALESCE(sa.cnt, 0) * 2 + COALESCE(ra.cnt, 0) * 3) AS score
+			FROM recent_posts rp
+			LEFT JOIN like_agg la ON la.post_id = rp.id
+			LEFT JOIN star_agg sa ON sa.post_id = rp.id
+			LEFT JOIN repost_agg ra ON ra.post_id = rp.id
+			ORDER BY score DESC, rp.created_at DESC, rp.id DESC
+			LIMIT $1`,
 			[safeLimit],
 		);
 		return rows.map(normalizePostRow);
@@ -2701,6 +2739,7 @@ class PostgresAdapter extends DatabaseAdapter {
 		const { rows } = await this.pool.query(
 			`SELECT COUNT(*)::int AS count FROM posts
 			 WHERE user_id = $1
+			   AND attachments IS NOT NULL
 			   AND jsonb_typeof(attachments) = 'array'
 			   AND jsonb_array_length(attachments) > 0`,
 			[Number(userId)],
@@ -2718,6 +2757,7 @@ class PostgresAdapter extends DatabaseAdapter {
 			 FROM posts p
 			 CROSS JOIN LATERAL jsonb_array_elements(p.attachments) WITH ORDINALITY AS attachment(file, position)
 			 WHERE p.user_id = $1
+			   AND p.attachments IS NOT NULL
 			   AND jsonb_typeof(p.attachments) = 'array'
 			   AND jsonb_array_length(p.attachments) > 0
 			 ORDER BY p.created_at DESC, p.id DESC, attachment.position ASC
@@ -3858,16 +3898,16 @@ class PostgresAdapter extends DatabaseAdapter {
 	async getUserBootstrapData(userId, notificationLimit = 200) {
 		const normalizedLimit = Math.min(Math.max(Number(notificationLimit) || 200, 1), 200);
 		const { rows } = await this.pool.query(
-			`WITH notification_rows AS MATERIALIZED (
+			`WITH notification_rows AS (
 				SELECT * FROM notifications
 				WHERE user_id = $1
 				ORDER BY created_at DESC, id DESC
 				LIMIT $2
-			), notification_users AS MATERIALIZED (
+			), notification_users AS (
 				SELECT DISTINCT u.*
 				FROM users u
 				JOIN notification_rows n ON n.from_user_id = u.id
-			), notification_posts AS MATERIALIZED (
+			), notification_posts AS (
 				SELECT DISTINCT p.id, p.content
 				FROM posts p
 				JOIN notification_rows n ON n.post_id = p.id
@@ -3963,6 +4003,7 @@ class PostgresAdapter extends DatabaseAdapter {
 				(SELECT COUNT(*)::int FROM posts WHERE user_id = $1) AS post_count,
 				(SELECT COUNT(*)::int FROM posts
 					WHERE user_id = $1
+						AND attachments IS NOT NULL
 						AND jsonb_typeof(attachments) = 'array'
 						AND jsonb_array_length(attachments) > 0) AS media_count,
 				(SELECT post_id FROM pinned_posts
@@ -3986,47 +4027,56 @@ class PostgresAdapter extends DatabaseAdapter {
 		const safeLimit = Math.min(Math.max(Number(limit) || 50, 1), 100);
 		let query;
 		if (type === 'followers') {
-			query = `SELECT u.id AS user_id, u.name, u.scid, u.icon_data,
-				COUNT(f.follower_id)::int AS follower_count
-				FROM users u
-				LEFT JOIN follows f ON f.following_id = u.id
-				GROUP BY u.id
-				ORDER BY follower_count DESC, u.id ASC
-				LIMIT $1`;
+			query = `WITH top_users AS (
+				SELECT following_id AS user_id, COUNT(*)::int AS follower_count
+				FROM follows
+				GROUP BY following_id
+				ORDER BY follower_count DESC, following_id ASC
+				LIMIT $1
+			)
+			SELECT u.id AS user_id, u.name, u.scid, u.icon_data, tu.follower_count
+			FROM top_users tu
+			JOIN users u ON u.id = tu.user_id
+			ORDER BY tu.follower_count DESC, tu.user_id ASC`;
 		} else if (type === 'posts') {
-			query = `SELECT u.id AS user_id, u.name, u.scid, u.icon_data,
-				COUNT(p.id)::int AS post_count
-				FROM users u
-				LEFT JOIN posts p ON p.user_id = u.id
-				GROUP BY u.id
-				ORDER BY post_count DESC, u.id ASC
-				LIMIT $1`;
+			query = `WITH top_users AS (
+				SELECT user_id, COUNT(*)::int AS post_count
+				FROM posts
+				WHERE group_id IS NULL
+				GROUP BY user_id
+				ORDER BY post_count DESC, user_id ASC
+				LIMIT $1
+			)
+			SELECT u.id AS user_id, u.name, u.scid, u.icon_data, tu.post_count
+			FROM top_users tu
+			JOIN users u ON u.id = tu.user_id
+			ORDER BY tu.post_count DESC, tu.user_id ASC`;
 		} else if (type === 'likes') {
-			query = `SELECT u.id AS user_id, u.name, u.scid, u.icon_data,
-				COALESCE(l.like_count, 0)::int AS like_count
-				FROM users u
-				LEFT JOIN (
-					SELECT p.user_id, COUNT(*)::int AS like_count
-					FROM likes l
-					JOIN posts p ON p.id = l.post_id
-					GROUP BY p.user_id
-				) l ON l.user_id = u.id
-				GROUP BY u.id, l.like_count
-				ORDER BY like_count DESC, u.id ASC
-				LIMIT $1`;
+			query = `WITH top_users AS (
+				SELECT p.user_id, COUNT(*)::int AS like_count
+				FROM likes l
+				JOIN posts p ON p.id = l.post_id
+				GROUP BY p.user_id
+				ORDER BY like_count DESC, p.user_id ASC
+				LIMIT $1
+			)
+			SELECT u.id AS user_id, u.name, u.scid, u.icon_data, tu.like_count
+			FROM top_users tu
+			JOIN users u ON u.id = tu.user_id
+			ORDER BY tu.like_count DESC, tu.user_id ASC`;
 		} else if (type === 'stars') {
-			query = `SELECT u.id AS user_id, u.name, u.scid, u.icon_data,
-				COALESCE(s.star_count, 0)::int AS star_count
-				FROM users u
-				LEFT JOIN (
-					SELECT p.user_id, COUNT(*)::int AS star_count
-					FROM stars s
-					JOIN posts p ON p.id = s.post_id
-					GROUP BY p.user_id
-				) s ON s.user_id = u.id
-				GROUP BY u.id, s.star_count
-				ORDER BY star_count DESC, u.id ASC
-				LIMIT $1`;
+			query = `WITH top_users AS (
+				SELECT p.user_id, COUNT(*)::int AS star_count
+				FROM stars s
+				JOIN posts p ON p.id = s.post_id
+				GROUP BY p.user_id
+				ORDER BY star_count DESC, p.user_id ASC
+				LIMIT $1
+			)
+			SELECT u.id AS user_id, u.name, u.scid, u.icon_data, tu.star_count
+			FROM top_users tu
+			JOIN users u ON u.id = tu.user_id
+			ORDER BY tu.star_count DESC, tu.user_id ASC`;
 		} else {
 			throw new Error('Invalid ranking type');
 		}
@@ -4044,56 +4094,76 @@ class PostgresAdapter extends DatabaseAdapter {
 	}
 
 	async getUserRanking(type, userId) {
+		const targetId = Number(userId);
 		let query;
 		if (type === 'followers') {
-			query = `SELECT rank, follower_count FROM (
-				SELECT u.id, COUNT(f.follower_id)::int AS follower_count,
-					ROW_NUMBER() OVER (ORDER BY COUNT(f.follower_id) DESC, u.id ASC)::int AS rank
-				FROM users u
-				LEFT JOIN follows f ON f.following_id = u.id
-				GROUP BY u.id
-			) t WHERE id = $1`;
+			query = `WITH my_count AS (
+				SELECT COUNT(*)::int AS cnt FROM follows WHERE following_id = $1
+			), higher AS (
+				SELECT COUNT(*)::int AS rank_offset
+				FROM (
+					SELECT following_id, COUNT(*)::int AS c
+					FROM follows
+					GROUP BY following_id
+					HAVING COUNT(*)::int > (SELECT cnt FROM my_count)
+				) h
+			)
+			SELECT (SELECT cnt FROM my_count) AS follower_count,
+			       (SELECT rank_offset + 1 FROM higher) AS rank`;
 		} else if (type === 'posts') {
-			query = `SELECT rank, post_count FROM (
-				SELECT u.id, COUNT(p.id)::int AS post_count,
-					ROW_NUMBER() OVER (ORDER BY COUNT(p.id) DESC, u.id ASC)::int AS rank
-				FROM users u
-				LEFT JOIN posts p ON p.user_id = u.id
-				GROUP BY u.id
-			) t WHERE id = $1`;
+			query = `WITH my_count AS (
+				SELECT COUNT(*)::int AS cnt FROM posts WHERE user_id = $1 AND group_id IS NULL
+			), higher AS (
+				SELECT COUNT(*)::int AS rank_offset
+				FROM (
+					SELECT user_id, COUNT(*)::int AS c
+					FROM posts
+					WHERE group_id IS NULL
+					GROUP BY user_id
+					HAVING COUNT(*)::int > (SELECT cnt FROM my_count)
+				) h
+			)
+			SELECT (SELECT cnt FROM my_count) AS post_count,
+			       (SELECT rank_offset + 1 FROM higher) AS rank`;
 		} else if (type === 'likes') {
-			query = `SELECT rank, like_count FROM (
-				SELECT u.id, COALESCE(l.like_count, 0)::int AS like_count,
-					ROW_NUMBER() OVER (ORDER BY COALESCE(l.like_count, 0) DESC, u.id ASC)::int AS rank
-				FROM users u
-				LEFT JOIN (
-					SELECT p.user_id, COUNT(*)::int AS like_count
-					FROM likes l
-					JOIN posts p ON p.id = l.post_id
+			query = `WITH my_count AS (
+				SELECT COUNT(*)::int AS cnt
+				FROM likes l JOIN posts p ON p.id = l.post_id
+				WHERE p.user_id = $1
+			), higher AS (
+				SELECT COUNT(*)::int AS rank_offset
+				FROM (
+					SELECT p.user_id, COUNT(*)::int AS c
+					FROM likes l JOIN posts p ON p.id = l.post_id
 					GROUP BY p.user_id
-				) l ON l.user_id = u.id
-				GROUP BY u.id, l.like_count
-			) t WHERE id = $1`;
+					HAVING COUNT(*)::int > (SELECT cnt FROM my_count)
+				) h
+			)
+			SELECT (SELECT cnt FROM my_count) AS like_count,
+			       (SELECT rank_offset + 1 FROM higher) AS rank`;
 		} else if (type === 'stars') {
-			query = `SELECT rank, star_count FROM (
-				SELECT u.id, COALESCE(s.star_count, 0)::int AS star_count,
-					ROW_NUMBER() OVER (ORDER BY COALESCE(s.star_count, 0) DESC, u.id ASC)::int AS rank
-				FROM users u
-				LEFT JOIN (
-					SELECT p.user_id, COUNT(*)::int AS star_count
-					FROM stars s
-					JOIN posts p ON p.id = s.post_id
+			query = `WITH my_count AS (
+				SELECT COUNT(*)::int AS cnt
+				FROM stars s JOIN posts p ON p.id = s.post_id
+				WHERE p.user_id = $1
+			), higher AS (
+				SELECT COUNT(*)::int AS rank_offset
+				FROM (
+					SELECT p.user_id, COUNT(*)::int AS c
+					FROM stars s JOIN posts p ON p.id = s.post_id
 					GROUP BY p.user_id
-				) s ON s.user_id = u.id
-				GROUP BY u.id, s.star_count
-			) t WHERE id = $1`;
+					HAVING COUNT(*)::int > (SELECT cnt FROM my_count)
+				) h
+			)
+			SELECT (SELECT cnt FROM my_count) AS star_count,
+			       (SELECT rank_offset + 1 FROM higher) AS rank`;
 		} else {
 			throw new Error('Invalid ranking type');
 		}
-		const { rows } = await this.pool.query(query, [Number(userId)]);
+		const { rows } = await this.pool.query(query, [targetId]);
 		const metricField = type === 'followers' ? 'follower_count' : (type === 'posts' ? 'post_count' : (type === 'likes' ? 'like_count' : 'star_count'));
 		return rows[0] ? {
-			rank: Number(rows[0].rank),
+			rank: Number(rows[0].rank || 1),
 			[metricField]: Number(rows[0][metricField] || 0),
 		} : { rank: null, [metricField]: 0 };
 	}
