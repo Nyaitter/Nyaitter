@@ -72,7 +72,7 @@ function extractToken(req) {
   return cookies.nyaitter_session || cookies.session || null;
 }
 
-const SESSION_CACHE_TTL_MS = 30000;
+const SESSION_CACHE_TTL_MS = 120000; // 2 minutes TTL
 const MAX_SESSION_CACHE_ENTRIES = 2000;
 const sessionPrincipalCache = new Map(); // tokenHash -> { principal, user, expiresAt }
 

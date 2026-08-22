@@ -2179,7 +2179,7 @@ class PostgresAdapter extends DatabaseAdapter {
 			if (cacheCfg.postCacheEnabled !== false) {
 				this._postCache = new MemoryBoundedCache({
 					maxSize: cacheCfg.postCacheMaxSize || 1000,
-					ttlMs: cacheCfg.postCacheTtlMs || 600000,
+					ttlMs: cacheCfg.postCacheTtlMs || 1800000,
 					maxHeapMb: cacheCfg.memoryCacheMaxHeapMb || 0,
 				});
 			}

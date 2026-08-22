@@ -284,7 +284,7 @@ async function fetchPostsByIds(db, postIds) {
 }
 
 const userGroupBadgesCache = new Map();
-const BADGES_CACHE_TTL_MS = 60000;
+const BADGES_CACHE_TTL_MS = 300000; // 5 minutes TTL
 
 async function attachGroupBadgesToUsers(db, users) {
 	if (!Array.isArray(users) || users.length === 0) return users;

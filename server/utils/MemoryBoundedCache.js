@@ -4,12 +4,12 @@ class MemoryBoundedCache {
   /**
    * @param {Object} options
    * @param {number} [options.maxSize=1000] - 最大エントリ数
-   * @param {number} [options.ttlMs=600000] - 有効期限（ミリ秒、既定10分）
+   * @param {number} [options.ttlMs=1800000] - 有効期限（ミリ秒、既定30分）
    * @param {number} [options.maxHeapMb=0] - メモリ使用量上限 (MB)。0 の場合は無制限
    */
-  constructor({ maxSize = 1000, ttlMs = 600000, maxHeapMb = 0 } = {}) {
+  constructor({ maxSize = 1000, ttlMs = 1800000, maxHeapMb = 0 } = {}) {
     this.maxSize = Math.max(1, Number(maxSize) || 1000);
-    this.ttlMs = Math.max(0, Number(ttlMs) || 600000);
+    this.ttlMs = Math.max(0, Number(ttlMs) || 1800000);
     this.maxHeapMb = Math.max(0, Number(maxHeapMb) || 0);
     this.cache = new Map();
   }
