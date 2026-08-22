@@ -122,11 +122,6 @@ async function getDiscoverableModePage(
 		beforeId = null,
 	},
 ) {
-	const followIds =
-		mode === 'timeline' && tab === 'following' && viewerId != null && db.getFollowIds
-			? await db.getFollowIds(viewerId)
-			: [];
-
 	return getDiscoverablePostPage({
 		db,
 		viewerId,
@@ -134,26 +129,26 @@ async function getDiscoverableModePage(
 		limit,
 		offset,
 		beforeId,
-		fetchCandidatePage: ({ limit: candidateLimit, offset: candidateOffset, beforeId: candidateBeforeId }) => {
+		fetchCandidatePage: async ({ limit: candidateLimit, offset: candidateOffset, beforeId: candidateBeforeId }) => {
 			if (mode === 'timeline') {
 				return db.getTimelinePostIds({
 					tab,
-					followIds,
+					viewerId,
 					limit: candidateLimit,
 					offset: candidateOffset,
 					beforeId: candidateBeforeId,
 				});
 			}
-				if (mode === 'recommended') {
-					return db.getRecommendedPostIds({
-						viewerId,
-						limit: candidateLimit,
-						offset: candidateOffset,
-						beforeId: candidateBeforeId,
-					});
-				}
+			if (mode === 'recommended') {
+				return db.getRecommendedPostIds({
+					viewerId,
+					limit: candidateLimit,
+					offset: candidateOffset,
+					beforeId: candidateBeforeId,
+				});
+			}
 			if (mode === 'search') {
-					return db.searchPostIds(query, candidateLimit, candidateOffset, candidateBeforeId);
+				return db.searchPostIds(query, candidateLimit, candidateOffset, candidateBeforeId);
 			}
 			throw new Error(`Unsupported discoverable mode: ${mode}`);
 		},

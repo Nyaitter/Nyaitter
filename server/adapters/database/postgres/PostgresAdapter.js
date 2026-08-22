@@ -2400,26 +2400,46 @@ class PostgresAdapter extends DatabaseAdapter {
 		return { posts, hasMore: posts.length === limit };
 	}
 
-	async getTimelinePostIds({ tab = 'foryou', followIds = [], limit = 30, offset = 0, beforeId = null } = {}) {
+	async getTimelinePostIds({ tab = 'foryou', followIds = [], viewerId = null, limit = 30, offset = 0, beforeId = null } = {}) {
 		const normalizedLimit = Math.max(1, Math.min(Number(limit) || 30, 100));
 		const normalizedOffset = Math.max(0, Number(offset) || 0);
 		const normalizedBeforeId = Number.isInteger(Number(beforeId)) && Number(beforeId) > 0
 			? Number(beforeId)
 			: null;
+		const parsedViewerId = Number(viewerId);
+		const validViewerId = Number.isSafeInteger(parsedViewerId) && parsedViewerId > 0 ? parsedViewerId : null;
+
 		let query;
 		let values;
 
 		if (tab === 'following') {
-			const ids = [...new Set((followIds || []).map(Number).filter(Number.isSafeInteger))];
-			if (ids.length === 0) return { ids: [], posts: [], has_more: false, next_cursor: null };
-			if (normalizedBeforeId != null) {
-				query = `SELECT * FROM posts WHERE user_id = ANY($1::int[]) AND group_id IS NULL AND reply_to IS NULL AND id < $2
-					ORDER BY created_at DESC, id DESC LIMIT $3`;
-				values = [ids, normalizedBeforeId, normalizedLimit + 1];
+			if (validViewerId != null) {
+				if (normalizedBeforeId != null) {
+					query = `SELECT p.* FROM posts p
+						WHERE p.group_id IS NULL AND p.reply_to IS NULL
+						  AND (p.user_id = $1 OR p.user_id IN (SELECT following_id FROM follows WHERE follower_id = $1))
+						  AND p.id < $2
+						ORDER BY p.created_at DESC, p.id DESC LIMIT $3`;
+					values = [validViewerId, normalizedBeforeId, normalizedLimit + 1];
+				} else {
+					query = `SELECT p.* FROM posts p
+						WHERE p.group_id IS NULL AND p.reply_to IS NULL
+						  AND (p.user_id = $1 OR p.user_id IN (SELECT following_id FROM follows WHERE follower_id = $1))
+						ORDER BY p.created_at DESC, p.id DESC LIMIT $2 OFFSET $3`;
+					values = [validViewerId, normalizedLimit + 1, normalizedOffset];
+				}
 			} else {
-				query = `SELECT * FROM posts WHERE user_id = ANY($1::int[]) AND group_id IS NULL AND reply_to IS NULL
-					ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3`;
-				values = [ids, normalizedLimit + 1, normalizedOffset];
+				const ids = [...new Set((followIds || []).map(Number).filter(Number.isSafeInteger))];
+				if (ids.length === 0) return { ids: [], posts: [], has_more: false, next_cursor: null };
+				if (normalizedBeforeId != null) {
+					query = `SELECT * FROM posts WHERE user_id = ANY($1::int[]) AND group_id IS NULL AND reply_to IS NULL AND id < $2
+						ORDER BY created_at DESC, id DESC LIMIT $3`;
+					values = [ids, normalizedBeforeId, normalizedLimit + 1];
+				} else {
+					query = `SELECT * FROM posts WHERE user_id = ANY($1::int[]) AND group_id IS NULL AND reply_to IS NULL
+						ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3`;
+					values = [ids, normalizedLimit + 1, normalizedOffset];
+				}
 			}
 		} else if (tab === 'announce') {
 			if (normalizedBeforeId != null) {
@@ -2438,6 +2458,7 @@ class PostgresAdapter extends DatabaseAdapter {
 			query = `SELECT * FROM posts WHERE group_id IS NULL AND reply_to IS NULL ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2`;
 			values = [normalizedLimit + 1, normalizedOffset];
 		}
+
 		const { rows } = await this.pool.query(query, values);
 		const normalizedRows = rows.map(normalizePostRow);
 		const posts = normalizedRows.slice(0, normalizedLimit);

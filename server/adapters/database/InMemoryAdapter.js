@@ -2776,13 +2776,17 @@ class InMemoryAdapter extends DatabaseAdapter {
 			};
 		}
 
-		async getTimelinePostIds({ tab = 'foryou', followIds = [], limit = 30, offset = 0, beforeId = null } = {}) {
+		async getTimelinePostIds({ tab = 'foryou', followIds = [], viewerId = null, limit = 30, offset = 0, beforeId = null } = {}) {
 			const normalizedLimit = Math.max(1, Number(limit) || 30);
 			const normalizedBeforeId = Number.isInteger(Number(beforeId)) && Number(beforeId) > 0
 				? Number(beforeId)
 				: null;
 			const normalizedOffset = normalizedBeforeId == null ? Math.max(0, Number(offset) || 0) : 0;
-			const followSet = tab === 'following' ? new Set((followIds || []).map(Number)) : null;
+			const followSet = tab === 'following'
+				? (viewerId != null && this.followingsByUser
+					? new Set([...(this.followingsByUser.get(Number(viewerId)) || new Set()), Number(viewerId)])
+					: new Set((followIds || []).map(Number)))
+				: null;
 			const matched = [];
 			for (const id of this.postIdsNewest) {
 				const post = this.posts.get(id);
