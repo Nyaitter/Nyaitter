@@ -318,6 +318,14 @@ for (const [resourcePath, router] of restRoutes) {
 
 app.use(apiPath('/auth'), require('./routes/auth'));
 
+app.get('/favicon.ico', (req, res) => {
+    const faviconPath = path.join(__dirname, '../page/favicon.png');
+    if (fs.existsSync(faviconPath)) {
+        return res.sendFile(faviconPath);
+    }
+    return res.status(204).end();
+});
+
 // ── Static Frontend Serving ────────────────────────────────────────────────────
 const pageDir = path.join(__dirname, '../page');
 const hasStaticPage = fs.existsSync(pageDir) && fs.statSync(pageDir).isDirectory();

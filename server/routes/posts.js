@@ -800,26 +800,31 @@ router.get('/:id', optionalAuth, async (req, res) => {
 		if (!post) {
 			return res.status(404).json({ error: 'Post not found' });
 		}
-
 		const userAgent = req.headers['user-agent'] || '';
 		const isApiRequest = req.originalUrl.startsWith('/api/') || req.originalUrl.startsWith('/server/api/');
-		const wantsHtml = !isApiRequest && (isCrawler(userAgent) || req.accepts(['html', 'json']) === 'html');
 
-		if (wantsHtml) {
-			const author = await db.getUserById(post.userId ?? post.user_id);
-			const publicUrl = getPublicUrl(req);
-			const frontendUrl = config.frontendUrl || null;
-			const pageDir = path.join(__dirname, '../../page');
-			const indexPath = path.join(pageDir, 'index.html');
-			let html = '';
-			if (fs.existsSync(indexPath)) {
-				const ogpTags = generatePostOgpTags({ post, author, publicUrl });
-				html = fs.readFileSync(indexPath, 'utf8').replace(/<title>.*?<\/title>/i, ogpTags);
-			} else {
-				html = generatePostHtml({ post, author, publicUrl, frontendUrl });
+		if (!isApiRequest) {
+			if (isCrawler(userAgent)) {
+				// Serve OGP HTML for crawlers / embed bots
+				const author = await db.getUserById(post.userId ?? post.user_id);
+				const publicUrl = getPublicUrl(req);
+				const frontendUrl = config.frontendUrl || null;
+				const html = generatePostHtml({ post, author, publicUrl, frontendUrl });
+				res.setHeader('Content-Type', 'text/html; charset=utf-8');
+				return res.send(html);
+			} else if (req.accepts(['html', 'json']) === 'html') {
+				// Human visitor in web browser: HTTP 302 redirect directly to SPA post hash
+				let redirectUrl = '';
+				if (config.frontendUrl) {
+					redirectUrl = `${config.frontendUrl.replace(/\/+$/, '')}/#post/${post.id}`;
+				} else {
+					const host = req.get('host') || 'nyaitter.jp';
+					const cleanHost = host.replace(/^(?:link|api)\./i, '');
+					const proto = (req.protocol === 'https' || req.get('x-forwarded-proto') === 'https') ? 'https' : 'http';
+					redirectUrl = `${proto}://${cleanHost}/#post/${post.id}`;
+				}
+				return res.redirect(302, redirectUrl);
 			}
-			res.setHeader('Content-Type', 'text/html; charset=utf-8');
-			return res.send(html);
 		}
 
 		const serializedPost = await serializePost(
