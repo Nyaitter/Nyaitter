@@ -71,11 +71,6 @@ function getPublicUrl(req = null) {
 }
 
 function getPostShareUrl(req = null) {
-  if (process.env.POST_SHARE_URL || config.postShareUrl) {
-    const directUrl = normalizePublicUrl(process.env.POST_SHARE_URL || config.postShareUrl);
-    if (directUrl) return directUrl;
-  }
-
   const portSetting = process.env.POST_SHARE_PORT || config.postSharePort;
   if (portSetting) {
     const port = Number(portSetting);
