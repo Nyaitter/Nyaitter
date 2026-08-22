@@ -3,6 +3,8 @@
 const { spawnSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+
+require('dotenv').config({ path: path.join(__dirname, '../.env') });
 const config = require('../config');
 
 const migrationsDir = __dirname;
