@@ -2579,6 +2579,7 @@ class PostgresAdapter extends DatabaseAdapter {
 
 		if (!this._affinityCache) this._affinityCache = new Map();
 		if (!this._followCache) this._followCache = new Map();
+		if (!this._candidatePostsCache) this._candidatePostsCache = { posts: [], expiresAt: 0 };
 		const now = Date.now();
 
 		let keywordProfile = new Map();
@@ -2612,9 +2613,20 @@ class PostgresAdapter extends DatabaseAdapter {
 			}
 		}
 
-		const { rows } = await this.pool.query(query, params);
-		const hasMore = rows.length >= candidateLimit;
-		const candidateRows = rows.slice(0, candidateLimit - 1);
+		let candidateRows = [];
+		let hasMore = false;
+
+		if (normalizedBeforeId == null && normalizedOffset === 0 && this._candidatePostsCache.expiresAt > now && this._candidatePostsCache.posts.length > 0) {
+			candidateRows = this._candidatePostsCache.posts;
+			hasMore = candidateRows.length >= candidateLimit;
+		} else {
+			const { rows } = await this.pool.query(query, params);
+			hasMore = rows.length >= candidateLimit;
+			candidateRows = rows.slice(0, candidateLimit - 1);
+			if (normalizedBeforeId == null && normalizedOffset === 0) {
+				this._candidatePostsCache = { posts: candidateRows, expiresAt: now + 15000 };
+			}
+		}
 
 		// Fast in-memory scoring on Node.js server
 		const scored = candidateRows.map((post) => {
