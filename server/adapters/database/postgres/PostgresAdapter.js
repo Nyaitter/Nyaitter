@@ -7,6 +7,7 @@ const {
 	formatNyaitterId,
 } = require('../../../utils/nyaitterAddress');
 const appConfig = require('../../../config');
+const MemoryBoundedCache = require('../../../utils/MemoryBoundedCache');
 const { normalizeTarget } = require('../../../utils/notification');
 const { normalizeBlockList } = require('../../../utils/blockList');
 const {
@@ -2165,28 +2166,78 @@ class PostgresAdapter extends DatabaseAdapter {
 					await client.query('UPDATE posts SET repost_count = repost_count + 1 WHERE id = $1', [Number(post.repostTo)]);
 				}
 				await this._adjustUserKeywordAffinitiesForTags(client, post.userId, post.tags, 1);
+				this._getPostCache()?.set(post.id, post);
 			}
 			return post;
 		});
 	}
 
+	_getPostCache() {
+		if (!this._postCache) {
+			const cacheCfg = appConfig.cache || {};
+			if (cacheCfg.postCacheEnabled !== false) {
+				this._postCache = new MemoryBoundedCache({
+					maxSize: cacheCfg.postCacheMaxSize || 1000,
+					ttlMs: cacheCfg.postCacheTtlMs || 600000,
+					maxHeapMb: cacheCfg.memoryCacheMaxHeapMb || 0,
+				});
+			}
+		}
+		return this._postCache;
+	}
+
 	async getPostById(id) {
 		if (id == null) return null;
+		const postId = Number(id);
+		if (!Number.isSafeInteger(postId) || postId <= 0) return null;
+
+		const cache = this._getPostCache();
+		const cached = cache?.get(postId);
+		if (cached) return cached;
+
 		const { rows } = await this.pool.query(
 			'SELECT * FROM posts WHERE id = $1',
-			[Number(id)],
+			[postId],
 		);
-		return normalizePostRow(rows[0] || null);
+		const post = normalizePostRow(rows[0] || null);
+		if (post) {
+			cache?.set(postId, post);
+		}
+		return post;
 	}
 
 	async getPostsByIds(postIds) {
 		const ids = [...new Set((postIds || []).map(Number).filter(Number.isSafeInteger))];
 		if (ids.length === 0) return [];
-		const { rows } = await this.pool.query(
-			'SELECT * FROM posts WHERE id = ANY($1::int[])',
-			[ids],
-		);
-		return rows.map(normalizePostRow);
+
+		const cache = this._getPostCache();
+		const result = [];
+		const missingIds = [];
+
+		for (const id of ids) {
+			const cached = cache?.get(id);
+			if (cached) {
+				result.push(cached);
+			} else {
+				missingIds.push(id);
+			}
+		}
+
+		if (missingIds.length > 0) {
+			const { rows } = await this.pool.query(
+				'SELECT * FROM posts WHERE id = ANY($1::int[])',
+				[missingIds],
+			);
+			for (const row of rows) {
+				const post = normalizePostRow(row);
+				if (post) {
+					cache?.set(post.id, post);
+					result.push(post);
+				}
+			}
+		}
+
+		return result;
 	}
 
 	async getPostReferencesByIds(postIds, maxDepth = 2) {
@@ -2325,13 +2376,18 @@ class PostgresAdapter extends DatabaseAdapter {
 				await this._adjustUserKeywordAffinitiesForTags(client, existing.user_id, existing.tags, -1);
 				await this._adjustUserKeywordAffinitiesForTags(client, existing.user_id, updated.tags, 1);
 			}
+			if (updated) {
+				this._getPostCache()?.set(updated.id, updated);
+			}
 			return updated;
 		});
 	}
 
 	async deletePost(postId, userId) {
+		const targetId = Number(postId);
+		this._getPostCache()?.delete(targetId);
 		return this._withTransaction(async (client) => {
-			const { rows } = await client.query('SELECT user_id, reply_to, repost_to FROM posts WHERE id = $1 FOR UPDATE', [Number(postId)]);
+			const { rows } = await client.query('SELECT user_id, reply_to, repost_to FROM posts WHERE id = $1 FOR UPDATE', [targetId]);
 			if (!rows[0] || Number(rows[0].user_id) !== Number(userId)) {
 				return false;
 			}
@@ -2342,20 +2398,22 @@ class PostgresAdapter extends DatabaseAdapter {
 			if (post.repost_to) {
 				await client.query('UPDATE posts SET repost_count = GREATEST(0, repost_count - 1) WHERE id = $1', [Number(post.repost_to)]);
 			}
-			await client.query('UPDATE posts SET reply_to = NULL WHERE reply_to = $1', [Number(postId)]);
-			await client.query('UPDATE posts SET repost_to = NULL WHERE repost_to = $1', [Number(postId)]);
-			await client.query('DELETE FROM likes WHERE post_id = $1', [Number(postId)]);
-			await client.query('DELETE FROM stars WHERE post_id = $1', [Number(postId)]);
-			await client.query('DELETE FROM reposts WHERE post_id = $1', [Number(postId)]);
-			await client.query('DELETE FROM pinned_posts WHERE post_id = $1', [Number(postId)]);
-			const result = await client.query('DELETE FROM posts WHERE id = $1', [Number(postId)]);
+			await client.query('UPDATE posts SET reply_to = NULL WHERE reply_to = $1', [targetId]);
+			await client.query('UPDATE posts SET repost_to = NULL WHERE repost_to = $1', [targetId]);
+			await client.query('DELETE FROM likes WHERE post_id = $1', [targetId]);
+			await client.query('DELETE FROM stars WHERE post_id = $1', [targetId]);
+			await client.query('DELETE FROM reposts WHERE post_id = $1', [targetId]);
+			await client.query('DELETE FROM pinned_posts WHERE post_id = $1', [targetId]);
+			const result = await client.query('DELETE FROM posts WHERE id = $1', [targetId]);
 			return result.rowCount > 0;
 		});
 	}
 
 	async adminDeletePost(postId) {
+		const targetId = Number(postId);
+		this._getPostCache()?.delete(targetId);
 		return this._withTransaction(async (client) => {
-			const { rows } = await client.query('SELECT reply_to, repost_to FROM posts WHERE id = $1 FOR UPDATE', [Number(postId)]);
+			const { rows } = await client.query('SELECT reply_to, repost_to FROM posts WHERE id = $1 FOR UPDATE', [targetId]);
 			if (rows[0]) {
 				const post = rows[0];
 				if (post.reply_to) {

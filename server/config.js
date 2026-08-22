@@ -417,6 +417,27 @@ const config = {
     ),
   },
 
+  cache: {
+    postCacheEnabled: envBoolean('POST_CACHE_ENABLED', get('cache.postCacheEnabled', true)),
+    postCacheMaxSize: exactIntegerSetting(
+      'post cache max size',
+      ['POST_CACHE_MAX_SIZE'],
+      ['cache.postCacheMaxSize'],
+      1000,
+      1,
+    ),
+    postCacheTtlMs: durationSetting(
+      'post cache TTL',
+      ['POST_CACHE_TTL_MS'],
+      ['cache.postCacheTtlMs'],
+      '10min',
+    ),
+    memoryCacheMaxHeapMb: envNonNegativeInteger(
+      'MEMORY_CACHE_MAX_HEAP_MB',
+      get('cache.memoryCacheMaxHeapMb', 0),
+    ),
+  },
+
   dm: {
     // 一時的に既定で無効。DM_E2E_ENABLED=true で明示的に再有効化できる。
     e2eEnabled: envBoolean('DM_E2E_ENABLED', get('dm.e2eEnabled', false)),
