@@ -485,6 +485,11 @@ router.get('/page', optionalAuth, async (req, res) => {
 	const db = getDbAdapter(req);
 	const mode = String(req.query.mode || 'timeline');
 	const tab = String(req.query.tab || 'foryou');
+	const isDiscoverableMode = [
+		'timeline',
+		'recommended',
+		'search',
+	].includes(mode);
 	const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 30, 1), 100);
 	const beforeId = safeParsePostId(req.query.before_id);
 	const offset = beforeId == null ? Math.max(parseInt(req.query.offset, 10) || 0, 0) : 0;
@@ -499,11 +504,6 @@ router.get('/page', optionalAuth, async (req, res) => {
 			if (cachedResult) {
 				result = cachedResult;
 			} else {
-				const isDiscoverableMode = [
-					'timeline',
-					'recommended',
-					'search',
-				].includes(mode);
 				if (isDiscoverableMode) {
 					result = await getDiscoverableModePage(db, {
 						mode,
