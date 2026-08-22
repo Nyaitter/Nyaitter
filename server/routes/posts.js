@@ -492,19 +492,16 @@ router.get('/page', optionalAuth, async (req, res) => {
 	const knownViewer = req.user?.visibilityUser || null;
 
 	const cacheKey = `${mode}:${tab}:${req.query.q || ''}:${currentUserId || 0}:${limit}:${offset}:${beforeId || 0}`;
-	const cachedData = timelineCacheManager.get(cacheKey);
-	if (cachedData) {
-		return res.json(cachedData);
-	}
+	const cachedResult = timelineCacheManager.getIds(cacheKey);
 
 		try {
-			let result = { ids: [], has_more: false };
+			let result = cachedResult || { ids: [], has_more: false };
 			const isDiscoverableMode = [
 				'timeline',
 				'recommended',
 				'search',
 			].includes(mode);
-			if (isDiscoverableMode) {
+			if (!cachedResult && isDiscoverableMode) {
 				result = await getDiscoverableModePage(db, {
 					mode,
 					tab,
@@ -515,7 +512,10 @@ router.get('/page', optionalAuth, async (req, res) => {
 					offset,
 					beforeId,
 				});
-			} else if (mode === 'profile') {
+				if (result?.ids) {
+					timelineCacheManager.setIds(cacheKey, result);
+				}
+			} else if (!cachedResult && mode === 'profile') {
 			const userId = safeParsePostId(req.query.user_id);
 			if (!userId) return res.status(400).json({ error: 'user_id is required' });
 			const subType = ['all', 'posts_only', 'replies_only'].includes(req.query.sub_type)
@@ -609,8 +609,6 @@ router.get('/page', optionalAuth, async (req, res) => {
 				includes_metrics: true,
 			},
 		};
-
-		timelineCacheManager.set(cacheKey, payload);
 
 		res.json(payload);
 	} catch (err) {

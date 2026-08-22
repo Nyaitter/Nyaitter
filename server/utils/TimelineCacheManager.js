@@ -1,38 +1,39 @@
 /**
- * Smart Timeline Cache Manager with In-Place Mutations.
- * Preserves high cache durability by patching cached timelines instead of flushing them.
+ * Smart Timeline ID List Cache Manager.
+ * Caches only post ID arrays and metadata, leaving post objects to be served
+ * from the unified MemoryBoundedCache (Post Cache).
  */
 
 class TimelineCacheManager {
 	constructor(ttlMs = 60000) {
 		this.ttlMs = ttlMs;
-		this.cache = new Map(); // key -> { data, expiresAt }
+		this.cache = new Map(); // key -> { ids: number[], has_more: boolean, expiresAt: number }
 	}
 
-	get(key) {
+	getIds(key) {
 		const entry = this.cache.get(key);
 		if (!entry) return null;
 		if (entry.expiresAt <= Date.now()) {
 			this.cache.delete(key);
 			return null;
 		}
-		return entry.data;
+		return { ids: [...entry.ids], has_more: entry.has_more };
 	}
 
-	set(key, data, customTtlMs = null) {
+	setIds(key, { ids = [], has_more = false }, customTtlMs = null) {
 		const ttl = customTtlMs ?? this.ttlMs;
 		this.cache.set(key, {
-			data,
+			ids: Array.isArray(ids) ? ids.map(Number) : [],
+			has_more: Boolean(has_more),
 			expiresAt: Date.now() + ttl,
 		});
 	}
 
 	/**
-	 * Prepends a newly created post to relevant cached timelines (e.g. foryou tab, offset 0).
+	 * Prepends newly created post ID to relevant timeline caches.
 	 */
-	onPostCreated(post, serializedPost = null) {
+	onPostCreated(post) {
 		const postId = Number(post.id);
-		const authorId = Number(post.userId ?? post.user_id);
 		const isPublicRoot = !post.groupId && !post.group_id && !post.replyTo && !post.reply_to;
 
 		for (const [key, entry] of this.cache.entries()) {
@@ -40,60 +41,23 @@ class TimelineCacheManager {
 				this.cache.delete(key);
 				continue;
 			}
-			// Only update page 1 (offset 0, no beforeId)
+			// Only update top page (offset 0, beforeId 0)
 			if (!key.includes(':0:0') && !key.endsWith(':0:0')) continue;
 
 			const [mode, tab] = key.split(':');
 			if (mode !== 'timeline' && mode !== 'recommended') continue;
 
 			if (isPublicRoot && (tab === 'foryou' || mode === 'recommended')) {
-				if (Array.isArray(entry.data?.posts)) {
-					const existingIdx = entry.data.posts.findIndex((p) => Number(p.id) === postId);
-					if (existingIdx === -1) {
-						const itemToInsert = serializedPost || {
-							id: postId,
-							userId: authorId,
-							content: post.content,
-							createdAt: post.createdAt || post.created_at || new Date().toISOString(),
-							...post,
-						};
-						entry.data.posts.unshift(itemToInsert);
-						if (entry.data.posts.length > 30) {
-							entry.data.posts.pop();
-						}
-					}
+				if (!entry.ids.includes(postId)) {
+					entry.ids.unshift(postId);
+					if (entry.ids.length > 30) entry.ids.pop();
 				}
 			}
 		}
 	}
 
 	/**
-	 * In-place updates an edited post inside cached timelines.
-	 */
-	onPostUpdated(postId, updatedFields) {
-		const pId = Number(postId);
-		for (const [key, entry] of this.cache.entries()) {
-			if (entry.expiresAt <= Date.now()) {
-				this.cache.delete(key);
-				continue;
-			}
-			if (Array.isArray(entry.data?.posts)) {
-				for (const post of entry.data.posts) {
-					if (Number(post.id) === pId) {
-						if (updatedFields.content !== undefined) post.content = updatedFields.content;
-						if (updatedFields.attachments !== undefined) post.attachments = updatedFields.attachments;
-						if (updatedFields.mask !== undefined) post.mask = updatedFields.mask;
-						if (updatedFields.lock !== undefined) post.lock = updatedFields.lock;
-						if (updatedFields.like_count !== undefined) post.like_count = updatedFields.like_count;
-						if (updatedFields.star_count !== undefined) post.star_count = updatedFields.star_count;
-					}
-				}
-			}
-		}
-	}
-
-	/**
-	 * In-place removes a deleted post from cached timelines.
+	 * Removes deleted post ID from cached timelines.
 	 */
 	onPostDeleted(postId) {
 		const pId = Number(postId);
@@ -102,38 +66,7 @@ class TimelineCacheManager {
 				this.cache.delete(key);
 				continue;
 			}
-			if (Array.isArray(entry.data?.posts)) {
-				entry.data.posts = entry.data.posts.filter((p) => Number(p.id) !== pId);
-			}
-		}
-	}
-
-	/**
-	 * In-place updates like / star counts on reaction toggle without invalidating the cache.
-	 */
-	onReactionUpdated(postId, { likeDelta = 0, starDelta = 0, likeCount = null, starCount = null } = {}) {
-		const pId = Number(postId);
-		for (const [key, entry] of this.cache.entries()) {
-			if (entry.expiresAt <= Date.now()) {
-				this.cache.delete(key);
-				continue;
-			}
-			if (Array.isArray(entry.data?.posts)) {
-				for (const post of entry.data.posts) {
-					if (Number(post.id) === pId) {
-						if (likeCount !== null) {
-							post.like_count = likeCount;
-						} else if (likeDelta !== 0) {
-							post.like_count = Math.max(0, (Number(post.like_count) || 0) + likeDelta);
-						}
-						if (starCount !== null) {
-							post.star_count = starCount;
-						} else if (starDelta !== 0) {
-							post.star_count = Math.max(0, (Number(post.star_count) || 0) + starDelta);
-						}
-					}
-				}
-			}
+			entry.ids = entry.ids.filter((id) => id !== pId);
 		}
 	}
 
