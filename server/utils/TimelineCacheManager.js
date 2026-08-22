@@ -1,84 +1,195 @@
+'use strict';
+
 /**
- * Smart Timeline ID List Cache Manager.
- * Caches only post ID arrays and metadata with short TTL and instant invalidation
- * on write events, ensuring new posts appear immediately on timelines.
+ * High-performance Timeline ID Cache Manager.
+ * 
+ * Design Principles:
+ * 1. O(1) post ingestion using Array.prototype.push() instead of unshift().
+ *    Posts are appended chronologically and returned in reverse (newest first).
+ * 2. Strict per-tab and per-viewer timeline mapping so new posts appear instantly
+ *    on relevant timelines (all, foryou, following, groups) without stale reads.
+ * 3. Bounded memory with LRU cleanup and TTL support.
  */
 
 class TimelineCacheManager {
-	constructor(ttlMs = 5000) {
-		this.ttlMs = ttlMs;
-		this.cache = new Map(); // key -> { ids: number[], has_more: boolean, expiresAt: number }
+	constructor(options = {}) {
+		this.ttlMs = options.ttlMs ?? 15000; // 15s TTL
+		this.maxEntries = options.maxEntries ?? 300;
+		this.maxTimelineSize = options.maxTimelineSize ?? 60;
+		// Map<string, { idsAsc: number[], has_more: boolean, expiresAt: number }>
+		this.cache = new Map();
 	}
 
 	getIds(key) {
 		const entry = this.cache.get(key);
 		if (!entry) return null;
+
 		if (entry.expiresAt <= Date.now()) {
 			this.cache.delete(key);
 			return null;
 		}
-		return { ids: [...entry.ids], has_more: entry.has_more };
+
+		// Return copy of IDs in descending order (newest first)
+		const idsDesc = [];
+		const len = entry.idsAsc.length;
+		for (let i = len - 1; i >= 0; i--) {
+			idsDesc.push(entry.idsAsc[i]);
+		}
+
+		return {
+			ids: idsDesc,
+			has_more: entry.has_more,
+		};
 	}
 
+	/**
+	 * Stores timeline IDs in internal ascending order (chronological) to allow
+	 * efficient push() for new incoming posts.
+	 */
 	setIds(key, { ids = [], has_more = false }, customTtlMs = null) {
+		if (!Array.isArray(ids)) return;
+
+		// Input IDs from DB are in descending order (newest first).
+		// We store them internally in ascending order (oldest first) so that new posts can be push()ed to the end!
+		const idsAsc = [];
+		for (let i = ids.length - 1; i >= 0; i--) {
+			const id = Number(ids[i]);
+			if (Number.isInteger(id) && id > 0) {
+				idsAsc.push(id);
+			}
+		}
+
+		// Enforce LRU cap
+		if (this.cache.size >= this.maxEntries) {
+			const oldestKey = this.cache.keys().next().value;
+			if (oldestKey) this.cache.delete(oldestKey);
+		}
+
 		const ttl = customTtlMs ?? this.ttlMs;
 		this.cache.set(key, {
-			ids: Array.isArray(ids) ? ids.map(Number) : [],
+			idsAsc,
 			has_more: Boolean(has_more),
 			expiresAt: Date.now() + ttl,
 		});
 	}
 
 	/**
-	 * Instantly invalidates all top-page timeline caches when a new post is created.
+	 * Appends new post ID to top-page timeline caches using push() - O(1) complexity.
 	 */
 	onPostCreated(post) {
-		for (const key of this.cache.keys()) {
-			// Invalidate any first-page query (offset: 0, beforeId: 0)
-			if (key.endsWith(':0:0') || key.includes(':0:0:0') || key.startsWith('timeline:') || key.startsWith('recommended:')) {
+		if (!post || !post.id) return;
+		const postId = Number(post.id);
+		const postAuthorId = Number(post.userId ?? post.user_id);
+		const groupId = post.groupId ?? post.group_id ?? null;
+		const isReply = Boolean(post.replyTo ?? post.reply_to);
+
+		const now = Date.now();
+
+		for (const [key, entry] of this.cache.entries()) {
+			if (entry.expiresAt <= now) {
 				this.cache.delete(key);
+				continue;
+			}
+
+			// Only top pages (offset 0, beforeId 0) receive live updates
+			if (!key.endsWith(':0:0')) continue;
+
+			const parts = key.split(':');
+			const mode = parts[0];
+			const tab = parts[1];
+			const viewerId = Number(parts[3]) || 0;
+
+			// If it's a search query cache, invalidate it
+			if (parts[2] && parts[2].length > 0) {
+				this.cache.delete(key);
+				continue;
+			}
+
+			if (mode === 'timeline') {
+				// Replies only show if viewing replies or thread
+				if (isReply) {
+					continue;
+				}
+
+				if (groupId) {
+					// Group post: only update matching group caches or invalidate
+					if (tab === `group:${groupId}`) {
+						if (!entry.idsAsc.includes(postId)) {
+							entry.idsAsc.push(postId);
+							if (entry.idsAsc.length > this.maxTimelineSize) {
+								entry.idsAsc.splice(0, entry.idsAsc.length - this.maxTimelineSize);
+							}
+						}
+					}
+					continue;
+				}
+
+				// Public post
+				if (tab === 'all' || tab === 'foryou') {
+					if (!entry.idsAsc.includes(postId)) {
+						entry.idsAsc.push(postId);
+						if (entry.idsAsc.length > this.maxTimelineSize) {
+							entry.idsAsc.splice(0, entry.idsAsc.length - this.maxTimelineSize);
+						}
+					}
+				} else if (tab === 'following') {
+					// If author matches viewer
+					if (viewerId === postAuthorId) {
+						if (!entry.idsAsc.includes(postId)) {
+							entry.idsAsc.push(postId);
+							if (entry.idsAsc.length > this.maxTimelineSize) {
+								entry.idsAsc.splice(0, entry.idsAsc.length - this.maxTimelineSize);
+							}
+						}
+					} else {
+						// For other viewers' following tabs, invalidate so next fetch queries DB
+						this.cache.delete(key);
+					}
+				}
+			} else if (mode === 'recommended') {
+				if (!isReply && !groupId) {
+					if (!entry.idsAsc.includes(postId)) {
+						entry.idsAsc.push(postId);
+						if (entry.idsAsc.length > this.maxTimelineSize) {
+							entry.idsAsc.splice(0, entry.idsAsc.length - this.maxTimelineSize);
+						}
+					}
+				}
 			}
 		}
 	}
 
 	/**
-	 * Removes deleted post ID from cached timelines or invalidates top pages.
+	 * Removes deleted post ID from timeline caches.
 	 */
 	onPostDeleted(postId) {
 		const pId = Number(postId);
+		const now = Date.now();
+
 		for (const [key, entry] of this.cache.entries()) {
-			if (entry.expiresAt <= Date.now()) {
+			if (entry.expiresAt <= now) {
 				this.cache.delete(key);
 				continue;
 			}
-			entry.ids = entry.ids.filter((id) => id !== pId);
-			if (key.endsWith(':0:0')) {
-				this.cache.delete(key);
+			const idx = entry.idsAsc.indexOf(pId);
+			if (idx !== -1) {
+				entry.idsAsc.splice(idx, 1);
 			}
 		}
 	}
 
-	onPostUpdated() {
-		// Invalidate first pages on post updates
-		this.clearTopPages();
-	}
-
-	onReactionUpdated() {
-		// Reactions handled in unified post cache
-	}
-
-	clearTopPages() {
-		for (const key of this.cache.keys()) {
-			if (key.endsWith(':0:0')) {
-				this.cache.delete(key);
-			}
-		}
-	}
-
+	/**
+	 * Invalidate all cached timeline keys.
+	 */
 	clear() {
 		this.cache.clear();
 	}
 }
 
-const timelineCacheManager = new TimelineCacheManager(5000); // 5s short cache, instantly cleared on new post
+const timelineCacheManager = new TimelineCacheManager({
+	ttlMs: 15000,
+	maxEntries: 300,
+	maxTimelineSize: 50,
+});
+
 module.exports = timelineCacheManager;

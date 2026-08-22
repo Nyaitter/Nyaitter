@@ -32,6 +32,7 @@ const {
 	processCreatePostAction,
 	processDeletePostAction,
 } = require('../services/PostActionProcessor');
+const timelineCacheManager = require('../utils/TimelineCacheManager');
 const path = require('path');
 const fs = require('fs');
 const { isCrawler, generatePostOgpTags, generatePostHtml } = require('../services/OgpService');
@@ -498,9 +499,14 @@ router.get('/page', optionalAuth, async (req, res) => {
 	const currentUserId = req.user ? req.user.id : null;
 	const knownViewer = req.user?.visibilityUser || null;
 
+	const cacheKey = `${mode}:${tab}:${req.query.q || ''}:${currentUserId || 0}:${limit}:${offset}:${beforeId || 0}`;
+	const cachedResult = timelineCacheManager.getIds(cacheKey);
+
 	try {
 		let result;
-		if (isDiscoverableMode) {
+		if (cachedResult) {
+			result = cachedResult;
+		} else if (isDiscoverableMode) {
 			result = await getDiscoverableModePage(db, {
 				mode,
 				tab,
@@ -511,6 +517,9 @@ router.get('/page', optionalAuth, async (req, res) => {
 				offset,
 				beforeId,
 			});
+			if (result?.ids) {
+				timelineCacheManager.setIds(cacheKey, result);
+			}
 		} else if (mode === 'profile') {
 			const userId = safeParsePostId(req.query.user_id);
 			if (!userId) return res.status(400).json({ error: 'user_id is required' });

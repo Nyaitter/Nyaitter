@@ -5,6 +5,7 @@ const { extractPostKeywords } = require('./PostKeywordService');
 const {
   serializeNotification,
 } = require('../utils/serialize');
+const timelineCacheManager = require('../utils/TimelineCacheManager');
 const {
   isOwnedAttachmentKey,
   normalizeContentType,
@@ -322,6 +323,7 @@ async function processCreatePostAction(context, payload) {
 
   if (groupAnnouncement && group) await notifyGroupAnnouncement(context, group, post);
   await publishNewTimelinePost(context, post);
+  timelineCacheManager.onPostCreated(post);
   enqueueGeminiModeration(context, post);
   return post;
 }
@@ -337,6 +339,7 @@ async function processDeletePostAction(context, { postId, userId, admin = false 
     throw new Error(admin ? 'Post not found' : 'You do not have permission to delete this post');
   }
 
+  timelineCacheManager.onPostDeleted(postId);
   await deleteStoredAttachments(
     context.storage,
     postToDelete.attachments,
