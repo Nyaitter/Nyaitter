@@ -1,6 +1,7 @@
 const dns = require('dns').promises;
 const https = require('https');
 const net = require('net');
+const { serializePost } = require('../utils/serialize');
 
 const MAX_URL_LENGTH = 2048;
 const MAX_HTML_BYTES = 128 * 1024;
@@ -475,15 +476,59 @@ function pruneCardCache(now) {
   }
 }
 
-async function getUrlCard(value) {
+function extractNyaitterPostIdFromRawString(raw) {
+  if (!raw || typeof raw !== 'string') return null;
+  const match = raw.match(/(?:#post\/|\/posts\/|\?post=)(\d+)/i) ||
+                raw.match(/\/@[^/\s]+\/posts\/(\d+)/i);
+  if (match && match[1]) {
+    const id = Number(match[1]);
+    if (Number.isInteger(id) && id > 0) return id;
+  }
+  return null;
+}
+
+async function getUrlCard(value, context = {}) {
+  const now = Date.now();
+  pruneCardCache(now);
+
+  // 1. Check if raw URL/path matches a Nyaitter post and can be resolved via database
+  const detectedPostId = extractNyaitterPostIdFromRawString(value);
+  if (detectedPostId && context.db && typeof context.db.getPostById === 'function') {
+    try {
+      const post = await context.db.getPostById(detectedPostId);
+      if (post) {
+        const serialized = await serializePost(
+          context.db,
+          post,
+          context.currentUserId || null,
+          0,
+          context.publicUrl || null,
+          context.knownViewer || null,
+        );
+        if (serialized) {
+          const cacheKey = `nyaitter:${detectedPostId}:${context.currentUserId || 0}`;
+          const postCard = {
+            type: 'nyaitter_post',
+            url: value,
+            post_id: Number(post.id),
+            post: serialized,
+          };
+          cardCache.set(cacheKey, { card: postCard, expiresAt: now + CACHE_TTL_MS });
+          pruneCardCache(now);
+          return postCard;
+        }
+      }
+    } catch (_) {}
+  }
+
   const targetUrl = normalizeTargetUrl(value);
   if (!targetUrl) return null;
 
-  const now = Date.now();
-  pruneCardCache(now);
-  const cached = cardCache.get(targetUrl.href);
+  const cacheKey = `${targetUrl.href}:${context.currentUserId || 0}`;
+  const cached = cardCache.get(cacheKey);
   if (cached && cached.expiresAt > now) return cached.card;
 
+  // 2. Standard remote URL resolution (oEmbed / Open Graph)
   let card = await getOEmbedCard(buildKnownOEmbedEndpoint(targetUrl), targetUrl);
   if (!card) {
     try {
@@ -501,11 +546,16 @@ async function getUrlCard(value) {
     }
   }
 
-  cardCache.set(targetUrl.href, { card, expiresAt: now + CACHE_TTL_MS });
+  if (card && !card.type) {
+    card.type = 'link';
+  }
+
+  cardCache.set(cacheKey, { card, expiresAt: now + CACHE_TTL_MS });
   pruneCardCache(now);
   return card;
 }
 
 module.exports = {
   getUrlCard,
+  extractNyaitterPostIdFromRawString,
 };
