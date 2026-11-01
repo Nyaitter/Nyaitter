@@ -2586,6 +2586,16 @@ class D1Adapter extends DatabaseAdapter {
 		return Array.isArray(res) ? res : [];
 	}
 
+	async listNotesByPostIds(postIds, currentUserId = null) {
+		const byPost = new Map();
+		const ids = [...new Set((postIds || []).map((id) => Number(id)).filter((id) => Number.isSafeInteger(id) && id > 0))];
+		for (const postId of ids) {
+			const notes = await this.listNotesByPost(postId, currentUserId);
+			if (notes.length > 0) byPost.set(postId, notes);
+		}
+		return byPost;
+	}
+
 	async countNotesByUserSince(userId, since) {
 		const res = await this._read(this._query('/community-notes/count', {
 			userId: requireId(userId, 'userId'),

@@ -216,6 +216,9 @@ applyTrustProxy(app);
 // ── Middleware Pipeline ────────────────────────────────────────────────────────
 // API routes parse body and attach tracking headers; static files bypass body parser for low CPU/memory
 app.use(httpCompression);
+// CORS はボディパーサーより前に置く。JSON 不正や容量超過でパーサーが
+// エラーを返した場合も、エラーレスポンスに CORS ヘッダーを残すため。
+app.use(flexibleCors);
 app.use(API_ENDPOINT, express.json({ limit: config.server.jsonBodyLimit }));
 app.use(
     API_ENDPOINT,
@@ -227,7 +230,6 @@ app.use(
 );
 app.use(API_ENDPOINT, requestId);
 app.use(securityHeaders);
-app.use(flexibleCors);
 app.use(API_ENDPOINT, csrfProtection);
 const healthPaths = new Set([apiPath('/health'), apiPath('/ready')]);
 app.use(API_ENDPOINT, (req, res, next) => {

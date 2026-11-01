@@ -818,13 +818,21 @@ async function serializePostsBatch(
 
 	const allPostIds = allPosts.map((p) => Number(p.id)).filter((id) => Number.isInteger(id) && id > 0);
 
-	const [additionalUsers, metrics, pollsByPostId, followSnapshot] = await Promise.all([
+	const [additionalUsers, metrics, pollsByPostId, followSnapshot, rawNotesByPostId] = await Promise.all([
 		fetchUsersByIds(db, missingAuthorIds),
 		fetchPostMetrics(db, allPosts, currentUserId, knownViewer),
 		typeof db.getPollsByPostIds === 'function' ? db.getPollsByPostIds(allPostIds, currentUserId) : new Map(),
 		(followingCheckAuthorIds.length > 0 && typeof db.getFollowRelationshipSnapshot === 'function')
 			? db.getFollowRelationshipSnapshot(normalizedViewerId, followingCheckAuthorIds)
 			: null,
+		// コミュニティノートは投稿ごとの個別取得 (N+1) を避け、posts へ集約する。
+		// 取得失敗でタイムライン全体を落とさないよう、失敗時は空に倒す。
+		(normalizedViewerId != null && typeof db.listNotesByPostIds === 'function')
+			? db.listNotesByPostIds(allPostIds, normalizedViewerId).catch((error) => {
+				console.warn('[serialize] batch notes fetch fallback:', error.message);
+				return new Map();
+			})
+			: new Map(),
 	]);
 
 	const authorsFollowingViewer = new Set();
@@ -860,6 +868,30 @@ async function serializePostsBatch(
 		Number(post.id),
 		canViewPostWithContext(post, visibilityContext),
 	]));
+	// ノートの閲覧可否はノート一覧 API と同じ canRead / publicNote で判定する。
+	// 可視でない投稿についてはノートの存在自体を秘匿する。
+	const noteSummariesByPostId = new Map();
+	if (rawNotesByPostId && rawNotesByPostId.size > 0) {
+		const { canRead: canReadNote, publicNote } = require('../services/CommunityNoteService');
+		await Promise.all([...rawNotesByPostId.entries()].map(async ([pid, notes]) => {
+			const post = postsById.get(pid);
+			if (!post || !visibleByPostId.get(pid) || !Array.isArray(notes)) return;
+			const readable = [];
+			for (const note of notes) {
+				try {
+					if (await canReadNote(db, note, normalizedViewerId, post)) {
+						readable.push({ ...publicNote(note), eligible: true });
+					}
+				} catch (error) {
+					console.warn('[serialize] note visibility check failed:', error.message);
+				}
+			}
+			noteSummariesByPostId.set(pid, {
+				notes: readable,
+				eligible: readable.some((n) => n.status === 'limited' || n.status === 'review'),
+			});
+		}));
+	}
 	const postKeywordBackfillService = db?.postKeywordBackfillService;
 	const groupIds = [...new Set(allPosts.filter(post => visibleByPostId.get(Number(post.id)))
 		.map(post => post.groupId ?? post.group_id).filter(Boolean).map(String))];
@@ -1038,6 +1070,8 @@ async function serializePostsBatch(
 			// 毎回投稿から読み直す。
 			recommendation_penalty: Math.max(0, Math.min(1, Number(post.recommendation_penalty ?? post.recommendationPenalty) || 0)),
 			poll: pollsByPostId.get(postId) || null,
+			community_notes: noteSummariesByPostId.get(postId)?.notes || [],
+			community_notes_eligible: noteSummariesByPostId.get(postId)?.eligible || false,
 		};
 		visitingPostIds.delete(postId);
 		return serialized;
