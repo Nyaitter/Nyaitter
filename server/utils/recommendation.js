@@ -138,7 +138,9 @@ function scoreRecommendedPosts(candidatePosts, {
 			}
 		}
 
-		const totalScore = Math.max(0, recencyScore + engagementScore + followScore + affinityScore - penalty);
+		const totalScoreRaw = Math.max(0, recencyScore + engagementScore + followScore + affinityScore - penalty);
+		const recommendationPenalty = Math.max(0, Math.min(1, Number(post?.recommendation_penalty ?? post?.recommendationPenalty) || 0));
+		const totalScore = totalScoreRaw * (1 - recommendationPenalty);
 		scored.push({
 			id: Number.isSafeInteger(postId) ? postId : null,
 			authorId: Number.isSafeInteger(authorId) ? authorId : null,

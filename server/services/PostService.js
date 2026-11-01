@@ -105,6 +105,7 @@ class PostService {
 
     const result = await this.db.toggleLike(userId, postId);
     updateUserReaction(this.db,userId,postId,'like',result.liked);
+    await require('./ReputationService').syncPostTrust(this.db,postId);
     return result;
   }
 
@@ -121,6 +122,7 @@ class PostService {
     }
     const result = await this.db.toggleStar(userId, postId);
     updateUserReaction(this.db,userId,postId,'star',result.starred);
+    await require('./ReputationService').syncPostTrust(this.db,postId);
     return result;
   }
 

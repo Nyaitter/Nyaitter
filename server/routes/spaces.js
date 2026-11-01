@@ -299,8 +299,13 @@ router.delete({
     const space = await getSpaceOr404(req, res);
     if (!space) return;
     await requireSpaceOwner(getDb(req), space, req.user.id);
-    await getDb(req).deleteSpace(space.id);
-    await req.app.locals.calls?.refreshStage(space.id);
+    const calls = req.app.locals.calls;
+    if (calls) {
+      await calls.withStageLock(space.id, async () => {
+        await getDb(req).deleteSpace(space.id);
+        await calls.refreshStageUnlocked(space.id, null);
+      });
+    } else await getDb(req).deleteSpace(space.id);
     const realtime = req.app.locals.realtime;
     if (realtime?.broadcastToSpace) realtime.broadcastToSpace(space.id, getDb(req), { type: 'space_deleted', space_id: space.id });
     res.json({ deleted: true });

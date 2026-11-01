@@ -1,5 +1,5 @@
 const express = require('express');
-const { optionalAuth, requireAuth, requireAuthAllowFrozen, invalidateSessionPrincipalCache } = require('../middleware/auth');
+const { optionalAuth, requireAuth, requireAuthAllowFrozen } = require('../middleware/auth');
 const crypto = require('crypto');
 const config = require('../config');
 const { isWithinRange, describeIntegerRange } = require('../utils/settingFormats');
@@ -24,6 +24,7 @@ const { normalizeBlockList } = require('../utils/blockList');
 const { isOwnedAttachmentKey, normalizeStorageKey } = require('../adapters/storage/safeStoragePath');
 const { ScratchIconService } = require('../services/ScratchIconService');
 const { listOwnedImposters } = require('../services/ImposterService');
+const { assertAuthenticatedUserAccess } = require('../services/auth/PostAsUserService');
 const {
 	createNotificationIfAllowed,
 } = require('../services/NotificationDeliveryService');
@@ -40,6 +41,53 @@ const profileUpdateLimiter = createRateLimiter(config.rateLimit.profileUpdate);
 const accountOperationLimiter = createRateLimiter(config.rateLimit.profileUpdate);
 const searchLimiter = createRateLimiter(config.rateLimit.profileUpdate);
 const accountDeletionConfirmations = new Map();
+const reputation = require('../services/ReputationService');
+const { containsProtectedStatus } = require('../utils/protectedStatus');
+const { actualRanks, displayRanks, displayOptions, validateDisplaySettings, ownDisplaySettings } = require('../utils/rankDisplay');
+
+router.get({path:'/me/status',summary:'自分の利用状態',auth:'required'},requireAuthAllowFrozen,async(req,res)=>{
+	try {
+		const db = getDbAdapter(req);
+		const [status, user] = await Promise.all([reputation.getStatus(db, req.user.id), db.getUserById(req.user.id)]);
+		const actual = { trust: status.trust.rank, writer: status.writer.rank, reviewer: status.reviewer.rank };
+		res.set('Cache-Control','no-store');
+		return res.json({ ...status, display_ranks: displayRanks(actual, user?.settings?.display_ranks), display_rank_options: displayOptions(actual), display_settings: ownDisplaySettings(user?.settings, actual) });
+	}
+	catch(error) { console.error('[users] status:',error.message); return res.status(503).json({error:'利用状態を取得できませんでした'}); }
+});
+
+router.post({path:'/:userId/trust-moderation',summary:'管理者による利用制限の指定・取消',auth:'admin'},requireAuth,async(req,res)=>{
+	if (!req.user.admin) return res.status(403).json({error:'管理者権限が必要です'});
+	const id=Number(req.params.userId); const reason=String(req.body?.reason || '').trim();
+	if (!Number.isSafeInteger(id) || id<=0 || typeof req.body?.banned!=='boolean' || reason.length<10) return res.status(400).json({error:'対象と判断理由を指定してください'});
+	try {
+		if (id===Number(req.user.id)) return res.status(403).json({error:'自分自身の利用制限は変更できません'});
+	const db=getDbAdapter(req); const target=await db.getUserById(id); if (!target) return res.status(404).json({error:'User not found'});
+	if (target.admin===true) return res.status(403).json({error:'他の管理者の利用制限は変更できません'});
+		await require('../services/ModLogService').operation(db, 'admin', req.user.id, req.body.banned ? 'trust_ban' : 'trust_unban', 'user', id, async () => {
+			await db.replaceReputationEvents(`manual-ban:${id}`,req.body.banned?[reputation.event('ban',id,'ban',1,0,undefined,{adminId:req.user.id,reason})]:[]);
+			return true;
+		}, 'failure');
+		return res.json({success:true});
+	} catch(error) { return res.status(500).json({error:'利用制限を更新できませんでした'}); }
+});
+
+router.post({path:'/:userId/note-outcome-retract',summary:'管理者による削除済みノート実績の取消',auth:'admin'},requireAuth,async(req,res)=>{
+	if (!req.user.admin) return res.status(403).json({error:'管理者権限が必要です'});
+	const userId=Number(req.params.userId);const noteId=Number(req.body?.noteId);const reason=String(req.body?.reason || '').trim();
+	if (![userId,noteId].every(id=>Number.isSafeInteger(id)&&id>0) || reason.length<10) return res.status(400).json({error:'対象と取消理由を指定してください'});
+	try {
+		const db=getDbAdapter(req);if (await db.getNote(noteId)) return res.status(409).json({error:'残っているノートは再判定または管理者削除を利用してください'});
+		const scope=`note:${noteId}`;const evidence=await db.getReputationEvidence(userId,scope);
+		if (!evidence.some(e=>e.scope===scope)) return res.status(404).json({error:'対象実績が見つかりません'});
+		await require('../services/ModLogService').operation(db, 'admin', req.user.id, 'note_outcome_retract', 'note', noteId, async () => {
+			await db.replaceReputationEvents(scope,[]);
+			await db.replaceReputationEvents(`note-retraction:${noteId}`,[reputation.event('audit',userId,'trust',0,0,undefined,{adminId:req.user.id,reason})]);
+			return true;
+		}, 'failure');
+		return res.json({success:true});
+	} catch(error) { return res.status(500).json({error:'ノート実績を取り消せませんでした'}); }
+});
 const ACCOUNT_CONFIRMATION_TTL_MS = 5 * 60 * 1000;
 const MAX_ACCOUNT_CONFIRMATIONS = 1000;
 
@@ -83,20 +131,17 @@ async function deleteOwnedImposterAccounts(req, db, storage, parentId) {
 	for (const imposter of imposters) {
 		const started = await db.beginAccountOperation(imposter.id, 'deleting');
 		if (!started) throw new Error(`Imposter account operation could not be started: ${imposter.id}`);
-		invalidateSessionPrincipalCache(imposter.id);
 		try {
 			req.app.locals.realtime?.closeUser?.(imposter.id, 1012, 'Parent account deletion');
 			const attachmentKeys = await db.getAccountAttachmentKeys(imposter.id);
 			await db.invalidateAllSessions(imposter.id);
 			const deleted = await db.deleteAccount(imposter.id);
 			if (!deleted) throw new Error(`Imposter account deletion did not complete: ${imposter.id}`);
-			invalidateSessionPrincipalCache(imposter.id);
 			invalidateUserBriefCache(imposter.id);
 			timelineCacheManager.clear();
 			await deleteStoredAccountAttachments(storage, attachmentKeys);
 		} catch (error) {
 			await db.finishAccountOperation(imposter.id, 'deleting').catch(() => {});
-			invalidateSessionPrincipalCache(imposter.id);
 			throw error;
 		}
 	}
@@ -221,6 +266,61 @@ async function sendScratchFallbackIcon(req, res, scid) {
 	return true;
 }
 
+// Icons are displayed at <= ~170 CSS px everywhere in the UI, but users can
+// upload multi-megapixel originals. Serve a variant capped at 512px (enough
+// for high-DPR profile headers) generated on demand and cached in memory;
+// the stored original is never modified. Animated GIFs and SVGs pass
+// through untouched so animation/vectors keep working exactly as before.
+const ICON_MAX_DIMENSION = 512;
+const ICON_CACHE_LIMIT = 24 * 1024 * 1024;
+const iconVariantCache = new Map();
+let iconVariantCacheBytes = 0;
+
+function iconCacheGet(key) {
+	const entry = iconVariantCache.get(key);
+	if (entry) {
+		iconVariantCache.delete(key);
+		iconVariantCache.set(key, entry);
+	}
+	return entry;
+}
+
+function iconCacheSet(key, entry) {
+	const existing = iconVariantCache.get(key);
+	if (existing) iconVariantCacheBytes -= existing.buffer.length;
+	iconVariantCache.set(key, entry);
+	iconVariantCacheBytes += entry.buffer.length;
+	while (iconVariantCacheBytes > ICON_CACHE_LIMIT && iconVariantCache.size > 1) {
+		const oldestKey = iconVariantCache.keys().next().value;
+		const oldest = iconVariantCache.get(oldestKey);
+		iconVariantCache.delete(oldestKey);
+		if (oldest) iconVariantCacheBytes -= oldest.buffer.length;
+	}
+}
+
+async function buildIconVariant(buffer, contentType) {
+	const sharp = require('sharp');
+	const metadata = await sharp(buffer).metadata();
+	const width = metadata.width || 0;
+	const height = metadata.height || 0;
+	if (!width || !height) return null;
+	if (width <= ICON_MAX_DIMENSION && height <= ICON_MAX_DIMENSION) return null;
+	if ((metadata.pages || 1) > 1) return null; // animated: keep original
+	let pipeline = sharp(buffer).resize({
+		width: ICON_MAX_DIMENSION,
+		height: ICON_MAX_DIMENSION,
+		fit: 'inside',
+		withoutEnlargement: true,
+	});
+	if (contentType === 'image/jpeg') pipeline = pipeline.jpeg({ quality: 85 });
+	else if (contentType === 'image/webp') pipeline = pipeline.webp({ quality: 85 });
+	else if (contentType === 'image/avif') pipeline = pipeline.avif({ quality: 70 });
+	else if (contentType === 'image/png') pipeline = pipeline.png();
+	else return null;
+	const resized = await pipeline.toBuffer();
+	return resized.length < buffer.length ? resized : null;
+}
+
 async function sendStoredIcon(req, res, fileId) {
 	const storage = getStorageAdapter(req);
 	if (!storage || typeof storage.read !== 'function') return false;
@@ -229,9 +329,32 @@ async function sendStoredIcon(req, res, fileId) {
 		const contentType = String(file?.contentType || '').split(';', 1)[0].trim().toLowerCase();
 		const buffer = Buffer.isBuffer(file?.buffer) ? file.buffer : Buffer.from(file?.buffer || '');
 		if (!contentType.startsWith('image/') || buffer.length === 0) return false;
+		const sourceHash = require('crypto').createHash('sha256').update(buffer).digest('hex').slice(0, 24);
+		let outgoing = buffer;
+		if (contentType !== 'image/gif' && contentType !== 'image/svg+xml') {
+			const cacheKey = `${fileId}|${sourceHash}`;
+			const cached = iconCacheGet(cacheKey);
+			if (cached) {
+				outgoing = cached.buffer;
+			} else {
+				try {
+					const variant = await buildIconVariant(buffer, contentType);
+					if (variant) outgoing = variant;
+				} catch (error) {
+					console.warn('[users/icon] resize failed, serving original:', error.message);
+				}
+				iconCacheSet(cacheKey, { buffer: outgoing });
+			}
+		}
+		const etag = `"icon-${require('crypto').createHash('sha256').update(outgoing).digest('hex').slice(0, 24)}"`;
 		res.setHeader('Cache-Control', 'public, max-age=21600, stale-while-revalidate=86400');
 		res.setHeader('Content-Type', contentType);
-		res.send(buffer);
+		res.setHeader('ETag', etag);
+		if (req.headers['if-none-match'] === etag) {
+			res.status(304).end();
+			return true;
+		}
+		res.send(outgoing);
 		return true;
 	} catch (error) {
 		console.warn('[users/icon] stored icon read failed:', error.message);
@@ -782,7 +905,9 @@ router.put({
 
 	try {
 		const { shadow } = req.body || {};
-		const status = await db.setUserStatus(userId, { shadow });
+		const status = shadow === undefined
+			? await db.setUserStatus(userId, { shadow })
+			: await require('../services/ModLogService').operation(db, 'admin', req.user.id, shadow ? 'search_exclude' : 'search_include', 'user', userId, () => db.setUserStatus(userId, { shadow }), 'failure');
 		if (!status) {
 			return res.status(404).json({ error: 'User not found' });
 		}
@@ -818,6 +943,7 @@ router.post({
 			const follows = await db.getFollowIds(followerId);
 			const currentlyFollowing = follows.some((id) => Number(id) === followingId);
 			const actionId = queue.enqueue('follow', async () => {
+				await assertAuthenticatedUserAccess(req, db, ['write']);
 				const result = await db.toggleFollow(followerId, followingId);
 				if (result.following) {
 					await createNotificationIfAllowed(db, {
@@ -1194,6 +1320,7 @@ router.put({
 	const userId = req.user.id;
 	const { name, me, bio, header_image, icon_data, settings, block } =
 		req.body;
+	if (containsProtectedStatus(req.body)) return res.status(400).json({error:'利用状態はプロフィール設定から変更できません'});
 	const validationError =
 		validateProfileText(name, 'name', config.limits.userNameLength) ||
 		validateProfileText(me, 'me', config.limits.profileBioLength) ||
@@ -1201,13 +1328,21 @@ router.put({
 	if (validationError) return res.status(400).json({ error: validationError });
 
 	try {
+		let nextSettings = settings;
+		if (settings !== undefined) {
+			const [current, profile] = await Promise.all([db.getUserById(userId), db.getReputationProfile(userId)]);
+			const displayError = validateDisplaySettings(settings, actualRanks(profile));
+			if (displayError) return res.status(400).json({ error: displayError });
+			nextSettings = { ...current?.settings, ...settings };
+			if (settings.display_ranks !== undefined) nextSettings.display_ranks = { ...current?.settings?.display_ranks, ...settings.display_ranks };
+		}
 		const updated = await db.updateUserProfile(userId, {
 			name,
 			me,
 			bio,
 			header_image,
 			icon_data,
-			settings,
+			settings: nextSettings,
 			block,
 		});
 		if (!updated) {
@@ -1215,7 +1350,6 @@ router.put({
 		}
 		invalidateUserBriefCache(userId);
 		updateUserBriefCache(updated, getPublicUrl(req));
-		invalidateSessionPrincipalCache(userId);
 		timelineCacheManager.updatePostAuthor(userId, {
 			name: updated.name,
 			me: updated.me || updated.bio || '',
@@ -1249,13 +1383,22 @@ router.put({
 	}
 
 	const { verify, freeze, admin } = req.body || {};
+	const actions = [
+		...(verify !== undefined ? [verify ? 'verify_user' : 'unverify_user'] : []),
+		...(freeze !== undefined ? [freeze ? 'freeze' : 'unfreeze'] : []),
+		...(admin !== undefined ? [admin ? 'grant_admin' : 'revoke_admin'] : []),
+	];
+	const modLog = require('../services/ModLogService');
 
 	try {
-		const updated = await db.updateUserProfile(userId, {
-			verify,
-			freeze,
-			admin,
-		});
+		let updated;
+		try {
+			updated = await db.updateUserProfile(userId, { verify, freeze, admin });
+		} catch (error) {
+			for (const action of actions) await modLog.record(db, 'admin', req.user.id, action, 'user', userId, 'failure');
+			throw error;
+		}
+		for (const action of actions) await modLog.record(db, 'admin', req.user.id, action, 'user', userId, updated ? 'success' : 'failure');
 		if (!updated) {
 			return res.status(404).json({ error: 'User not found' });
 		}

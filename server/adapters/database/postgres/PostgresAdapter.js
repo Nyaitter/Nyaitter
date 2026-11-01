@@ -81,10 +81,15 @@ function normalizeUserRow(row) {
 		icon_data: row.icon_data || null,
 		verify: Boolean(row.verify),
 		admin: Boolean(row.admin),
+		admin_request_excluded: Boolean(row.admin_request_excluded),
 		freeze: row.freeze || null,
 		shadow: Boolean(row.shadow),
 		block: normalizeBlockList(rawBlock, id),
 		created_at: toIsoString(row.created_at),
+		note_rank: Number.isFinite(Number(row.note_rank)) ? Number(row.note_rank) : 0,
+		note_affirmative_score: Number.isFinite(Number(row.note_affirmative_score)) ? Number(row.note_affirmative_score) : 0,
+		note_max_per_day: Number.isFinite(Number(row.note_max_per_day)) ? Number(row.note_max_per_day) : 1,
+		note_min_public_threshold: Number.isFinite(Number(row.note_min_public_threshold)) ? Number(row.note_min_public_threshold) : 0,
 	};
 }
 
@@ -168,6 +173,8 @@ function normalizePostRow(row) {
 		repostCount: Math.max(0, Number(row.repost_count ?? row.repostCount) || 0),
 		reply_count: Math.max(0, Number(row.reply_count ?? row.replyCount) || 0),
 		replyCount: Math.max(0, Number(row.reply_count ?? row.replyCount) || 0),
+		recommendation_penalty: Number(row.recommendation_penalty ?? row.recommendationPenalty ?? 0) || 0,
+		recommendationPenalty: Number(row.recommendation_penalty ?? row.recommendationPenalty ?? 0) || 0,
 		...(row.liked_by_me !== undefined ? { liked_by_me: Boolean(row.liked_by_me) } : {}),
 		...(row.starred_by_me !== undefined ? { starred_by_me: Boolean(row.starred_by_me) } : {}),
 		...(author ? { author } : {}),
@@ -372,6 +379,7 @@ function normalizeGroupDmRow(row, viewerId = null) {
 	const res = {
 		id: String(row.id),
 		host_id: Number(row.host_id ?? row.hostId),
+		state_version: String(row.state_version),
 		title: row.title || '',
 		member: memberList,
 		accepted,
@@ -492,6 +500,20 @@ function mapBlockedLoginIp(row) {
 }
 
 class PostgresAdapter extends DatabaseAdapter {
+	async createModLog(input) {
+		const m = require('../modLogs'); const row = m.normalizeRecord(input, crypto.randomUUID());
+		const inserted = await this.pool.query('INSERT INTO mod_logs (id, created_at, actor_type, actor_id, action, target_type, target_id, result) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (id) DO NOTHING RETURNING id', [row.id,row.createdAt,row.actorType,row.actorId,row.action,row.targetType,row.targetId,row.result]);
+		if (!inserted.rowCount) {
+			const { rows } = await this.pool.query('SELECT id,created_at AS "createdAt",actor_type AS "actorType",actor_id AS "actorId",action,target_type AS "targetType",target_id AS "targetId",result FROM mod_logs WHERE id=$1', [row.id]);
+			if (!rows[0] || !m.sameRecord(rows[0], row)) throw new Error('Mod log ID conflict');
+		}
+		return row;
+	}
+	async searchModLogs(input = {}) {
+		const m = require('../modLogs'); const q = m.query(input, 'postgres');
+		const { rows } = await this.pool.query(q.sql, q.args);
+		return m.page(rows.map(m.mapRow), q.limit);
+	}
 	constructor(options = {}) {
 		super();
 		this.config = options;
@@ -506,6 +528,7 @@ class PostgresAdapter extends DatabaseAdapter {
 		);
 		this.groupDmReadCache = new Map();
 		this.groupDmReadCacheGeneration = 0;
+		this.supportsGroupDmSendIdempotency = true;
 	}
 
 	async connect() {
@@ -760,13 +783,13 @@ class PostgresAdapter extends DatabaseAdapter {
 		}
 	}
 
-	async getUserById(id) {
+	async getUserById(id, { fresh = false } = {}) {
 		if (id == null) return null;
 		const userId = Number(id);
 		if (!Number.isSafeInteger(userId) || userId <= 0) return null;
 
 		const cache = this._getUserCache();
-		const cached = cache?.get(userId);
+		const cached = fresh ? null : cache?.get(userId);
 		if (cached) return cached;
 
 		const { rows } = await this.pool.query(
@@ -776,6 +799,8 @@ class PostgresAdapter extends DatabaseAdapter {
 		const user = normalizeUserRow(rows[0]);
 		if (user) {
 			this._setCachedUser(user);
+		} else if (fresh) {
+			cache?.delete(userId);
 		}
 		return user;
 	}
@@ -1432,6 +1457,9 @@ class PostgresAdapter extends DatabaseAdapter {
 			await client.query('UPDATE moderation_reports SET reporter_user_id = $2 WHERE reporter_user_id = $1', [previousId, nextId]);
 			await client.query('UPDATE moderation_reports SET assigned_admin_id = $2 WHERE assigned_admin_id = $1', [previousId, nextId]);
 			await client.query('UPDATE logs SET nyaitter_id = $2 WHERE nyaitter_id = $1', [previousId, nextId]);
+			for (const prefix of ['manual-ban:','false-report-penalty:','moderation-user:']) {
+				await client.query('UPDATE reputation_events SET scope=$2 WHERE scope=$1',[`${prefix}${previousId}${prefix==='moderation-user:'?':target':''}`,`${prefix}${nextId}${prefix==='moderation-user:'?':target':''}`]);
+			}
 
 			// groups and memberships
 			await client.query('UPDATE groups SET owner_id = $2 WHERE owner_id = $1', [previousId, nextId]);
@@ -1467,6 +1495,7 @@ class PostgresAdapter extends DatabaseAdapter {
 					Number(msg?.userid) === previousId ? { ...msg, userid: nextId } : msg
 				));
 				const unread = { ...(typeof group.unread === 'object' && group.unread !== null ? group.unread : parseJsonSafe(group.unread, {})) };
+				if (Array.isArray(unread._accepted)) unread._accepted = unread._accepted.map((id) => Number(id) === previousId ? nextId : Number(id));
 				if (Object.prototype.hasOwnProperty.call(unread, String(previousId))) {
 					unread[String(nextId)] = unread[String(previousId)];
 					delete unread[String(previousId)];
@@ -1633,6 +1662,7 @@ class PostgresAdapter extends DatabaseAdapter {
 				const rawPost = Array.isArray(group.post) ? group.post : parseJsonSafe(group.post, []);
 				const messages = rawPost.filter((message) => Number(message?.userid) !== Number(userId));
 				const unread = { ...(typeof group.unread === 'object' && group.unread !== null ? group.unread : parseJsonSafe(group.unread, {})) };
+				if (Array.isArray(unread._accepted)) unread._accepted = unread._accepted.filter((id) => Number(id) !== Number(userId));
 				delete unread[String(userId)];
 				const hostId = Number(group.host_id) === Number(userId) ? members[0] : Number(group.host_id);
 				await client.query(
@@ -5756,7 +5786,7 @@ class PostgresAdapter extends DatabaseAdapter {
 		return normalizeGroupDmRow(rows[0], hostId);
 	}
 
-	async updateGroupDm(dmId, updates) {
+	async updateGroupDm(dmId, updates, expectedPost = undefined, expectedState = undefined) {
 		const sets = [];
 		const values = [];
 		let i = 1;
@@ -5786,11 +5816,8 @@ class PostgresAdapter extends DatabaseAdapter {
 			sets.push(`unread = $${i++}::jsonb`);
 			values.push(JSON.stringify(updates.unread));
 		} else if (updates.accepted !== undefined) {
-			const existing = await this.getGroupDm(dmId);
-			const unreadObj = existing?.unread && typeof existing.unread === 'object' ? { ...existing.unread } : {};
-			unreadObj._accepted = Array.from(new Set(updates.accepted.map(Number).filter(Number.isInteger)));
-			sets.push(`unread = $${i++}::jsonb`);
-			values.push(JSON.stringify(unreadObj));
+			sets.push(`unread = jsonb_set(COALESCE(unread, '{}'::jsonb), '{_accepted}', $${i++}::jsonb)`);
+			values.push(JSON.stringify(Array.from(new Set(updates.accepted.map(Number).filter(Number.isInteger)))));
 		}
 		if (updates.time !== undefined) {
 			sets.push(`time = $${i++}`);
@@ -5803,8 +5830,16 @@ class PostgresAdapter extends DatabaseAdapter {
 		}
 
 		values.push(String(dmId));
+		let condition = '';
+		if (expectedPost !== undefined) { values.push(JSON.stringify(expectedPost)); condition += ` AND post = $${values.length}::jsonb`; }
+		if (expectedState) {
+			values.push(Number(expectedState.host_id), expectedState.member, JSON.stringify(expectedState.accepted));
+			condition += ` AND host_id = $${values.length - 2} AND member = $${values.length - 1}::int[] AND COALESCE(unread->'_accepted', to_jsonb(member)) = $${values.length}::jsonb`;
+			values.push(String(expectedState.state_version));
+			condition += ` AND state_version = $${values.length}::bigint`;
+		}
 		const { rows } = await this.pool.query(
-			`UPDATE group_dms SET ${sets.join(', ')} WHERE id = $${i} RETURNING *`,
+			`UPDATE group_dms SET ${sets.join(', ')} WHERE id = $${i}${condition} RETURNING *`,
 			values,
 		);
 		this._clearGroupDmReadCache();
@@ -5812,7 +5847,29 @@ class PostgresAdapter extends DatabaseAdapter {
 		return normalizeGroupDmRow(rows[0]);
 	}
 
-	async appendToGroupDm(dmId, message, senderId = null) {
+	async editGroupDmMessage(dmId, messageId, userId, content) {
+		const result = await this._withTransaction(async (client) => {
+			const { rows } = await client.query('SELECT * FROM group_dms WHERE id = $1 FOR UPDATE', [String(dmId)]);
+			const row = rows[0];
+			if (!row) return { error: 'not_found' };
+			if (!(row.member || []).map(Number).includes(Number(userId))) return { error: 'forbidden' };
+			const unread = typeof row.unread === 'object' && row.unread !== null ? row.unread : parseJsonSafe(row.unread, {});
+			const accepted = Array.isArray(unread._accepted) ? unread._accepted : row.member;
+			if (!accepted.map(Number).includes(Number(userId))) return { error: 'forbidden' };
+			const posts = Array.isArray(row.post) ? row.post : parseJsonSafe(row.post, []);
+			const index = posts.findIndex((item) => String(item.id) === String(messageId));
+			if (index < 0) return { error: 'not_found' };
+			const message = posts[index];
+			if (Number(message.userid) !== Number(userId) || message.type !== 'user' || message.e2e || message.deleted || message.deleted_at) return { error: 'forbidden' };
+			posts[index] = { ...message, content, edited_at: new Date().toISOString() };
+			await client.query('UPDATE group_dms SET post = $2::jsonb, latest_message = $2::jsonb -> -1 WHERE id = $1', [String(dmId), JSON.stringify(posts)]);
+			return { message: posts[index], member: row.member.filter((id) => accepted.map(Number).includes(Number(id))) };
+		});
+		this._clearGroupDmReadCache();
+		return result;
+	}
+
+	async appendToGroupDm(dmId, message, senderId = null, options = undefined) {
 		const result = await this._withTransaction(async (client) => {
 			const { rows: existingRows } = await client.query(
 				'SELECT * FROM group_dms WHERE id = $1 FOR UPDATE',
@@ -5821,32 +5878,53 @@ class PostgresAdapter extends DatabaseAdapter {
 			const row = existingRows[0];
 			if (!row) return null;
 
+			const unread = { ...(typeof row.unread === 'object' && row.unread !== null ? row.unread : parseJsonSafe(row.unread, {})) };
+			const members = (row.member || []).map(Number);
+			const accepted = Array.isArray(unread._accepted) ? unread._accepted.map(Number) : members;
+			if (options?.requestId != null && members.includes(Number(senderId))) {
+				const { rows } = await client.query('SELECT request_hash, response_message FROM group_dm_send_requests WHERE dm_id = $1 AND sender_id = $2 AND request_id = $3', [String(dmId), Number(senderId), options.requestId]);
+				if (rows[0]) {
+					if (rows[0].request_hash !== options.requestHash) return { idempotencyConflict: true };
+					return { ...normalizeGroupDmRow(row, senderId), idempotencyReplay: rows[0].response_message };
+				}
+			}
+			if (options) {
+				const expected = options.expectedState;
+				if (!expected || !members.includes(Number(senderId)) || String(row.state_version) !== String(expected.state_version) || Number(row.host_id) !== Number(expected.host_id) || JSON.stringify(members) !== JSON.stringify(expected.member) || JSON.stringify(accepted) !== JSON.stringify(expected.accepted)) return null;
+				if (!accepted.includes(Number(senderId))) {
+					if (!options.joinEvent) return null;
+					unread._accepted = [...accepted, Number(senderId)];
+				} else if (options.joinEvent) return null;
+			}
 			const time = message.time ? toIsoString(message.time) : new Date().toISOString();
 			const posts = Array.isArray(row.post) ? row.post : parseJsonSafe(row.post, []);
+			if (options?.joinEvent) posts.push(options.joinEvent);
 			posts.push(message);
 
-		const unread = { ...(typeof row.unread === 'object' && row.unread !== null ? row.unread : parseJsonSafe(row.unread, {})) };
 		if (senderId !== null) {
 			unread[String(senderId)] = 0;
 			for (const memberId of row.member || []) {
 					const normalizedMemberId = Number(memberId);
 					if (normalizedMemberId === Number(senderId)) continue;
 					const key = String(normalizedMemberId);
-					unread[key] = Number(unread[key] || 0) + 1;
+					unread[key] = Number(unread[key] || 0) + (options?.joinEvent ? 2 : 1);
 				}
 			}
 
 			const { rows } = await client.query(
 				`UPDATE group_dms
 				 SET post = $1::jsonb,
-				     message_count = message_count + 1,
+				     message_count = message_count + $5,
 				     latest_message = $1::jsonb -> -1,
 				     time = $2,
 				     unread = $3::jsonb
 				 WHERE id = $4
 				 RETURNING *`,
-				[JSON.stringify(posts), time, JSON.stringify(unread), String(dmId)],
+				[JSON.stringify(posts), time, JSON.stringify(unread), String(dmId), options?.joinEvent ? 2 : 1],
 			);
+			if (options?.requestId != null) {
+				await client.query('INSERT INTO group_dm_send_requests (dm_id, sender_id, request_id, request_hash, response_message) VALUES ($1, $2, $3, $4, $5::jsonb)', [String(dmId), Number(senderId), options.requestId, options.requestHash, JSON.stringify(message)]);
+			}
 			return normalizeGroupDmRow(rows[0], senderId);
 		});
 		this._clearGroupDmReadCache();
@@ -5891,19 +5969,30 @@ class PostgresAdapter extends DatabaseAdapter {
 		});
 	}
 
-	async deleteGroupDm(dmId) {
-		const { rowCount } = await this.pool.query('DELETE FROM group_dms WHERE id = $1', [String(dmId)]);
+	async deleteGroupDm(dmId, expectedState = undefined) {
+		const values = [String(dmId)];
+		let condition = '';
+		if (expectedState) {
+			values.push(Number(expectedState.host_id), expectedState.member, JSON.stringify(expectedState.accepted), String(expectedState.state_version));
+			condition = " AND host_id = $2 AND member = $3::int[] AND COALESCE(unread->'_accepted', to_jsonb(member)) = $4::jsonb AND state_version = $5::bigint";
+		}
+		const { rowCount } = await this.pool.query(`DELETE FROM group_dms WHERE id = $1${condition}`, values);
 		this._clearGroupDmReadCache();
 		return rowCount > 0;
 	}
 
-	async leaveGroupDm(dmId, userId) {
+	async leaveGroupDm(dmId, userId, expectedState = undefined) {
 		const result = await this._withTransaction(async (client) => {
-			const { rows } = await client.query('SELECT member, unread FROM group_dms WHERE id = $1 FOR UPDATE', [String(dmId)]);
+			const { rows } = await client.query('SELECT host_id, member, unread, state_version FROM group_dms WHERE id = $1 FOR UPDATE', [String(dmId)]);
 			if (!rows[0]) return false;
 
-			const members = (rows[0].member || []).map(Number).filter((id) => id !== Number(userId));
 			const unread = { ...(typeof rows[0].unread === 'object' && rows[0].unread !== null ? rows[0].unread : parseJsonSafe(rows[0].unread, {})) };
+			const currentMembers = (rows[0].member || []).map(Number);
+			const accepted = Array.isArray(unread._accepted) ? unread._accepted.map(Number) : currentMembers;
+			if (!currentMembers.includes(Number(userId))) return false;
+			if (expectedState && (String(rows[0].state_version) !== String(expectedState.state_version) || Number(rows[0].host_id) !== Number(expectedState.host_id) || JSON.stringify(currentMembers) !== JSON.stringify(expectedState.member) || JSON.stringify(accepted) !== JSON.stringify(expectedState.accepted))) return false;
+			const members = currentMembers.filter((id) => id !== Number(userId));
+			unread._accepted = accepted.filter((id) => id !== Number(userId));
 			delete unread[String(userId)];
 
 			await client.query(
@@ -6500,6 +6589,7 @@ class PostgresAdapter extends DatabaseAdapter {
 			 LEFT JOIN moderation_reports r
 			   ON r.assigned_admin_id = u.id AND r.status = 'assigned'
 			 WHERE u.admin = TRUE
+			   AND u.admin_request_excluded = FALSE
 			   AND COALESCE(u."freeze", '') = ''
 			   AND NOT (u.id = ANY($1::int[]))
 			 GROUP BY u.id`,
@@ -6511,8 +6601,21 @@ class PostgresAdapter extends DatabaseAdapter {
 		}));
 	}
 
+	async setAdminRequestExcluded(userId, excluded) {
+		const { rows } = await this.pool.query(
+			'UPDATE users SET admin_request_excluded = $2 WHERE id = $1 AND admin = TRUE RETURNING *',
+			[Number(userId), excluded],
+		);
+		return normalizeUserRow(rows[0]);
+	}
+
 	async assignModerationReport(reportId, assignment = {}) {
 		return this._withTransaction(async (client) => {
+			const eligible = await client.query(
+				`SELECT id FROM users WHERE id = $1 AND admin = TRUE AND admin_request_excluded = FALSE AND COALESCE("freeze", '') = '' FOR UPDATE`,
+				[Number(assignment.adminId)],
+			);
+			if (!eligible.rows.length) return null;
 			const existingRes = await client.query('SELECT * FROM moderation_reports WHERE id = $1 FOR UPDATE', [Number(reportId)]);
 			const existing = existingRes.rows[0];
 			if (!existing || existing.status === 'resolved') return null;
@@ -7345,6 +7448,504 @@ class PostgresAdapter extends DatabaseAdapter {
 		);
 		return rows.map((r) => String(r.user_id)).filter((id) => /^[A-Za-z0-9_-]+$/.test(id));
 	}
+	// ==================== Community Notes ====================
+
+	_normalizeCommunityNoteSources(sources) {
+		if (!Array.isArray(sources)) throw new Error('sources must be an array');
+		const out = [];
+		const seen = new Set();
+		for (const src of sources) {
+			const url = String(src?.url || src || '').trim();
+			const title = src?.title != null ? String(src.title).trim() : '';
+			if (!url) continue;
+			let parsed;
+			try { parsed = new URL(url); } catch (_) { continue; }
+			if (parsed.protocol !== 'https:') throw new Error('source URL must use https');
+			if (seen.has(url)) continue;
+			seen.add(url);
+			out.push({ url, title });
+		}
+		return out;
+	}
+
+	async _getNoteRatingSummary(noteId, currentUserId = null) {
+		const { rows } = await this.pool.query(
+			'SELECT helpful, COUNT(*)::int AS cnt FROM note_ratings WHERE note_id = $1 GROUP BY helpful',
+			[Number(noteId)],
+		);
+		let helpfulCount = 0;
+		let total = 0;
+		for (const r of rows) {
+			const c = Number(r.cnt) || 0;
+			total += c;
+			if (r.helpful === true) helpfulCount += c;
+		}
+		let myRating = null;
+		if (currentUserId != null) {
+			const r2 = await this.pool.query('SELECT helpful FROM note_ratings WHERE note_id=$1 AND user_id=$2', [Number(noteId), Number(currentUserId)]);
+			if (r2.rows[0]) myRating = Boolean(r2.rows[0].helpful);
+		}
+		return { helpfulCount, totalRatingCount: total, myRating };
+	}
+
+	async _reasonTagsForNotes(noteIds) {
+		if (!noteIds || noteIds.length === 0) return [];
+		const { rows } = await this.pool.query(
+			'SELECT * FROM note_reason_tags WHERE note_id = ANY($1::int[])',
+			[noteIds.map(Number)],
+		);
+		return rows;
+	}
+
+	async _formatNote(noteRow, ratings, reasonTagRows, currentUserId = null) {
+		if (!noteRow) return null;
+		let summary = ratings;
+		if (!summary || typeof summary.helpfulCount === 'undefined') {
+			summary = await this._getNoteRatingSummary(noteRow.id, currentUserId);
+		}
+		const sources = parseJsonSafe(noteRow.sources, []);
+		const tags = (reasonTagRows || []).filter((t) => Number(t.note_id) === Number(noteRow.id)).map((t) => ({ side: t.side, code: t.code }));
+		return {
+			id: Number(noteRow.id),
+			postId: Number(noteRow.post_id),
+			distributionKey: noteRow.distribution_key || `${noteRow.post_id}:${noteRow.user_id}`,
+			userId: Number(noteRow.user_id),
+			content: String(noteRow.content || ''),
+			sources: Array.isArray(sources) ? sources : [],
+			status: String(noteRow.status || 'limited'),
+			stage: Number(noteRow.stage ?? 1) || 1,
+			publishedAt: toIsoString(noteRow.published_at),
+			createdAt: toIsoString(noteRow.created_at),
+			updatedAt: toIsoString(noteRow.updated_at),
+			helpfulCount: Number(summary.helpfulCount || 0),
+			totalRatingCount: Number(summary.totalRatingCount || 0),
+			myRating: summary.myRating ?? null,
+			reasons: tags,
+		};
+	}
+
+	async _ensureReasonDef(code, side, label) {
+		try {
+			await this.pool.query(
+				`INSERT INTO note_reason_tag_defs (code, side, label_ja) VALUES ($1,$2,$3) ON CONFLICT (code) DO NOTHING`,
+				[String(code), String(side), String(label || code)],
+			);
+		} catch (_) {}
+	}
+
+	async createNote({ postId, userId, content, sources = [], reasons = [], status = 'limited', dailyLimit = null, postLimit = 20 } = {}) {
+		if (dailyLimit !== null && (!Number.isInteger(dailyLimit) || dailyLimit < 1)) throw new Error('Invalid note daily limit');
+		const normSources = this._normalizeCommunityNoteSources(sources);
+		const pId = Number(postId);
+		const uId = Number(userId);
+		const now = new Date();
+		let rows;
+		try {
+			({ rows } = await this._withTransaction(async client => {
+				await client.query('SELECT id FROM users WHERE id=$1 FOR UPDATE',[uId]);
+				await client.query('SELECT id FROM posts WHERE id=$1 FOR UPDATE',[pId]);
+				const counts=await client.query(`SELECT (SELECT COUNT(*) FROM note_creation_claims WHERE user_id=$1 AND created_at >= $3) AS daily,(SELECT COUNT(*) FROM community_notes WHERE post_id=$2) AS total`,[uId,pId,new Date(`${now.toISOString().slice(0,10)}T00:00:00Z`)]);
+				if (dailyLimit !== null && Number(counts.rows[0].daily)>=dailyLimit) throw Object.assign(new Error('本日のノート作成上限に達しました'),{code:'NOTE_DAILY_LIMIT',statusCode:429});
+				if (Number(counts.rows[0].total)>=postLimit) throw Object.assign(new Error('この投稿のノート上限に達しました'),{code:'NOTE_POST_LIMIT',statusCode:429});
+				await client.query('INSERT INTO note_creation_claims(post_id,user_id) VALUES($1,$2)',[pId,uId]);
+				return client.query(`INSERT INTO community_notes (post_id,user_id,content,sources,status,created_at,updated_at,distribution_key) VALUES($1,$2,$3,$4::jsonb,$5,$6,$6,$7) RETURNING *`,[pId,uId,String(content||''),JSON.stringify(normSources),String(status||'limited'),now,`${pId}:${uId}`]);
+			}));
+		} catch (error) {
+			// 一意制約違反は重複作成。制約名を含む生メッセージを外へ出さない。
+			if (error && error.code === '23505') {
+				throw Object.assign(new Error('同じ投稿には一度だけノートを作成できます'), { code: 'NOTE_ALREADY_EXISTS', statusCode: 409 });
+			}
+			throw error;
+		}
+		const row = rows[0];
+		if (Array.isArray(reasons)) {
+			for (const r of reasons) {
+				const side = String(r?.side || '').trim();
+				const code = String(r?.code || r || '').trim();
+				if (!side || !code) continue;
+				await this._ensureReasonDef(code, side, r?.label_ja || r?.label);
+				try {
+					await this.pool.query(
+						`INSERT INTO note_reason_tags (note_id, side, code) VALUES ($1,$2,$3) ON CONFLICT (note_id, side, code) DO NOTHING`,
+						[Number(row.id), side, code],
+					);
+				} catch (_) {}
+			}
+		}
+		const summary = await this._getNoteRatingSummary(row.id, uId);
+		const tags = await this._reasonTagsForNotes([Number(row.id)]);
+		return this._formatNote(row, summary, tags, uId);
+	}
+
+	async getNote(noteId, currentUserId = null) {
+		const nId = Number(noteId);
+		if (!Number.isSafeInteger(nId) || nId <= 0) return null;
+		const { rows } = await this.pool.query('SELECT * FROM community_notes WHERE id = $1', [nId]);
+		if (!rows[0]) return null;
+		const tags = await this._reasonTagsForNotes([nId]);
+		const summary = await this._getNoteRatingSummary(nId, currentUserId);
+		return this._formatNote(rows[0], summary, tags, currentUserId);
+	}
+
+	async listNotesByPost(postId, currentUserId = null) {
+		const pId = Number(postId);
+		const { rows: noteRows } = await this.pool.query(
+			'SELECT * FROM community_notes WHERE post_id = $1 ORDER BY created_at DESC',
+			[pId],
+		);
+		if (noteRows.length === 0) return [];
+		const noteIds = noteRows.map((r) => Number(r.id));
+		const tags = await this._reasonTagsForNotes(noteIds);
+		const { rows: ratingRows } = await this.pool.query(
+			'SELECT note_id, helpful, user_id FROM note_ratings WHERE note_id = ANY($1::int[])',
+			[noteIds],
+		);
+		const byNote = new Map();
+		for (const id of noteIds) byNote.set(id, { helpfulCount: 0, totalRatingCount: 0, myRating: null });
+		for (const rr of ratingRows) {
+			const nid = Number(rr.note_id);
+			const entry = byNote.get(nid);
+			if (!entry) continue;
+			entry.totalRatingCount += 1;
+			if (rr.helpful === true) entry.helpfulCount += 1;
+			if (currentUserId != null && Number(rr.user_id) === Number(currentUserId)) entry.myRating = Boolean(rr.helpful);
+		}
+		return Promise.all(noteRows.map((r) => this._formatNote(r, byNote.get(Number(r.id)), tags, currentUserId)));
+	}
+
+	async countNotesByUserSince(userId, since) {
+		const uId = Number(userId);
+		const { rows } = await this.pool.query(
+			'SELECT COUNT(*)::int AS cnt FROM community_notes WHERE user_id = $1 AND created_at >= $2',
+			[uId, since instanceof Date ? since : new Date(since)],
+		);
+		return Number(rows[0]?.cnt || 0);
+	}
+
+	async rateNote({ noteId, userId, helpful, weight = 1, maxRatings = 200, relationManifest = null, expectedRatingVersion = null } = {}) {
+		const nId = Number(noteId);
+		const uId = Number(userId);
+		const help = Boolean(helpful);
+		await this._withTransaction(async client => {
+			const noteRow=await client.query('SELECT n.id,n.user_id,p.user_id AS post_author_id,n.rating_version FROM community_notes n JOIN posts p ON p.id=n.post_id WHERE n.id=$1 FOR UPDATE OF n',[nId]);
+			if (expectedRatingVersion!==null && Number(noteRow.rows[0]?.rating_version)!==expectedRatingVersion) { const error=new Error('投票状態が同時に変更されました');error.code='NOTE_VOTE_CONFLICT';throw error; }
+			if (expectedRatingVersion!==null) {
+				const covered=new Set(relationManifest?.coveredUserIds || []);
+				if (relationManifest?.basis!=='admission-evidence'||relationManifest.complete!==true||!relationManifest.version||!relationManifest.evidenceRef||![uId,Number(noteRow.rows[0]?.user_id),Number(noteRow.rows[0]?.post_author_id)].every(id=>covered.has(id))) throw new Error('関係証跡が不完全です');
+			}
+			const prior=await client.query('SELECT revision,authorized,legacy FROM note_vote_admissions WHERE note_id=$1 AND user_id=$2 ORDER BY revision DESC LIMIT 1',[nId,uId]);
+			const reacceptLegacy=expectedRatingVersion!==null&&prior.rows.length>0&&(prior.rows[0].legacy===true||prior.rows[0].authorized!==true);
+			const now = new Date();
+			const savedWeight = Math.min(1.5,Math.max(1,weight));
+			const changed = await client.query(`INSERT INTO note_ratings(note_id,user_id,helpful,created_at,updated_at,weight)
+				 SELECT $1,$2,$3,$6,$6,$4 WHERE EXISTS(SELECT 1 FROM note_ratings WHERE note_id=$1 AND user_id=$2) OR (SELECT COUNT(*) FROM note_ratings WHERE note_id=$1)<$5
+				 ON CONFLICT(note_id,user_id) DO UPDATE SET helpful=EXCLUDED.helpful,updated_at=EXCLUDED.updated_at WHERE note_ratings.helpful IS DISTINCT FROM EXCLUDED.helpful OR $7 RETURNING note_id`,[nId,uId,help,savedWeight,maxRatings,now,reacceptLegacy]);
+			if (changed.rowCount) {
+				const current = await client.query('SELECT weight FROM note_ratings WHERE note_id=$1 AND user_id=$2',[nId,uId]);
+				const revision = Number(prior.rows[0]?.revision || 0) + 1;
+				await client.query('INSERT INTO note_vote_admissions(note_id,user_id,revision,admitted_at,authorized,weight,evidence_ref,relation_manifest,legacy) VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,FALSE)',[nId,uId,revision,now,Boolean(relationManifest&&expectedRatingVersion!==null),Number(current.rows[0].weight),relationManifest&&expectedRatingVersion!==null?`note:${nId}:vote:${uId}:revision:${revision}`:null,relationManifest == null ? null : JSON.stringify(relationManifest)]);
+			}
+		});
+		return this.getRatingsSummary(nId, uId);
+	}
+
+	async getNoteVoteEvidence(noteId) {
+		const nId = Number(noteId);
+		return this._withTransaction(async client=>{
+			await client.query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY');
+			const note=await client.query('SELECT rating_version FROM community_notes WHERE id=$1',[nId]);
+			if (!note.rows[0]) return null;
+			const ratings=await client.query(`SELECT r.user_id,r.helpful,r.created_at,r.updated_at,r.weight,a.revision,a.admitted_at AS cast_at,a.legacy
+				FROM note_ratings r LEFT JOIN LATERAL (SELECT revision,admitted_at,legacy FROM note_vote_admissions WHERE note_id=r.note_id AND user_id=r.user_id ORDER BY revision DESC LIMIT 1) a ON TRUE
+				WHERE r.note_id=$1 ORDER BY r.user_id`,[nId]);
+			const admissions=await client.query('SELECT user_id,revision,admitted_at,authorized,weight,evidence_ref,relation_manifest,legacy FROM note_vote_admissions WHERE note_id=$1 ORDER BY user_id,revision',[nId]);
+			return {version:Number(note.rows[0].rating_version),
+				ratings:ratings.rows.map(row=>({userId:Number(row.user_id),helpful:row.helpful,weight:Number(row.weight),revision:row.legacy||row.revision==null?null:Number(row.revision),castAt:row.legacy?null:toIsoString(row.cast_at),createdAt:toIsoString(row.created_at),updatedAt:toIsoString(row.updated_at)})),
+				admissions:admissions.rows.map(row=>({noteId:nId,userId:Number(row.user_id),revision:Number(row.revision),admittedAt:toIsoString(row.admitted_at),authorized:Boolean(row.authorized),weight:Number(row.weight),evidenceRef:row.evidence_ref,relationManifest:typeof row.relation_manifest==='string'?JSON.parse(row.relation_manifest):row.relation_manifest,legacy:Boolean(row.legacy)})),
+			};
+		});
+	}
+
+	async getRatingsSummary(noteIdOrObj, userId = null) {
+		let noteId = noteIdOrObj;
+		let uid = userId;
+		if (noteIdOrObj && typeof noteIdOrObj === 'object') {
+			noteId = noteIdOrObj.noteId ?? noteIdOrObj.id;
+			uid = noteIdOrObj.userId ?? noteIdOrObj.user_id ?? uid;
+		}
+		const nId = Number(noteId);
+		const { rows } = await this.pool.query('SELECT helpful, COUNT(*)::int cnt FROM note_ratings WHERE note_id=$1 GROUP BY helpful', [nId]);
+		let helpfulCount = 0;
+		let total = 0;
+		for (const r of rows) {
+			const c = Number(r.cnt) || 0;
+			total += c;
+			if (r.helpful === true) helpfulCount += c;
+		}
+		let myRating = null;
+		if (uid != null) {
+			const r = await this.pool.query('SELECT helpful FROM note_ratings WHERE note_id=$1 AND user_id=$2', [nId, Number(uid)]);
+			if (r.rows[0]) myRating = Boolean(r.rows[0].helpful);
+		}
+		return { helpfulCount, totalRatingCount: total, myRating };
+	}
+
+
+	async deleteNote(noteId) {
+		const { rowCount } = await this.pool.query('DELETE FROM community_notes WHERE id = $1', [Number(noteId)]);
+		return (rowCount || 0) > 0;
+	}
+
+	// ===== Phase 2 helpers =====
+	async listEngagedUsersByPost(postId) {
+		const { rows } = await this.pool.query(
+			`SELECT user_id FROM likes WHERE post_id = $1
+			 UNION SELECT user_id FROM stars WHERE post_id = $1
+			 UNION SELECT user_id FROM reposts WHERE post_id = $1
+			 UNION SELECT user_id FROM posts WHERE reply_to = $1`,
+			[Number(postId)],
+		);
+		return rows.map((r) => Number(r.user_id)).filter(Number.isSafeInteger);
+	}
+
+	async listEngagedUsersByPostPage(postId,{afterUserId=0,limit=500}={}) {
+		const {rows}=await this.pool.query(`SELECT user_id FROM (
+			SELECT user_id FROM likes WHERE post_id=$1
+			UNION SELECT user_id FROM stars WHERE post_id=$1
+			UNION SELECT user_id FROM reposts WHERE post_id=$1
+			UNION SELECT user_id FROM posts WHERE reply_to=$1
+		) engaged WHERE user_id>$2 ORDER BY user_id LIMIT $3`,[Number(postId),Number(afterUserId),Math.min(500,Math.max(1,Number(limit)||500))]);
+		return rows.map(row=>Number(row.user_id)).filter(Number.isSafeInteger);
+	}
+
+	async getUserFollows(userId) {
+		const { rows } = await this.pool.query('SELECT following_id FROM follows WHERE follower_id = $1', [Number(userId)]);
+		return rows.map((r) => Number(r.following_id)).filter(Number.isSafeInteger);
+	}
+
+	async getNoteRelevanceContext(userIds,authorId) {
+		const ids=[...new Set([...userIds.map(Number),Number(authorId)])];if(!ids.length)return {users:[],followingByUser:new Map(),sharedUserIds:new Set()};
+		const [users,relations]=await Promise.all([
+			this.getUsersByIds(ids),
+			this.pool.query(`WITH candidates AS (SELECT unnest($1::int[]) AS user_id), counts AS (
+				SELECT follower_id,COUNT(*)::int AS total FROM follows WHERE follower_id=ANY($3::int[]) GROUP BY follower_id
+			), intersection_counts AS (
+				SELECT f.follower_id AS user_id,COUNT(*)::int AS total FROM follows f JOIN follows a ON a.following_id=f.following_id AND a.follower_id=$2 WHERE f.follower_id=ANY($1::int[]) GROUP BY f.follower_id
+			), shared AS (
+				SELECT candidate.user_id FROM candidates candidate WHERE
+				EXISTS(SELECT 1 FROM group_memberships a JOIN group_memberships b ON a.group_id=b.group_id WHERE a.user_id=candidate.user_id AND b.user_id=$2 AND a.status='active' AND b.status='active') OR
+				EXISTS(SELECT 1 FROM dm_channels d WHERE d.participants @> ARRAY[candidate.user_id,$2]::int[]) OR
+				EXISTS(SELECT 1 FROM group_dms d WHERE d.member @> ARRAY[candidate.user_id,$2]::int[])
+			)
+			SELECT candidates.user_id,COALESCE(counts.total,0) AS user_total,COALESCE(author.total,0) AS author_total,COALESCE(intersection_counts.total,0) AS overlap,shared.user_id IS NOT NULL AS shared
+			FROM candidates LEFT JOIN counts ON counts.follower_id=candidates.user_id LEFT JOIN counts author ON author.follower_id=$2
+			LEFT JOIN intersection_counts ON intersection_counts.user_id=candidates.user_id LEFT JOIN shared ON shared.user_id=candidates.user_id`,[userIds.map(Number),Number(authorId),ids]),
+		]);
+		const sharedUserIds=new Set(),relevanceByUser=new Map();for(const row of relations.rows){const id=Number(row.user_id),union=Number(row.user_total)+Number(row.author_total)-Number(row.overlap);const shared=Boolean(row.shared);if(shared)sharedUserIds.add(id);relevanceByUser.set(id,(union?Number(row.overlap)/union:0)+(shared?0.2:0));}
+		return {users,relevanceByUser,sharedUserIds};
+	}
+
+	async listGroupDmsForUser(userId) {
+		const { rows } = await this.pool.query('SELECT id FROM group_dms WHERE member @> ARRAY[$1]::int[]', [Number(userId)]);
+		return rows.map((r) => String(r.id));
+	}
+
+	async createNoteDistribution(data = {}) {
+		const noteId = Number(data.noteId ?? data.note_id);
+		const userId = Number(data.userId ?? data.user_id);
+		const tier = Number(data.tier ?? 1);
+		const notified = Boolean(data.notified ?? false);
+		await this.pool.query(
+			`INSERT INTO note_distribution (note_id, user_id, tier, notified, created_at)
+			 VALUES ($1,$2,$3,$4,NOW()) ON CONFLICT (note_id, user_id) DO UPDATE SET tier=$3, notified=$4`,
+			[noteId, userId, tier, notified],
+		);
+		const { rows } = await this.pool.query('SELECT * FROM note_distribution WHERE note_id=$1 AND user_id=$2', [noteId, userId]);
+		return rows[0] ? {
+				noteId: Number(rows[0].note_id),
+				userId: Number(rows[0].user_id),
+				tier: Number(rows[0].tier),
+				notified: Boolean(rows[0].notified),
+				createdAt: toIsoString(rows[0].created_at),
+			} : null;
+	}
+
+	async getNoteDistribution(noteId, userId) {
+		const { rows } = await this.pool.query('SELECT * FROM note_distribution WHERE note_id=$1 AND user_id=$2', [Number(noteId), Number(userId)]);
+		return rows[0] ? {noteId:Number(rows[0].note_id),userId:Number(rows[0].user_id),tier:Number(rows[0].tier),notified:Boolean(rows[0].notified),createdAt:toIsoString(rows[0].created_at)} : null;
+	}
+
+	async getNoteDistributionStates(noteId,userIds) {
+		if(!userIds.length)return [];
+		const {rows}=await this.pool.query('SELECT note_id,user_id,tier,notified,created_at FROM note_distribution WHERE note_id=$1 AND user_id=ANY($2::int[])',[Number(noteId),userIds.map(Number)]);
+		return rows.map(r=>({noteId:Number(r.note_id),userId:Number(r.user_id),tier:Number(r.tier),notified:Boolean(r.notified),createdAt:toIsoString(r.created_at)}));
+	}
+
+	async listNoteDistributionsByNote(noteId) {
+		const { rows } = await this.pool.query('SELECT * FROM note_distribution WHERE note_id=$1', [Number(noteId)]);
+		return rows.map((r) => ({
+				noteId: Number(r.note_id),
+				userId: Number(r.user_id),
+				tier: Number(r.tier),
+				notified: Boolean(r.notified),
+				createdAt: toIsoString(r.created_at),
+			}));
+	}
+
+	async listNoteDistributionsByUser(userId) {
+		const { rows } = await this.pool.query('SELECT * FROM note_distribution WHERE user_id=$1', [Number(userId)]);
+		return rows.map((r) => ({
+				noteId: Number(r.note_id),
+				userId: Number(r.user_id),
+				tier: Number(r.tier),
+				notified: Boolean(r.notified),
+				createdAt: toIsoString(r.created_at),
+			}));
+	}
+
+	async updateNoteDistribution(noteId, userId, fields = {}) {
+		const sets = [];
+		const params = [];
+		let idx = 1;
+		if (fields.tier != null) { sets.push(`tier=$${idx++}`); params.push(Number(fields.tier)); }
+		if (fields.notified != null) { sets.push(`notified=$${idx++}`); params.push(Boolean(fields.notified)); }
+		if (sets.length === 0) return this.getNoteDistribution(noteId, userId);
+		params.push(Number(noteId), Number(userId));
+		await this.pool.query(`UPDATE note_distribution SET ${sets.join(',')} WHERE note_id=$${idx++} AND user_id=$${idx}`, params);
+		return this.getNoteDistribution(noteId, userId);
+	}
+
+	async upsertNoteDistribution(data = {}) {
+		return this.createNoteDistribution(data);
+	}
+
+	async upsertNoteDistributions(rows=[]) {
+		for(let offset=0;offset<rows.length;offset+=500){const batch=rows.slice(offset,offset+500);if(!batch.length)continue;
+			await this.pool.query(`INSERT INTO note_distribution(note_id,user_id,tier,notified,created_at)
+				SELECT * FROM UNNEST($1::int[],$2::int[],$3::int[],$4::boolean[],$5::timestamptz[])
+				ON CONFLICT(note_id,user_id) DO UPDATE SET tier=EXCLUDED.tier,notified=EXCLUDED.notified`,[
+				batch.map(r=>Number(r.noteId)),batch.map(r=>Number(r.userId)),batch.map(r=>Number(r.tier??1)),batch.map(r=>Boolean(r.notified)),batch.map(()=>new Date()),
+			]);
+		}return rows;
+	}
+
+	async deleteNoteDistribution(noteId, userId = null) {
+		if (userId == null) {
+			await this.pool.query('DELETE FROM note_distribution WHERE note_id=$1', [Number(noteId)]);
+		} else {
+			await this.pool.query('DELETE FROM note_distribution WHERE note_id=$1 AND user_id=$2', [Number(noteId), Number(userId)]);
+		}
+		return true;
+	}
+
+	async updateNote(noteId, fields = {}) {
+		const sets = [];
+		const params = [];
+		let idx = 1;
+		if (fields.status != null) { sets.push(`status=$${idx++}`); params.push(String(fields.status)); }
+		if (fields.stage != null) { sets.push(`stage=$${idx++}`); params.push(Number(fields.stage)); }
+		if (fields.publishedAt != null || fields.published_at != null) {
+			const v = fields.publishedAt ?? fields.published_at;
+			sets.push(`published_at=$${idx++}`); params.push(v ? new Date(v) : null);
+		}
+		if (sets.length === 0) return this.getNote(noteId);
+		sets.push('updated_at=NOW()');
+		params.push(Number(noteId));
+		const { rows } = await this.pool.query(`UPDATE community_notes SET ${sets.join(',')} WHERE id=$${idx} RETURNING *`, params);
+		if (!rows[0]) return null;
+		const tags = await this._reasonTagsForNotes([Number(noteId)]);
+		const summary = await this._getNoteRatingSummary(noteId);
+		return this._formatNote(rows[0], summary, tags);
+	}
+
+	async listNoteReasonTagDefs({ side } = {}) {
+		const params = [];
+		let sql = 'SELECT code, side, label_ja, description, sort_order FROM note_reason_tag_defs WHERE enabled = TRUE';
+		if (side) {
+			params.push(String(side));
+			sql += ` AND side = $${params.length}`;
+		}
+		sql += ' ORDER BY sort_order ASC, code ASC';
+		const { rows } = await this.pool.query(sql, params);
+		return rows.map((r) => ({
+			code: r.code,
+			side: r.side,
+			label: r.label_ja,
+			description: r.description ?? null,
+			sortOrder: Number(r.sort_order) || 0,
+		}));
+	}
+
+	async saveNoteRatingReasons({ noteId, userId, codes = [] } = {}) {
+		const nId = Number(noteId);
+		const uId = Number(userId);
+		const unique = [...new Set((Array.isArray(codes) ? codes : []).map((c) => String(c || '').trim()).filter(Boolean))];
+		await this._withTransaction(async (client) => {
+			await client.query('DELETE FROM note_rating_reasons WHERE note_id = $1 AND user_id = $2', [nId, uId]);
+			for (const code of unique) {
+				await client.query(
+					`INSERT INTO note_rating_reasons (note_id, user_id, code, created_at)
+					 VALUES ($1,$2,$3,NOW())
+					 ON CONFLICT (note_id, user_id, code) DO NOTHING`,
+					[nId, uId, code],
+				);
+			}
+		});
+		return unique;
+	}
+
+	// Shared group / DM membership helpers (Phase 2)
+	async getSharedGroupCount(userId1, userId2) {
+		const { rows } = await this.pool.query(
+			`SELECT COUNT(*)::int AS cnt
+			 FROM group_memberships a
+			 JOIN group_memberships b ON a.group_id = b.group_id
+			 WHERE a.user_id = $1 AND b.user_id = $2
+			   AND a.status = 'active' AND b.status = 'active'`,
+			[Number(userId1), Number(userId2)],
+		);
+		return Number(rows?.[0]?.cnt || 0);
+	}
+
+	async getSharedDmCount(userId1, userId2) {
+		const { rows } = await this.pool.query(
+			`SELECT
+			 (SELECT COUNT(*)::int FROM dm_channels WHERE participants @> ARRAY[$1::int, $2::int]) +
+			 (SELECT COUNT(*)::int FROM group_dms WHERE member @> ARRAY[$1::int, $2::int]) AS cnt`,
+			[Number(userId1), Number(userId2)],
+		);
+		return Number(rows?.[0]?.cnt || 0);
+	}
+
+	async getSharedGroupMembership(userId1, userId2) {
+		const groups = await this.getSharedGroupCount(userId1, userId2);
+		const dms = await this.getSharedDmCount(userId1, userId2);
+		const bonus = (groups > 0 || dms > 0) ? 0.2 : 0;
+		return { groups, dms, total: groups + dms, bonus };
+	}
+
+	async sharedGroupCount(...args) { return this.getSharedGroupCount(...args); }
+	async sharedGroupMembership(...args) { return this.getSharedGroupMembership(...args); }
+	async hasSharedGroupMembership(userId1, userId2) {
+		return (await this.getSharedGroupCount(userId1, userId2)) > 0;
+	}
+
+	async updatePostRecommendationPenalty(postId, delta = 0.1, max = 1) {
+		const result = await this.pool.query(
+			`UPDATE posts
+			 SET recommendation_penalty = LEAST($2::real, GREATEST(0::real, COALESCE(recommendation_penalty,0) + $3::real))
+			 WHERE id = $1`,
+			[Number(postId), Number(max) || 1, Number(delta) || 0],
+		);
+		return (result.rowCount || 0) > 0;
+	}
+	async incrementPostRecommendationPenalty(...args) { return this.updatePostRecommendationPenalty(...args); }
+	async addPostRecommendationPenalty(...args) { return this.updatePostRecommendationPenalty(...args); }
+
 }
+
+require('../reputation').installPostgres(PostgresAdapter);
+module.exports = PostgresAdapter;
+
 
 module.exports = PostgresAdapter;

@@ -5,6 +5,7 @@ const net = require('net');
 const os = require('os');
 const path = require('path');
 const { writeSnapshot, readSnapshot } = require('../services/DataMigrationService');
+const modLog = require('../services/ModLogService');
 
 const MAX_COMMAND_BYTES = 8 * 1024;
 
@@ -22,6 +23,7 @@ function getOperatorSocketPath() {
 
 function parseUserId(value) {
   const normalized = String(value ?? '').replace(/^#/, '');
+  if (!/^\d+$/.test(normalized)) return null;
   const userId = Number(normalized);
   if (!Number.isSafeInteger(userId) || userId < 0) return null;
   return userId;
@@ -39,7 +41,7 @@ function createCommandHandler({ dbAdapter, shutdown, getStatus, managers = {} })
 
     // ── ステータス ──────────────────────────────────────────────────────────
     if (command.action === 'status' || command.action === 'get-server-status') {
-      return { ok: true, status: getStatus() };
+      return { ok: true, status: { ...getStatus(), modLog: modLog.health() } };
     }
 
     // ── ユーザー / 管理者 ──────────────────────────────────────────────────
@@ -57,6 +59,44 @@ function createCommandHandler({ dbAdapter, shutdown, getStatus, managers = {} })
       } catch (err) {
         return { ok: false, error: err.message };
       }
+    }
+
+    if (command.action === 'list-operator-users') {
+      if (!['admin', 'verify'].includes(command.field)) return { ok: false, error: 'Invalid field' };
+      const users = await dbAdapter.getAllUsers();
+      return { ok: true, users: users.filter((user) => user[command.field] === true).map((user) => ({
+        id: Number(user.id), name: user.name, scid: user.scid,
+        ...(command.field === 'admin' ? { requests: user.admin_request_excluded ? '対象外' : '対象' } : {}),
+      })) };
+    }
+
+    if (command.action === 'set-admin-request-exclusion') {
+      const userId = parseUserId(command.userId);
+      if (userId == null || typeof command.excluded !== 'boolean') {
+        return { ok: false, error: 'Invalid userId or excluded value' };
+      }
+      const updated = await modLog.operation(dbAdapter, 'operator', null, command.excluded ? 'exclude_admin_requests' : 'include_admin_requests', 'user', userId, () => dbAdapter.setAdminRequestExcluded(userId, command.excluded), 'failure');
+      if (!updated) return { ok: false, error: `Admin #${userId} was not found` };
+      return { ok: true, user: { id: Number(updated.id), excluded: Boolean(updated.admin_request_excluded) } };
+    }
+
+    if (command.action === 'set-verify') {
+      const userId = parseUserId(command.userId);
+      if (userId == null || typeof command.verify !== 'boolean') {
+        return { ok: false, error: 'set-verify requires a valid userId and boolean verify value' };
+      }
+      let existing;
+      try { existing = await dbAdapter.getUserById(userId); } catch (error) {
+        await modLog.record(dbAdapter, 'operator', null, command.verify ? 'verify_user' : 'unverify_user', 'user', userId, 'failure');
+        throw error;
+      }
+      if (!existing) {
+        await modLog.record(dbAdapter, 'operator', null, command.verify ? 'verify_user' : 'unverify_user', 'user', userId, 'failure');
+        return { ok: false, error: `User #${userId} was not found` };
+      }
+      const updated = await modLog.operation(dbAdapter, 'operator', null, command.verify ? 'verify_user' : 'unverify_user', 'user', userId, () => dbAdapter.updateUserProfile(userId, { verify: command.verify }), 'failure');
+      if (!updated) return { ok: false, error: `Unable to update user #${userId}` };
+      return { ok: true, user: { id: Number(updated.id), verify: updated.verify === true } };
     }
 
     if (command.action === 'search-users') {
@@ -100,10 +140,17 @@ function createCommandHandler({ dbAdapter, shutdown, getStatus, managers = {} })
       if (userId == null || typeof command.admin !== 'boolean') {
         return { ok: false, error: 'set-admin requires a valid userId and boolean admin value' };
       }
-      const existing = await dbAdapter.getUserById(userId);
-      if (!existing) return { ok: false, error: `User #${userId} was not found` };
+      let existing;
+      try { existing = await dbAdapter.getUserById(userId); } catch (error) {
+        await modLog.record(dbAdapter, 'operator', null, command.admin ? 'grant_admin' : 'revoke_admin', 'user', userId, 'failure');
+        throw error;
+      }
+      if (!existing) {
+        await modLog.record(dbAdapter, 'operator', null, command.admin ? 'grant_admin' : 'revoke_admin', 'user', userId, 'failure');
+        return { ok: false, error: `User #${userId} was not found` };
+      }
 
-      const updated = await dbAdapter.updateUserProfile(userId, { admin: command.admin });
+      const updated = await modLog.operation(dbAdapter, 'operator', null, command.admin ? 'grant_admin' : 'revoke_admin', 'user', userId, () => dbAdapter.updateUserProfile(userId, { admin: command.admin }), 'failure');
       if (!updated) return { ok: false, error: `Unable to update user #${userId}` };
       return {
         ok: true,
@@ -179,6 +226,15 @@ function createCommandHandler({ dbAdapter, shutdown, getStatus, managers = {} })
     }
 
     // ── 監査ログ ───────────────────────────────────────────────────────────
+    if (command.action === 'search-mod-logs') {
+      try {
+        const filters = require('../adapters/database/modLogs').normalizeFilters(command.filters || {});
+        return { ok: true, ...await dbAdapter.searchModLogs(filters) };
+      } catch (err) {
+        return { ok: false, error: err instanceof TypeError || err instanceof RangeError ? 'Invalid mod log filters' : 'Mod log search failed' };
+      }
+    }
+
     if (command.action === 'get-audit-logs') {
       if (!managers.adminAuditFn) return { ok: false, error: 'Audit log provider not available' };
       try {

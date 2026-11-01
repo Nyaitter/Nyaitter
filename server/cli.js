@@ -24,6 +24,13 @@ nscli — Nyaitter ローカル管理CLI
 使用方法:
   nscli  admin grant <#ユーザーID>
   nscli  admin revoke <#ユーザーID>
+  nscli  admin list
+  nscli  admin requests-exclude <#ユーザーID>
+  nscli  admin requests-include <#ユーザーID>
+  nscli  mod-logs [--actor-type 値] [--actor-id ID] [--action 値] [--target-type 値] [--target-id ID] [--result 値] [--from ISO時刻] [--to ISO時刻] [--limit 件数] [--before-time ISO時刻 --before-id ID]
+  nscli  verify grant <#ユーザーID>
+  nscli  verify revoke <#ユーザーID>
+  nscli  verify list
   nscli  server start
   nscli  server stop
   nscli  server restart
@@ -175,10 +182,39 @@ async function setAdministrator(userIdArgument, admin) {
     );
 }
 
+async function setVerification(userIdArgument, verify) {
+    const userId = parseUserId(userIdArgument);
+    if (userId == null) throw new Error('ユーザーIDは #3480 または 3480 形式の非負整数で指定してください');
+    const response = await requestOperatorCommand({ action: 'set-verify', userId, verify });
+    if (!response?.ok) throw new Error(response?.error || '認証状態の更新に失敗しました');
+    console.log(`#${response.user.id} の認証を${response.user.verify ? '付与' : '解除'}しました。`);
+}
+
+async function listOperatorUsers(field) {
+    const response = await requestOperatorCommand({ action: 'list-operator-users', field });
+    if (!response?.ok) throw new Error(response?.error || '一覧の取得に失敗しました');
+    console.table(response.users);
+}
+
 async function main(argv) {
     const [group, command, argument] = argv;
     if (!group || group === '--help' || group === '-h' || group === 'help') {
         printUsage();
+        return;
+    }
+
+    if (group === 'mod-logs') {
+        const flags = { '--actor-type': 'actorType', '--actor-id': 'actorId', '--action': 'action', '--target-type': 'targetType', '--target-id': 'targetId', '--result': 'result', '--from': 'from', '--to': 'to', '--limit': 'limit', '--before-time': 'beforeTime', '--before-id': 'beforeId' };
+        const filters = {};
+        for (let i = 1; i < argv.length; i += 2) {
+            const key = flags[argv[i]], value = argv[i + 1];
+            if (!key || value === undefined || value.startsWith('--') || Object.hasOwn(filters, key)) throw new Error('無効なオプションです。');
+            filters[key] = value;
+        }
+        require('./adapters/database/modLogs').normalizeFilters(filters);
+        const response = await requestOperatorCommand({ action: 'search-mod-logs', filters });
+        if (!response?.ok) throw new Error(response?.error || 'ModLogs の取得に失敗しました。');
+        console.log(JSON.stringify({ logs: response.logs, nextCursor: response.nextCursor }, null, 2));
         return;
     }
 
@@ -218,12 +254,35 @@ async function main(argv) {
     }
 
     if (group === 'admin') {
+        if (command === 'requests-exclude' || command === 'requests-include') {
+            const userId = parseUserId(argument);
+            if (userId == null) throw new Error('ユーザーIDは #3480 または 3480 形式の非負整数で指定してください');
+            const response = await requestOperatorCommand({ action: 'set-admin-request-exclusion', userId, excluded: command === 'requests-exclude' });
+            if (!response?.ok) throw new Error(response?.error || '設定に失敗しました');
+            console.log(`#${response.user.id} をリクエスト${response.user.excluded ? '対象外' : '対象'}に設定しました。`);
+            return;
+        }
+        if (command === 'list') {
+            await listOperatorUsers('admin');
+            return;
+        }
         if (command === 'grant' || command === 'add') {
             await setAdministrator(argument, true);
             return;
         }
         if (command === 'revoke' || command === 'remove') {
             await setAdministrator(argument, false);
+            return;
+        }
+    }
+
+    if (group === 'verify') {
+        if (command === 'list') {
+            await listOperatorUsers('verify');
+            return;
+        }
+        if (command === 'grant' || command === 'revoke') {
+            await setVerification(argument, command === 'grant');
             return;
         }
     }

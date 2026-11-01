@@ -80,6 +80,10 @@ function normalizeUser(user) {
 	return {
 		...user,
 		block: normalizeBlockList(user.block, user.id),
+		note_rank: Number((user.note_rank ?? user.noteRank) ?? 0),
+		note_affirmative_score: Number((user.note_affirmative_score ?? user.noteAffirmativeScore) ?? 0),
+		note_max_per_day: Number((user.note_max_per_day ?? user.noteMaxPerDay) ?? 1),
+		note_min_public_threshold: Number((user.note_min_public_threshold ?? user.noteMinPublicThreshold) ?? 0),
 	};
 }
 
@@ -103,6 +107,8 @@ function normalizePost(post) {
 	post.group_announcement = post.groupAnnouncement;
 	post.replyControl = post.replyControl ?? post.reply_control ?? 'everyone';
 	post.reply_control = post.replyControl;
+	post.recommendation_penalty = Number((post.recommendation_penalty ?? post.recommendationPenalty) ?? 0) || 0;
+	post.recommendationPenalty = post.recommendation_penalty;
 	if (post.tags && typeof post.tags === 'string') {
 		try {
 			post.tags = JSON.parse(post.tags);
@@ -243,6 +249,7 @@ function serializeGroupDm(row, userId = null) {
 		member: memberList,
 		accepted,
 		host_id: row.host_id ?? row.hostId,
+		state_version: row.state_version,
 		time: row.time instanceof Date ? row.time.toISOString() : (row.time || null),
 		post: Array.isArray(row.post) ? row.post : [],
 	};
@@ -282,6 +289,17 @@ function mapModerationReport(row) {
 }
 
 class D1Adapter extends DatabaseAdapter {
+	async createModLog(input) {
+		const m = require('../modLogs');
+		// Keep the same primary key across a retried request: D1 may have committed
+		// the first request even when the response was lost.
+		const row = m.normalizeRecord(input, require('crypto').randomUUID());
+		return this._request('/mod-logs', { method: 'POST', body: row, retry: true });
+	}
+	async searchModLogs(input = {}) {
+		const filters = require('../modLogs').normalizeFilters(input);
+		return this._request('/mod-logs/search', { method: 'POST', body: filters, retry: true });
+	}
 	constructor(options = {}) {
 		super();
 		this.workerUrl = options.workerUrl || options.endpoint || process.env.D1_WORKER_URL || '';
@@ -295,6 +313,7 @@ class D1Adapter extends DatabaseAdapter {
 		this.batchMaxItems = boundedInteger(options.batchMaxItems ?? process.env.D1_BATCH_MAX_ITEMS, 100, 1, 500);
 		this.readCache = new Map();
 		this.inFlightReads = new Map();
+		this.supportsGroupDmSendIdempotency = true;
 	}
 
 	async connect() {
@@ -328,19 +347,37 @@ class D1Adapter extends DatabaseAdapter {
 	}
 
 	async exportDataSnapshot() {
-		const { createSnapshot } = require('../../../services/DataMigrationService');
+		const { normalizeSnapshot, signSnapshot } = require('../../../services/DataMigrationService');
 		const snapshot = await this._read('/migration/snapshot', { cacheSeconds: 0 });
-		return createSnapshot('d1', snapshot?.tables || {});
+		if (snapshot?.version == null) throw new Error('D1 worker returned an unsupported migration snapshot');
+		// ワーカーが返した tables_present / skipped_columns を保持したまま正規化する。
+		// 旧ワーカーが返さないテーブルは「省略」として扱われ、宛先で保持される。
+		return signSnapshot(normalizeSnapshot({ ...snapshot, source_adapter: 'd1' }));
 	}
 
 	async importDataSnapshot(snapshot, { replace = false } = {}) {
 		if (replace !== true) throw new Error('Destination replacement requires replace=true');
 		const { normalizeSnapshot } = require('../../../services/DataMigrationService');
+		const normalized = normalizeSnapshot(snapshot);
+		if (normalized.tables.group_dms.length && !normalized.tables_present.includes('group_dm_send_requests')) throw new Error('DM snapshot is missing send request history');
+		if (normalized.tables.group_dm_send_requests.length) {
+			const capability = await this._read('/migration/dm-send-requests-v1', { cacheSeconds: 0 });
+			if (capability?.supported !== true) throw new Error('D1 worker cannot import DM send requests');
+		}
 		const result = await this._write('/migration/snapshot/import', {
 			replace: true,
-			snapshot: normalizeSnapshot(snapshot),
+			// tables_present を含めて送る。ワーカーはこれを見て「含まれるテーブルだけ」を置換する。
+			snapshot: normalized,
 		});
-		return result?.counts || {};
+		return {
+			counts: result?.counts || {},
+			imported_tables: result?.imported_tables || normalized.tables_present,
+			preserved_tables: result?.preserved_tables || [],
+			cascaded_tables: result?.cascaded_tables || [],
+			cleared_tables: result?.cleared_tables || [],
+			skipped_columns: result?.skipped_columns || {},
+			excluded_tables: result?.excluded_tables || [],
+		};
 	}
 
 	_clearReadCache() {
@@ -829,8 +866,9 @@ class D1Adapter extends DatabaseAdapter {
 		return normalizeUser(await this._read(`/users/scid/${encodeURIComponent(String(scid))}`));
 	}
 
-	async getUserById(id) {
+	async getUserById(id, { fresh = false } = {}) {
 		const userId = requireId(id, 'id');
+		if (fresh) return normalizeUser(await this._request(`/users/${userId}`, { retry: true }));
 		return normalizeUser(await this._read(`/users/${userId}`));
 	}
 
@@ -1000,6 +1038,10 @@ class D1Adapter extends DatabaseAdapter {
 	async getAllUsers() {
 		const users = await this._read('/users', { cacheSeconds: 0 });
 		return Array.isArray(users) ? users.map(normalizeUser).filter(Boolean) : [];
+	}
+
+	async setAdminRequestExcluded(userId, excluded) {
+		return normalizeUser(await this._write(`/users/${requireId(userId, 'userId')}/admin-request-exclusion`, { excluded }));
 	}
 
 	async getImposterUsers() {
@@ -2095,17 +2137,33 @@ class D1Adapter extends DatabaseAdapter {
 		return serializeGroupDm(dm, dmData.hostId);
 	}
 
-	async updateGroupDm(dmId, updates) {
-		const dm = await this._write(`/group-dms/${encodeURIComponent(String(dmId))}/update`, updates);
+	async updateGroupDm(dmId, updates, expectedPost = undefined, expectedState = undefined, guardedHistory = false) {
+		let dm;
+		try {
+			dm = await this._write(`/group-dms/${encodeURIComponent(String(dmId))}/${guardedHistory ? 'update-history-guarded' : 'update'}`, { ...updates, ...(expectedPost === undefined ? {} : { _expectedPost: expectedPost }), ...(expectedState ? { _expectedState: expectedState } : {}) });
+		} catch (error) {
+			if (guardedHistory && error.status === 404) error.code = 'DM_GUARDED_UPDATE_UNAVAILABLE';
+			throw error;
+		}
 		return serializeGroupDm(dm, dm?.host_id ?? dm?.hostId);
 	}
 
-	async appendToGroupDm(dmId, message, senderId = null) {
-		const dm = await this._write(`/group-dms/${encodeURIComponent(String(dmId))}/messages`, {
+	async editGroupDmMessage(dmId, messageId, userId, content) {
+		return this._write(`/group-dms/${encodeURIComponent(String(dmId))}/edit-message`, {
+			messageId: String(messageId), userId: requireId(userId, 'userId'), content,
+		});
+	}
+
+	async appendToGroupDm(dmId, message, senderId = null, options = undefined) {
+		const action = options?.requestId != null ? 'messages-idempotent' : (options ? 'messages-guarded' : 'messages');
+		const dm = await this._write(`/group-dms/${encodeURIComponent(String(dmId))}/${action}`, {
 			message,
 			senderId: senderId == null ? null : requireId(senderId, 'senderId'),
+			...(options || {}),
 		});
-		return serializeGroupDm(dm, senderId);
+		if (dm?.idempotencyConflict) return { idempotencyConflict: true };
+		const serialized = serializeGroupDm(dm, senderId);
+		return dm?.idempotencyReplay ? { ...serialized, idempotencyReplay: dm.idempotencyReplay } : serialized;
 	}
 
 	async markGroupDmRead(dmId, userId) {
@@ -2124,14 +2182,16 @@ class D1Adapter extends DatabaseAdapter {
 		return Number(res?.total ?? res?.count ?? res ?? 0);
 	}
 
-	async deleteGroupDm(dmId) {
-		const result = await this._write(`/group-dms/${encodeURIComponent(String(dmId))}/delete`);
+	async deleteGroupDm(dmId, expectedState = undefined) {
+		const action = expectedState ? 'delete-guarded' : 'delete';
+		const result = await this._write(`/group-dms/${encodeURIComponent(String(dmId))}/${action}`, expectedState ? { expectedState } : {});
 		return typeof result === 'boolean' ? result : !!result?.success;
 	}
 
-	async leaveGroupDm(dmId, userId) {
+	async leaveGroupDm(dmId, userId, expectedState = undefined) {
 		const result = await this._write(`/group-dms/${encodeURIComponent(String(dmId))}/leave`, {
 			userId: requireId(userId, 'userId'),
+			...(expectedState ? { expectedState } : {}),
 		});
 		return typeof result === 'boolean' ? result : !!result?.success;
 	}
@@ -2485,6 +2545,241 @@ class D1Adapter extends DatabaseAdapter {
 		const res = await this._write(`/post-events/${requireId(eventId, 'eventId', 1)}/fail`, body);
 		return res?.success === true;
 	}
-}
+	// ==================== Community Notes ====================
 
+	async createNote(noteData = {}) {
+		const payload = { ...noteData };
+		if (payload.id == null) {
+			payload.id = Number(BigInt(`0x${require('crypto').randomUUID().replace(/-/g, '').slice(0, 13)}`) % 9007199254740991n);
+		}
+		if (payload.postId != null && payload.post_id == null) payload.post_id = payload.postId;
+		if (payload.userId != null && payload.user_id == null) payload.user_id = payload.userId;
+		if (payload.sources == null) payload.sources = [];
+		try {
+			return await this._write('/community-notes', payload);
+		} catch (error) {
+			// ワーカーの理由別エラー（重複／日次上限／投稿上限）を他アダプタと同じ形へそろえる。
+			const match = String(error?.message || '').match(/\{.*\}/s);
+			if (match) {
+				try {
+					const parsed = JSON.parse(match[0]);
+					if (parsed && typeof parsed.error === 'string') {
+						error.message = parsed.error;
+						if (parsed.code) error.code = parsed.code;
+						error.statusCode = error.status;
+					}
+				} catch (_) {}
+			}
+			throw error;
+		}
+	}
+
+	async getNote(noteId, currentUserId = null) {
+		const query = { currentUserId: currentUserId == null ? null : requireId(currentUserId, 'currentUserId') };
+		return this._read(this._query(`/community-notes/${requireId(noteId, 'noteId')}`, query), { cacheSeconds: 0 });
+	}
+
+	async listNotesByPost(postId, currentUserId = null) {
+		const res = await this._read(this._query(`/posts/${requireId(postId, 'postId')}/notes`, {
+			currentUserId: currentUserId == null ? null : requireId(currentUserId, 'currentUserId'),
+		}), { cacheSeconds: 0 });
+		return Array.isArray(res) ? res : [];
+	}
+
+	async countNotesByUserSince(userId, since) {
+		const res = await this._read(this._query('/community-notes/count', {
+			userId: requireId(userId, 'userId'),
+			since: since instanceof Date ? since.toISOString() : String(since),
+		}), { cacheSeconds: 0 });
+		return Number(res?.count ?? res ?? 0);
+	}
+
+	async rateNote({ noteId, userId, helpful, weight = 1, maxRatings = 200, relationManifest = null, expectedRatingVersion = null } = {}) {
+		try { return await this._write(`/community-notes/${requireId(noteId, 'noteId')}/ratings`, {
+			userId: requireId(userId, 'userId'),
+			helpful: Boolean(helpful),
+			weight: Math.min(1.5,Math.max(1,weight)),
+			maxRatings,
+			relationManifest,
+			expectedRatingVersion,
+		}); } catch (error) { if (error.status===409) error.code='NOTE_VOTE_CONFLICT'; throw error; }
+	}
+
+	async getNoteVoteEvidence(noteId) {
+		return this._read(`/community-notes/${requireId(noteId, 'noteId')}/vote-evidence`, { cacheSeconds: 0 });
+	}
+
+	async getRatingsSummary(noteIdOrObj, userId = null) {
+		let noteId = noteIdOrObj;
+		let uid = userId;
+		if (noteIdOrObj && typeof noteIdOrObj === 'object') {
+			noteId = noteIdOrObj.noteId ?? noteIdOrObj.id;
+			uid = noteIdOrObj.userId ?? noteIdOrObj.user_id ?? uid;
+		}
+		const query = { currentUserId: uid == null ? null : requireId(uid, 'currentUserId') };
+		return this._read(this._query(`/community-notes/${requireId(noteId, 'noteId')}/ratings-summary`, query), { cacheSeconds: 0 });
+	}
+
+	async listNoteReasonTagDefs({ side } = {}) {
+		const res = await this._read(this._query('/note-reason-tags', side ? { side } : {}), { cacheSeconds: 0 });
+		const rows = Array.isArray(res) ? res : (Array.isArray(res?.tags) ? res.tags : []);
+		return rows.map((r) => ({
+			code: String(r.code),
+			side: String(r.side),
+			label: String(r.label ?? r.label_ja ?? r.code),
+			description: r.description ?? null,
+			sortOrder: Number(r.sortOrder ?? r.sort_order ?? 0) || 0,
+		}));
+	}
+
+	async saveNoteRatingReasons({ noteId, userId, codes = [] } = {}) {
+		const res = await this._write(`/community-notes/${requireId(noteId, 'noteId')}/rating-reasons`, {
+			userId: requireId(userId, 'userId'),
+			codes: Array.isArray(codes) ? codes.map(String) : [],
+		});
+		return Array.isArray(res?.codes) ? res.codes : [];
+	}
+
+	// delete support
+	async deleteNote(noteId) {
+		const result = await this._write(`/community-notes/${requireId(noteId, 'noteId')}`, {}, 'DELETE');
+		return result?.success === true;
+	}
+
+	// ===== Phase 2 helpers =====
+	async listEngagedUsersByPost(postId) {
+		const res = await this._read(`/posts/${requireId(postId, 'postId')}/engaged-users`, { cacheSeconds: 0 });
+		if (Array.isArray(res)) return res.map(Number).filter(Number.isSafeInteger);
+		if (Array.isArray(res?.userIds)) return res.userIds.map(Number).filter(Number.isSafeInteger);
+		if (Array.isArray(res?.users)) return res.users.map((u) => Number(u?.id ?? u?.user_id ?? u?.userId)).filter(Number.isSafeInteger);
+		return [];
+	}
+
+	async listEngagedUsersByPostPage(postId,{afterUserId=0,limit=500}={}) {
+		const params=new URLSearchParams({afterUserId:String(Number(afterUserId)||0),limit:String(Math.min(500,Math.max(1,Number(limit)||500)))});
+		const res=await this._read(`/posts/${requireId(postId,'postId')}/engaged-users-page?${params}`,{cacheSeconds:0});
+		if(Array.isArray(res))return res.map(Number).filter(Number.isSafeInteger);
+		return Array.isArray(res?.userIds)?res.userIds.map(Number).filter(Number.isSafeInteger):[];
+	}
+
+	async getNoteRelevanceContext(userIds,authorId) {
+		const ids=[...new Set([...userIds.map(Number),Number(authorId)])].filter(id=>Number.isSafeInteger(id)&&id>0);
+		const result=await this._write('/community-notes/relevance-context',{userIds:ids,authorId:Number(authorId)});
+		return {users:result?.users||[],relevanceByUser:new Map(Object.entries(result?.relevanceByUser||{}).map(([id,value])=>[Number(id),Number(value)])),sharedUserIds:new Set((result?.sharedUserIds||[]).map(Number))};
+	}
+
+	async createNoteDistribution(data = {}) {
+		return this._write('/community-note-distributions', {
+			noteId: requireId(data.noteId ?? data.note_id, 'noteId'),
+			userId: requireId(data.userId ?? data.user_id, 'userId'),
+			tier: data.tier != null ? Number(data.tier) : 1,
+			notified: Boolean(data.notified ?? false),
+		});
+	}
+
+	async getNoteDistribution(noteId, userId) {
+		return this._read(this._query('/community-note-distributions', {
+			noteId: requireId(noteId, 'noteId'),
+			userId: requireId(userId, 'userId'),
+		}), { cacheSeconds: 0 });
+	}
+
+	async getNoteDistributionStates(noteId,userIds) {
+		const rows=[];for(let offset=0;offset<userIds.length;offset+=500){const ids=userIds.slice(offset,offset+500).map(id=>requireId(id,'userId'));
+			const result=await this._read(this._query('/community-note-distributions/batch',{noteId:requireId(noteId,'noteId'),userIds:ids.join(',')}),{cacheSeconds:0});
+			if(Array.isArray(result))rows.push(...result);
+		}return rows;
+	}
+
+	async listNoteDistributionsByNote(noteId) {
+		const res = await this._read(this._query('/community-note-distributions', { noteId: requireId(noteId, 'noteId') }), { cacheSeconds: 0 });
+		return Array.isArray(res) ? res : (Array.isArray(res?.distributions) ? res.distributions : []);
+	}
+
+	async listNoteDistributionsByUser(userId) {
+		const res = await this._read(this._query('/community-note-distributions', { userId: requireId(userId, 'userId') }), { cacheSeconds: 0 });
+		return Array.isArray(res) ? res : (Array.isArray(res?.distributions) ? res.distributions : []);
+	}
+
+	async updateNoteDistribution(noteId, userId, fields = {}) {
+		return this._write('/community-note-distributions', {
+			noteId: requireId(noteId, 'noteId'),
+			userId: requireId(userId, 'userId'),
+			...(fields.tier != null ? { tier: Number(fields.tier) } : {}),
+			...(fields.notified != null ? { notified: Boolean(fields.notified) } : {}),
+		});
+	}
+
+	async upsertNoteDistribution(data = {}) {
+		return this.createNoteDistribution(data);
+	}
+
+	async upsertNoteDistributions(rows=[]) {
+		for(let offset=0;offset<rows.length;offset+=500)await this._write('/community-note-distributions/batch',{rows:rows.slice(offset,offset+500).map(row=>({noteId:requireId(row.noteId,'noteId'),userId:requireId(row.userId,'userId'),tier:Number(row.tier??1),notified:Boolean(row.notified??false)}))});
+		return rows;
+	}
+
+	async deleteNoteDistribution(noteId, userId = null) {
+		const path = userId == null ? `/community-note-distributions/${requireId(noteId, 'noteId')}` : `/community-note-distributions/${requireId(noteId, 'noteId')}/${requireId(userId, 'userId')}`;
+		return this._write(path, {}, 'DELETE');
+	}
+
+	async updateNote(noteId, fields = {}) {
+		return this._write(`/community-notes/${requireId(noteId, 'noteId')}`, {
+			...(fields.status != null ? { status: String(fields.status) } : {}),
+			...(fields.stage != null ? { stage: Number(fields.stage) } : {}),
+			...(fields.publishedAt != null || fields.published_at != null ? { publishedAt: fields.publishedAt ?? fields.published_at ?? null } : {}),
+		}, 'PATCH');
+	}
+
+	// Shared group / DM membership helpers (Phase 2)
+	async getSharedGroupCount(userId1, userId2) {
+		const res = await this._read(this._query('/shared-group-membership', {
+			userId1: requireId(userId1, 'userId1'),
+			userId2: requireId(userId2, 'userId2'),
+		}), { cacheSeconds: 0 });
+		return Number(res?.groups ?? res?.groupCount ?? 0);
+	}
+
+	async getSharedDmCount(userId1, userId2) {
+		const res = await this._read(this._query('/shared-group-membership', {
+			userId1: requireId(userId1, 'userId1'),
+			userId2: requireId(userId2, 'userId2'),
+		}), { cacheSeconds: 0 });
+		return Number(res?.dms ?? 0);
+	}
+
+	async getSharedGroupMembership(userId1, userId2) {
+		const res = await this._read(this._query('/shared-group-membership', {
+			userId1: requireId(userId1, 'userId1'),
+			userId2: requireId(userId2, 'userId2'),
+		}), { cacheSeconds: 0 });
+		return {
+			groups: Number(res?.groups ?? 0),
+			dms: Number(res?.dms ?? 0),
+			total: Number(res?.total ?? ((res?.groups || 0) + (res?.dms || 0))),
+			bonus: Number(res?.bonus ?? (((res?.groups || 0) + (res?.dms || 0)) > 0 ? 0.2 : 0)),
+		};
+	}
+	async sharedGroupCount(...args) { return this.getSharedGroupCount(...args); }
+	async sharedGroupMembership(...args) { return this.getSharedGroupMembership(...args); }
+	async hasSharedGroupMembership(userId1, userId2) { return (await this.getSharedGroupCount(userId1, userId2)) > 0; }
+
+	async updatePostRecommendationPenalty(postId, delta = 0.1, max = 1) {
+		await this._write(`/posts/${requireId(postId, 'postId')}/recommendation-penalty`, {
+			delta: Number(delta) || 0,
+			max: Number(max) || 1,
+		});
+		return true;
+	}
+	async incrementPostRecommendationPenalty(...args) { return this.updatePostRecommendationPenalty(...args); }
+	async addPostRecommendationPenalty(...args) { return this.updatePostRecommendationPenalty(...args); }
+
+	// Override base getUserFollows consistency
+	async getUserFollows(userId) {
+		return this.getFollowIds(userId);
+	}
+
+}
+require('../reputation').installD1(D1Adapter);
 module.exports = D1Adapter;

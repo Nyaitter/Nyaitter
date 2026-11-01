@@ -7,6 +7,7 @@ const {
 	serializeNotification,
 	serializeNotifications,
 } = require('../utils/serialize');
+const { extractNumericHashtagUserIds } = require('../utils/mentionText');
 const {
 	createNotificationIfAllowed,
 } = require('../services/NotificationDeliveryService');
@@ -49,8 +50,15 @@ async function validateClientNotification(db, senderId, recipientId, type, targe
 			}
 			return null;
 		}
-		if (type === 'mention' && !String(post.content || '').includes(`@${recipientId}`)) {
-			return { error: '投稿本文にメンションが含まれていません。' };
+		if (type === 'mention') {
+			// 投稿時の自動通知と同じ数値列全体を比較する（部分一致させない）。
+			const hasAtMention = [...String(post.content || '').matchAll(/@(\d+)/g)]
+				.some((match) => Number(match[1]) === Number(recipientId));
+			const hasHashtagMention = !hasAtMention && extractNumericHashtagUserIds(post.content).includes(Number(recipientId))
+				&& await db.getUserById(recipientId);
+			if (!hasAtMention && !hasHashtagMention) {
+				return { error: '投稿本文にメンションが含まれていません。' };
+			}
 		}
 		return null;
 	}
@@ -115,12 +123,12 @@ router.post({
 	if (!Number.isInteger(recipientId) || recipientId <= 0) {
 		return res.status(400).json({ error: 'recipient_id must be a positive integer' });
 	}
-	if (!NOTIFICATION_TYPES.includes(type)) {
+	if (!NOTIFICATION_TYPES.has(type)) {
 		return res.status(400).json({ error: `Invalid notification type: ${type}` });
 	}
 
 	const normalizedTarget = normalizeTarget(target);
-	if (req.user.role !== 'admin') {
+	if (!req.user.admin) {
 		const validation = await validateClientNotification(db, senderId, recipientId, type, normalizedTarget);
 		if (validation?.error) {
 			return res.status(403).json({ error: validation.error });

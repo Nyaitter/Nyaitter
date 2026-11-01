@@ -7,6 +7,24 @@
  */
 
 class DatabaseAdapter {
+	async createModLog() { throw new Error('createModLog not implemented'); }
+	async searchModLogs() { throw new Error('searchModLogs not implemented'); }
+	async getReputationProfile(userId, {excludeScope=null}={}) { throw new Error('getReputationProfile() must be implemented'); }
+	async getWriterQualificationProfile(userId, {excludeScope=null}={}) { throw new Error('getWriterQualificationProfile() must be implemented'); }
+	async getNoteSelectionKeys(userIds) { throw new Error('getNoteSelectionKeys() must be implemented'); }
+	async getReputationContext(userIds) { throw new Error('getReputationContext() must be implemented'); }
+	async claimNoteNotification(noteId,userId) { throw new Error('claimNoteNotification() must be implemented'); }
+	async releaseNoteNotification(noteId,userId) { throw new Error('releaseNoteNotification() must be implemented'); }
+	async claimReviewerOutcome(userId,authorId,day,noteId) { throw new Error('claimReviewerOutcome() must be implemented'); }
+	async claimReputationNotice(key) { throw new Error('claimReputationNotice() must be implemented'); }
+	async releaseReputationNotice(key) { throw new Error('releaseReputationNotice() must be implemented'); }
+	async listNoteNegativeReasons(noteId,userIds) { throw new Error('listNoteNegativeReasons() must be implemented'); }
+	async getReputationEvidence(userId, prefix) { throw new Error('getReputationEvidence() must be implemented'); }
+	async syncReportReputation(reportId, options) { throw new Error('syncReportReputation() must be implemented'); }
+	async replaceReputationEvents(scope, events, evaluation = null) { throw new Error('replaceReputationEvents() must be implemented'); }
+	async getNoteReviewData(noteId) { throw new Error('getNoteReviewData() must be implemented'); }
+	async listNotesForPosts(postIds) { throw new Error('listNotesForPosts() must be implemented'); }
+	async listPositivePostUsers(postId, limit) { throw new Error('listPositivePostUsers() must be implemented'); }
 	
 	async connect() {
 		throw new Error('connect() must be implemented');
@@ -502,13 +520,18 @@ class DatabaseAdapter {
 	}
 
 	
-	async updateGroupDm(dmId, updates) {
+	// expectedState compares host_id, member and accepted at the write boundary.
+	async updateGroupDm(dmId, updates, expectedPost = undefined, expectedState = undefined) {
 		throw new Error('updateGroupDm() must be implemented');
 	}
 
 	
-	async appendToGroupDm(dmId, message, senderId = null) {
+	async appendToGroupDm(dmId, message, senderId = null, options = undefined) {
 		throw new Error('appendToGroupDm() must be implemented');
+	}
+
+	async editGroupDmMessage(dmId, messageId, userId, content) {
+		throw new Error('editGroupDmMessage() must be implemented');
 	}
 
 	
@@ -527,12 +550,12 @@ class DatabaseAdapter {
 	}
 
 	
-	async deleteGroupDm(dmId) {
+	async deleteGroupDm(dmId, expectedState = undefined) {
 		throw new Error('deleteGroupDm() must be implemented');
 	}
 
 	
-	async leaveGroupDm(dmId, userId) {
+	async leaveGroupDm(dmId, userId, expectedState = undefined) {
 		throw new Error('leaveGroupDm() must be implemented');
 	}
 
@@ -658,6 +681,7 @@ class DatabaseAdapter {
 	async getModerationReportById(reportId) { throw new Error('getModerationReportById() must be implemented'); }
 	async listModerationReportsForAdmin(adminId, options = {}) { throw new Error('listModerationReportsForAdmin() must be implemented'); }
 	async getModerationAdminWorkloads(excludedAdminIds = []) { throw new Error('getModerationAdminWorkloads() must be implemented'); }
+	async setAdminRequestExcluded(userId, excluded) { throw new Error('setAdminRequestExcluded() must be implemented'); }
 	async assignModerationReport(reportId, assignment) { throw new Error('assignModerationReport() must be implemented'); }
 	async getOverdueModerationReports(cutoff, claimStaleBeforeIso) { throw new Error('getOverdueModerationReports() must be implemented'); }
 	async getUnassignedModerationReports(limit = 100) { throw new Error('getUnassignedModerationReports() must be implemented'); }
@@ -773,6 +797,46 @@ class DatabaseAdapter {
 	async getPollVoters(pollId) {
 		return [];
 	}
+
+	// Community Notes Phase 2 helpers
+	async getNoteVoteEvidence(noteId) { throw new Error('getNoteVoteEvidence() must be implemented'); }
+	async listEngagedUsersByPost(postId) { throw new Error('listEngagedUsersByPost() must be implemented'); }
+	async listEngagedUsersByPostPage(postId, options) { throw new Error('listEngagedUsersByPostPage() must be implemented'); }
+	async getNoteRelevanceContext(userIds, authorId) { throw new Error('getNoteRelevanceContext() must be implemented'); }
+	async getUserFollows(userId) { return (await this.getFollowing(userId, 100000)).map((u) => Number(u?.id ?? u?.user_id ?? u?.userId)).filter(Number.isSafeInteger); }
+	async listGroupDmsForUser(userId) {
+		const dms = await this.getGroupDmsForUser(userId, { limit: 1000 });
+		return (Array.isArray(dms) ? dms : []).map((d) => String(d?.id ?? d?.dmId ?? d));
+	}
+	async getSharedGroupCount(userId1, userId2) { return 0; }
+	async getSharedDmCount(userId1, userId2) { return 0; }
+	async getSharedGroupMembership(userId1, userId2) {
+		const groups = await this.getSharedGroupCount(userId1, userId2);
+		const dms = await this.getSharedDmCount(userId1, userId2);
+		const bonus = (groups > 0 || dms > 0) ? 0.2 : 0;
+		return { groups, dms, total: groups + dms, bonus };
+	}
+	async sharedGroupCount(...args) { return this.getSharedGroupCount(...args); }
+	async sharedGroupMembership(...args) { return this.getSharedGroupMembership(...args); }
+	async hasSharedGroupMembership(userId1, userId2) {
+		return (await this.getSharedGroupCount(userId1, userId2)) > 0;
+	}
+	async updatePostRecommendationPenalty(postId, delta = 0.1, max = 1) { return false; }
+	async incrementPostRecommendationPenalty(...args) { return this.updatePostRecommendationPenalty(...args); }
+	async addPostRecommendationPenalty(...args) { return this.updatePostRecommendationPenalty(...args); }
+	async createNoteDistribution(data = {}) { throw new Error('createNoteDistribution() must be implemented'); }
+	async getNoteDistribution(noteId, userId) { throw new Error('getNoteDistribution() must be implemented'); }
+	async getNoteDistributionStates(noteId, userIds) { throw new Error('getNoteDistributionStates() must be implemented'); }
+	async listNoteDistributionsByNote(noteId) { throw new Error('listNoteDistributionsByNote() must be implemented'); }
+	async listNoteDistributionsByUser(userId) { throw new Error('listNoteDistributionsByUser() must be implemented'); }
+	async updateNoteDistribution(noteId, userId, fields = {}) { throw new Error('updateNoteDistribution() must be implemented'); }
+	async upsertNoteDistribution(data = {}) { throw new Error('upsertNoteDistribution() must be implemented'); }
+	async upsertNoteDistributions(rows = []) { throw new Error('upsertNoteDistributions() must be implemented'); }
+	async deleteNoteDistribution(noteId, userId = null) { throw new Error('deleteNoteDistribution() must be implemented'); }
+	async updateNote(noteId, fields = {}) { throw new Error('updateNote() must be implemented'); }
+	async listNoteReasonTagDefs({ side } = {}) { throw new Error('listNoteReasonTagDefs() must be implemented'); }
+	async saveNoteRatingReasons({ noteId, userId, codes } = {}) { throw new Error('saveNoteRatingReasons() must be implemented'); }
+
 }
 
 module.exports = DatabaseAdapter;

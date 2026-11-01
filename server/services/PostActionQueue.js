@@ -6,17 +6,20 @@ class PostActionQueue {
   constructor({ maxPendingJobs = 1000, concurrency = 5 } = {}) {
     this.maxPendingJobs = maxPendingJobs;
     this.concurrency = Math.max(1, Math.min(concurrency, 20));
-    this.queue = [];
-    this.head = 0;
+    this.queues = Array.from({ length: 11 }, () => ({ jobs: [], head: 0 }));
+    this.pending = 0;
+    this.lastEnqueuedAt = -Infinity;
+    this.clockReversed = false;
     this.activeWorkers = 0;
     this.stopped = false;
+    this.nextSequence = 0;
   }
 
   get length() {
-    return this.queue.length - this.head;
+    return this.pending;
   }
 
-  enqueue(type, run) {
+  enqueue(type, run, policy = null) {
     if (this.stopped) {
       const error = new Error('Post action queue is unavailable');
       error.statusCode = 503;
@@ -32,38 +35,61 @@ class PostActionQueue {
     }
 
     const actionId = crypto.randomUUID();
-    this.queue.push({ actionId, type: String(type || 'post'), run });
+    const priority=policy && !policy.exempt && Number.isInteger(policy.queuePriority)?Math.max(-5,Math.min(5,policy.queuePriority)):0;
+    const enqueuedAt = Date.now();
+    if (enqueuedAt < this.lastEnqueuedAt) this.clockReversed = true;
+    this.lastEnqueuedAt = enqueuedAt;
+    this.queues[priority + 5].jobs.push({ actionId, type: String(type || 'post'), run, priority, enqueuedAt, sequence: this.nextSequence++ });
+    this.pending += 1;
     this._dispatch();
     return actionId;
   }
 
   stop() {
     this.stopped = true;
-    this.queue.length = 0;
-    this.head = 0;
+    for (const queue of this.queues) {
+      queue.jobs.length = 0;
+      queue.head = 0;
+    }
+    this.pending = 0;
   }
 
   _dispatch() {
-    while (!this.stopped && this.activeWorkers < this.concurrency && this.head < this.queue.length) {
-      const job = this.queue[this.head];
-      this.queue[this.head] = null;
-      this.head += 1;
-
-      // Periodic compact to release memory
-      if (this.head > 64 && this.head * 2 >= this.queue.length) {
-        this.queue = this.queue.slice(this.head);
-        this.head = 0;
+    while (!this.stopped && this.activeWorkers < this.concurrency && this.pending > 0) {
+      const now = Date.now();
+      let bestQueue = null;
+      let bestIndex = -1;
+      let bestJob = null;
+      let bestValue = -Infinity;
+      for (const queue of this.queues) {
+        const end = this.clockReversed ? queue.jobs.length : Math.min(queue.head + 1, queue.jobs.length);
+        for (let i = queue.head; i < end; i += 1) {
+          const job = queue.jobs[i];
+          const value = job.priority + Math.floor((now - job.enqueuedAt) / 1000);
+          if (value > bestValue || (value === bestValue && (!bestJob || job.sequence < bestJob.sequence))) {
+            bestQueue = queue;
+            bestIndex = i;
+            bestJob = job;
+            bestValue = value;
+          }
+        }
       }
-
-      if (job) {
-        this.activeWorkers += 1;
-        this._runJob(job);
+      if (bestIndex === bestQueue.head) {
+        bestQueue.jobs[bestQueue.head++] = null;
+        if (bestQueue.head > 64 && bestQueue.head * 2 >= bestQueue.jobs.length) {
+          bestQueue.jobs = bestQueue.jobs.slice(bestQueue.head);
+          bestQueue.head = 0;
+        }
+      } else {
+        bestQueue.jobs.splice(bestIndex, 1);
       }
-    }
-
-    if (this.head >= this.queue.length) {
-      this.queue.length = 0;
-      this.head = 0;
+      this.pending -= 1;
+      if (this.pending === 0) {
+        this.clockReversed = false;
+        this.lastEnqueuedAt = -Infinity;
+      }
+      this.activeWorkers += 1;
+      this._runJob(bestJob);
     }
   }
 
@@ -77,7 +103,7 @@ class PostActionQueue {
       );
     } finally {
       this.activeWorkers = Math.max(0, this.activeWorkers - 1);
-      if (!this.stopped && this.head < this.queue.length) {
+      if (!this.stopped && this.pending > 0) {
         this._dispatch();
       }
     }

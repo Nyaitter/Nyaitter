@@ -28,6 +28,8 @@ const NOTIFICATION_TYPES = new Set([
   'verification_approved',
   'verification_rejected',
   'poll_ended',
+  'community_note',
+  'note_rate',
 ]);
 
 const TARGET_KINDS = new Set(['post', 'dm', 'user', 'route']);

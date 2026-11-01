@@ -20,7 +20,8 @@ const {
 } = require('./NotificationDeliveryService');
 const {
   resolvePostingUser,
-  assertPostingUserWritable,
+  assertPostingUserAccess,
+  assertAuthenticatedUserAccess,
 } = require('./auth/PostAsUserService');
 const {
   normalizeGroupId,
@@ -28,6 +29,10 @@ const {
   listActiveGroupMemberIds,
   hasPermission,
 } = require('./GroupService');
+const {
+  extractNumericHashtagUserIds,
+  isMentionedInText,
+} = require('../utils/mentionText');
 
 const idempotencyCache = new Map();
 const recentUserPostSignatures = new Map();
@@ -153,6 +158,30 @@ async function notifyPostAction(context, { userId, type, fromUserId, postId }) {
   });
 }
 
+async function fetchExistingUserIds(db, ids) {
+  const unique = [...new Set((ids || []).map(Number).filter((id) => Number.isSafeInteger(id) && id > 0))];
+  if (unique.length === 0) return new Set();
+  let users = [];
+  if (typeof db.getUsersByIds === 'function') {
+    try {
+      users = (await db.getUsersByIds(unique)) || [];
+    } catch (_) {
+      users = [];
+    }
+  }
+  const found = new Set((users || [])
+    .map((user) => Number(user?.id))
+    .filter((id) => Number.isSafeInteger(id) && id > 0));
+  const missing = unique.filter((id) => !found.has(id));
+  if (missing.length > 0 && typeof db.getUserById === 'function') {
+    const fetched = await Promise.all(missing.map((id) => db.getUserById(id).catch(() => null)));
+    for (const user of fetched) {
+      if (user && Number.isSafeInteger(Number(user.id))) found.add(Number(user.id));
+    }
+  }
+  return found;
+}
+
 async function publishNewTimelinePost(context, post) {
   if (!post || post.groupId || post.group_id || post.replyTo != null || post.reply_to != null) return;
   if (!context.realtime?.publishPostToFollowers) return;
@@ -194,8 +223,17 @@ async function notifyGroupAnnouncement(context, group, post, knownMemberIds = nu
 }
 
 async function processCreatePostAction(context, payload) {
-  const postingUser = assertPostingUserWritable(
+  const attachments = Array.isArray(payload.attachments) ? payload.attachments : [];
+  const pollAttachment = attachments.find((a) => a && a.type === 'poll') || (payload.poll && typeof payload.poll === 'object' ? payload.poll : null);
+  const fileAttachments = attachments.filter((a) => a && a.type !== 'poll');
+  const features = ['write', 'posts'];
+  if (pollAttachment) features.push('polls');
+  if (fileAttachments.length > 0) features.push('uploads');
+  const postingUser = await assertPostingUserAccess(
+    context.authRequest,
+    context.db,
     await resolvePostingUser(context.authRequest, context.db, payload.postAsUserId),
+    features,
   );
   const userId = Number(postingUser.id);
   const rawSchedule = payload.scheduledAt ?? payload.scheduled_at;
@@ -212,7 +250,6 @@ async function processCreatePostAction(context, payload) {
     throw error;
   }
   const content = typeof payload.content === 'string' ? payload.content.trim() : '';
-  const attachments = Array.isArray(payload.attachments) ? payload.attachments : [];
   const replyTo = normalizeTargetPostId(payload.replyTo);
   const repostTo = normalizeTargetPostId(payload.repostTo);
   const isAnnouncement = payload.announcement === true;
@@ -342,8 +379,8 @@ async function processCreatePostAction(context, payload) {
         const isRootAuthor = Number(rootPost.userId) === Number(userId);
         const isParentAuthor = Number(replyTarget.userId) === Number(userId);
         if (!isRootAuthor && !isParentAuthor) {
-          const isMentionedInRoot = Boolean(rootPost.content && new RegExp(`@${userId}\\b`).test(rootPost.content));
-          const isMentionedInParent = Boolean(replyTarget.content && new RegExp(`@${userId}\\b`).test(replyTarget.content));
+          const isMentionedInRoot = isMentionedInText(rootPost.content, userId);
+          const isMentionedInParent = isMentionedInText(replyTarget.content, userId);
           const isMentioned = isMentionedInRoot || isMentionedInParent;
           let permitted = false;
           if (rootReplyControl === 'following' || rootReplyControl === 'following_or_mentioned') {
@@ -392,9 +429,6 @@ async function processCreatePostAction(context, payload) {
       throw error;
     }
   }
-
-  const pollAttachment = attachments.find((a) => a && a.type === 'poll') || (payload.poll && typeof payload.poll === 'object' ? payload.poll : null);
-  const fileAttachments = attachments.filter((a) => a && a.type !== 'poll');
 
   const processedAttachments = fileAttachments.map((attachment) => {
     if (attachment.data !== undefined) {
@@ -463,7 +497,23 @@ async function processCreatePostAction(context, payload) {
 
   const replyTarget = replyTo ? relatedPosts.get(replyTo) : null;
   const repostTarget = repostTo ? relatedPosts.get(repostTo) : null;
-  const needsGroupRecipientCheck = Boolean(group && (replyTarget || repostTarget || /@\d+/.test(content)));
+
+  // @メンションと、実在ユーザーに一致する純粋数値ハッシュタグを同一の宛先集合として扱う。
+  const mentionUserIds = new Set();
+  for (const match of content.matchAll(/@(\d+)/g)) {
+    const mentionedUserId = Number(match[1]);
+    if (!Number.isInteger(mentionedUserId) || mentionedUserId <= 0) continue;
+    mentionUserIds.add(mentionedUserId);
+  }
+  const numericHashtagIds = extractNumericHashtagUserIds(content);
+  if (numericHashtagIds.length > 0) {
+    const existingIds = await fetchExistingUserIds(context.db, numericHashtagIds);
+    for (const id of existingIds) mentionUserIds.add(id);
+  }
+
+  const needsGroupRecipientCheck = Boolean(group && (
+    replyTarget || repostTarget || mentionUserIds.size > 0
+  ));
   // グループメンバー一覧は、宛先チェックとグループアナウンス通知の双方で
   // 必要になる場合があるため、1回だけ取得して共有する。
   const groupMemberIds = (group && (needsGroupRecipientCheck || groupAnnouncement))
@@ -500,9 +550,7 @@ async function processCreatePostAction(context, payload) {
   }
 
   // メンション通知
-  for (const match of content.matchAll(/@(\d+)/g)) {
-    const mentionedUserId = Number(match[1]);
-    if (!Number.isInteger(mentionedUserId) || mentionedUserId <= 0) continue;
+  for (const mentionedUserId of mentionUserIds) {
     if (excludedNotificationIds.has(mentionedUserId)) continue;
     excludedNotificationIds.add(mentionedUserId);
     if (!canNotifyPostRecipient(mentionedUserId)) continue;
@@ -568,16 +616,38 @@ async function processCreatePostAction(context, payload) {
   return post;
 }
 
-async function processDeletePostAction(context, { postId, userId, admin = false }) {
+async function processDeletePostAction(context, payload) {
+  if (!payload.admin) return runDeletePostAction(context, payload);
+  return require('./ModLogService').operation(context.db, 'admin', payload.userId, 'delete_post_processing', 'post', payload.postId, async () => {
+    await runDeletePostAction(context, payload);
+    return true;
+  }, 'failure');
+}
+
+async function runDeletePostAction(context, { postId, userId, admin = false }) {
+  const user = await assertAuthenticatedUserAccess(context.authRequest, context.db, ['write', 'posts']);
+  if (Number(user.id) !== Number(userId)
+    || (admin && !(user.admin === true && context.authRequest.user.admin === true))) {
+    const error = new Error('この投稿を削除する権限がありません。');
+    error.statusCode = 403;
+    throw error;
+  }
   const postToDelete = await context.db.getPostById(postId);
   if (!postToDelete) throw new Error('Post not found');
+  if (!admin && Number(postToDelete.userId) !== Number(userId)) {
+    const error = new Error('自分の投稿だけを削除できます。');
+    error.statusCode = 403;
+    throw error;
+  }
+  const notesToDelete=await context.db.listNotesByPost(postId);
 
   const success = admin
-    ? await context.db.adminDeletePost(postId)
+    ? await require('./ModLogService').operation(context.db, 'admin', userId, 'delete_post', 'post', postId, () => context.db.adminDeletePost(postId), 'failure')
     : await context.db.deletePost(postId, userId);
   if (!success) {
     throw new Error(admin ? 'Post not found' : 'You do not have permission to delete this post');
   }
+  await require('./ReputationService').cancelPostEvents(context.db,postId,notesToDelete);
 
   timelineCacheManager.onPostDeleted(postId);
   invalidateImmutablePostCache(postId);
@@ -615,6 +685,7 @@ async function runEditPostAction(context, { postId, userId, content, attachments
   }
 
   const updated = await context.db.updatePost(postId, updatePayload);
+  await require('./ReputationService').syncPostTrust(context.db,postId);
   invalidateImmutablePostCache(postId);
 
   // 返信制限変更時スレッド全体に伝播、条件外の返信を削除
@@ -631,7 +702,7 @@ async function runEditPostAction(context, { postId, userId, content, attachments
         for (const reply of existingReplies) {
           if (!reply) continue;
           if (replyControl !== 'everyone' && Number(reply.userId) !== Number(userId)) {
-            const isMentioned = Boolean(normalizedContent && new RegExp(`@${reply.userId}\\b`).test(normalizedContent));
+            const isMentioned = isMentionedInText(normalizedContent, reply.userId);
             let permitted = false;
             if (replyControl === 'following') {
               const isFollowed = typeof context.db.isFollowing === 'function'
@@ -689,6 +760,18 @@ function buildEditDedupeKey({ postId, userId, content, mask, lock, replyControl 
 
 async function processEditPostAction(context, payload) {
   const hasAttachments = Array.isArray(payload.attachments) && payload.attachments.length > 0;
+  const features = ['write', 'posts'];
+  if (hasAttachments) {
+    if (payload.attachments.some(attachment => attachment?.type === 'poll')) features.push('polls');
+    if (payload.attachments.some(attachment => attachment?.type !== 'poll')) features.push('uploads');
+  }
+  const user = await assertAuthenticatedUserAccess(context.authRequest, context.db, features);
+  if (Number(user.id) !== Number(payload.userId)) {
+    const error = new Error('自分の投稿だけを編集できます。');
+    error.statusCode = 403;
+    throw error;
+  }
+  if (payload.attachments !== undefined) validateAttachmentReferences(payload.attachments, Number(user.id));
   if (hasAttachments) return runEditPostAction(context, payload);
 
   const dedupeKey = buildEditDedupeKey(payload);

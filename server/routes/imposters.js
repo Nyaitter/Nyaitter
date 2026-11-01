@@ -2,7 +2,8 @@
 
 const api = require('../utils/ApiRegistry');
 const config = require('../config');
-const { requireAuthAllowFrozen, invalidateSessionPrincipalCache } = require('../middleware/auth');
+const { attachDisplayRanks } = require('../utils/rankDisplay');
+const { requireAuthAllowFrozen } = require('../middleware/auth');
 const { serializeUserBrief, invalidateUserBriefCache } = require('../utils/serialize');
 const timelineCacheManager = require('../utils/TimelineCacheManager');
 const { getPublicUrl } = require('../utils/nyaitterAddress');
@@ -74,6 +75,7 @@ router.get({
   const db = getDbAdapter(req);
   try {
     const imposters = await listAccessibleImposters(db, req.user.id);
+    await attachDisplayRanks(db, imposters);
     res.json({
       imposters: imposters.map((imposter) => serializeImposter(
         imposter,
@@ -117,6 +119,7 @@ router.post({
         imposter: toImposterSettings(parent.id),
       },
     });
+    await attachDisplayRanks(db, [imposter]);
     res.status(201).json({
       imposter: serializeImposter(imposter, parent.id, getPublicUrl(req)),
     });
@@ -155,6 +158,7 @@ router.post({
         imposter: toImposterSettings(metadata.parent_id, members),
       },
     });
+    await attachDisplayRanks(db, [updated]);
     res.json({ imposter: serializeImposter(updated, req.user.id, getPublicUrl(req)) });
   } catch (error) {
     console.error('[imposters] add member error:', error);
@@ -190,6 +194,7 @@ router.patch({
         imposter: toImposterSettings(metadata.parent_id, members),
       },
     });
+    await attachDisplayRanks(db, [updated]);
     res.json({ imposter: serializeImposter(updated, req.user.id, getPublicUrl(req)) });
   } catch (error) {
     console.error('[imposters] update member role error:', error);
@@ -219,6 +224,7 @@ router.delete({
         imposter: toImposterSettings(metadata.parent_id, members),
       },
     });
+    await attachDisplayRanks(db, [updated]);
     res.json({ imposter: serializeImposter(updated, req.user.id, getPublicUrl(req)) });
   } catch (error) {
     console.error('[imposters] delete member error:', error);
@@ -247,13 +253,11 @@ router.delete({
 
     deletionStarted = Boolean(await db.beginAccountOperation(imposter.id, 'deleting'));
     if (!deletionStarted) return res.status(409).json({ error: 'インポスターは別のアカウント操作中です。しばらく待って再試行してください。' });
-    invalidateSessionPrincipalCache(imposter.id);
     const attachmentKeys = await db.getAccountAttachmentKeys(imposter.id);
     req.app.locals.realtime?.closeUser?.(imposter.id, 1012, 'Imposter account deletion');
     await db.invalidateAllSessions(imposter.id);
     const deleted = await db.deleteAccount(imposter.id);
     if (!deleted) throw new Error('Imposter account deletion did not complete');
-    invalidateSessionPrincipalCache(imposter.id);
     invalidateUserBriefCache(imposter.id);
     timelineCacheManager.clear();
     await deleteStoredAttachments(req.app.locals.storageAdapter, attachmentKeys);
@@ -262,7 +266,6 @@ router.delete({
     console.error('[imposters] delete error:', error);
     if (deletionStarted) {
       await db.finishAccountOperation(imposterId, 'deleting').catch(() => {});
-      invalidateSessionPrincipalCache(imposterId);
     }
     res.status(500).json({ error: 'インポスターの削除に失敗しました。' });
   }

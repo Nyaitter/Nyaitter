@@ -1,10 +1,12 @@
 'use strict';
 
+const { attachDisplayRanks, publicDisplayRanks } = require('../utils/rankDisplay');
+
 const crypto = require('crypto');
 const express = require('express');
 const config = require('../config');
 const { requireAuth, optionalAuth } = require('../middleware/auth');
-const { serializePostsByIds, invalidateUserBriefCache, clearUserBriefCache } = require('../utils/serialize');
+const { serializePostsByIds, serializeUserBrief, invalidateUserBriefCache, clearUserBriefCache } = require('../utils/serialize');
 const { getPublicUrl } = require('../utils/nyaitterAddress');
 const { createNotificationIfAllowed } = require('../services/NotificationDeliveryService');
 const { resolvePostingUser } = require('../services/auth/PostAsUserService');
@@ -317,6 +319,7 @@ router.get({
     if (!group) return;
     const db = getDb(req);
     const owner = await db.getUserById(group.ownerId ?? group.owner_id);
+    await attachDisplayRanks(db, [owner]);
     let membershipState = { membership: null, roles: [] };
     let pendingJoinRequest = null;
     if (req.user) {
@@ -329,7 +332,7 @@ router.get({
     }
     res.json({
       group: groupPayload(group, {
-        owner: owner ? { id: owner.id, name: owner.name || '', nyaitter_id: owner.handle || null, icon_data: owner.icon_data || null } : null,
+        owner: owner ? { id: owner.id, name: owner.name || '', nyaitter_id: owner.handle || null, icon_data: owner.icon_data || null, display_ranks: publicDisplayRanks(owner) } : null,
         membership: membershipPayload(membershipState.membership),
         roles: membershipState.membership?.status === 'active' ? membershipState.roles.map(rolePayload) : undefined,
       }),
@@ -670,7 +673,8 @@ router.get({
     }
     const memberships = await getDb(req).getGroupMemberships(group.id, { status: requestedStatus, limit: 200, offset: normalizeOffset(req.query.offset) });
     const users = await getDb(req).getUsersByIds(memberships.map((membership) => membership.userId ?? membership.user_id));
-    const usersById = new Map(users.map((user) => [Number(user.id), user]));
+    await attachDisplayRanks(getDb(req), users);
+    const usersById = new Map(users.map((user) => [Number(user.id), serializeUserBrief(user, getPublicUrl(req))]));
     res.json({ members: memberships.map((membership) => ({ membership: membershipPayload(membership), user: usersById.get(Number(membership.userId ?? membership.user_id)) || null })) });
   } catch (error) {
     errorResponse(res, error, 'member list error');

@@ -13,6 +13,8 @@ Nyaitter サーバーと Cloudflare D1 の間を中継する Worker です。D1 
 
 ## コマンド
 
+既存データベースへの適用前に、[マイグレーションの注意事項](../../server/migrations/README.md)を確認してください。
+
 ```bash
 npm run dev
 npm run migrate:local

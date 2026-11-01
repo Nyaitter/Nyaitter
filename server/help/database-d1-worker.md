@@ -23,12 +23,16 @@ npx wrangler secret put AUTH_TOKEN
 
 ## 3. テーブルを作り、Worker を公開する
 
+既存データベースに適用する前に、[マイグレーションの注意事項](../migrations/README.md)を確認してください。
+
 ```bash
 cd ../..
 DB_ADAPTER=d1 npm run migrate
 cd workers/d1-proxy
 npm run deploy
 ```
+
+適用したファイルは記録され、再実行しても適用済みのファイルは実行されません。同じファイルを手作業で繰り返し実行しないでください（列の追加など、繰り返し実行できない内容が含まれます）。
 
 ## 4. サーバーに接続先を設定する
 

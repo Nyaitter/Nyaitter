@@ -12,6 +12,8 @@ const {
 const { extractViewContent } = require('./viewContent');
 const { getUserReactions, invalidateUserReactions } = require('./UserReactionCache');
 const { getVisibleDmUnreadCount } = require('../services/DmVisibilityService');
+const { publicSettings } = require('./protectedStatus');
+const { attachDisplayRanks, publicDisplayRanks, ownDisplaySettingsForUser } = require('./rankDisplay');
 
 const USER_BRIEF_CACHE_LIMIT = 5000;
 const userBriefCache = new Map();
@@ -86,6 +88,7 @@ function serializeUserBrief(user, publicUrl = null, { includeSearchExclusion = f
 		verify: Boolean(user.verify),
 		is_imposter: Boolean(user.settings?.imposter?.parent_id),
 		group_badges: effectiveBadges,
+		display_ranks: publicDisplayRanks(user),
 		...(includeSearchExclusion ? { shadow: !!user.shadow } : {}),
 	};
 
@@ -171,6 +174,7 @@ async function serializeNotification(db, notification, publicUrl = null) {
 
 async function serializeUser(db, user, viewerId = null, publicUrl = null) {
 	if (!user) return null;
+	await attachDisplayRanks(db, [user]);
 	const id = user.id;
 	const isSelf = viewerId != null && Number(viewerId) === Number(id);
 	let accountState;
@@ -266,7 +270,8 @@ async function serializeUser(db, user, viewerId = null, publicUrl = null) {
 		icon_data: user.icon_data || null,
 		icon_available: Boolean(user.icon_data || user.scid),
 		header_image: user.header_image || null,
-		settings: user.settings || {},
+		settings: { ...publicSettings(user.settings || {}), ...(isSelf ? ownDisplaySettingsForUser(user) : {}) },
+		display_ranks: publicDisplayRanks(user),
 		block: isSelf ? (Array.isArray(user.block) ? user.block : []) : [],
 		notice: structuredNotifications,
 		notification_unread_count: isSelf ? unreadCount : 0,
@@ -295,6 +300,7 @@ async function serializePublicProfile(
 	knownGroups = null,
 ) {
 	if (!user) return null;
+	await attachDisplayRanks(db, [user]);
 	const isSelf = viewerId != null && Number(viewerId) === Number(user.id);
 	const settings = user.settings || {};
 	const state = (enabled) => (isSelf || enabled ? 'public' : 'private');
@@ -389,6 +395,7 @@ async function serializePublicProfile(
 		icon_data: user.icon_data || null,
 		icon_available: Boolean(user.icon_data || user.scid),
 		account_state: user.freeze ? 'frozen' : 'active',
+		display_ranks: publicDisplayRanks(user),
 		admin: !!user.admin,
 		verify: !!user.verify,
 		is_imposter: !!user.settings?.imposter?.parent_id,
@@ -432,6 +439,7 @@ function pruneUserGroupBadgesCache(now = Date.now()) {
 
 async function attachGroupBadgesToUsers(db, users) {
 	if (!Array.isArray(users) || users.length === 0) return users;
+	await attachDisplayRanks(db, users);
 	const now = Date.now();
 	const ids = [...new Set(users.map((u) => Number(u?.id)).filter(Number.isInteger))];
 	if (ids.length === 0) return users;
@@ -765,6 +773,9 @@ async function serializePostsBatch(
 	const viewerMentionRegex = Number.isSafeInteger(normalizedViewerId) && normalizedViewerId > 0
 		? new RegExp(`@${normalizedViewerId}\\b`)
 		: null;
+	const viewerNumericHashtagRegex = Number.isSafeInteger(normalizedViewerId) && normalizedViewerId > 0
+		? new RegExp(`#${normalizedViewerId}(?=$|[<>\/@#\\s])`)
+		: null;
 
 	function getRootPost(post) {
 		const postId = Number(post?.id);
@@ -986,7 +997,9 @@ async function serializePostsBatch(
 		} else {
 			const isMentioned = Boolean(
 				(viewerMentionRegex && post.content && viewerMentionRegex.test(post.content)) ||
-				(viewerMentionRegex && rootPost.content && viewerMentionRegex.test(rootPost.content))
+				(viewerNumericHashtagRegex && post.content && viewerNumericHashtagRegex.test(post.content)) ||
+				(viewerMentionRegex && rootPost.content && viewerMentionRegex.test(rootPost.content)) ||
+				(viewerNumericHashtagRegex && rootPost.content && viewerNumericHashtagRegex.test(rootPost.content))
 			);
 			if (effectiveReplyControl === 'mentioned' || effectiveReplyControl === 'mentioned_only') {
 				canReply = isMentioned;
@@ -1021,6 +1034,9 @@ async function serializePostsBatch(
 			repost_count: Number(metric.repost_count || 0),
 			liked_by_me: !!metric.liked_by_me,
 			starred_by_me: !!metric.starred_by_me,
+			// コミュニティノート公開時の推薦スコア減衰。キャッシュ対象外の値なので
+			// 毎回投稿から読み直す。
+			recommendation_penalty: Math.max(0, Math.min(1, Number(post.recommendation_penalty ?? post.recommendationPenalty) || 0)),
 			poll: pollsByPostId.get(postId) || null,
 		};
 		visitingPostIds.delete(postId);

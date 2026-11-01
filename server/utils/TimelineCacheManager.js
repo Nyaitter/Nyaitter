@@ -19,6 +19,13 @@ class TimelineCacheManager {
 		this.maxEntries = options.maxEntries ?? 300;
 		this.maxTimelineSize = options.maxTimelineSize ?? 60;
 		this.ringBufferSize = options.ringBufferSize ?? 500;
+		// Hard byte budget for cached payloads/post bodies. Entry-count caps
+		// alone cannot bound memory: one entry can hold up to
+		// maxTimelineSize fully serialized posts. Eviction is LRU (the Map
+		// is re-inserted on read), and evicted entries are simply re-fetched
+		// from the database on demand, so responses never change.
+		this.maxTotalBytes = options.maxTotalBytes ?? 32 * 1024 * 1024;
+		this.totalBytes = 0;
 		// Map<string, { idsAsc: number[], idsSet: Set<number>, postsById: Map, has_more: boolean, next_cursor: string|null, expiresAt: number, meta: EntryMeta|null }>
 		this.cache = new Map();
 		// In-Memory Ring Buffer for Zero-Latency Public Timeline
@@ -98,18 +105,50 @@ class TimelineCacheManager {
 		};
 	}
 
+	_estimateBytes(value) {
+		try {
+			return Buffer.byteLength(JSON.stringify(value) || '');
+		} catch (_) {
+			return 0;
+		}
+	}
+
+	_trackReplace(key, bytes) {
+		const existing = this.cache.get(key);
+		if (existing?.bytes) this.totalBytes -= existing.bytes;
+		this.totalBytes += bytes;
+	}
+
+	_deleteTracked(key) {
+		const existing = this.cache.get(key);
+		if (existing?.bytes) this.totalBytes -= existing.bytes;
+		this.cache.delete(key);
+	}
+
+	_evictToByteCap(protectedKey) {
+		while (this.totalBytes > this.maxTotalBytes && this.cache.size > 1) {
+			const oldestKey = this.cache.keys().next().value;
+			if (oldestKey === undefined || oldestKey === protectedKey) break;
+			this._deleteTracked(oldestKey);
+		}
+	}
+
 	setPayload(key, payload, customTtlMs = null, meta = null) {
 		if (!payload) return;
-		if (this.cache.size >= this.maxEntries) {
+		if (this.cache.size >= this.maxEntries && !this.cache.has(key)) {
 			const oldestKey = this.cache.keys().next().value;
-			if (oldestKey) this.cache.delete(oldestKey);
+			if (oldestKey) this._deleteTracked(oldestKey);
 		}
 		const ttl = customTtlMs ?? this.ttlMs;
+		const bytes = this._estimateBytes(payload);
+		this._trackReplace(key, bytes);
 		this.cache.set(key, {
 			payload,
+			bytes,
 			expiresAt: Date.now() + ttl,
 			meta: this._normalizeMeta(meta),
 		});
+		this._evictToByteCap(key);
 	}
 
 	getIds(key) {
@@ -161,21 +200,25 @@ class TimelineCacheManager {
 			.map((post) => [Number(post.id), post]));
 
 		// Enforce LRU cap
-		if (this.cache.size >= this.maxEntries) {
+		if (this.cache.size >= this.maxEntries && !this.cache.has(key)) {
 			const oldestKey = this.cache.keys().next().value;
-			if (oldestKey) this.cache.delete(oldestKey);
+			if (oldestKey) this._deleteTracked(oldestKey);
 		}
 
 		const ttl = customTtlMs ?? this.ttlMs;
+		const bytes = this._estimateBytes([...postsById.values()]) + idsAsc.length * 8;
+		this._trackReplace(key, bytes);
 		this.cache.set(key, {
 			idsAsc,
 			idsSet: new Set(idsAsc),
 			postsById,
+			bytes,
 			has_more: Boolean(has_more),
 			next_cursor: next_cursor == null || next_cursor === '' ? null : String(next_cursor),
 			expiresAt: Date.now() + ttl,
 			meta: this._normalizeMeta(meta),
 		});
+		this._evictToByteCap(key);
 
 		// Auto seed ring buffer for public timelines
 		if (key.startsWith('timeline:all:') || key.startsWith('timeline:foryou:')) {
@@ -414,6 +457,7 @@ class TimelineCacheManager {
 	 */
 	clear() {
 		this.cache.clear();
+		this.totalBytes = 0;
 	}
 }
 

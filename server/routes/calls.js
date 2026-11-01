@@ -6,6 +6,7 @@ const { createSpaceWithDefaults, normalizeSpaceId, countSpacesByOwner } = requir
 const { authorizeRoom, stagePayload, fail } = require('../services/CallService');
 const { createGuestCallSession, revokeGuestCallSession, SESSION_TTL_MS } = require('../services/GuestCallSessionService');
 const config = require('../config');
+const { publicDisplayRanks } = require('../utils/rankDisplay');
 
 const router = api.createRouter({ tag: 'calls', basePath: '/calls', description: 'ステージとDM通話' });
 const db = req => req.app.locals.dbAdapter;
@@ -95,12 +96,13 @@ router.get({ path: '/stages/:id', auth: 'optional', summary: 'ステージの参
         info = { id: stage.id, stage, role: 'audience' };
     }
     const host = await db(req).getUserById(info.stage.owner_id);
-    const participants = req.app.locals.calls.roster(req.app.locals.calls.rooms.get(`stage:${info.id}`) || new Map());
-    res.json({ stage: info.stage, role: info.role, guest: !req.user, host: { id: info.stage.owner_id, name: host?.name || 'ホスト' }, participants, ...rtcPolicy(), ice_servers: ice() });
+    const participants = await req.app.locals.calls.roster(req.app.locals.calls.rooms.get(`stage:${info.id}`) || new Map(), [host]);
+    res.json({ stage: info.stage, role: info.role, guest: !req.user, host: { id: info.stage.owner_id, name: host?.name || 'ホスト', display_ranks: publicDisplayRanks(host) }, participants, ...rtcPolicy(), ice_servers: ice() });
 }));
 
 router.post({ path: '/stages/:id/guest-session', auth: 'optional', summary: 'ゲスト通話セッションを作成' }, optionalAuth, wrap(async (req, res) => {
     if (req.user) fail(400, 'ログイン中のユーザーはゲスト参加を使えません。');
+    if (!require('../utils/featureAccess').hasFeatureAccess(config.reputation, 'Neutral', ['write', 'call'])) fail(403, '現在のアカウント状態ではこの機能を利用できません');
     if (!normalizeSpaceId(req.params.id)) fail(404, 'ステージが見つかりません。');
     const stage = stagePayload(await db(req).getSpaceById(req.params.id));
     if (!stage || stage.visibility !== 'public' || !stage.allow_guest_join || stage.status === 'ended') fail(403, 'このステージはゲスト参加できません。');
@@ -119,37 +121,45 @@ router.delete({ path: '/stages/guest-session', auth: 'optional', summary: 'ゲ�
 });
 
 router.patch({ path: '/stages/:id', auth: 'required', summary: 'ステージの開始・終了・スピーカー招待' }, requireAuth, wrap(async (req, res) => {
-    const info = await authorizeRoom(db(req), 'stage', req.params.id, req.user.id);
-    if (info.role !== 'host') fail(403, 'ホストのみ操作できます。');
-    const { stage } = info;
-    const settings = { version: 1, scheduled_at: stage.scheduled_at, status: stage.status, speaker_ids: stage.speaker_ids, allow_guest_join: stage.allow_guest_join === true };
-    if (req.body.status !== undefined) {
-        if (!['live', 'ended'].includes(req.body.status) || stage.status === 'ended') fail(400, 'ステージの状態を変更できません。');
-        settings.status = req.body.status;
-    }
-    if (req.body.speaker_ids !== undefined) settings.speaker_ids = ids(req.body.speaker_ids);
-    if (req.body.allow_guest_join !== undefined) {
-        if (typeof req.body.allow_guest_join !== 'boolean') fail(400, 'ゲスト参加の設定が正しくありません。');
-        settings.allow_guest_join = req.body.allow_guest_join;
-    }
-    const invited = ids(req.body.invite_ids || []);
-    for (const uid of [...new Set([...settings.speaker_ids, ...invited])]) {
-        if (!await db(req).getUserById(uid)) fail(400, '招待先のユーザーが見つかりません。');
-        if (uid !== req.user.id) await db(req).createSpaceMember({ spaceId: info.id, userId: uid, role: 'member' });
-    }
-    const updated = await db(req).updateSpace(info.id, { stage_settings: JSON.stringify(settings) });
-    await req.app.locals.calls.refreshStage(info.id);
+    if (!normalizeSpaceId(req.params.id)) fail(404, 'ステージが見つかりません。');
+    const updated = await req.app.locals.calls.updateStage(req.params.id, async (space, settings) => {
+        if (Number(space.ownerId ?? space.owner_id) !== Number(req.user.id)) fail(403, 'ホストのみ操作できます。');
+        if (req.body.status !== undefined) {
+            if (!['live', 'ended'].includes(req.body.status) || (settings.status === 'ended' && req.body.status !== 'ended')) fail(400, 'ステージの状態を変更できません。');
+            if (req.body.status === 'ended' && settings.status !== 'ended') {
+                settings.ended_at = new Date().toISOString();
+                settings.end_reason = 'host';
+                settings.host_absent_since = null;
+                settings.host_absence_deadline = null;
+            }
+            settings.status = req.body.status;
+        }
+        if (req.body.speaker_ids !== undefined) settings.speaker_ids = ids(req.body.speaker_ids);
+        if (req.body.allow_guest_join !== undefined) {
+            if (typeof req.body.allow_guest_join !== 'boolean') fail(400, 'ゲスト参加の設定が正しくありません。');
+            settings.allow_guest_join = req.body.allow_guest_join;
+        }
+        const invited = ids(req.body.invite_ids || []);
+        for (const uid of [...new Set([...(settings.speaker_ids || []), ...invited])]) {
+            if (!await db(req).getUserById(uid)) fail(400, '招待先のユーザーが見つかりません。');
+            if (uid !== req.user.id) await db(req).createSpaceMember({ spaceId: req.params.id, userId: uid, role: 'member' });
+        }
+        return settings;
+    });
     res.json({ stage: stagePayload(updated) });
 }));
 
 router.get({ path: '/dm/:id', auth: 'required', summary: 'DM通話の参加情報' }, requireAuth, wrap(async (req, res) => {
     const info = await authorizeRoom(db(req), 'dm', req.params.id, req.user.id);
     const accepted = info.dm.accepted ?? info.dm.unread?._accepted ?? info.dm.member;
-    const members = await Promise.all(info.dm.member.filter(id => accepted.map(Number).includes(Number(id))).map(async id => {
-        const user = await db(req).getUserById(Number(id));
-        return { id: Number(id), name: user?.name || '参加者' };
-    }));
-    const participants = req.app.locals.calls.roster(req.app.locals.calls.rooms.get(`dm:${info.id}`) || new Map());
+    const memberIds = info.dm.member.map(Number).filter(id => accepted.map(Number).includes(id));
+    const users = await db(req).getUsersByIds(memberIds);
+    const usersById = new Map(users.filter(Boolean).map(user => [Number(user.id), user]));
+    const participants = await req.app.locals.calls.roster(req.app.locals.calls.rooms.get(`dm:${info.id}`) || new Map(), users);
+    const members = memberIds.map(id => {
+        const user = usersById.get(id);
+        return { id, name: user?.name || '参加者', display_ranks: publicDisplayRanks(user) };
+    });
     res.json({ title: info.dm.title || members.filter(user => user.id !== req.user.id).map(user => user.name).join('、') || '通話', members, participants, active: participants.length > 0, ...rtcPolicy(), ice_servers: ice() });
 }));
 

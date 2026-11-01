@@ -1,4 +1,8 @@
-const { getValidRememberedAccounts } = require('./RememberedAccountService');
+const { readRememberedAccounts } = require('./RememberedAccountService');
+const SessionManager = require('./SessionManager');
+const config = require('../../config');
+const { trustRank } = require('../../utils/reputationPolicy');
+const { hasFeatureAccess } = require('../../utils/featureAccess');
 const { canOperateImposter } = require('../ImposterService');
 
 function normalizeUserId(value) {
@@ -26,14 +30,20 @@ async function resolvePostingUser(req, db, requestedUserId = null) {
   }
 
   if (requestedId === currentUserId) {
-    return req.user?.visibilityUser || (await db.getUserById(requestedId));
+    return db.getUserById(requestedId, { fresh: true });
   }
 
-  const rememberedAccounts = await getValidRememberedAccounts(req, db);
+  // キュー待機中のセッション失効や権限変更をキャッシュで見逃さない。
+  const rememberedAccounts = (await Promise.all(readRememberedAccounts(req).map(async (account) => {
+    const session = await db.getSessionByToken(SessionManager.hashToken(account.token));
+    if (!session || Number(session.userId) !== account.userId) return null;
+    const user = await db.getUserById(session.userId, { fresh: true });
+    return user ? { userId: Number(user.id), user } : null;
+  }))).filter(Boolean);
   const directAccount = rememberedAccounts.find((account) => account.userId === requestedId);
   if (directAccount) return directAccount.user;
 
-  const imposter = await db.getUserById(requestedId);
+  const imposter = await db.getUserById(requestedId, { fresh: true });
   if (imposter && rememberedAccounts.some((account) => canOperateImposter(imposter, account.userId))) {
     return imposter;
   }
@@ -50,7 +60,35 @@ function assertPostingUserWritable(user) {
   return user;
 }
 
+async function assertPostingUserAccess(req, db, postingUser, features) {
+  const principal = req.user;
+  const authenticatedUser = assertPostingUserWritable(await db.getUserById(principal?.id, { fresh: true }));
+  if (Number(postingUser?.id) === Number(authenticatedUser.id)) postingUser = authenticatedUser;
+  assertPostingUserWritable(postingUser);
+  const users = [{
+    user: authenticatedUser,
+    admin: authenticatedUser.admin === true && principal.admin === true,
+  }];
+  if (Number(postingUser.id) !== Number(authenticatedUser.id)) {
+    users.push({ user: postingUser, admin: postingUser.admin === true });
+  }
+  for (const { user, admin } of users) {
+    if (admin) continue;
+    const profile = await db.getReputationProfile(user.id);
+    if (!hasFeatureAccess(config.reputation, trustRank(profile, config.reputation), features)) {
+      throw postAsAuthorizationError('現在のアカウント状態ではこの機能を利用できません');
+    }
+  }
+  return postingUser;
+}
+
+async function assertAuthenticatedUserAccess(req, db, features) {
+  return assertPostingUserAccess(req, db, await db.getUserById(req.user?.id, { fresh: true }), features);
+}
+
 module.exports = {
   resolvePostingUser,
   assertPostingUserWritable,
+  assertPostingUserAccess,
+  assertAuthenticatedUserAccess,
 };

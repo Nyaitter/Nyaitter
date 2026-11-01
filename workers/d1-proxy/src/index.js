@@ -1,5 +1,17 @@
 import postSearchQuery from '../../../server/utils/postSearchQuery.js';
+import modLogs from '../../../server/adapters/database/modLogs.js';
+import reputationStorage from '../../../server/adapters/database/reputation.js';
+import reportReputation from '../../../server/adapters/database/reportReputation.js';
+import dataMigrationSchema from '../../../server/services/DataMigrationSchema.js';
+import dataMigrationOrder from '../../../server/services/DataMigrationOrder.js';
 const { buildPostSearchSql } = postSearchQuery;
+const {
+	TABLE_SPECS,
+	INSERT_ORDER,
+	RESET_ORDER,
+	EXCLUDED_TABLES,
+} = dataMigrationSchema;
+const { orderDeletions } = dataMigrationOrder;
 
 function json(data, status = 200, headers = {}) {
 	return new Response(JSON.stringify(data), {
@@ -350,56 +362,40 @@ function formatD1PollRow(poll, voteRows = [], currentUserId = null) {
 	};
 }
 
-const MIGRATION_TABLES = [
-	'users', 'user_auth_providers', 'spaces', 'space_channels', 'space_members', 'space_messages', 'sessions', 'trusted_login_ips', 'login_approvals', 'account_recovery_requests', 'blocked_login_ips', 'bot_tokens', 'posts',
-	'likes', 'stars', 'reposts', 'pinned_posts', 'follows', 'dm_channels', 'dm_messages',
-		'group_dms', 'dm_e2e_keys', 'notifications', 'push_subscriptions', 'moderation_reports', 'logs',
-		'groups', 'group_roles', 'group_memberships', 'group_invites', 'group_join_requests',
-	'user_keyword_affinities', 'polls', 'poll_votes', 'authorized_apps', 'post_feedback',
-];
-const MIGRATION_COLUMNS = {
-	users: ['id', 'scid', 'name', 'handle', 'nyaitter_address', 'auth_provider', 'provider_domain', 'external_id', 'external_profile', 'uuid', 'settings', 'bio', 'header_image', 'icon_data', 'verify', 'freeze', 'admin', 'shadow', 'block', 'account_operation', 'created_at'],
-	sessions: ['session_id', 'token', 'user_id', 'ip_hash', 'ip_masked', 'user_agent', 'expires_at', 'created_at'],
-	trusted_login_ips: ['user_id', 'ip_hash', 'ip_masked', 'created_at', 'last_used_at'],
-	login_approvals: ['id', 'user_id', 'ip_hash', 'ip_masked', 'user_agent', 'auth_provider', 'poll_token_hash', 'status', 'created_at', 'expires_at', 'decided_at', 'consumed_at'],
-	account_recovery_requests: ['id', 'user_id', 'ip_hash', 'ip_masked', 'user_agent', 'auth_provider', 'request_token_hash', 'status', 'trust_score', 'wait_until', 'started_at', 'last_notified_at', 'notified_count', 'decided_at', 'decided_by', 'consumed_at'],
-	blocked_login_ips: ['user_id', 'ip_hash', 'ip_masked', 'reason', 'source_recovery_id', 'created_at'],
-	bot_tokens: ['token_id', 'token_hash', 'user_id', 'name', 'created_at', 'last_used_at'],
-	posts: ['id', 'user_id', 'content', 'attachments', 'mask', 'lock', 'announcement', 'reply_to', 'repost_to', 'tags', 'tags_generated_at', 'group_id', 'group_announcement', 'created_at'],
-	likes: ['user_id', 'post_id', 'created_at'],
-	stars: ['user_id', 'post_id', 'created_at'],
-	reposts: ['user_id', 'post_id', 'created_at'],
-	pinned_posts: ['user_id', 'post_id', 'created_at'],
-	follows: ['follower_id', 'following_id', 'created_at'],
-	dm_channels: ['id', 'participants', 'created_at'],
-	dm_messages: ['id', 'channel_id', 'sender_id', 'content', 'sent_at', 'read_at'],
-	group_dms: ['id', 'host_id', 'title', 'member', 'post', 'unread', 'time', 'created_at'],
-	dm_e2e_keys: ['user_id', 'public_key', 'created_at', 'updated_at'],
-	notifications: ['id', 'user_id', 'type', 'from_user_id', 'post_id', 'target', 'message', 'read', 'clicked', 'created_at'],
-	push_subscriptions: ['user_id', 'endpoint', 'expiration_time', 'p256dh', 'auth', 'session_token', 'created_at', 'updated_at'],
-	moderation_reports: ['id', 'reporter_user_id', 'target_kind', 'target_id', 'description', 'target_snapshot', 'assignment_type', 'status', 'assigned_admin_id', 'assigned_at', 'excluded_admin_ids', 'resolution', 'created_at', 'resolved_at', 'claimed_at'],
-	logs: ['id', 'scratch_id', 'nyaitter_id', 'masked_ip_uuid', 'log_time'],
-	groups: ['id', 'owner_id', 'name', 'description', 'icon_data', 'header_image', 'visibility', 'deleted_at', 'created_at', 'updated_at'],
-	group_roles: ['id', 'group_id', 'name', 'permissions', 'is_system', 'sort_order', 'created_at', 'updated_at'],
-	group_memberships: ['group_id', 'user_id', 'role_id', 'status', 'joined_at', 'updated_at'],
-	group_invites: ['id', 'group_id', 'inviter_id', 'invitee_id', 'status', 'created_at', 'responded_at'],
-	group_join_requests: ['id', 'group_id', 'user_id', 'status', 'reviewed_by', 'created_at', 'reviewed_at'],
-	user_keyword_affinities: ['user_id', 'keyword', 'score', 'updated_at'],
-	polls: ['id', 'post_id', 'user_id', 'title', 'options', 'allow_multiple', 'allow_other', 'show_results_before_voting', 'expires_at', 'closed', 'closed_notified', 'created_at'],
-	poll_votes: ['id', 'poll_id', 'user_id', 'option_id', 'other_text', 'created_at'],
-	authorized_apps: ['id', 'user_id', 'app_id', 'app_token_hash', 'app_name', 'app_icon_url', 'scopes', 'access_token_id', 'access_token_hash', 'created_at', 'updated_at', 'last_used_at'],
-	post_feedback: ['user_id', 'post_id', 'kind', 'created_at'],
-	user_auth_providers: ['id', 'user_id', 'provider', 'provider_user_id', 'provider_profile', 'created_at'],
-	spaces: ['stage_settings', 'id', 'owner_id', 'name', 'description', 'icon_data', 'header_image', 'visibility', 'group_id', 'created_at', 'updated_at'],
-	space_channels: ['id', 'space_id', 'name', 'kind', 'sort_order', 'created_at'],
-	space_members: ['space_id', 'user_id', 'role', 'joined_at'],
-	space_messages: ['id', 'space_id', 'channel_id', 'user_id', 'content', 'created_at'],
-};
-const MIGRATION_JSON_COLUMNS = new Set(['external_profile', 'settings', 'block', 'attachments', 'tags', 'participants', 'member', 'post', 'unread', 'target', 'target_snapshot', 'excluded_admin_ids', 'resolution', 'permissions', 'options', 'scopes', 'provider_profile']);
-const MIGRATION_BOOLEAN_COLUMNS = new Set(['verify', 'admin', 'shadow', 'mask', 'lock', 'announcement', 'group_announcement', 'is_system', 'read', 'clicked']);
-const MIGRATION_INSERT_ORDER = ['users', 'user_auth_providers', 'spaces', 'space_channels', 'space_members', 'space_messages', 'groups', 'group_roles', 'group_memberships', 'group_invites', 'group_join_requests', 'posts', 'dm_channels', 'group_dms', 'dm_e2e_keys', 'sessions', 'trusted_login_ips', 'login_approvals', 'account_recovery_requests', 'blocked_login_ips', 'bot_tokens', 'authorized_apps', 'follows', 'likes', 'stars', 'reposts', 'pinned_posts', 'user_keyword_affinities', 'post_feedback', 'dm_messages', 'notifications', 'push_subscriptions', 'moderation_reports', 'logs'];
+// 移行テーブル/列の定義はサーバー側の唯一の情報源（DataMigrationSchema）から取る。
+// D1 とサーバーで列リストを二重管理すると必ずずれ、移行先で静かにデータが消える。
+const MIGRATION_TABLES = TABLE_SPECS.map((spec) => spec.table);
+const MIGRATION_COLUMNS = Object.fromEntries(TABLE_SPECS.map((spec) => [spec.table, spec.columns]));
+const MIGRATION_INSERT_ORDER = INSERT_ORDER.slice();
+const MIGRATION_RESET_ORDER = RESET_ORDER.slice();
+// 派生列はコピーしない。D1 はトリガーでカウンタを維持しており、値を入れたうえで
+// トリガーが加算すると二重計上になるため、投入後に実データから再計算する。
+const MIGRATION_DERIVED_COLUMNS = Object.fromEntries(
+	TABLE_SPECS.filter((spec) => spec.derived?.length).map((spec) => [spec.table, spec.derived]),
+);
+const MIGRATION_JSON_COLUMNS = new Set([
+	'external_profile', 'settings', 'block', 'attachments', 'tags', 'stage_settings', 'participants', 'member', 'post',
+	'unread', 'target', 'target_snapshot', 'excluded_admin_ids', 'resolution', 'permissions', 'options', 'scopes',
+	'provider_profile', 'latest_message', 'response_message',
+]);
+const MIGRATION_BOOLEAN_COLUMNS = new Set([
+	'verify', 'admin', 'admin_request_excluded', 'shadow', 'mask', 'lock', 'announcement', 'group_announcement',
+	'is_system', 'read', 'clicked', 'allow_multiple', 'allow_other', 'show_results_before_voting', 'closed',
+	'closed_notified',
+]);
+// Keep a replacement within documented D1 per-script binding limits and leave
+// headroom for runtime overhead. A multi-batch import would lose atomicity.
+const MIGRATION_MAX_BINDINGS = 5000;
+// D1's batch API caps a batch at 1,000 prepared statements. Keep this explicit
+// so replacements that cannot fit in one atomic batch are rejected pre-delete.
+const MIGRATION_MAX_STATEMENTS = 1000;
+const MIGRATION_MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024;
+const SUPPORTED_SNAPSHOT_VERSIONS = [1, 2];
+// 移行対象外（意図的）。スナップショットに記録して報告する。
+const MIGRATION_EXCLUDED_TABLES = EXCLUDED_TABLES.map((entry) => ({ table: entry.table, reason: entry.reason }));
 
 function migrationValue(column, value) {
+	if (column === 'admin_request_excluded' && value == null) return 0;
 	if (value == null) return null;
 	// エクスポートはD1の生値をそのまま返すため、JSON列が既に文字列の場合は再エンコードしない。
 	if (MIGRATION_JSON_COLUMNS.has(column)) return typeof value === 'string' ? value : JSON.stringify(value);
@@ -411,42 +407,262 @@ function safeMigrationIdentifier(value) {
 	return /^[a-z_][a-z0-9_]*$/.test(value) ? value : null;
 }
 
+// 実スキーマの外部キー関係（削除順と CASCADE 連鎖の判定に使う）。
+async function migrationForeignKeyEdges(db) {
+	const { results } = await db.prepare(
+		`SELECT m.name AS child, f."table" AS parent, f.on_delete AS on_delete
+		   FROM sqlite_master m, pragma_foreign_key_list(m.name) f
+		  WHERE m.type = 'table'`,
+	).all();
+	return (results || []).map((row) => ({ child: row.child, parent: row.parent, onDelete: row.on_delete }));
+}
+
+async function tableColumnNames(db, table) {
+	const identifier = safeMigrationIdentifier(table);
+	if (!identifier) return [];
+	const { results } = await db.prepare(`PRAGMA table_info(${identifier})`).all();
+	return (results || []).map((row) => row.name);
+}
+
+// 実際に存在する列だけを返す。migration 未適用の列を INSERT して
+// バッチ全体を失敗させないため（欠落は結果として報告する）。
+async function migrationColumnsFor(db, table) {
+	const declared = MIGRATION_COLUMNS[table] || [];
+	const derived = new Set(MIGRATION_DERIVED_COLUMNS[table] || []);
+	const available = new Set(await tableColumnNames(db, table));
+	return declared.filter((column) => available.has(column) && !derived.has(column));
+}
+
+// 派生列（カウンタ・集約キャッシュ）を実データから再計算する。
+// 投入値を使わないのでトリガーと二重計上にならず、既存のずれも自己修復する。
+// 派生列（カウンタ・集約キャッシュ）を実データから再計算する。
+// 投入値を使わないのでトリガーと二重計上にならず、既存のずれも自己修復する。
+// 宛先に列が無い（migration 0008 未適用など）場合は文を作らない。
+// 作ってしまうとバッチ全体が失敗し、置換が巻き戻って「スナップショットに無い表だけ保持」
+// ではなく「何も移行されない」状態になる。
+async function derivedRepairStatements(db) {
+	const statements = [];
+	const postColumns = new Set(await tableColumnNames(db, 'posts'));
+	if (postColumns.size && ['like_count', 'star_count', 'repost_count', 'reply_count'].every((column) => postColumns.has(column))) {
+		statements.push(db.prepare(
+			`UPDATE posts SET
+				like_count = (SELECT COUNT(*) FROM likes WHERE likes.post_id = posts.id),
+				star_count = (SELECT COUNT(*) FROM stars WHERE stars.post_id = posts.id),
+				repost_count = (SELECT COUNT(*) FROM reposts WHERE reposts.post_id = posts.id),
+				reply_count = (SELECT COUNT(*) FROM posts replies WHERE replies.reply_to = posts.id)`,
+		));
+	}
+	const groupDmColumns = new Set(await tableColumnNames(db, 'group_dms'));
+	if (groupDmColumns.has('message_count') && groupDmColumns.has('latest_message')) {
+		// post は JSON 文字列で保持されているため TEXT 版の JSON 関数を使う。
+		statements.push(db.prepare(
+			`UPDATE group_dms SET
+				message_count = COALESCE(json_array_length(post), 0),
+				latest_message = CASE WHEN COALESCE(json_array_length(post), 0) > 0 THEN json_extract(post, '$[' || (json_array_length(post) - 1) || ']') ELSE NULL END`,
+		));
+	} else if (groupDmColumns.has('message_count')) {
+		statements.push(db.prepare('UPDATE group_dms SET message_count = COALESCE(json_array_length(post), 0)'));
+	}
+	return statements;
+}
+
 async function exportMigrationSnapshot(db) {
 	const tables = {};
+	const skippedColumns = {};
+	const queries = [];
+	const queryTables = [];
+	// D1 自身のスナップショットは常に version 2 なので、excluded_tables も必ず付ける。
+	// 付け忘れると受け手が「除外表の記録が無い旧ファイル」として扱い、CLI の
+	// excluded_tables が空になって「黙って落ちた」のか区別できなくなる。
+	const excludedTables = MIGRATION_EXCLUDED_TABLES.map((entry) => ({ table: entry.table, reason: entry.reason }));
 	for (const table of MIGRATION_TABLES) {
-		const { results } = await db.prepare(`SELECT * FROM ${table}`).all();
-		tables[table] = results || [];
+		if (table === 'mod_logs' && !(await db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='mod_logs'").first())) { tables[table] = []; continue; }
+		const available = await tableColumnNames(db, table);
+		if (!available.length) continue;
+		const columns = MIGRATION_COLUMNS[table].filter((column) => available.includes(column));
+		const missing = MIGRATION_COLUMNS[table].filter((column) => !available.includes(column));
+		if (missing.length) skippedColumns[table] = missing;
+		queries.push(db.prepare(`SELECT ${columns.map((column) => safeMigrationIdentifier(column)).join(', ')} FROM ${table}`));
+		queryTables.push(table);
 	}
-	return { version: 1, created_at: new Date().toISOString(), source_adapter: 'd1', tables };
+	const results = queries.length ? await db.batch(queries) : [];
+	for (let i = 0; i < queryTables.length; i++) tables[queryTables[i]] = results[i].results || [];
+	return {
+		version: 2,
+		created_at: new Date().toISOString(),
+		source_adapter: 'd1',
+		// 実際に含むテーブル。ここに無いテーブルは宛先で保持される。
+		tables_present: Object.keys(tables),
+		mod_logs_present: Object.prototype.hasOwnProperty.call(tables, 'mod_logs'),
+		excluded_tables: excludedTables,
+		...(Object.keys(skippedColumns).length ? { skipped_columns: skippedColumns } : {}),
+		tables,
+	};
+}
+
+function migrationIncludedTables(snapshot) {
+	const present = new Set();
+	const declared = Array.isArray(snapshot?.tables_present) ? snapshot.tables_present : null;
+	// version 2 は tables_present が唯一の根拠。tables にだけあるキー（省略）を
+	// ここで含めてしまうと、サーバー側 createSnapshot が全表のキーを作るため
+	// 省略したはずのテーブルが宛先で空に上書きされる。
+	const explicit = Number(snapshot?.version) >= 2 && declared !== null;
+	if (explicit) {
+		for (const table of declared) if (MIGRATION_TABLES.includes(table)) present.add(table);
+		// tables_present に載っていない表の行は黙って捨てない。
+		for (const table of MIGRATION_TABLES) {
+			if (present.has(table)) continue;
+			const rows = snapshot?.tables?.[table];
+			if (Array.isArray(rows) && rows.length) {
+				throw new Error(`Migration snapshot table ${table} has rows but is not listed in tables_present`);
+			}
+		}
+	} else {
+		for (const table of MIGRATION_TABLES) {
+			if (Object.prototype.hasOwnProperty.call(snapshot?.tables || {}, table)) present.add(table);
+		}
+	}
+	// 後方互換: mod_logs_present === false は「保持」を意味する。
+	if (snapshot?.mod_logs_present === false) present.delete('mod_logs');
+	return present;
 }
 
 async function importMigrationSnapshot(db, snapshot) {
-	if (!snapshot || Number(snapshot.version) !== 1 || !snapshot.tables || typeof snapshot.tables !== 'object') {
+	if (!snapshot || !SUPPORTED_SNAPSHOT_VERSIONS.includes(Number(snapshot.version)) || !snapshot.tables || typeof snapshot.tables !== 'object') {
 		throw new Error('Invalid migration snapshot');
 	}
-	for (const table of MIGRATION_INSERT_ORDER.slice().reverse()) {
-		await db.prepare(`DELETE FROM ${table}`).run();
+	const snapshotBytes = new TextEncoder().encode(JSON.stringify(snapshot)).byteLength;
+	if (snapshotBytes > MIGRATION_MAX_SNAPSHOT_BYTES) {
+		throw new Error(`Migration snapshot exceeds the safe atomic-import size limit (${MIGRATION_MAX_SNAPSHOT_BYTES} bytes)`);
+	}
+	const included = migrationIncludedTables(snapshot);
+	if (included.has('group_dms') && snapshot.tables.group_dms?.length && !included.has('group_dm_send_requests')) throw new Error('DM snapshot is missing send request history');
+	const modLogs = included.has('mod_logs') ? (snapshot.tables.mod_logs ?? []) : [];
+	if (!Array.isArray(modLogs)) throw new Error('Invalid mod_logs snapshot');
+	const modLogIds = new Set();
+	for (const row of modLogs) {
+		if (!row || typeof row.id !== 'string' || !row.id || modLogIds.has(row.id) ||
+			['created_at', 'actor_type', 'action', 'target_type', 'target_id', 'result'].some(key => typeof row[key] !== 'string' || !row[key]) ||
+			(row.actor_id != null && typeof row.actor_id !== 'string')) throw new Error('Invalid or duplicate mod log in migration snapshot');
+		modLogIds.add(row.id);
+	}
+	const hasModLogs = Boolean(await db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='mod_logs'").first());
+	if (!hasModLogs && modLogs.length) throw new Error('Destination requires mod_logs migration');
+	if (!hasModLogs) included.delete('mod_logs');
+	// データを入れるのに宛先テーブルが無ければ、黙って抜けずに失敗する。
+	const missingTables = [];
+	for (const table of included) {
+		const rows = Array.isArray(snapshot.tables[table]) ? snapshot.tables[table] : [];
+		if (rows.length && !(await tableColumnNames(db, table)).length) missingTables.push(table);
+	}
+	if (missingTables.length) {
+		throw new Error(`Destination is missing tables required by the snapshot: ${missingTables.join(', ')}`);
+	}
+
+	const columnsByTable = {};
+	const skippedColumns = {};
+	for (const table of MIGRATION_INSERT_ORDER) {
+		if (!included.has(table)) continue;
+		const columns = await migrationColumnsFor(db, table);
+		columnsByTable[table] = columns;
+		const missing = (MIGRATION_COLUMNS[table] || []).filter((column) => !columns.includes(column)
+			&& !(MIGRATION_DERIVED_COLUMNS[table] || []).includes(column));
+		if (table === 'group_dm_send_requests' && missing.length && snapshot.tables[table]?.length) throw new Error('Destination is missing DM send request columns');
+		if (missing.length) skippedColumns[table] = missing;
+	}
+
+	const statements = [];
+	let bindingCount = 0;
+	const addStatement = (sql, values = []) => {
+		if (statements.length >= MIGRATION_MAX_STATEMENTS) {
+			throw new Error(`Migration snapshot exceeds the safe atomic-import statement limit (${MIGRATION_MAX_STATEMENTS})`);
+		}
+		bindingCount += values.length;
+		if (bindingCount > MIGRATION_MAX_BINDINGS) {
+			throw new Error(`Migration snapshot exceeds the safe atomic-import binding limit (${MIGRATION_MAX_BINDINGS})`);
+		}
+		statements.push(db.prepare(sql).bind(...values));
+	};
+	// スナップショットに含まれるテーブルと、そこからの CASCADE で消えるテーブルだけを空にする。
+	// 関係の無いテーブルは残す。旧スナップショットが知らない新テーブルも、
+	// 参照先が消えない限り保持される。
+	// 連鎖は推移的に辿る（posts → groups → group_roles / spaces → space_channels、の様に
+	// 孫以降も消える）。一段だけだと実削除と報告が食い違う。
+	const foreignKeys = await migrationForeignKeyEdges(db);
+	const cascaded = [];
+	const cascadeStack = [...included];
+	while (cascadeStack.length) {
+		const parent = cascadeStack.pop();
+		for (const edge of foreignKeys) {
+			if (edge.parent !== parent || edge.child === parent) continue;
+			if (String(edge.onDelete || '').toUpperCase() !== 'CASCADE') continue;
+			if (included.has(edge.child) || cascaded.includes(edge.child)) continue;
+			if (!(await tableColumnNames(db, edge.child)).length) continue;
+			cascaded.push(edge.child);
+			cascadeStack.push(edge.child);
+		}
+	}
+	const deleteTargets = [...included].concat(cascaded.filter((table) => !included.has(table)));
+	// SQLite は文ごとに外部キーを即時検査するため、親（参照される側）から消す。
+	const { parentFirst } = orderDeletions(deleteTargets, foreignKeys);
+	for (const table of parentFirst) {
+		addStatement(`DELETE FROM ${table}`);
 	}
 	for (const table of MIGRATION_INSERT_ORDER) {
-		const columns = MIGRATION_COLUMNS[table];
+		if (!included.has(table)) continue;
+		const columns = columnsByTable[table];
+		if (!columns.length) continue;
 		const rows = Array.isArray(snapshot.tables[table]) ? snapshot.tables[table] : [];
 		for (const originalRow of rows) {
 			const row = table === 'posts'
 				? { ...originalRow, reply_to: null, repost_to: null }
 				: originalRow;
 			const placeholders = columns.map(() => '?').join(', ');
-			await db.prepare(`INSERT INTO ${table} (${columns.join(', ')}) VALUES (${placeholders})`)
-				.bind(...columns.map((column) => migrationValue(column, row[column])))
-				.run();
+			addStatement(`INSERT INTO ${table} (${columns.join(', ')}) VALUES (${placeholders})`,
+				columns.map((column) => migrationValue(column, row[column])));
 		}
 	}
-	for (const row of (snapshot.tables.posts || [])) {
+	for (const row of (included.has('posts') ? (snapshot.tables.posts || []) : [])) {
 		if (row.reply_to == null && row.repost_to == null) continue;
-		await db.prepare('UPDATE posts SET reply_to = ?, repost_to = ? WHERE id = ?')
-			.bind(row.reply_to ?? null, row.repost_to ?? null, row.id)
-			.run();
+		addStatement('UPDATE posts SET reply_to = ?, repost_to = ? WHERE id = ?', [row.reply_to ?? null, row.repost_to ?? null, row.id]);
 	}
-	return Object.fromEntries(MIGRATION_TABLES.map((table) => [table, Array.isArray(snapshot.tables[table]) ? snapshot.tables[table].length : 0]));
+	// 派生カウンタは投入後に再計算する（D1のトリガーは reply_to を後から UPDATE しても
+	// 加算しないため、返信数の復帰はここでしか行えない）。
+	if (included.has('posts')) {
+		for (const statement of await derivedRepairStatements(db)) {
+			if (statements.length >= MIGRATION_MAX_STATEMENTS) {
+				throw new Error(`Migration snapshot exceeds the safe atomic-import statement limit (${MIGRATION_MAX_STATEMENTS})`);
+			}
+			statements.push(statement);
+		}
+	}
+	// post_events は移行対象外。D1 のトリガーが投稿投入時に作る合成イベントを
+	// 残すと、移行直後に過去投稿の通知が一斉生成されるため、最後に空にする。
+	const clearedTables = [];
+	if (await tableColumnNames(db, 'post_events').then((columns) => columns.length > 0)) {
+		if (statements.length >= MIGRATION_MAX_STATEMENTS) {
+			throw new Error(`Migration snapshot exceeds the safe atomic-import statement limit (${MIGRATION_MAX_STATEMENTS})`);
+		}
+		// 投稿を入れるとトリガーが post_events を作るため、投入後は必ず空にする
+		// （残すと移行直後に過去投稿の通知が一斉生成される）。
+		statements.push(db.prepare('DELETE FROM post_events'));
+		clearedTables.push('post_events');
+	}
+	// D1 batch is a transaction; keep every delete, insert and reference repair
+	// in this one batch so failures cannot leave a partially replaced snapshot.
+	if (statements.length) await db.batch(statements);
+	return {
+		counts: Object.fromEntries(MIGRATION_TABLES.map((table) => [table,
+			included.has(table) && Array.isArray(snapshot.tables[table]) ? snapshot.tables[table].length : null])),
+		imported_tables: MIGRATION_INSERT_ORDER.filter((table) => included.has(table)),
+		preserved_tables: MIGRATION_TABLES.filter((table) => !included.has(table) && !cascaded.includes(table)),
+		// 置換で親行が消えるため CASCADE で連鎖削除した従属テーブル（データは失われた）。
+		cascaded_tables: cascaded,
+		// 置換/CASCADE とは独立した移行処理で空にしたテーブル。
+		cleared_tables: clearedTables,
+		skipped_columns: skippedColumns,
+		excluded_tables: Array.isArray(snapshot.excluded_tables) ? snapshot.excluded_tables : MIGRATION_EXCLUDED_TABLES,
+	};
 }
 
 function normalizeBlockUserId(value) {
@@ -487,6 +703,7 @@ function normalizeUserRow(row) {
 		icon_data: row.icon_data || null,
 		verify: Boolean(row.verify),
 		admin: Boolean(row.admin),
+		admin_request_excluded: Boolean(row.admin_request_excluded),
 		freeze: row.freeze || null,
 		shadow: Boolean(row.shadow),
 		block: normalizeBlockList(parseJsonSafe(row.block, []), row.id),
@@ -620,6 +837,7 @@ function normalizePostRow(row) {
 		...(row.star_count !== undefined ? { star_count: Number(row.star_count) || 0 } : {}),
 		...(row.repost_count !== undefined ? { repost_count: Number(row.repost_count) || 0 } : {}),
 		...(row.reply_count !== undefined ? { reply_count: Number(row.reply_count) || 0 } : {}),
+		...(row.recommendation_penalty !== undefined ? { recommendation_penalty: Number(row.recommendation_penalty) || 0 } : {}),
 		...(row.liked_by_me !== undefined ? { liked_by_me: Boolean(row.liked_by_me) } : {}),
 		...(row.starred_by_me !== undefined ? { starred_by_me: Boolean(row.starred_by_me) } : {}),
 		author: row.author_id != null
@@ -702,6 +920,7 @@ function normalizeGroupDmRow(row, viewerId = null) {
 	const post = parseJsonSafe(row.post, []);
 	const res = {
 		id: row.id,
+		state_version: String(row.state_version),
 		host_id: row.host_id,
 		title: row.title || '',
 		member: Array.isArray(member) ? member.map(Number) : [],
@@ -766,14 +985,32 @@ export default {
 		const method = request.method;
 
 					try {
+				if (method === 'POST' && pathname === '/mod-logs') {
+					let row; try { row = modLogs.normalizeRecord(await request.json(), crypto.randomUUID()); } catch (_) { return badRequest('Invalid mod log'); }
+					const inserted = await db.prepare('INSERT INTO mod_logs (id, created_at, actor_type, actor_id, action, target_type, target_id, result) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING RETURNING id').bind(row.id, row.createdAt, row.actorType, row.actorId, row.action, row.targetType, row.targetId, row.result).first();
+					if (!inserted) {
+						const existing = await db.prepare('SELECT * FROM mod_logs WHERE id = ?').bind(row.id).first();
+						if (!existing || !modLogs.sameRecord(modLogs.mapRow(existing), row)) throw new Error('Mod log ID conflict');
+					}
+					return json(row);
+				}
+				if (method === 'POST' && pathname === '/mod-logs/search') {
+					let q; try { q = modLogs.query(await request.json(), 'sqlite'); } catch (_) { return badRequest('Invalid filters'); }
+					const rows = await db.prepare(q.sql).bind(...q.args).all();
+					return json(modLogs.page(rows.results.map(modLogs.mapRow), q.limit));
+				}
 				if (method === 'GET' && pathname === '/migration/snapshot') {
 					return json(await exportMigrationSnapshot(db));
+				}
+				if (method === 'GET' && pathname === '/migration/dm-send-requests-v1') {
+					await db.prepare('SELECT dm_id, sender_id, request_id, request_hash, response_message FROM group_dm_send_requests LIMIT 0').all();
+					return json({ supported: true });
 				}
 
 				if (method === 'POST' && pathname === '/migration/snapshot/import') {
 					const body = await request.json();
 					if (body?.replace !== true) return badRequest('replace must be true');
-					return json({ counts: await importMigrationSnapshot(db, body.snapshot) });
+					return json(await importMigrationSnapshot(db, body.snapshot));
 				}
 
 				if (method === 'POST' && pathname === '/sessions') {
@@ -1616,13 +1853,13 @@ export default {
 
 						const statements = [
 							db.prepare(
-								`INSERT INTO users (id, scid, name, handle, nyaitter_address, auth_provider, provider_domain, external_id, external_profile, uuid, settings, block, bio, header_image, icon_data, verify, admin, freeze, shadow, created_at, account_operation)
-								 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+								`INSERT INTO users (id, scid, name, handle, nyaitter_address, auth_provider, provider_domain, external_id, external_profile, uuid, settings, block, bio, header_image, icon_data, verify, admin, freeze, shadow, created_at, account_operation, admin_request_excluded)
+								 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 							).bind(
 								nextId, user.scid, user.name, formatNyaitterId(nextId), user.nyaitter_address,
 								user.auth_provider, user.provider_domain, user.external_id, user.external_profile,
 								user.uuid, user.settings, user.block, user.bio, user.header_image, user.icon_data,
-								user.verify, user.admin, user.freeze, user.shadow, user.created_at, user.account_operation,
+								user.verify, user.admin, user.freeze, user.shadow, user.created_at, user.account_operation, user.admin_request_excluded,
 							),
 							db.prepare('UPDATE sessions SET user_id = ? WHERE user_id = ?').bind(nextId, previousId),
 							db.prepare('UPDATE trusted_login_ips SET user_id = ? WHERE user_id = ?').bind(nextId, previousId),
@@ -1631,6 +1868,11 @@ export default {
 							db.prepare('UPDATE blocked_login_ips SET user_id = ? WHERE user_id = ?').bind(nextId, previousId),
 							db.prepare('UPDATE bot_tokens SET user_id = ? WHERE user_id = ?').bind(nextId, previousId),
 							db.prepare('UPDATE posts SET user_id = ? WHERE user_id = ?').bind(nextId, previousId),
+							...['community_notes','note_ratings','note_rating_reasons','note_distribution','note_creation_claims','note_selection_identities','reputation_events','reputation_daily','reputation_profiles','reviewer_outcome_claims'].map(table=>db.prepare(`UPDATE ${table} SET user_id=? WHERE user_id=?`).bind(nextId,previousId)),
+							db.prepare('UPDATE reviewer_outcome_claims SET author_id=? WHERE author_id=?').bind(nextId,previousId),
+							db.prepare('UPDATE reviewer_outcome_candidates SET user_id=? WHERE user_id=?').bind(nextId,previousId),
+							db.prepare('UPDATE reviewer_outcome_candidates SET author_id=? WHERE author_id=?').bind(nextId,previousId),
+							...['manual-ban:','false-report-penalty:','moderation-user:'].map(prefix=>db.prepare('UPDATE reputation_events SET scope=? WHERE scope=?').bind(`${prefix}${nextId}${prefix==='moderation-user:'?':target':''}`,`${prefix}${previousId}${prefix==='moderation-user:'?':target':''}`)),
 							db.prepare('UPDATE likes SET user_id = ? WHERE user_id = ?').bind(nextId, previousId),
 							db.prepare('UPDATE stars SET user_id = ? WHERE user_id = ?').bind(nextId, previousId),
 							db.prepare('UPDATE reposts SET user_id = ? WHERE user_id = ?').bind(nextId, previousId),
@@ -1674,6 +1916,7 @@ export default {
 								Number(message?.userid) === previousId ? { ...message, userid: nextId } : message
 							));
 							const unread = { ...parseJsonSafe(group.unread, {}) };
+							if (Array.isArray(unread._accepted)) unread._accepted = unread._accepted.map((id) => Number(id) === previousId ? nextId : Number(id));
 							if (Object.prototype.hasOwnProperty.call(unread, String(previousId))) {
 								unread[String(nextId)] = unread[String(previousId)];
 								delete unread[String(previousId)];
@@ -1770,6 +2013,7 @@ export default {
 						else {
 							const messages = parseJsonSafe(group.post, []).filter((message) => Number(message?.userid) !== userId);
 							const unread = { ...parseJsonSafe(group.unread, {}) }; delete unread[String(userId)];
+							if (Array.isArray(unread._accepted)) unread._accepted = unread._accepted.filter((id) => Number(id) !== userId);
 							const hostId = Number(group.host_id) === userId ? members[0] : Number(group.host_id);
 							statements.push(db.prepare('UPDATE group_dms SET host_id = ?, member = ?, post = ?, unread = ? WHERE id = ?')
 								.bind(hostId, JSON.stringify(members), JSON.stringify(messages), JSON.stringify(unread), group.id));
@@ -1905,6 +2149,15 @@ export default {
 				return json({ success: true });
 			}
 
+			if (method === 'POST' && pathname.match(/^\/users\/(\d+)\/admin-request-exclusion$/)) {
+				const userId = Number(pathname.split('/')[2]);
+				const body = await request.json();
+				if (typeof body.excluded !== 'boolean') return badRequest('Invalid excluded value');
+				const result = await db.prepare('UPDATE users SET admin_request_excluded = ? WHERE id = ? AND admin = 1').bind(body.excluded ? 1 : 0, userId).run();
+				if (!result.meta.changes) return json(null);
+				return json(normalizeUserRow(await db.prepare('SELECT * FROM users WHERE id = ?').bind(userId).first()));
+			}
+
 			if (method === 'POST' && pathname.match(/^\/users\/(\d+)\/profile$/)) {
 				const userId = Number(pathname.split('/')[2]);
 				const body = await request.json();
@@ -2024,7 +2277,7 @@ export default {
 						`SELECT u.id AS admin_id, COUNT(r.id) AS active_count
 						 FROM users u
 						 LEFT JOIN moderation_reports r ON r.assigned_admin_id = u.id AND r.status = 'assigned'
-						 WHERE u.admin = 1 AND COALESCE(u.freeze, '') = '' ${exclusionClause}
+						 WHERE u.admin = 1 AND u.admin_request_excluded = 0 AND COALESCE(u.freeze, '') = '' ${exclusionClause}
 						 GROUP BY u.id`
 					).bind(...excluded).all();
 					return json((results || []).map((row) => ({
@@ -2097,12 +2350,12 @@ export default {
 						? null
 						: String(body.claimStaleBefore);
 					const claimClause = claimStaleBefore ? ' AND (claimed_at IS NULL OR claimed_at <= ?)' : '';
-					const bindings = [Number(body.adminId), assignedAt, JSON.stringify(excluded), reportId];
+					const bindings = [Number(body.adminId), assignedAt, JSON.stringify(excluded), reportId, Number(body.adminId)];
 					if (claimStaleBefore) bindings.push(claimStaleBefore);
 					const result = await db.prepare(
 						`UPDATE moderation_reports
 						 SET status = 'assigned', assigned_admin_id = ?, assigned_at = ?, excluded_admin_ids = ?, claimed_at = NULL
-						 WHERE id = ?${claimClause}`
+						 WHERE id = ? AND status <> 'resolved' AND EXISTS (SELECT 1 FROM users WHERE id = ? AND admin = 1 AND admin_request_excluded = 0 AND COALESCE(freeze, '') = '')${claimClause}`
 					).bind(...bindings).run();
 					// changes 0 = CAS 失敗。再SELECT して行を返すとサービス側は奪取成功と誤認する。
 					if (result.meta.changes === 0) return json(null);
@@ -4396,11 +4649,19 @@ export default {
 				return json(normalizeGroupDmRow(row, hostId));
 			}
 
-			if (method === 'POST' && pathname.match(/^\/group-dms\/([^/]+)\/update$/)) {
+			if (method === 'POST' && pathname.match(/^\/group-dms\/([^/]+)\/(update|update-history-guarded)$/)) {
 				const dmId = decodeURIComponent(pathname.split('/')[2]);
 				const updates = await request.json();
+				if (pathname.endsWith('/update-history-guarded') && (!updates._expectedState || !Array.isArray(updates._expectedPost) || !Array.isArray(updates.post))) return badRequest('Expected DM state and history are required');
 				const currentRow = await db.prepare('SELECT * FROM group_dms WHERE id = ?').bind(dmId).first();
 				if (!currentRow) return notFound('Group DM not found');
+				if (updates._expectedState) {
+					const member = parseJsonSafe(currentRow.member, []).map(Number);
+					const unread = parseJsonSafe(currentRow.unread, {});
+					const accepted = Array.isArray(unread._accepted) ? unread._accepted.map(Number) : member;
+					const expected = updates._expectedState;
+					if (String(currentRow.state_version) !== String(expected.state_version) || Number(currentRow.host_id) !== Number(expected.host_id) || JSON.stringify(member) !== JSON.stringify(expected.member) || JSON.stringify(accepted) !== JSON.stringify(expected.accepted)) return json(null);
+				}
 				const sets = [];
 				const values = [];
 
@@ -4418,10 +4679,112 @@ export default {
 
 				if (sets.length > 0) {
 					values.push(dmId);
-					await db.prepare(`UPDATE group_dms SET ${sets.join(', ')} WHERE id = ?`).bind(...values).run();
+					let condition = '';
+					if (updates._expectedPost !== undefined) {
+						condition = ' AND post = ?';
+						values.push(JSON.stringify(updates._expectedPost));
+					}
+					if (updates._expectedState || updates.accepted !== undefined) {
+						condition += ' AND host_id = ? AND member = ? AND unread IS ? AND state_version = ?';
+						values.push(currentRow.host_id, currentRow.member, currentRow.unread, currentRow.state_version);
+					}
+					const result = await db.prepare(`UPDATE group_dms SET ${sets.join(', ')} WHERE id = ?${condition}`).bind(...values).run();
+					if (!result.meta.changes) return json(null);
 				}
 				const row = await db.prepare('SELECT * FROM group_dms WHERE id = ?').bind(dmId).first();
 				return json(normalizeGroupDmRow(row));
+			}
+
+			if (method === 'POST' && pathname.match(/^\/group-dms\/([^/]+)\/edit-message$/)) {
+				const dmId = decodeURIComponent(pathname.split('/')[2]);
+				const { messageId, userId, content } = await request.json();
+				for (let attempt = 0; attempt < 20; attempt++) {
+					const row = await db.prepare('SELECT * FROM group_dms WHERE id = ?').bind(dmId).first();
+					if (!row) return json({ error: 'not_found' });
+					const member = parseJsonSafe(row.member, []);
+					if (!member.map(Number).includes(Number(userId))) return json({ error: 'forbidden' });
+					const unread = parseJsonSafe(row.unread, {});
+					const accepted = Array.isArray(unread._accepted) ? unread._accepted : member;
+					if (!accepted.map(Number).includes(Number(userId))) return json({ error: 'forbidden' });
+					const posts = parseJsonSafe(row.post, []);
+					const index = posts.findIndex((item) => String(item.id) === String(messageId));
+					if (index < 0) return json({ error: 'not_found' });
+					const message = posts[index];
+					if (Number(message.userid) !== Number(userId) || message.type !== 'user' || message.e2e || message.deleted || message.deleted_at) return json({ error: 'forbidden' });
+					posts[index] = { ...message, content, edited_at: new Date().toISOString() };
+					const result = await db.prepare('UPDATE group_dms SET post = ? WHERE id = ? AND post = ? AND member = ? AND unread IS ?').bind(JSON.stringify(posts), dmId, row.post, row.member, row.unread).run();
+					if (result.meta.changes) return json({ message: posts[index], member: member.filter((id) => accepted.map(Number).includes(Number(id))) });
+				}
+				throw new Error('DM edit conflict');
+			}
+
+			if (method === 'POST' && pathname.match(/^\/group-dms\/([^/]+)\/messages-idempotent$/)) {
+				const dmId = decodeURIComponent(pathname.split('/')[2]);
+				const { message, senderId, expectedState, joinEvent, requestId, requestHash } = await request.json();
+				if (!expectedState || senderId == null || !message || typeof requestId !== 'string' || typeof requestHash !== 'string') return json(null);
+				const row = await db.prepare('SELECT * FROM group_dms WHERE id = ?').bind(dmId).first();
+				if (!row) return json(null);
+				const members = parseJsonSafe(row.member, []).map(Number);
+				if (!members.includes(Number(senderId))) return json(null);
+				const lookup = async () => db.prepare('SELECT request_hash, response_message FROM group_dm_send_requests WHERE dm_id = ? AND sender_id = ? AND request_id = ?').bind(dmId, Number(senderId), requestId).first();
+				const replay = async (previous) => {
+					if (previous.request_hash !== requestHash) return { idempotencyConflict: true };
+					const current = await db.prepare('SELECT * FROM group_dms WHERE id = ?').bind(dmId).first();
+					if (!current || !parseJsonSafe(current.member, []).map(Number).includes(Number(senderId))) return null;
+					return { ...normalizeGroupDmRow(current, senderId), idempotencyReplay: parseJsonSafe(previous.response_message, null) };
+				};
+				const previous = await lookup();
+				if (previous) return json(await replay(previous));
+				const unread = parseJsonSafe(row.unread, {});
+				const accepted = (Array.isArray(unread._accepted) ? unread._accepted : members).map(Number);
+				if (String(row.state_version) !== String(expectedState.state_version) || Number(row.host_id) !== Number(expectedState.host_id) || JSON.stringify(members) !== JSON.stringify(expectedState.member) || JSON.stringify(accepted) !== JSON.stringify(expectedState.accepted)) return json(null);
+				if (!accepted.includes(Number(senderId))) {
+					if (!joinEvent) return json(null);
+					unread._accepted = [...accepted, Number(senderId)];
+				} else if (joinEvent) return json(null);
+				const posts = parseJsonSafe(row.post, []);
+				if (joinEvent) posts.push(joinEvent);
+				posts.push(message);
+				unread[String(senderId)] = 0;
+				for (const member of members) if (member !== Number(senderId)) unread[String(member)] = Number(unread[String(member)] || 0) + (joinEvent ? 2 : 1);
+				const token = crypto.randomUUID();
+				const results = await db.batch([
+					db.prepare(`INSERT INTO group_dm_send_requests (dm_id, sender_id, request_id, request_hash, response_message, attempt_token)
+						SELECT ?, ?, ?, ?, ?, ? FROM group_dms WHERE id = ? AND post = ? AND unread IS ? AND member = ? AND host_id = ? AND state_version = ?
+						ON CONFLICT (dm_id, sender_id, request_id) DO NOTHING`).bind(dmId, Number(senderId), requestId, requestHash, JSON.stringify(message), token, dmId, row.post, row.unread, row.member, row.host_id, row.state_version),
+					db.prepare(`UPDATE group_dms SET post = ?, unread = ?, time = ? WHERE id = ? AND EXISTS
+						(SELECT 1 FROM group_dm_send_requests WHERE dm_id = ? AND sender_id = ? AND request_id = ? AND attempt_token = ?)`).bind(JSON.stringify(posts), JSON.stringify(unread), message.time || new Date().toISOString(), dmId, dmId, Number(senderId), requestId, token),
+				]);
+				if (results[0].meta.changes) {
+					const current = await db.prepare('SELECT * FROM group_dms WHERE id = ?').bind(dmId).first();
+					return json(normalizeGroupDmRow(current, senderId));
+				}
+				const raced = await lookup();
+				return json(raced ? await replay(raced) : null);
+			}
+
+			if (method === 'POST' && pathname.match(/^\/group-dms\/([^/]+)\/messages-guarded$/)) {
+				const dmId = decodeURIComponent(pathname.split('/')[2]);
+				const { message, senderId, expectedState, joinEvent } = await request.json();
+				if (!expectedState || senderId == null || !message) return json(null);
+				const row = await db.prepare('SELECT * FROM group_dms WHERE id = ?').bind(dmId).first();
+				if (!row) return json(null);
+				const members = parseJsonSafe(row.member, []).map(Number);
+				const unread = parseJsonSafe(row.unread, {});
+				const accepted = (Array.isArray(unread._accepted) ? unread._accepted : members).map(Number);
+				if (!members.includes(Number(senderId)) || String(row.state_version) !== String(expectedState.state_version) || Number(row.host_id) !== Number(expectedState.host_id) || JSON.stringify(members) !== JSON.stringify(expectedState.member) || JSON.stringify(accepted) !== JSON.stringify(expectedState.accepted)) return json(null);
+				if (!accepted.includes(Number(senderId))) {
+					if (!joinEvent) return json(null);
+					unread._accepted = [...accepted, Number(senderId)];
+				} else if (joinEvent) return json(null);
+				const posts = parseJsonSafe(row.post, []);
+				if (joinEvent) posts.push(joinEvent);
+				posts.push(message);
+				unread[String(senderId)] = 0;
+				for (const member of members) if (member !== Number(senderId)) unread[String(member)] = Number(unread[String(member)] || 0) + (joinEvent ? 2 : 1);
+				const updated = await db.prepare('UPDATE group_dms SET post = ?, unread = ?, time = ? WHERE id = ? AND post = ? AND unread IS ? AND member = ? AND host_id = ? AND state_version = ? RETURNING *').bind(JSON.stringify(posts), JSON.stringify(unread), message.time || new Date().toISOString(), dmId, row.post, row.unread, row.member, row.host_id, row.state_version).first();
+				if (updated) updated.state_version = (BigInt(updated.state_version) + 1n).toString();
+				return json(normalizeGroupDmRow(updated, senderId));
 			}
 
 			if (method === 'POST' && pathname.match(/^\/group-dms\/([^/]+)\/messages$/)) {
@@ -4430,6 +4793,7 @@ export default {
 				const message = body.message;
 				const senderId = body.senderId != null ? Number(body.senderId) : null;
 
+				for (let attempt = 0; attempt < 20; attempt++) {
 				const row = await db.prepare('SELECT * FROM group_dms WHERE id = ?').bind(dmId).first();
 				if (!row) return notFound('Group DM not found');
 
@@ -4449,10 +4813,13 @@ export default {
 				}
 
 				const time = message.time || new Date().toISOString();
-				await db.prepare('UPDATE group_dms SET post = ?, unread = ?, time = ? WHERE id = ?').bind(JSON.stringify(posts), JSON.stringify(unread), time, dmId).run();
+				const result = await db.prepare('UPDATE group_dms SET post = ?, unread = ?, time = ? WHERE id = ? AND post = ? AND unread = ? AND member = ?').bind(JSON.stringify(posts), JSON.stringify(unread), time, dmId, row.post, row.unread, row.member).run();
+				if (!result.meta.changes) continue;
 
 				const updated = await db.prepare('SELECT * FROM group_dms WHERE id = ?').bind(dmId).first();
 				return json(normalizeGroupDmRow(updated, senderId));
+				}
+				throw new Error('DM send conflict');
 			}
 
 			if (method === 'POST' && pathname.match(/^\/group-dms\/([^/]+)\/read$/)) {
@@ -4460,12 +4827,7 @@ export default {
 				const body = await request.json();
 				const userId = Number(body.userId);
 
-				const row = await db.prepare('SELECT unread FROM group_dms WHERE id = ?').bind(dmId).first();
-				if (row) {
-					const unread = parseJsonSafe(row.unread, {});
-					unread[String(userId)] = 0;
-					await db.prepare('UPDATE group_dms SET unread = ? WHERE id = ?').bind(JSON.stringify(unread), dmId).run();
-				}
+				await db.prepare("UPDATE group_dms SET unread = json_set(COALESCE(unread, '{}'), '$.' || ?, 0) WHERE id = ?").bind(String(userId), dmId).run();
 				return json({ success: true });
 			}
 
@@ -4502,9 +4864,24 @@ export default {
 				return json({ total: Number(row?.total || 0) });
 			}
 
-			if (method === 'POST' && pathname.match(/^\/group-dms\/([^/]+)\/delete$/)) {
+			if (method === 'POST' && pathname.match(/^\/group-dms\/([^/]+)\/delete(?:-guarded)?$/)) {
 				const dmId = decodeURIComponent(pathname.split('/')[2]);
-				const res = await db.prepare('DELETE FROM group_dms WHERE id = ?').bind(dmId).run();
+				const bodyText = await request.text();
+				const { expectedState } = bodyText ? (JSON.parse(bodyText) || {}) : {};
+				if (pathname.endsWith('/delete-guarded') && !expectedState) return json({ success: false });
+				let statement = db.prepare('DELETE FROM group_dms WHERE id = ?');
+				let values = [dmId];
+				if (expectedState) {
+					const row = await db.prepare('SELECT host_id, member, unread, state_version FROM group_dms WHERE id = ?').bind(dmId).first();
+					if (!row) return json({ success: false });
+					const member = parseJsonSafe(row.member, []).map(Number);
+					const unread = parseJsonSafe(row.unread, {});
+					const accepted = Array.isArray(unread._accepted) ? unread._accepted.map(Number) : member;
+					if (String(row.state_version) !== String(expectedState.state_version) || Number(row.host_id) !== Number(expectedState.host_id) || JSON.stringify(member) !== JSON.stringify(expectedState.member) || JSON.stringify(accepted) !== JSON.stringify(expectedState.accepted)) return json({ success: false });
+					statement = db.prepare('DELETE FROM group_dms WHERE id = ? AND host_id = ? AND member = ? AND unread IS ? AND state_version = ?');
+					values = [dmId, row.host_id, row.member, row.unread, row.state_version];
+				}
+				const res = await statement.bind(...values).run();
 				return json({ success: res.meta.changes > 0 });
 			}
 
@@ -4513,15 +4890,20 @@ export default {
 				const body = await request.json();
 				const userId = Number(body.userId);
 
-				const row = await db.prepare('SELECT member, unread FROM group_dms WHERE id = ?').bind(dmId).first();
+				const row = await db.prepare('SELECT host_id, member, unread, state_version FROM group_dms WHERE id = ?').bind(dmId).first();
 				if (!row) return json({ success: false });
 
-				const members = parseJsonSafe(row.member, []).filter((id) => Number(id) !== userId);
+				const currentMembers = parseJsonSafe(row.member, []).map(Number);
 				const unread = parseJsonSafe(row.unread, {});
+				const accepted = Array.isArray(unread._accepted) ? unread._accepted.map(Number) : currentMembers;
+				const expected = body.expectedState;
+				if (!currentMembers.includes(userId) || (expected && (String(row.state_version) !== String(expected.state_version) || Number(row.host_id) !== Number(expected.host_id) || JSON.stringify(currentMembers) !== JSON.stringify(expected.member) || JSON.stringify(accepted) !== JSON.stringify(expected.accepted)))) return json({ success: false });
+				const members = currentMembers.filter((id) => id !== userId);
+				unread._accepted = accepted.filter((id) => id !== userId);
 				delete unread[String(userId)];
 
-				await db.prepare('UPDATE group_dms SET member = ?, unread = ? WHERE id = ?').bind(JSON.stringify(members), JSON.stringify(unread), dmId).run();
-				return json({ success: true });
+				const result = await db.prepare('UPDATE group_dms SET member = ?, unread = ? WHERE id = ? AND host_id = ? AND member = ? AND unread IS ? AND state_version = ?').bind(JSON.stringify(members), JSON.stringify(unread), dmId, row.host_id, row.member, row.unread, row.state_version).run();
+				return json({ success: result.meta.changes > 0 });
 			}
 
 			if (method === 'POST' && pathname === '/group-dms/find-by-members') {
@@ -4998,9 +5380,544 @@ export default {
 				})));
 			}
 
+			// ==================== Community Notes ====================
+			if (method==='POST' && pathname==='/reputation/selection-keys') {
+				const body=await request.json();const ids=JSON.stringify((body.ids || []).map(Number).filter(id=>Number.isSafeInteger(id)&&id>0).slice(0,2000));
+				const result=await db.batch([db.prepare('INSERT OR IGNORE INTO note_selection_identities(user_id,selection_key) SELECT id,lower(hex(randomblob(16))) FROM users WHERE id IN (SELECT value FROM json_each(?))').bind(ids),db.prepare('SELECT user_id,selection_key FROM note_selection_identities WHERE user_id IN (SELECT value FROM json_each(?))').bind(ids)]);
+				return json(Object.fromEntries(result[1].results.map(r=>[Number(r.user_id),r.selection_key])));
+			}
+			if (method==='POST' && pathname==='/reputation/claim-reviewer-outcome') {
+				const body=await request.json();const row=await db.prepare('SELECT note_id FROM reviewer_outcome_claims WHERE user_id=? AND author_id=? AND day=?').bind(Number(body.userId),Number(body.authorId),String(body.day)).first();
+				return json(Number(row?.note_id)===Number(body.noteId));
+			}
+			if (method==='POST' && pathname==='/reputation/context') {
+				const body=await request.json(); const ids=[...new Set((body.ids || []).map(Number).filter(id=>Number.isSafeInteger(id)&&id>0))].slice(0,502);
+				if (!ids.length) return json({users:[],profiles:{},edges:[]});
+				const slots='SELECT value FROM json_each(?)'; const encoded=JSON.stringify(ids);
+				if (body.displayOnly === true) {
+					const [users, profiles] = await db.batch([
+						db.prepare('SELECT id,settings FROM users WHERE id IN (' + slots + ')').bind(encoded),
+						db.prepare('SELECT user_id,dimension,score,successes FROM reputation_profiles WHERE user_id IN (' + slots + ')').bind(encoded),
+					]);
+					const byUser = {};
+					for (const row of profiles.results) { byUser[row.user_id] ||= {}; Object.assign(byUser[row.user_id], reputationStorage.profileFromRows([row])); }
+					return json({ users: users.results.map(user => ({ ...user, settings: parseJsonMaybe(user.settings, {}) })), profiles: byUser });
+				}
+				const [users,profiles,edges]=await db.batch([
+				 db.prepare(`SELECT * FROM users WHERE id IN (${slots})`).bind(encoded),
+				 db.prepare(reputationStorage.reputationProfileQuery('sqlite',true)).bind(encoded),
+				 db.prepare(`SELECT follower_id AS a,following_id AS b FROM follows WHERE follower_id IN (${slots}) AND following_id IN (${slots}) UNION SELECT a.user_id,b.user_id FROM group_memberships a JOIN group_memberships b ON a.group_id=b.group_id WHERE a.user_id IN (${slots}) AND b.user_id IN (${slots}) AND a.status='active' AND b.status='active'`).bind(encoded,encoded,encoded,encoded)]);
+				const byUser={}; for (const row of profiles.results) {byUser[row.user_id] ||= {};Object.assign(byUser[row.user_id],reputationStorage.profileFromRows([row]));}
+				return json({users:users.results.map(u=>({...u,settings:parseJsonMaybe(u.settings,{}),block:parseJsonMaybe(u.block,[])})),profiles:byUser,edges:edges.results.map(r=>[Number(r.a),Number(r.b)])});
+			}
+			if(method==='POST'&&pathname==='/community-notes/relevance-context'){
+				const body=await request.json(),ids=[...new Set((body.userIds||[]).map(Number).filter(id=>Number.isSafeInteger(id)&&id>0))].slice(0,102),authorId=Number(body.authorId);
+				if(!Number.isSafeInteger(authorId)||authorId<=0||!ids.length)return json({users:[],followingByUser:{},sharedUserIds:[]});
+				const encoded=JSON.stringify([...new Set([...ids,authorId])]),candidateIds=JSON.stringify(ids);
+				const [users,relations]=await db.batch([
+					db.prepare('SELECT * FROM users WHERE id IN (SELECT CAST(value AS INTEGER) FROM json_each(?))').bind(encoded),
+					db.prepare(`WITH candidates AS (SELECT CAST(value AS INTEGER) AS user_id FROM json_each(?)), counts AS (
+						SELECT follower_id,COUNT(*) AS total FROM follows WHERE follower_id IN (SELECT CAST(value AS INTEGER) FROM json_each(?)) GROUP BY follower_id
+					), overlaps AS (
+						SELECT f.follower_id AS user_id,COUNT(*) AS total FROM follows f JOIN follows a ON a.following_id=f.following_id AND a.follower_id=? WHERE f.follower_id IN (SELECT CAST(value AS INTEGER) FROM json_each(?)) GROUP BY f.follower_id
+					), shared AS (
+						SELECT CAST(c.value AS INTEGER) AS user_id FROM json_each(?) c WHERE
+						EXISTS(SELECT 1 FROM group_memberships a JOIN group_memberships b ON a.group_id=b.group_id WHERE a.user_id=CAST(c.value AS INTEGER) AND b.user_id=? AND a.status='active' AND b.status='active') OR
+						EXISTS(SELECT 1 FROM dm_channels d WHERE EXISTS(SELECT 1 FROM json_each(d.participants) p WHERE CAST(p.value AS INTEGER)=CAST(c.value AS INTEGER)) AND EXISTS(SELECT 1 FROM json_each(d.participants) p WHERE CAST(p.value AS INTEGER)=?)) OR
+						EXISTS(SELECT 1 FROM group_dms d WHERE EXISTS(SELECT 1 FROM json_each(d.member) p WHERE CAST(p.value AS INTEGER)=CAST(c.value AS INTEGER)) AND EXISTS(SELECT 1 FROM json_each(d.member) p WHERE CAST(p.value AS INTEGER)=?))
+					), totals AS (SELECT candidates.user_id,COALESCE(user_count.total,0) AS user_total,COALESCE(author_count.total,0) AS author_total,COALESCE(overlaps.total,0) AS overlap,shared.user_id IS NOT NULL AS shared FROM candidates
+						LEFT JOIN counts user_count ON user_count.follower_id=candidates.user_id LEFT JOIN counts author_count ON author_count.follower_id=? LEFT JOIN overlaps ON overlaps.user_id=candidates.user_id LEFT JOIN shared ON shared.user_id=candidates.user_id)
+					SELECT * FROM totals`).bind(candidateIds,encoded,authorId,candidateIds,candidateIds,authorId,authorId,authorId,authorId),
+				]);
+				const relevanceByUser={},sharedUserIds=[];for(const row of relations.results||[]){const id=Number(row.user_id),union=Number(row.user_total)+Number(row.author_total)-Number(row.overlap),shared=Boolean(row.shared);if(shared)sharedUserIds.push(id);relevanceByUser[id]=(union?Number(row.overlap)/union:0)+(shared?0.2:0);}
+				return json({users:(users.results||[]).map(user=>({...user,settings:parseJsonMaybe(user.settings,{}),block:parseJsonMaybe(user.block,[])})),relevanceByUser,sharedUserIds});
+			}
+			if (method==='POST' && pathname==='/reputation/claim-note-notification') {
+				const body=await request.json(); const result=await db.prepare('UPDATE note_distribution SET notified=1 WHERE note_id=? AND user_id=? AND notified=0 AND tier<>0').bind(Number(body.noteId),Number(body.userId)).run();
+				return json(result.meta.changes>0);
+			}
+			if (method==='POST' && pathname==='/reputation/claim-notice') {
+				const body=await request.json(); const result=await db.prepare('INSERT OR IGNORE INTO reputation_notice_claims(notice_key) VALUES(?)').bind(String(body.key)).run();
+				return json(result.meta.changes>0);
+			}
+			if (method==='POST' && pathname==='/reputation/release-note-notification') {
+				const body=await request.json(); const result=await db.prepare('UPDATE note_distribution SET notified=0 WHERE note_id=? AND user_id=? AND notified=1').bind(Number(body.noteId),Number(body.userId)).run();
+				return json(result.meta.changes>0);
+			}
+			if (method==='POST' && pathname==='/reputation/release-notice') {
+				const body=await request.json(); const result=await db.prepare('DELETE FROM reputation_notice_claims WHERE notice_key=?').bind(String(body.key)).run();
+				return json(result.meta.changes>0);
+			}
+			if (method==='GET' && /^\/community-notes\/\d+\/negative-reasons$/.test(pathname)) {
+				const noteId=Number(pathname.split('/')[2]);
+				const userIdsParam=url.searchParams.get('userIds');
+				if (userIdsParam===null) {
+					const rows=await db.prepare(`SELECT d.label_ja,COUNT(*) AS total FROM note_rating_reasons r JOIN note_reason_tag_defs d ON d.code=r.code JOIN note_ratings v ON v.note_id=r.note_id AND v.user_id=r.user_id WHERE r.note_id=? AND v.helpful=0 AND d.side='negative' GROUP BY d.label_ja ORDER BY total DESC,d.label_ja LIMIT 3`).bind(noteId).all();
+					return json(rows.results.map(r=>r.label_ja));
+				}
+				const userIds=(userIdsParam==='' ? [] : userIdsParam.split(',').map(Number).filter(Number.isSafeInteger));
+				if (!userIds.length) return json([]);
+				const rows=await db.prepare(`SELECT d.label_ja,COUNT(*) AS total FROM note_rating_reasons r JOIN note_reason_tag_defs d ON d.code=r.code JOIN note_ratings v ON v.note_id=r.note_id AND v.user_id=r.user_id WHERE r.note_id=? AND r.user_id IN (${userIds.map(()=>'?').join(',')}) AND v.helpful=0 AND d.side='negative' GROUP BY d.label_ja ORDER BY total DESC,d.label_ja LIMIT 3`).bind(noteId,...userIds).all();
+				return json(rows.results.map(r=>r.label_ja));
+			}
+			if (method === 'GET' && /^\/reputation\/\d+\/evidence$/.test(pathname)) {
+				const prefix=url.searchParams.get('prefix') || '';
+				const rows=await db.prepare('SELECT scope,event_key,dimension,amount,successes,day,metadata FROM reputation_events WHERE user_id=? AND substr(scope,1,?) = ? ORDER BY scope').bind(Number(pathname.split('/')[2]),prefix.length,prefix).all();
+				return json(rows.results.map(r=>({...r,metadata:JSON.parse(r.metadata)})));
+			}
+			if (method === 'POST' && pathname === '/reputation/report') {
+				const body=await request.json();
+				try {return json(await reportReputation.applySqlite(db,body.reportId,body));}
+				catch (error) {if ([400,404,409].includes(error.statusCode)) return json({error:error.message},error.statusCode);throw error;}
+			}
+			if (method === 'GET' && /^\/reputation\/\d+$/.test(pathname)) {
+				const excludeScope=url.searchParams.get('excludeScope');
+				const args=excludeScope===null?[Number(pathname.split('/')[2])]:[Number(pathname.split('/')[2]),excludeScope];
+				const qualification=url.searchParams.get('writerQualification')==='1';
+				const rows=await db.prepare(qualification?reputationStorage.writerQualificationQuery('sqlite'):reputationStorage.reputationProfileQuery('sqlite',false,excludeScope!==null)).bind(...(qualification?[Number(pathname.split('/')[2]),excludeScope]:args)).all();
+				return json(reputationStorage.profileFromRows(rows.results));
+			}
+			if (method === 'POST' && pathname === '/reputation/events') {
+				const body=await request.json();
+				const results=await db.batch(reputationStorage.sqliteReputationStatements(db,String(body.scope),body.events,body.evaluation));
+				return json(body.evaluation ? results[body.evaluation.status==='deleted'?results.length-1:results.length-2].meta.changes>0 : true);
+			}
+			if (method === 'GET' && /^\/community-notes\/\d+\/review-data$/.test(pathname)) {
+				const noteId=Number(pathname.split('/')[2]);
+				const rows=await db.prepare('SELECT n.rating_version,r.user_id,r.helpful,r.created_at,r.updated_at,r.weight FROM community_notes n LEFT JOIN note_ratings r ON r.note_id=n.id WHERE n.id=? ORDER BY r.created_at,r.user_id').bind(noteId).all();
+				return json(rows.results.length ? {version:Number(rows.results[0].rating_version),ratings:rows.results.filter(r=>r.user_id!=null).map(r=>({userId:Number(r.user_id),helpful:Boolean(r.helpful),createdAt:r.created_at,updatedAt:r.updated_at,weight:Number(r.weight)}))}:null);
+			}
+			if (method === 'GET' && /^\/community-notes\/\d+\/vote-evidence$/.test(pathname)) {
+				const noteId=Number(pathname.split('/')[2]);
+				const [ratings,admissions,note]=await db.batch([
+					 db.prepare(`SELECT r.user_id,r.helpful,r.created_at,r.updated_at,r.weight,
+						(SELECT revision FROM note_vote_admissions WHERE note_id=r.note_id AND user_id=r.user_id ORDER BY revision DESC LIMIT 1) AS revision,
+						(SELECT admitted_at FROM note_vote_admissions WHERE note_id=r.note_id AND user_id=r.user_id ORDER BY revision DESC LIMIT 1) AS cast_at,
+						(SELECT legacy FROM note_vote_admissions WHERE note_id=r.note_id AND user_id=r.user_id ORDER BY revision DESC LIMIT 1) AS vote_legacy
+						FROM note_ratings r WHERE r.note_id=? ORDER BY r.user_id`).bind(noteId),
+					db.prepare('SELECT user_id,revision,admitted_at,authorized,weight,evidence_ref,relation_manifest,legacy FROM note_vote_admissions WHERE note_id=? ORDER BY user_id,revision').bind(noteId),
+					db.prepare('SELECT rating_version FROM community_notes WHERE id=?').bind(noteId),
+				]);
+				if (!note.results[0]) return json(null);
+				return json({version:Number(note.results[0].rating_version),ratings:ratings.results.map(row=>({userId:Number(row.user_id),helpful:Boolean(row.helpful),weight:Number(row.weight),revision:row.vote_legacy||row.revision==null?null:Number(row.revision),castAt:row.vote_legacy?null:row.cast_at,createdAt:row.created_at,updatedAt:row.updated_at})),admissions:admissions.results.map(row=>({noteId,userId:Number(row.user_id),revision:Number(row.revision),admittedAt:row.admitted_at,authorized:Boolean(row.authorized),weight:Number(row.weight),evidenceRef:row.evidence_ref,relationManifest:parseJsonMaybe(row.relation_manifest,null),legacy:Boolean(row.legacy)}))});
+			}
+			if (method === 'POST' && pathname === '/community-notes/by-posts') {
+				const body=await request.json(); const ids=[...new Set((body.ids || []).map(Number).filter(id=>Number.isSafeInteger(id)&&id>0))].slice(0,100);
+				if (!ids.length) return json([]);
+				const rows=await db.prepare(`SELECT * FROM community_notes WHERE post_id IN (${ids.map(()=>'?').join(',')})`).bind(...ids).all();
+				return json(await Promise.all(rows.results.map(n=>formatCommunityNoteRow(n))));
+			}
+			if (method === 'GET' && /^\/posts\/\d+\/positive-users$/.test(pathname)) {
+				const id=Number(pathname.split('/')[2]);
+				const rows=await db.prepare('SELECT user_id FROM likes WHERE post_id=? UNION SELECT user_id FROM stars WHERE post_id=? ORDER BY user_id LIMIT ?').bind(id,id,Math.min(Number(url.searchParams.get('limit'))||200,500)).all();
+				return json(rows.results.map(r=>Number(r.user_id)));
+			}
+
+			function parseJsonMaybe(value, fallback) {
+				if (value == null) return fallback;
+				if (typeof value === 'object') return value;
+				try { return JSON.parse(value); } catch (_) { return fallback; }
+			}
+
+			async function communityNoteRatingsSummary(noteId, currentUserId = null) {
+				const { results } = await db.prepare('SELECT helpful, user_id FROM note_ratings WHERE note_id = ?').bind(noteId).all();
+				let helpfulCount = 0;
+				let totalRatingCount = 0;
+				let myRating = null;
+				for (const r of results || []) {
+					totalRatingCount += 1;
+					if (Number(r.helpful) === 1 || r.helpful === true) helpfulCount += 1;
+					if (currentUserId != null && Number(r.user_id) === Number(currentUserId)) myRating = (Number(r.helpful) === 1 || r.helpful === true);
+				}
+				return { helpfulCount, totalRatingCount, myRating };
+			}
+
+			async function communityNoteTagRows(noteId) {
+				const { results } = await db.prepare('SELECT side, code FROM note_reason_tags WHERE note_id = ?').bind(noteId).all();
+				return (results || []).map((r) => ({ side: r.side, code: r.code }));
+			}
+
+			async function formatCommunityNoteRow(note, currentUserId = null) {
+				if (!note) return null;
+				const summary = await communityNoteRatingsSummary(Number(note.id), currentUserId);
+				const tags = await communityNoteTagRows(Number(note.id));
+				const sources = parseJsonMaybe(note.sources, []);
+				return {
+					id: Number(note.id),
+					postId: Number(note.post_id),
+					distributionKey: note.distribution_key || `${note.post_id}:${note.user_id}`,
+					userId: Number(note.user_id),
+					content: note.content,
+					sources: Array.isArray(sources) ? sources : [],
+					status: note.status || 'limited',
+					stage: Number(note.stage ?? 1) || 1,
+					publishedAt: note.published_at ?? null,
+					createdAt: note.created_at ?? null,
+					updatedAt: note.updated_at ?? null,
+					helpfulCount: summary.helpfulCount,
+					totalRatingCount: summary.totalRatingCount,
+					myRating: summary.myRating,
+					reasons: tags,
+				};
+			}
+
+			if (method === 'GET' && pathname.match(/^\/posts\/(\d+)\/engaged-users$/)) {
+				const postId = Number(pathname.split('/')[2]);
+				const ids = new Set();
+				try {
+					const { results: likeRows } = await db.prepare('SELECT user_id FROM likes WHERE post_id = ?').bind(postId).all();
+					for (const r of likeRows || []) ids.add(Number(r.user_id));
+				} catch (_) {}
+				try {
+					const { results: starRows } = await db.prepare('SELECT user_id FROM stars WHERE post_id = ?').bind(postId).all();
+					for (const r of starRows || []) ids.add(Number(r.user_id));
+				} catch (_) {}
+				try {
+					const { results: repostRows } = await db.prepare('SELECT user_id FROM reposts WHERE post_id = ?').bind(postId).all();
+					for (const r of repostRows || []) ids.add(Number(r.user_id));
+				} catch (_) {}
+				try {
+					const { results: replyRows } = await db.prepare('SELECT user_id FROM posts WHERE reply_to = ?').bind(postId).all();
+					for (const r of replyRows || []) ids.add(Number(r.user_id));
+				} catch (_) {}
+				return json([...ids].filter(Number.isSafeInteger));
+			}
+
+			if (method === 'GET' && pathname.match(/^\/posts\/(\d+)\/engaged-users-page$/)) {
+				const postId=Number(pathname.split('/')[2]);
+				const afterUserId=Math.max(0,Number(url.searchParams.get('afterUserId'))||0);
+				const limit=Math.min(500,Math.max(1,Number(url.searchParams.get('limit'))||500));
+				const {results}=await db.prepare(`SELECT user_id FROM (
+					SELECT user_id FROM likes WHERE post_id=?
+					UNION SELECT user_id FROM stars WHERE post_id=?
+					UNION SELECT user_id FROM reposts WHERE post_id=?
+					UNION SELECT user_id FROM posts WHERE reply_to=?
+				) engaged WHERE user_id>? ORDER BY user_id LIMIT ?`).bind(postId,postId,postId,postId,afterUserId,limit).all();
+				return json((results||[]).map(row=>Number(row.user_id)).filter(Number.isSafeInteger));
+			}
+
+			if (method === 'GET' && pathname === '/note-reason-tags') {
+				const side = url.searchParams.get('side');
+				let sql = 'SELECT code, side, label_ja, description, sort_order FROM note_reason_tag_defs WHERE enabled = 1';
+				const binds = [];
+				if (side) { sql += ' AND side = ?'; binds.push(side); }
+				sql += ' ORDER BY sort_order ASC, code ASC';
+				const { results } = await db.prepare(sql).bind(...binds).all();
+				return json((results || []).map((r) => ({
+					code: r.code,
+					side: r.side,
+					label: r.label_ja,
+					description: r.description ?? null,
+					sortOrder: Number(r.sort_order) || 0,
+				})));
+			}
+
+			if (method === 'POST' && pathname === '/community-notes') {
+				const body = await request.json();
+				const postId = Number(body.postId ?? body.post_id);
+				const userId = Number(body.userId ?? body.userId);
+				const content = String(body.content || '');
+				// sources normalization
+				let rawSources = body.sources || [];
+				if (!Array.isArray(rawSources)) rawSources = [];
+				const sources = [];
+				const seen = new Set();
+				for (const src of rawSources) {
+					const url = String(src?.url || src || '').trim();
+					const title = src?.title != null ? String(src.title).trim() : '';
+					if (!url) continue;
+					let parsed;
+					try { parsed = new URL(url); } catch (_) { continue; }
+					if (parsed.protocol !== 'https:') continue;
+					if (seen.has(url)) continue;
+					seen.add(url);
+					sources.push({ url, title });
+				}
+				const status = String(body.status || 'limited');
+				const dailyLimit = body.dailyLimit === undefined ? null : body.dailyLimit;
+				if (dailyLimit !== null && (!Number.isInteger(dailyLimit) || dailyLimit < 1)) return json({error:'Invalid note daily limit'},400);
+				const noteId = body.id != null ? Number(body.id) : Number(BigInt(`0x${crypto.randomUUID().replace(/-/g, '').slice(0, 13)}`) % 9007199254740991n);
+				const now = new Date().toISOString();
+				const creation = await db.batch([
+					db.prepare(`INSERT INTO note_creation_claims(post_id,user_id,created_at) SELECT ?,?,? WHERE
+					 NOT EXISTS(SELECT 1 FROM note_creation_claims WHERE post_id=? AND user_id=?) AND
+					 (? IS NULL OR (SELECT COUNT(*) FROM note_creation_claims WHERE user_id=? AND created_at>=?)<?) AND
+					 (SELECT COUNT(*) FROM community_notes WHERE post_id=?)<?`).bind(postId,userId,now,postId,userId,dailyLimit,userId,`${now.slice(0,10)}T00:00:00.000Z`,dailyLimit,postId,Number(body.postLimit)||20),
+					db.prepare(
+					`INSERT INTO community_notes (id, post_id, user_id, content, sources, status, created_at, updated_at,distribution_key)
+					 SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE changes()>0`
+				).bind(noteId, postId, userId, content, JSON.stringify(sources), status, now, now,`${postId}:${userId}`)]);
+				if (!creation[1].meta.changes) {
+					const existingClaim = await db.prepare('SELECT 1 AS hit FROM note_creation_claims WHERE post_id=? AND user_id=?').bind(postId,userId).first();
+					if (existingClaim) return json({error:'同じ投稿には一度だけノートを作成できます',code:'NOTE_ALREADY_EXISTS'},409);
+					if (dailyLimit !== null) {
+						const daily = await db.prepare('SELECT COUNT(*) AS cnt FROM note_creation_claims WHERE user_id=? AND created_at>=?').bind(userId,`${now.slice(0,10)}T00:00:00.000Z`).first();
+						if (Number(daily?.cnt || 0) >= dailyLimit) return json({error:'本日のノート作成上限に達しました',code:'NOTE_DAILY_LIMIT'},429);
+					}
+					return json({error:'この投稿のノート上限に達しました',code:'NOTE_POST_LIMIT'},429);
+				}
+
+				// reasons
+				const reasons = Array.isArray(body.reasons) ? body.reasons : [];
+				for (const r of reasons) {
+					const side = String(r?.side || '').trim();
+					const code = String(r?.code || r || '').trim();
+					if (!side || !code) continue;
+					try {
+						await db.prepare('INSERT OR IGNORE INTO note_reason_tag_defs (code, side, label_ja, sort_order, enabled) VALUES (?, ?, ?, 0, 1)').bind(code, side, code).run();
+					} catch (_) {}
+					try {
+						await db.prepare('INSERT OR IGNORE INTO note_reason_tags (note_id, side, code) VALUES (?, ?, ?)').bind(noteId, side, code).run();
+					} catch (_) {}
+				}
+
+				const note = await db.prepare('SELECT * FROM community_notes WHERE id = ?').bind(noteId).first();
+				return json(await formatCommunityNoteRow(note, userId));
+			}
+
+			if (method === 'GET' && pathname.match(/^\/posts\/(\d+)\/notes$/)) {
+				const postId = Number(pathname.split('/')[2]);
+				const currentUserId = url.searchParams.get('currentUserId') != null ? Number(url.searchParams.get('currentUserId')) : null;
+				const { results: notes } = await db.prepare('SELECT * FROM community_notes WHERE post_id = ? ORDER BY created_at DESC').bind(postId).all();
+				const out = [];
+				for (const n of notes || []) {
+					out.push(await formatCommunityNoteRow(n, currentUserId));
+				}
+				return json(out);
+			}
+
+			if (method === 'GET' && pathname.match(/^\/community-notes\/(\d+)$/)) {
+				const noteId = Number(pathname.split('/')[2]);
+				const currentUserId = url.searchParams.get('currentUserId') != null ? Number(url.searchParams.get('currentUserId')) : null;
+				const note = await db.prepare('SELECT * FROM community_notes WHERE id = ?').bind(noteId).first();
+				if (!note) return notFound('Note not found');
+				return json(await formatCommunityNoteRow(note, currentUserId));
+			}
+
+			if (method === 'GET' && pathname === '/community-notes/count') {
+				const userId = Number(url.searchParams.get('userId'));
+				const since = url.searchParams.get('since');
+				if (!Number.isFinite(userId)) return badRequest('userId required');
+				let sql = 'SELECT COUNT(*) AS cnt FROM community_notes WHERE user_id = ?';
+				const binds = [userId];
+				if (since) {
+					sql += ' AND created_at >= ?';
+					binds.push(since);
+				}
+				const row = await db.prepare(sql).bind(...binds).first();
+				return json({ count: Number(row?.cnt || 0) });
+			}
+
+			if (method === 'POST' && pathname.match(/^\/community-notes\/(\d+)\/ratings$/)) {
+				const noteId = Number(pathname.split('/')[2]);
+				const body = await request.json();
+				const userId = Number(body.userId ?? body.user_id);
+				const helpful = (body.helpful === true || body.helpful === 'true' || body.helpful === 1) ? 1 : 0;
+				const now = new Date().toISOString();
+				const savedWeight=Math.min(1.5,Math.max(1,Number(body.weight)||1));
+				let reacceptLegacy=false;
+				if (body.expectedRatingVersion != null) {
+					const note=await db.prepare('SELECT n.rating_version,n.user_id,p.user_id AS post_author_id FROM community_notes n JOIN posts p ON p.id=n.post_id WHERE n.id=?').bind(noteId).first();
+					if (!note || Number(note.rating_version)!==Number(body.expectedRatingVersion)) return json({error:'投票状態が同時に変更されました'},409);
+					const manifest=body.relationManifest,covered=new Set(manifest?.coveredUserIds || []);
+					if (manifest?.basis!=='admission-evidence'||manifest.complete!==true||!manifest.version||!manifest.evidenceRef||![userId,Number(note.user_id),Number(note.post_author_id)].every(id=>covered.has(id))) return json({error:'関係証跡が不完全です'},400);
+					const prior=await db.prepare(`SELECT a.authorized,a.legacy FROM note_vote_admissions a JOIN note_ratings r ON r.note_id=a.note_id AND r.user_id=a.user_id
+						WHERE a.note_id=? AND a.user_id=? ORDER BY a.revision DESC LIMIT 1`).bind(noteId,userId).first();
+					reacceptLegacy=Boolean(prior&&(Number(prior.legacy)===1||Number(prior.authorized)!==1));
+				}
+				const results=await db.batch([db.prepare(`INSERT INTO note_ratings(note_id,user_id,helpful,created_at,updated_at,weight)
+					 SELECT ?,?,?,?,?,? WHERE (EXISTS(SELECT 1 FROM note_ratings WHERE note_id=? AND user_id=?) OR (SELECT COUNT(*) FROM note_ratings WHERE note_id=?)<?)
+					 AND (? IS NULL OR (SELECT rating_version FROM community_notes WHERE id=?)=?)
+					 ON CONFLICT(note_id,user_id) DO UPDATE SET helpful=excluded.helpful,updated_at=excluded.updated_at WHERE note_ratings.helpful<>excluded.helpful OR ?`)
+					 .bind(noteId,userId,helpful,now,now,savedWeight,noteId,userId,noteId,Number(body.maxRatings)||200,body.expectedRatingVersion ?? null,noteId,body.expectedRatingVersion ?? null,reacceptLegacy?1:0),
+					db.prepare(`INSERT INTO note_vote_admissions(note_id,user_id,revision,admitted_at,authorized,weight,evidence_ref,relation_manifest,legacy)
+					 SELECT ?,?,COALESCE(MAX(revision),0)+1,?, ?, (SELECT weight FROM note_ratings WHERE note_id=? AND user_id=?),
+					 CASE WHEN ? THEN 'note:'||?||':vote:'||?||':revision:'||(COALESCE(MAX(revision),0)+1) ELSE NULL END,?,0
+					 FROM note_vote_admissions WHERE note_id=? AND user_id=? HAVING changes()>0`)
+					 .bind(noteId,userId,now,Boolean(body.relationManifest&&body.expectedRatingVersion!=null)?1:0,noteId,userId,Boolean(body.relationManifest&&body.expectedRatingVersion!=null)?1:0,noteId,userId,body.relationManifest == null ? null : JSON.stringify(body.relationManifest),noteId,userId)]);
+				if (body.expectedRatingVersion!=null && !results[0].meta.changes) {
+					const current=await db.prepare('SELECT rating_version FROM community_notes WHERE id=?').bind(noteId).first();
+					if (Number(current?.rating_version)!==Number(body.expectedRatingVersion)) return json({error:'投票状態が同時に変更されました'},409);
+				}
+				const summary = await communityNoteRatingsSummary(noteId, userId);
+				return json(summary);
+			}
+
+			if (method === 'POST' && pathname.match(/^\/community-notes\/(\d+)\/rating-reasons$/)) {
+				const noteId = Number(pathname.split('/')[2]);
+				const body = await request.json();
+				const userId = Number(body.userId ?? body.user_id);
+				if (!Number.isFinite(userId)) return badRequest('userId required');
+				const codes = [...new Set((Array.isArray(body.codes) ? body.codes : [])
+					.map((c) => String(c || '').trim())
+					.filter(Boolean))];
+				const now = new Date().toISOString();
+				await db.prepare('DELETE FROM note_rating_reasons WHERE note_id = ? AND user_id = ?').bind(noteId, userId).run();
+				for (const code of codes) {
+					try {
+						await db.prepare('INSERT OR IGNORE INTO note_rating_reasons (note_id, user_id, code, created_at) VALUES (?, ?, ?, ?)').bind(noteId, userId, code, now).run();
+					} catch (_) {}
+				}
+				return json({ success: true, codes });
+			}
+
+			if (method === 'GET' && pathname.match(/^\/community-notes\/(\d+)\/ratings-summary$/)) {
+				const noteId = Number(pathname.split('/')[2]);
+				const currentUserId = url.searchParams.get('currentUserId') != null ? Number(url.searchParams.get('currentUserId')) : null;
+				const summary = await communityNoteRatingsSummary(noteId, currentUserId);
+				return json(summary);
+			}
+
+
+
+			if (method === 'DELETE' && pathname.match(/^\/community-notes\/(\d+)$/)) {
+				const noteId = Number(pathname.split('/')[2]);
+				await db.prepare('DELETE FROM note_rating_reasons WHERE note_id = ?').bind(noteId).run();
+				await db.prepare('DELETE FROM note_reason_tags WHERE note_id = ?').bind(noteId).run();
+				await db.prepare('DELETE FROM note_ratings WHERE note_id = ?').bind(noteId).run();
+				await db.prepare('DELETE FROM note_distribution WHERE note_id = ?').bind(noteId).run();
+				await db.prepare('DELETE FROM note_vote_admissions WHERE note_id = ?').bind(noteId).run();
+				const removed = await db.prepare('DELETE FROM community_notes WHERE id = ?').bind(noteId).run();
+				return json({ success: (removed.meta?.changes || 0) > 0 });
+			}
+
+			if (method === 'PATCH' && pathname.match(/^\/community-notes\/(\d+)$/)) {
+				const noteId = Number(pathname.split('/')[2]);
+				const body = await request.json();
+				const sets = [];
+				const vals = [];
+				if (body.status != null) { sets.push('status = ?'); vals.push(String(body.status)); }
+				if (body.stage != null) { sets.push('stage = ?'); vals.push(Number(body.stage)); }
+				const pa = body.publishedAt ?? body.published_at;
+				if (body.publishedAt !== undefined || body.published_at !== undefined) { sets.push('published_at = ?'); vals.push(pa == null ? null : String(pa)); }
+				if (sets.length > 0) {
+					sets.push('updated_at = ?');
+					vals.push(new Date().toISOString());
+					vals.push(noteId);
+					await db.prepare(`UPDATE community_notes SET ${sets.join(', ')} WHERE id = ?`).bind(...vals).run();
+				}
+				const note = await db.prepare('SELECT * FROM community_notes WHERE id = ?').bind(noteId).first();
+				if (!note) return notFound('Note not found');
+				return json(await formatCommunityNoteRow(note, null));
+			}
+
+			// note_distribution
+			if (method === 'POST' && pathname === '/community-note-distributions/batch') {
+				const body=await request.json(),rows=Array.isArray(body.rows)?body.rows:[];
+				for(let offset=0;offset<rows.length;offset+=100){const batch=rows.slice(offset,offset+100).filter(row=>Number.isSafeInteger(Number(row.noteId))&&Number.isSafeInteger(Number(row.userId)));
+					if(!batch.length)continue;const now=new Date().toISOString();
+					await db.batch(batch.map(row=>db.prepare(`INSERT INTO note_distribution(note_id,user_id,tier,notified,created_at) VALUES(?,?,?,?,?)
+						ON CONFLICT(note_id,user_id) DO UPDATE SET tier=excluded.tier,notified=excluded.notified`).bind(Number(row.noteId),Number(row.userId),Number(row.tier??1),row.notified?1:0,now)));
+				}return json({ok:true,count:rows.length});
+			}
+			if (method === 'POST' && pathname === '/community-note-distributions') {
+				const body = await request.json();
+				const noteId = Number(body.noteId ?? body.note_id);
+				const userId = Number(body.userId ?? body.user_id);
+				const tier = body.tier != null ? Number(body.tier) : 1;
+				const notified = Boolean(body.notified ?? false);
+				const existing = await db.prepare('SELECT 1 AS x FROM note_distribution WHERE note_id = ? AND user_id = ?').bind(noteId, userId).first();
+				const now = new Date().toISOString();
+				if (existing) {
+					await db.prepare('UPDATE note_distribution SET tier = ?, notified = ? WHERE note_id = ? AND user_id = ?').bind(tier, notified ? 1 : 0, noteId, userId).run();
+				} else {
+					await db.prepare('INSERT INTO note_distribution (note_id, user_id, tier, notified, created_at) VALUES (?, ?, ?, ?, ?)').bind(noteId, userId, tier, notified ? 1 : 0, now).run();
+				}
+				return json({ noteId, userId, tier, notified, createdAt: now });
+			}
+
+			if (method === 'GET' && pathname === '/community-note-distributions') {
+				const noteId = url.searchParams.get('noteId') != null ? Number(url.searchParams.get('noteId')) : null;
+				const userId = url.searchParams.get('userId') != null ? Number(url.searchParams.get('userId')) : null;
+				if (noteId != null && userId != null) {
+					const row = await db.prepare('SELECT * FROM note_distribution WHERE note_id = ? AND user_id = ?').bind(noteId, userId).first();
+					if (!row) return json(null);
+					return json({ noteId: Number(row.note_id), userId: Number(row.user_id), tier: Number(row.tier), notified: Boolean(row.notified), createdAt: row.created_at ?? null });
+				}
+				let sql = 'SELECT * FROM note_distribution WHERE 1=1';
+				const binds = [];
+				if (noteId != null) { sql += ' AND note_id = ?'; binds.push(noteId); }
+				if (userId != null) { sql += ' AND user_id = ?'; binds.push(userId); }
+				const { results } = await db.prepare(sql).bind(...binds).all();
+				const out = (results || []).map((r) => ({ noteId: Number(r.note_id), userId: Number(r.user_id), tier: Number(r.tier), notified: Boolean(r.notified), createdAt: r.created_at ?? null }));
+				return json(out);
+			}
+
+			if (method === 'GET' && pathname === '/community-note-distributions/batch') {
+				const noteId=Number(url.searchParams.get('noteId'));
+				const ids=(url.searchParams.get('userIds')||'').split(',').map(Number).filter(Number.isSafeInteger).slice(0,500);
+				if(!Number.isSafeInteger(noteId)||noteId<=0||!ids.length)return json([]);
+				const {results}=await db.prepare(`SELECT note_id,user_id,tier,notified,created_at FROM note_distribution WHERE note_id=? AND user_id IN (${ids.map(()=>'?').join(',')})`).bind(noteId,...ids).all();
+				return json((results||[]).map(row=>({noteId:Number(row.note_id),userId:Number(row.user_id),tier:Number(row.tier),notified:Boolean(row.notified),createdAt:row.created_at??null})));
+			}
+
+			if (method === 'DELETE' && pathname.match(/^\/community-note-distributions\/(\d+)(?:\/(\d+))?$/)) {
+				const parts = pathname.split('/');
+				const noteId = Number(parts[2]);
+				const userId = parts[3] != null ? Number(parts[3]) : null;
+				if (userId == null) {
+					await db.prepare('DELETE FROM note_distribution WHERE note_id = ?').bind(noteId).run();
+				} else {
+					await db.prepare('DELETE FROM note_distribution WHERE note_id = ? AND user_id = ?').bind(noteId, userId).run();
+				}
+				return json({ success: true });
+			}
+
+			if (method === 'GET' && pathname === '/shared-group-membership') {
+				const u1 = Number(url.searchParams.get('userId1'));
+				const u2 = Number(url.searchParams.get('userId2'));
+				let groups = 0;
+				try {
+					const row = await db.prepare('SELECT COUNT(*) AS c FROM group_memberships a JOIN group_memberships b ON a.group_id = b.group_id WHERE a.user_id = ? AND b.user_id = ? AND a.status = ? AND b.status = ?').bind(u1, u2, 'active', 'active').first();
+					groups = Number(row?.c || 0);
+				} catch (_) {}
+				let dms = 0;
+				try {
+					const { results: dmRows } = await db.prepare('SELECT participants FROM dm_channels').all();
+					for (const r of dmRows || []) {
+						let parts = [];
+						try { parts = JSON.parse(r.participants); } catch (_) { parts = String(r.participants || '').split(',').map((x) => Number(String(x).trim())); }
+						if (parts.map(Number).includes(u1) && parts.map(Number).includes(u2)) dms++;
+					}
+				} catch (_) {}
+				try {
+					const { results: gdmRows } = await db.prepare('SELECT member FROM group_dms').all();
+					for (const r of gdmRows || []) {
+						let members = [];
+						try { members = JSON.parse(r.member); } catch (_) { members = String(r.member || '').split(',').map((x) => Number(String(x).trim())); }
+						if (members.map(Number).includes(u1) && members.map(Number).includes(u2)) dms++;
+					}
+				} catch (_) {}
+				const total = groups + dms;
+				const bonus = total > 0 ? 0.2 : 0;
+				return json({ groups, dms, total, bonus });
+			}
+
+			if (method === 'POST' && pathname.match(/^\/posts\/(\d+)\/recommendation-penalty$/)) {
+				const postId = Number(pathname.split('/')[2]);
+				const body = await request.json();
+				const delta = Number(body?.delta) || 0;
+				const max = Number(body?.max) || 1;
+				const row = await db.prepare('SELECT recommendation_penalty FROM posts WHERE id = ?').bind(postId).first();
+				const current = Number(row?.recommendation_penalty) || 0;
+				const next = Math.min(max, Math.max(0, current + delta));
+				await db.prepare('UPDATE posts SET recommendation_penalty = ? WHERE id = ?').bind(next, postId).run();
+				return json({ success: true, recommendation_penalty: next });
+			}
+
 			return notFound(`Path ${method} ${pathname} not handled`);
 		} catch (error) {
 			return internalError(error);
 		}
 	},
+};
+
+// Named exports are also used by isolated SQLite-backed migration tests.
+export {
+	importMigrationSnapshot,
+	exportMigrationSnapshot,
+	MIGRATION_TABLES,
+	MIGRATION_COLUMNS,
+	MIGRATION_INSERT_ORDER,
+	MIGRATION_EXCLUDED_TABLES,
 };

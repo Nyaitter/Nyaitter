@@ -22,6 +22,7 @@ function getClientIp(req) {
 function createRateLimiter(options = {}) {
   const windowMs = options.windowMs || config.rateLimit?.general?.windowMs || 60000;
   const max = options.max || config.rateLimit?.general?.max || 1000;
+  const category = options.category || Object.keys(config.rateLimit || {}).find(key=>config.rateLimit[key]===options) || 'general';
   const keyGenerator = options.keyGenerator || ((req) => {
     if (req.user?.id) return `user:${req.user.id}`;
     return `ip:${getClientIp(req)}`;
@@ -55,13 +56,35 @@ function createRateLimiter(options = {}) {
   }, Math.max(10000, windowMs));
   timer.unref();
 
-  return function rateLimitMiddleware(req, res, next) {
+  return async function rateLimitMiddleware(req, res, next) {
     if (!config.rateLimit?.enabled) {
       return next();
     }
 
-    const key = keyGenerator(req);
+    let effectiveMax=max; let rules=null;
+    try {
+      if (options.resolvePrincipal && !req.user && req.app?.locals?.dbAdapter) req.user=await require('./auth').getAuthenticatedPrincipal(req);
+      if (req.user && category!=='auth') {
+        const reputation=require('../services/ReputationService');
+        rules=req.trustPolicy || await reputation.effectivePolicy(req.app.locals.dbAdapter,req.user);
+        req.trustPolicy=rules;
+        req.trustPolicyPrincipalId=req.user.id;
+        if (!rules.exempt) effectiveMax=rules.rateLimits?.[category] ?? Math.max(1,Math.floor(max*rules.rateMultiplier));
+      }
+    } catch(error) {
+      console.error('[rateLimit] status lookup:',error.message);
+      return res.status(503).json({error:'利用状態を確認できませんでした'});
+    }
     const now = Date.now();
+    const ipKey=`ip:${getClientIp(req)}`;
+    if (options.resolvePrincipal && req.user && !rules?.exempt) {
+      let ipEntry=store.get(ipKey);
+      if (ipEntry?.blockedUntil && now<ipEntry.blockedUntil) {res.setHeader('Retry-After',Math.max(1,Math.ceil((ipEntry.blockedUntil-now)/1000)));return res.status(429).json({error:'Too Many Requests'});}
+      if (!ipEntry || now>=ipEntry.resetTime) {if (!ipEntry) trimStore(now);ipEntry={count:0,resetTime:now+windowMs};store.set(ipKey,ipEntry);}
+      ipEntry.count++;
+      if (ipEntry.count>max) {res.setHeader('Retry-After',Math.max(1,Math.ceil((ipEntry.resetTime-now)/1000)));return res.status(429).json({error:'Too Many Requests',message:'接続元からのリクエストが多すぎます。'});}
+    }
+    const key = options.resolvePrincipal && (!req.user || rules?.exempt)?ipKey:keyGenerator(req);
     let entry = store.get(key);
 
     // 継続的過剰リクエストによる一時ブロック判定
@@ -83,7 +106,7 @@ function createRateLimiter(options = {}) {
     entry.count += 1;
 
     // 上限の2倍を超える過剰リクエストを発行した場合はクールダウンブロック
-    if (entry.count > max * 2) {
+    if (entry.count > effectiveMax * 2) {
       entry.blockedUntil = now + Math.max(windowMs * 5, 300000);
       res.setHeader('Retry-After', Math.max(1, Math.ceil((entry.blockedUntil - now) / 1000)));
       return res.status(429).json({
@@ -92,7 +115,7 @@ function createRateLimiter(options = {}) {
       });
     }
 
-    if (entry.count > max) {
+    if (entry.count > effectiveMax) {
       res.setHeader('Retry-After', Math.max(1, Math.ceil((entry.resetTime - now) / 1000)));
       return res.status(429).json({
         error: 'Too Many Requests',
@@ -100,16 +123,18 @@ function createRateLimiter(options = {}) {
       });
     }
 
-    res.setHeader('X-RateLimit-Limit', max);
-    res.setHeader('X-RateLimit-Remaining', Math.max(0, max - entry.count));
+    res.setHeader('X-RateLimit-Limit', effectiveMax);
+    res.setHeader('X-RateLimit-Remaining', Math.max(0, effectiveMax - entry.count));
     res.setHeader('X-RateLimit-Reset', Math.ceil(entry.resetTime / 1000));
 
     next();
   };
 }
 
-const generalLimiter = createRateLimiter();
+const generalLimiter = createRateLimiter({resolvePrincipal:true,category:'general'});
 const authLimiter = createRateLimiter({
+  category: 'auth',
+  keyGenerator: req => `ip:${getClientIp(req)}`,
   windowMs: config.rateLimit?.auth?.windowMs,
   max: config.rateLimit?.auth?.max || 20,
 });

@@ -17,6 +17,25 @@ const { isFuzzyMatch, calculateStringSimilarity } = require('../../utils/fuzzySe
 const { encodePostCursor, decodePostCursor } = require('../../utils/postCursor');
 
 class InMemoryAdapter extends DatabaseAdapter {
+	async createModLog(input) {
+		const m = require('./modLogs'); const row = m.normalizeRecord(input, crypto.randomUUID());
+		(this.modLogs ||= []);
+		const existing = this.modLogs.find((item) => item.id === row.id);
+		if (existing) {
+			if (!m.sameRecord(existing, row)) throw new Error('Mod log ID conflict');
+			return { ...existing };
+		}
+		this.modLogs.push(row); return { ...row };
+	}
+	async searchModLogs(input = {}) {
+		const m = require('./modLogs'); const f = m.normalizeFilters(input);
+		const rows = (this.modLogs || []).filter(row => m.fields.every(k => f[k] === undefined || row[k] === f[k])
+			&& (!f.from || row.createdAt >= f.from) && (!f.to || row.createdAt <= f.to)
+			&& (!f.beforeTime || row.createdAt < f.beforeTime || (row.createdAt === f.beforeTime && row.id < f.beforeId)))
+			.sort((a, b) => a.createdAt === b.createdAt ? (a.id < b.id ? 1 : -1) : (a.createdAt < b.createdAt ? 1 : -1))
+			.slice(0, f.limit + 1).map(row => ({ ...row }));
+		return m.page(rows, f.limit);
+	}
 	constructor() {
 		super();
 		this.users = new Map(); // id -> user
@@ -52,6 +71,8 @@ class InMemoryAdapter extends DatabaseAdapter {
 		this.starCountByPost = new Map();
 		this.repostCountByPost = new Map();
 		this.likes = new Map(); // `${userId}:${postId}` -> true
+		this.likedUserIdsByPost = new Map();
+		this.starredUserIdsByPost = new Map();
 		this.stars = new Map();
 		this.likedPostIdsByUser = new Map(); // userId -> Set(postId)
 		this.starredPostIdsByUser = new Map(); // userId -> Set(postId)
@@ -62,6 +83,8 @@ class InMemoryAdapter extends DatabaseAdapter {
 
 		this.dmChannels = new Map(); // channelId -> { id, participants, messages, ... }
 		this.groupDms = new Map(); // dmId -> { id, title, member, host_id, time, post, unread }
+		this.groupDmSendRequests = new Map();
+		this.supportsGroupDmSendIdempotency = true;
 		this.groupDmIdsByMember = new Map(); // userId -> Set(dmId)
 		this.groupDmUnreadTotalByMember = new Map(); // userId -> unread total
 		this.dmE2EKeys = new Map(); // userId -> { public_key, created_at, updated_at }
@@ -71,6 +94,18 @@ class InMemoryAdapter extends DatabaseAdapter {
 		this.pollVoteIdsByPoll = new Map(); // pollId -> Set(voteId)
 		this.nextPollId = 1;
 		this.nextPollVoteId = 1;
+
+		this.communityNotes = new Map(); // noteId -> note
+		this.noteIdsByPost = new Map();
+		this.noteCreationDaysByUser = new Map();
+		this.noteRatingUsersByNote = new Map();
+		this.noteDistributionUsersByNote = new Map();
+		this.noteRatings = new Map(); // `${noteId}:${userId}` -> rating
+		this.noteRatingReasons = new Map(); // `${noteId}:${userId}:${code}` -> rating reason
+		this.noteReasonTags = new Map(); // `${noteId}:${side}:${code}` -> tag
+		this.noteReasonTagDefs = this._loadNoteReasonTagDefs(); // code -> definition
+		this.noteDistributions = new Map(); // `${noteId}:${userId}` -> distribution
+		this.nextCommunityNoteId = 1;
 
 		this.follows = new Map(); // `${followerId}:${followingId}` -> true
 		this.followingIdsByUser = new Map(); // followerId -> Set(followingId)
@@ -87,6 +122,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 		this.nextNotificationId = 1;
 		this.nextDmId = 1;
 		this.logs = []; // { scratch_id, nyaitter_id, masked_ip_uuid, log_time }
+		this.modLogs = [];
 
 		this.externalAuthToId = new Map(); // `${provider}:${external_id}` -> id
 		this.userAuthProviders = new Map(); // id -> { id, userId, provider, providerUserId, providerProfile, createdAt }
@@ -161,6 +197,10 @@ class InMemoryAdapter extends DatabaseAdapter {
 				read_at: message.readAt,
 			}))),
 			group_dms: [...this.groupDms.values()],
+			group_dm_send_requests: [...this.groupDmSendRequests.entries()].map(([key, value]) => {
+				const [dm_id, sender_id, request_id] = JSON.parse(key);
+				return { dm_id, sender_id, request_id, request_hash: value.hash, response_message: value.message };
+			}),
 							dm_e2e_keys: [...this.dmE2EKeys.entries()].map(([user_id, record]) => ({
 					user_id,
 					public_key: record.public_key,
@@ -173,6 +213,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 				[...subscriptions.values()].map((subscription) => ({ user_id, ...subscription }))
 			)),
 				moderation_reports: [...this.moderationReports.values()],
+				mod_logs: this.modLogs,
 				logs: this.logs,
 				user_keyword_affinities: [...this.userKeywordAffinityByUser.entries()].flatMap(([user_id, affinities]) => (
 					[...affinities.entries()].map(([keyword, entry]) => ({
@@ -190,16 +231,63 @@ class InMemoryAdapter extends DatabaseAdapter {
 						created_at: new Date().toISOString(),
 					}))
 				)),
+				polls: [...new Map([...this.polls.values()].map((poll) => [String(poll.id), poll])).values()],
+				poll_votes: [...new Map([...this.pollVotes.values()].map((vote) => [String(vote.id), vote])).values()],
+				authorized_apps: [...this.authorizedApps.values()],
 		};
 		return createSnapshot('memory', rows);
 	}
 
 	async importDataSnapshot(snapshot, { replace = false } = {}) {
+		const staged = Object.assign(Object.create(Object.getPrototypeOf(this)), this);
+		const result = await staged._importDataSnapshot(snapshot, { replace });
+		Object.assign(this, staged);
+		return result;
+	}
+
+	async _importDataSnapshot(snapshot, { replace = false } = {}) {
 		if (replace !== true) throw new Error('Destination replacement requires replace=true');
 		const { normalizeSnapshot } = require('../../services/DataMigrationService');
 		const data = normalizeSnapshot(snapshot);
+		if (data.tables.group_dms.length && !data.tables_present.includes('group_dm_send_requests')) throw new Error('DM snapshot is missing send request history');
+		if (data.tables.group_dm_send_requests.length && data.tables.group_dms.some((dm) => !/^\d+$/.test(String(dm.id)))) throw new Error('Memory cannot import DM send requests for non-numeric conversation IDs');
+		// スナップショットに含まれないテーブルは「未対応で省略された」とみなして保持する。
+		// 旧形式のスナップショットで新テーブルを空にしてしまう事故を防ぐ。
+		const included = new Set(data.tables_present || Object.keys(data.tables));
+		const preserved = {};
+		// ノート・評判系は移行対象外（excluded_tables）でスナップショットに決して
+		// 含まれない。含まれないテーブルは保持するのがこの置換の原則なので、
+		// 対象外だからといって無報告で消さず、状態を保持して結果で報告する。
+		const NOTE_REPUTATION_FIELDS = [
+			'communityNotes', 'noteIdsByPost', 'noteCreationDaysByUser', 'noteRatingUsersByNote',
+			'noteDistributionUsersByNote', 'noteRatings', 'noteRatingReasons', 'noteReasonTags',
+			'noteReasonTagDefs', 'noteDistributions', 'nextCommunityNoteId', 'noteCreationClaims',
+			'noteVoteAdmissions', 'noteSelectionKeys', 'reputationEvents', 'reputationDaily',
+			'reputationProfiles', 'reputationNoticeClaims', 'reviewerOutcomeCandidates', 'reviewerOutcomeClaims',
+		];
+		const preservedNoteState = {};
+		for (const field of NOTE_REPUTATION_FIELDS) {
+			if (Object.prototype.hasOwnProperty.call(this, field)) preservedNoteState[field] = this[field];
+		}
+		if (!included.has('mod_logs')) preserved.mod_logs = this.modLogs;
+		if (!included.has('account_recovery_requests')) preserved.account_recovery_requests = this.accountRecoveryRequests;
+		if (!included.has('blocked_login_ips')) preserved.blocked_login_ips = this.blockedLoginIps;
+		if (!included.has('polls')) preserved.polls = this.polls;
+		if (!included.has('poll_votes')) preserved.poll_votes = this.pollVotes;
+		if (!included.has('authorized_apps')) preserved.authorized_apps = this.authorizedApps;
+		if (!included.has('post_feedback')) preserved.post_feedback = this.postFeedbackByUser;
 		const empty = new InMemoryAdapter();
 		Object.assign(this, empty);
+		Object.assign(this, preservedNoteState);
+		if (preserved.account_recovery_requests) this.accountRecoveryRequests = preserved.account_recovery_requests;
+		if (preserved.blocked_login_ips) this.blockedLoginIps = preserved.blocked_login_ips;
+		if (preserved.polls) this.polls = preserved.polls;
+		if (preserved.poll_votes) this.pollVotes = preserved.poll_votes;
+		if (preserved.authorized_apps) this.authorizedApps = preserved.authorized_apps;
+		if (preserved.post_feedback) this.postFeedbackByUser = preserved.post_feedback;
+		this.modLogs = Object.prototype.hasOwnProperty.call(preserved, 'mod_logs')
+			? preserved.mod_logs
+			: data.tables.mod_logs.map(require('./modLogs').mapRow);
 
 		for (const row of data.tables.users) {
 			const user = {
@@ -277,6 +365,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 				ipHash: row.ip_hash,
 				ipMasked: row.ip_masked,
 				userAgent: row.user_agent,
+				ip: row.ip ?? null,
 				expiresAt: row.expires_at,
 				createdAt: row.created_at,
 			});
@@ -444,9 +533,15 @@ class InMemoryAdapter extends DatabaseAdapter {
 			}
 		}
 		for (const row of data.tables.group_dms) {
-			const dm = { ...row, host_id: row.host_id, member: row.member, post: row.post, unread: row.unread, time: row.time };
+			const numericId = /^\d+$/.test(String(row.id)) ? Number(row.id) : NaN;
+			const id = Number.isSafeInteger(numericId) ? numericId : row.id;
+			const dm = { ...row, id, state_version: Number(row.state_version ?? 0), accepted: row.accepted ?? row.unread?._accepted ?? row.member, host_id: row.host_id, member: row.member, post: row.post, unread: row.unread, time: row.time };
 			this.groupDms.set(dm.id, dm);
+			if (Number.isSafeInteger(id)) this.nextDmId = Math.max(this.nextDmId, id + 1);
 			this._addGroupDmMemberIndexes(dm);
+		}
+		for (const row of data.tables.group_dm_send_requests) {
+			this.groupDmSendRequests.set(JSON.stringify([String(row.dm_id), Number(row.sender_id), row.request_id]), { hash: row.request_hash, message: row.response_message });
 		}
 					for (const row of data.tables.dm_e2e_keys) {
 				this.dmE2EKeys.set(row.user_id, {
@@ -487,7 +582,95 @@ class InMemoryAdapter extends DatabaseAdapter {
 			id: row.id, scratch_id: row.scratch_id, nyaitter_id: row.nyaitter_id,
 			masked_ip_uuid: row.masked_ip_uuid, log_time: row.log_time,
 		}));
-		return Object.fromEntries(Object.entries(data.tables).map(([table, rows]) => [table, rows.length]));
+		for (const row of data.tables.polls) {
+			if (row.id == null) continue;
+			const pollId = String(row.id);
+			const poll = {
+				id: pollId,
+				post_id: row.post_id == null ? null : String(row.post_id),
+				user_id: row.user_id == null ? null : String(row.user_id),
+				title: String(row.title || ''),
+				options: Array.isArray(row.options) ? row.options : [],
+				allow_multiple: Boolean(row.allow_multiple),
+				allow_other: Boolean(row.allow_other),
+				show_results_before_voting: row.show_results_before_voting !== false,
+				expires_at: row.expires_at ?? null,
+				closed_notified: Boolean(row.closed_notified),
+				closed: Boolean(row.closed),
+				closed_at: null,
+				created_at: row.created_at ?? null,
+				updated_at: row.created_at ?? null,
+			};
+			// 内部索引は文字列キーと数値キーの両方で引かれるため、両方に同じ実体を入れる。
+			this.polls.set(pollId, poll);
+			if (/^-?\d+$/.test(pollId)) this.polls.set(Number(pollId), poll);
+			if (poll.post_id != null) {
+				this.pollByPostId.set(poll.post_id, pollId);
+				this.pollByPostId.set(Number(poll.post_id), pollId);
+			}
+			this.pollVoteIdsByPoll.set(pollId, new Set());
+			if (/^-?\d+$/.test(pollId)) this.pollVoteIdsByPoll.set(Number(pollId), new Set());
+			const numericId = Number(pollId);
+			if (Number.isSafeInteger(numericId) && numericId >= this.nextPollId) this.nextPollId = numericId + 1;
+		}
+		for (const row of data.tables.poll_votes) {
+			if (row.id == null) continue;
+			const voteId = String(row.id);
+			const vote = {
+				id: voteId,
+				poll_id: row.poll_id == null ? null : String(row.poll_id),
+				user_id: row.user_id == null ? null : String(row.user_id),
+				option_id: Number(row.option_id),
+				other_text: row.other_text ?? null,
+				created_at: row.created_at ?? null,
+			};
+			this.pollVotes.set(voteId, vote);
+			if (/^-?\d+$/.test(voteId)) this.pollVotes.set(Number(voteId), vote);
+			if (vote.poll_id != null) {
+				if (!this.pollVoteIdsByPoll.has(vote.poll_id)) this.pollVoteIdsByPoll.set(vote.poll_id, new Set());
+				this.pollVoteIdsByPoll.get(vote.poll_id).add(voteId);
+			}
+			const numericId = Number(voteId);
+			if (Number.isSafeInteger(numericId) && numericId >= this.nextPollVoteId) this.nextPollVoteId = numericId + 1;
+		}
+		for (const row of data.tables.authorized_apps) {
+			if (!Number.isSafeInteger(row.id)) continue;
+			const record = {
+				id: row.id,
+				user_id: Number(row.user_id),
+				app_id: row.app_id,
+				app_token_hash: row.app_token_hash,
+				app_name: row.app_name,
+				app_icon_url: row.app_icon_url ?? null,
+				scopes: Array.isArray(row.scopes) ? row.scopes : [],
+				access_token_id: row.access_token_id ?? null,
+				access_token_hash: row.access_token_hash ?? null,
+				created_at: row.created_at ?? null,
+				updated_at: row.updated_at ?? null,
+				last_used_at: row.last_used_at ?? null,
+			};
+			this.authorizedApps.set(record.id, record);
+			this.authorizedAppLookup.set(`${record.user_id}:${record.app_id}:${record.app_token_hash}`, record.id);
+			if (record.access_token_id) this.authorizedAppByAccessTokenId.set(record.access_token_id, record.id);
+			if (record.id >= this.nextAuthorizedAppId) this.nextAuthorizedAppId = record.id + 1;
+		}
+		const counts = Object.fromEntries(Object.entries(data.tables).map(([table, rows]) => [table, rows.length]));
+		const { EXCLUDED_TABLES, EXCLUDED_TABLE_NAMES } = require('../../services/DataMigrationSchema');
+		return {
+			imported: counts,
+			counts,
+			imported_tables: [...included],
+			// スナップショットに含まれず宛先に残したテーブル。ノート・評判系は
+			// 移行対象外のため常にここへ入り、消えていないことを明示する。
+			preserved_tables: Object.keys(counts).filter((table) => !included.has(table) && !EXCLUDED_TABLE_NAMES.includes(table))
+				.concat(EXCLUDED_TABLE_NAMES.filter((table) => table !== 'post_events')),
+			cascaded_tables: [],
+			cleared_tables: [],
+			skipped_columns: {},
+			excluded_tables: (data.excluded_tables && data.excluded_tables.length)
+				? data.excluded_tables
+				: EXCLUDED_TABLES.map((entry) => ({ table: entry.table, reason: entry.reason })),
+		};
 	}
 
 		_addPostIndexes(post) {
@@ -615,6 +798,8 @@ class InMemoryAdapter extends DatabaseAdapter {
 			_updateUserReactionIndex(index, userId, postId, active) {
 			const normalizedUserId = Number(userId);
 			const normalizedPostId = Number(postId);
+			if (index===this.likedPostIdsByUser) this._updateUserReactionIndex(this.likedUserIdsByPost,normalizedPostId,normalizedUserId,active);
+			if (index===this.starredPostIdsByUser) this._updateUserReactionIndex(this.starredUserIdsByPost,normalizedPostId,normalizedUserId,active);
 			if (active) {
 				if (!index.has(normalizedUserId)) index.set(normalizedUserId, new Set());
 				index.get(normalizedUserId).add(normalizedPostId);
@@ -1035,6 +1220,10 @@ class InMemoryAdapter extends DatabaseAdapter {
 			shadow: false,
 			lock: false,
 			account_operation: null,
+			note_rank: 0,
+			note_affirmative_score: 0,
+			note_max_per_day: 1,
+			note_min_public_threshold: 0,
 			...(user || {}),
 		};
 		normalized.block = normalizeBlockList(normalized.block, normalized.id);
@@ -2726,6 +2915,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 	async toggleLike(userId, postId) {
 		const key = `${userId}:${postId}`;
 		const currentlyLiked = this.likes.has(key);
+		this._updateUserReactionIndex(this.likedUserIdsByPost, Number(postId), Number(userId), !currentlyLiked);
 
 		const currentCount = this.likeCountByPost.get(postId) || 0;
 			if (currentlyLiked) {
@@ -2764,6 +2954,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 	async toggleStar(userId, postId) {
 		const key = `${userId}:${postId}`;
 		const currentlyStarred = this.stars.has(key);
+		this._updateUserReactionIndex(this.starredUserIdsByPost, Number(postId), Number(userId), !currentlyStarred);
 
 		const currentCount = this.starCountByPost.get(postId) || 0;
 			if (currentlyStarred) {
@@ -2931,6 +3122,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 			member: dm.member.slice(),
 			accepted: Array.isArray(dm.accepted) ? dm.accepted.slice() : dm.member.slice(),
 			host_id: dm.host_id,
+			state_version: String(dm.state_version ?? 0),
 			time: dm.time,
 			post: dm.post ? dm.post.slice() : [],
 			unread: dm.unread ? { ...dm.unread } : {},
@@ -2974,6 +3166,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 		const dm = {
 			id,
 			host_id: dmData.hostId,
+			state_version: 0,
 			member: dmData.member.slice(),
 			accepted: Array.isArray(dmData.accepted) ? dmData.accepted.slice() : dmData.member.slice(),
 			title: dmData.title || '',
@@ -2986,9 +3179,13 @@ class InMemoryAdapter extends DatabaseAdapter {
 		return this._serializeGroupDm(dm, dmData.hostId);
 	}
 
-	async updateGroupDm(dmId, updates) {
+	async updateGroupDm(dmId, updates, expectedPost = undefined, expectedState = undefined) {
 		const dm = this.groupDms.get(Number(dmId));
 		if (!dm) return null;
+		if (expectedPost !== undefined && JSON.stringify(dm.post) !== JSON.stringify(expectedPost)) return null;
+		if (expectedState && (String(dm.state_version ?? 0) !== String(expectedState.state_version) || Number(dm.host_id) !== Number(expectedState.host_id)
+			|| JSON.stringify(dm.member) !== JSON.stringify(expectedState.member)
+			|| JSON.stringify(dm.accepted ?? dm.member) !== JSON.stringify(expectedState.accepted))) return null;
 
 		if (updates.title !== undefined) dm.title = updates.title;
 		if (updates.member !== undefined) {
@@ -3006,15 +3203,51 @@ class InMemoryAdapter extends DatabaseAdapter {
 		if (updates.post !== undefined) dm.post = updates.post.slice();
 		if (updates.time !== undefined) dm.time = updates.time;
 
+		if (['title', 'member', 'accepted', 'host_id', 'post', 'time'].some((key) => updates[key] !== undefined)) dm.state_version = (dm.state_version ?? 0) + 1;
 		return this._serializeGroupDm(dm, dm.host_id);
 	}
 
-	async appendToGroupDm(dmId, message, senderId = null) {
+	async editGroupDmMessage(dmId, messageId, userId, content) {
+		const dm = this.groupDms.get(Number(dmId));
+		if (!dm) return { error: 'not_found' };
+		if (!dm.member.map(Number).includes(Number(userId))) return { error: 'forbidden' };
+		const accepted = Array.isArray(dm.accepted) ? dm.accepted : (Array.isArray(dm.unread?._accepted) ? dm.unread._accepted : dm.member);
+		if (!accepted.map(Number).includes(Number(userId))) return { error: 'forbidden' };
+		const index = (dm.post || []).findIndex((item) => String(item.id) === String(messageId));
+		if (index < 0) return { error: 'not_found' };
+		const message = dm.post[index];
+		if (Number(message.userid) !== Number(userId) || message.type !== 'user' || message.e2e || message.deleted || message.deleted_at) return { error: 'forbidden' };
+		dm.post[index] = { ...message, content, edited_at: new Date().toISOString() };
+		dm.state_version = (dm.state_version ?? 0) + 1;
+		return { message: dm.post[index], member: dm.member.filter((id) => accepted.map(Number).includes(Number(id))) };
+	}
+
+	async appendToGroupDm(dmId, message, senderId = null, options = undefined) {
 		const dm = this.groupDms.get(Number(dmId));
 		if (!dm) return null;
+		const requestKey = options?.requestId == null ? null : JSON.stringify([String(dmId), Number(senderId), options.requestId]);
+		if (requestKey && dm.member.map(Number).includes(Number(senderId))) {
+			const previous = this.groupDmSendRequests.get(requestKey);
+			if (previous) {
+				if (previous.hash !== options.requestHash) return { idempotencyConflict: true };
+				return { ...this._serializeGroupDm(dm, senderId), idempotencyReplay: structuredClone(previous.message) };
+			}
+		}
+		if (options) {
+			const expected = options.expectedState;
+			if (!expected || !dm.member.map(Number).includes(Number(senderId)) || String(dm.state_version ?? 0) !== String(expected.state_version) || Number(dm.host_id) !== Number(expected.host_id) || JSON.stringify(dm.member) !== JSON.stringify(expected.member) || JSON.stringify(dm.accepted ?? dm.member) !== JSON.stringify(expected.accepted)) return null;
+			const accepted = dm.accepted ?? dm.member;
+			if (!accepted.map(Number).includes(Number(senderId))) {
+				if (!options.joinEvent) return null;
+				dm.accepted = [...accepted, Number(senderId)];
+				dm.post = dm.post || [];
+				dm.post.push(options.joinEvent);
+			} else if (options.joinEvent) return null;
+		}
 
 		dm.post = dm.post || [];
 		dm.post.push(message);
+		dm.state_version = (dm.state_version ?? 0) + 1;
 		dm.time = message.time || new Date().toISOString();
 
 		if (senderId !== null) {
@@ -3029,12 +3262,14 @@ class InMemoryAdapter extends DatabaseAdapter {
 			}
 			for (const memberId of dm.member) {
 				if (memberId !== senderId) {
-					dm.unread[memberId] = (dm.unread[memberId] || 0) + 1;
-					this.groupDmUnreadTotalByMember.set(memberId, (this.groupDmUnreadTotalByMember.get(memberId) || 0) + 1);
+					const increment = options?.joinEvent ? 2 : 1;
+					dm.unread[memberId] = (dm.unread[memberId] || 0) + increment;
+					this.groupDmUnreadTotalByMember.set(memberId, (this.groupDmUnreadTotalByMember.get(memberId) || 0) + increment);
 				}
 			}
 		}
 
+		if (requestKey) this.groupDmSendRequests.set(requestKey, { hash: options.requestHash, message: structuredClone(message) });
 		return this._serializeGroupDm(dm, senderId);
 	}
 
@@ -3063,20 +3298,32 @@ class InMemoryAdapter extends DatabaseAdapter {
 		return this.groupDmUnreadTotalByMember.get(Number(userId)) || 0;
 	}
 
-	async deleteGroupDm(dmId) {
+	async deleteGroupDm(dmId, expectedState = undefined) {
 		const normalizedDmId = Number(dmId);
 		const dm = this.groupDms.get(normalizedDmId);
 		if (!dm) return false;
+		if (expectedState && (String(dm.state_version ?? 0) !== String(expectedState.state_version) || Number(dm.host_id) !== Number(expectedState.host_id)
+			|| JSON.stringify(dm.member) !== JSON.stringify(expectedState.member)
+			|| JSON.stringify(dm.accepted ?? dm.member) !== JSON.stringify(expectedState.accepted))) return false;
 		this._removeGroupDmMemberIndexes(dm);
+		for (const key of this.groupDmSendRequests.keys()) {
+			if (JSON.parse(key)[0] === String(dmId)) this.groupDmSendRequests.delete(key);
+		}
 		return this.groupDms.delete(normalizedDmId);
 	}
 
-	async leaveGroupDm(dmId, userId) {
+	async leaveGroupDm(dmId, userId, expectedState = undefined) {
 		const dm = this.groupDms.get(Number(dmId));
 		if (!dm) return false;
+		if (expectedState && (String(dm.state_version ?? 0) !== String(expectedState.state_version) || Number(dm.host_id) !== Number(expectedState.host_id)
+			|| JSON.stringify(dm.member) !== JSON.stringify(expectedState.member)
+			|| JSON.stringify(dm.accepted ?? dm.member) !== JSON.stringify(expectedState.accepted))) return false;
+		if (!dm.member.map(Number).includes(Number(userId))) return false;
 		this._removeGroupDmMemberIndexes(dm);
-		dm.member = dm.member.filter((id) => id !== userId);
+		dm.member = dm.member.filter((id) => Number(id) !== Number(userId));
+		if (Array.isArray(dm.accepted)) dm.accepted = dm.accepted.filter((id) => Number(id) !== Number(userId));
 		if (dm.unread) delete dm.unread[userId];
+		dm.state_version = (dm.state_version ?? 0) + 1;
 		this._addGroupDmMemberIndexes(dm);
 		return true;
 	}
@@ -3727,7 +3974,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 		async getModerationAdminWorkloads(excludedAdminIds = []) {
 			const excluded = new Set((excludedAdminIds || []).map(Number));
 			return [...this.users.values()]
-				.filter((user) => Boolean(user.admin) && !user.freeze && !excluded.has(Number(user.id)))
+				.filter((user) => Boolean(user.admin) && !user.freeze && !user.admin_request_excluded && !excluded.has(Number(user.id)))
 				.map((user) => ({
 					adminId: Number(user.id),
 					activeCount: [...this.moderationReports.values()].filter((report) => (
@@ -3736,7 +3983,16 @@ class InMemoryAdapter extends DatabaseAdapter {
 				}));
 		}
 
+		async setAdminRequestExcluded(userId, excluded) {
+			const user = this.users.get(Number(userId));
+			if (!user || !user.admin) return null;
+			user.admin_request_excluded = excluded;
+			return user;
+		}
+
 		async assignModerationReport(reportId, assignment = {}) {
+			const admin = this.users.get(Number(assignment.adminId));
+			if (!admin || !admin.admin || admin.freeze || admin.admin_request_excluded) return null;
 			const report = this.moderationReports.get(Number(reportId));
 			if (!report || report.status === 'resolved') return null;
 			if (
@@ -4680,6 +4936,20 @@ class InMemoryAdapter extends DatabaseAdapter {
 			user.id = nextId;
 			user.handle = formatNyaitterId(nextId);
 			this.users.set(nextId, user);
+			for (const note of this.communityNotes.values()) if (Number(note.userId)===previousId) note.userId=nextId;
+			for (const map of [this.noteRatings,this.noteDistributions]) for (const [key,row] of [...map]) if (Number(row.userId)===previousId) {map.delete(key);row.userId=nextId;map.set(`${row.noteId}:${nextId}`,row);}
+			for (const [key,row] of [...this.noteRatingReasons]) if (Number(row.userId)===previousId) {this.noteRatingReasons.delete(key);row.userId=nextId;this.noteRatingReasons.set(`${row.noteId}:${nextId}:${row.code}`,row);}
+			if (this.reputationProfiles?.has(previousId)) {this.reputationProfiles.set(nextId,this.reputationProfiles.get(previousId));this.reputationProfiles.delete(previousId);}
+			if (this.noteSelectionKeys?.has(previousId)) {this.noteSelectionKeys.set(nextId,this.noteSelectionKeys.get(previousId));this.noteSelectionKeys.delete(previousId);}
+			if (this.noteCreationDaysByUser.has(previousId)) {this.noteCreationDaysByUser.set(nextId,this.noteCreationDaysByUser.get(previousId));this.noteCreationDaysByUser.delete(previousId);}
+			for (const index of [this.likedUserIdsByPost,this.starredUserIdsByPost,this.noteRatingUsersByNote,this.noteDistributionUsersByNote]) for (const ids of index.values()) if (ids.delete(previousId)) ids.add(nextId);
+			for (const [key,row] of [...(this.reputationDaily || [])]) if (key.startsWith(`${previousId}:`)) {this.reputationDaily.delete(key);this.reputationDaily.set(`${nextId}:${key.slice(String(previousId).length+1)}`,row);}
+			for (const [scope,events] of [...(this.reputationEvents || [])]) {
+				for (const e of events) if (e.userId===previousId) e.userId=nextId;
+				for (const prefix of ['manual-ban:','false-report-penalty:','moderation-user:']) if (scope===`${prefix}${previousId}${prefix==='moderation-user:'?':target':''}`) {this.reputationEvents.delete(scope);this.reputationEvents.set(`${prefix}${nextId}${prefix==='moderation-user:'?':target':''}`,events);}
+			}
+			for (const [key,claim] of [...(this.noteCreationClaims || [])]) if (claim.userId===previousId) {this.noteCreationClaims.delete(key);claim.userId=nextId;this.noteCreationClaims.set(`${key.split(':')[0]}:${nextId}`,claim);}
+			for (const [key,noteId] of [...(this.reviewerOutcomeClaims || [])]) {const [uid,author,...day]=key.split(':');if (Number(uid)===previousId || Number(author)===previousId) {this.reviewerOutcomeClaims.delete(key);this.reviewerOutcomeClaims.set(`${Number(uid)===previousId?nextId:uid}:${Number(author)===previousId?nextId:author}:${day.join(':')}`,noteId);}}
 			if (user.scid) this.scidToId.set(user.scid, nextId);
 			if (user.nyaitter_address) this.nyaitterAddressToId.set(user.nyaitter_address, nextId);
 
@@ -4755,9 +5025,13 @@ class InMemoryAdapter extends DatabaseAdapter {
 				});
 			}
 			for (const dm of this.groupDms.values()) {
+				const previousState = JSON.stringify([dm.host_id, dm.member, dm.accepted]);
 				this._removeGroupDmMemberIndexes(dm);
 				dm.host_id = Number(dm.host_id) === previousId ? nextId : Number(dm.host_id);
 				dm.member = (dm.member || []).map((id) => Number(id) === previousId ? nextId : Number(id));
+				if (Array.isArray(dm.accepted)) dm.accepted = dm.accepted.map((id) => Number(id) === previousId ? nextId : Number(id));
+				if (Array.isArray(dm.unread?._accepted)) dm.unread._accepted = dm.unread._accepted.map((id) => Number(id) === previousId ? nextId : Number(id));
+				if (previousState !== JSON.stringify([dm.host_id, dm.member, dm.accepted])) dm.state_version = (dm.state_version ?? 0) + 1;
 				dm.post = (dm.post || []).map((message) => (
 					Number(message?.userid) === previousId ? { ...message, userid: nextId } : message
 				));
@@ -4868,16 +5142,6 @@ class InMemoryAdapter extends DatabaseAdapter {
 				this.authorizedAppLookup.set(`${app.userId}:${app.appId}:${app.appTokenHash}`, id);
 			}
 
-			const updatedAffinities = new Map();
-			for (const [key, affinity] of this.userKeywordAffinities.entries()) {
-				if (Number(affinity.user_id) === previousId) {
-					affinity.user_id = nextId;
-					updatedAffinities.set(`${nextId}:${affinity.keyword}`, affinity);
-				} else {
-					updatedAffinities.set(key, affinity);
-				}
-			}
-			this.userKeywordAffinities = updatedAffinities;
 			if (this.userKeywordAffinityByUser.has(previousId)) {
 				const affinityMap = this.userKeywordAffinityByUser.get(previousId);
 				this.userKeywordAffinityByUser.delete(previousId);
@@ -4962,6 +5226,9 @@ class InMemoryAdapter extends DatabaseAdapter {
 			if (!(dm.member || []).map(Number).includes(normalizedUserId)) continue;
 			this._removeGroupDmMemberIndexes(dm);
 			dm.member = dm.member.map(Number).filter((id) => id !== normalizedUserId);
+			if (Array.isArray(dm.accepted)) dm.accepted = dm.accepted.filter((id) => Number(id) !== normalizedUserId);
+			if (Array.isArray(dm.unread?._accepted)) dm.unread._accepted = dm.unread._accepted.filter((id) => Number(id) !== normalizedUserId);
+			dm.state_version = (dm.state_version ?? 0) + 1;
 			dm.post = (dm.post || []).filter((message) => Number(message?.userid) !== normalizedUserId);
 			delete dm.unread?.[String(normalizedUserId)];
 			if (dm.member.length === 0) this.groupDms.delete(dmId);
@@ -4969,6 +5236,10 @@ class InMemoryAdapter extends DatabaseAdapter {
 				if (Number(dm.host_id) === normalizedUserId) dm.host_id = dm.member[0];
 				this._addGroupDmMemberIndexes(dm);
 			}
+		}
+		for (const key of this.groupDmSendRequests.keys()) {
+			const [dmId, senderId] = JSON.parse(key);
+			if (senderId === normalizedUserId || !this.groupDms.has(Number(dmId))) this.groupDmSendRequests.delete(key);
 		}
 
 		for (const key of [...this.follows.keys()]) {
@@ -5290,6 +5561,486 @@ class InMemoryAdapter extends DatabaseAdapter {
 		}
 		return Array.from(voters);
 	}
+	// ==================== Community Notes ====================
+
+	// 理由タグ定義は migration の seed を唯一の情報源とする。
+	_loadNoteReasonTagDefs() {
+		const defs = new Map();
+		try {
+			const fs = require('fs');
+			const path = require('path');
+			const migrationPath = path.join(__dirname, '../../migrations/034_community_notes_phase1.sql');
+			const sql = fs.readFileSync(migrationPath, 'utf8');
+			const start = sql.search(/INSERT\s+INTO\s+note_reason_tag_defs/i);
+			if (start === -1) return defs;
+			const end = sql.indexOf(';', start);
+			const insertSql = end === -1 ? sql.slice(start) : sql.slice(start, end);
+			const rowPattern = /\(\s*'((?:[^']|'')*)'\s*,\s*'((?:[^']|'')*)'\s*,\s*'((?:[^']|'')*)'\s*,\s*'((?:[^']|'')*)'\s*,\s*(\d+)\s*,\s*(TRUE|FALSE|1|0)\s*\)/gi;
+			let match;
+			while ((match = rowPattern.exec(insertSql)) !== null) {
+				const code = match[1].replace(/''/g, "'");
+				defs.set(code, {
+					code,
+					side: match[2].replace(/''/g, "'"),
+					label: match[3].replace(/''/g, "'"),
+					description: match[4].replace(/''/g, "'"),
+					sortOrder: Number(match[5]) || 0,
+					enabled: ['true', '1'].includes(match[6].toLowerCase()),
+				});
+			}
+		} catch (_) {
+			// 定義が読めない場合は空のままにする (評価理由は保存されない)。
+		}
+		return defs;
+	}
+
+	async listNoteReasonTagDefs({ side } = {}) {
+		let defs = [...this.noteReasonTagDefs.values()].filter((d) => d.enabled !== false);
+		if (side) defs = defs.filter((d) => d.side === String(side));
+		defs.sort((a, b) => (a.sortOrder - b.sortOrder) || a.code.localeCompare(b.code));
+		return defs.map((d) => ({
+			code: d.code,
+			side: d.side,
+			label: d.label,
+			description: d.description ?? null,
+			sortOrder: Number(d.sortOrder) || 0,
+		}));
+	}
+
+	async saveNoteRatingReasons({ noteId, userId, codes = [] } = {}) {
+		const nId = Number(noteId);
+		const uId = Number(userId);
+		const unique = [...new Set((Array.isArray(codes) ? codes : []).map((c) => String(c || '').trim()).filter(Boolean))];
+		const prefix = `${nId}:${uId}:`;
+		for (const key of [...this.noteRatingReasons.keys()]) {
+			if (String(key).startsWith(prefix)) this.noteRatingReasons.delete(key);
+		}
+		const createdAt = new Date();
+		for (const code of unique) {
+			this.noteRatingReasons.set(`${prefix}${code}`, { noteId: nId, userId: uId, code, createdAt });
+		}
+		return unique;
+	}
+
+	_normalizeCommunityNoteSources(sources) {
+		if (!Array.isArray(sources)) throw new Error('sources must be an array');
+		const out = [];
+		const seen = new Set();
+		for (const src of sources) {
+			const url = String(src?.url || src || '').trim();
+			const title = src?.title != null ? String(src.title).trim() : '';
+			if (!url) continue;
+			let parsed;
+			try { parsed = new URL(url); } catch (_) { continue; }
+			if (parsed.protocol !== 'https:') throw new Error('source URL must use https');
+			if (seen.has(url)) continue;
+			seen.add(url);
+			out.push({ url, title });
+		}
+		return out;
+	}
+
+	_getNoteRatingSummary(noteId, currentUserId = null) {
+		let helpfulCount = 0; let total = 0; let myRating = null;
+		for (const uid of this.noteRatingUsersByNote.get(Number(noteId)) || []) {
+			const r=this.noteRatings.get(`${Number(noteId)}:${uid}`);if (!r) continue;
+			total++;
+			if (r.helpful) helpfulCount++;
+			if (currentUserId != null && Number(r.userId) === Number(currentUserId)) myRating = Boolean(r.helpful);
+		}
+		return { helpfulCount, totalRatingCount: total, myRating };
+	}
+
+	_reasonTagsForNote(noteId) {
+		return this.communityNotes.get(Number(noteId))?.reasonTags || [];
+	}
+
+	_formatNote(note, summary, requestedUserId = null) {
+		if (!note) return null;
+		return {
+			id: Number(note.id),
+			postId: Number(note.postId),
+			distributionKey: note.distributionKey || `${note.postId}:${note.userId}`,
+			userId: Number(note.userId),
+			content: String(note.content || ''),
+			sources: Array.isArray(note.sources) ? note.sources : [],
+			status: String(note.status || 'limited'),
+			stage: Number(note.stage ?? note.tier ?? 1) || 1,
+			publishedAt: note.publishedAt instanceof Date ? note.publishedAt.toISOString() : (note.publishedAt ?? note.published_at ?? null),
+			createdAt: note.createdAt instanceof Date ? note.createdAt.toISOString() : (note.createdAt || null),
+			updatedAt: note.updatedAt instanceof Date ? note.updatedAt.toISOString() : (note.updatedAt || null),
+			helpfulCount: Number(summary?.helpfulCount || 0),
+			totalRatingCount: Number(summary?.totalRatingCount || 0),
+			myRating: summary?.myRating ?? null,
+			reasons: this._reasonTagsForNote(note.id),
+		};
+	}
+
+	async createNote({ postId, userId, content, sources = [], reasons = [], status = 'limited', dailyLimit = null, postLimit = 20 } = {}) {
+		if (dailyLimit !== null && (!Number.isInteger(dailyLimit) || dailyLimit < 1)) throw new Error('Invalid note daily limit');
+		this.noteCreationClaims ||= new Map();
+		const claimKey = `${Number(postId)}:${Number(userId)}`;
+		const today = new Date().toISOString().slice(0,10);
+		if (this.noteCreationClaims.has(claimKey)) throw Object.assign(new Error('同じ投稿には一度だけノートを作成できます'),{code:'NOTE_ALREADY_EXISTS',statusCode:409});
+		if (dailyLimit !== null && (this.noteCreationDaysByUser.get(Number(userId))?.get(today) || 0)>=dailyLimit) throw Object.assign(new Error('本日のノート作成上限に達しました'),{code:'NOTE_DAILY_LIMIT',statusCode:429});
+		if ((this.noteIdsByPost.get(Number(postId))?.size || 0)>=postLimit) throw Object.assign(new Error('この投稿のノート上限に達しました'),{code:'NOTE_POST_LIMIT',statusCode:429});
+		this.noteCreationClaims.set(claimKey,{userId:Number(userId),day:today});
+		if (!this.noteCreationDaysByUser.has(Number(userId))) this.noteCreationDaysByUser.set(Number(userId),new Map());
+		const days=this.noteCreationDaysByUser.get(Number(userId));days.set(today,(days.get(today)||0)+1);
+		const normSources = this._normalizeCommunityNoteSources(sources);
+		const id = this.nextCommunityNoteId++;
+		const note = {
+			id,
+			postId: Number(postId),
+			userId: Number(userId),
+			distributionKey: `${Number(postId)}:${Number(userId)}`,
+			reasonTags: [],
+			content: String(content || ''),
+			sources: normSources,
+			status: String(status || 'limited'),
+			stage: 1,
+			ratingVersion: 0,
+			publishedAt: null,
+			createdAt: new Date(),
+			updatedAt: new Date(),
+		};
+		this.communityNotes.set(id, note);
+		if (!this.noteIdsByPost.has(Number(postId))) this.noteIdsByPost.set(Number(postId),new Set());
+		this.noteIdsByPost.get(Number(postId)).add(id);
+		if (Array.isArray(reasons)) {
+			for (const r of reasons) {
+				const side = String(r?.side || '').trim();
+				const code = String(r?.code || r || '').trim();
+				if (!side || !code) continue;
+				const key = `${id}:${side}:${code}`;
+				this.noteReasonTags.set(key, { noteId: id, side, code });
+				note.reasonTags.push({side,code});
+			}
+		}
+		const summary = this._getNoteRatingSummary(id, userId);
+		return this._formatNote(note, summary, userId);
+	}
+
+	async getNote(noteId, currentUserId = null) {
+		const nId = Number(noteId);
+		const note = this.communityNotes.get(nId);
+		if (!note) return null;
+		const summary = this._getNoteRatingSummary(nId, currentUserId);
+		return this._formatNote(note, summary, currentUserId);
+	}
+
+	async listNotesByPost(postId, currentUserId = null) {
+		const pId = Number(postId);
+		const notes = [...(this.noteIdsByPost.get(pId) || [])].map(id=>this.communityNotes.get(id)).filter(Boolean);
+		notes.sort((a,b) => new Date(b.createdAt) - new Date(a.createdAt));
+		return notes.map(n => {
+			const summary = this._getNoteRatingSummary(n.id, currentUserId);
+			return this._formatNote(n, summary, currentUserId);
+		});
+	}
+
+	async countNotesByUserSince(userId, since) {
+		const uId = Number(userId);
+		const cutoff = new Date(since);
+		let cnt = 0;
+		for (const n of this.communityNotes.values()) {
+			if (Number(n.userId) !== uId) continue;
+			if (new Date(n.createdAt) >= cutoff) cnt++;
+		}
+		return cnt;
+	}
+
+	async rateNote({ noteId, userId, helpful, weight = 1, maxRatings = 200, relationManifest = null, expectedRatingVersion = null } = {}) {
+		const nId = Number(noteId);
+		const uId = Number(userId);
+		const key = `${nId}:${uId}`;
+		const existing = this.noteRatings.get(key);
+		const receipts=this.noteVoteAdmissions?.get(key) || [];
+		const latestReceipt=[...receipts].sort((a,b)=>b.revision-a.revision)[0];
+		const reacceptLegacy=Boolean(existing&&expectedRatingVersion!==null&&latestReceipt&&(latestReceipt.legacy||latestReceipt.authorized!==true));
+		const note = this.communityNotes.get(nId);
+		if (!note) throw new Error('Note not found');
+		if (expectedRatingVersion !== null && (note.ratingVersion || 0) !== expectedRatingVersion) { const error=new Error('投票状態が同時に変更されました');error.code='NOTE_VOTE_CONFLICT';throw error; }
+		if (expectedRatingVersion !== null) {
+			const post=this.posts.get(Number(note.postId));
+			const covered=new Set(relationManifest?.coveredUserIds || []);
+			if (relationManifest?.basis!=='admission-evidence'||relationManifest.complete!==true||!relationManifest.version||!relationManifest.evidenceRef||![uId,Number(note.userId),Number(post?.userId ?? post?.user_id)].every(id=>covered.has(id))) throw new Error('関係証跡が不完全です');
+		}
+		if (!existing && this._getNoteRatingSummary(nId).totalRatingCount >= maxRatings) throw new Error('評価受付上限に達しました');
+		if (!existing || existing.helpful !== Boolean(helpful) || reacceptLegacy) {
+			const admittedAt = new Date();
+			const savedWeight = existing?.weight ?? Math.min(1.5,Math.max(1,weight));
+			const revision = Math.max(0,...receipts.map(receipt=>receipt.revision))+1;
+			const row = { noteId: nId, userId: uId, helpful: Boolean(helpful), weight: savedWeight, revision, createdAt: existing?.createdAt ?? admittedAt, updatedAt: admittedAt };
+			this.noteRatings.set(key, row);
+			this.noteVoteAdmissions ||= new Map();
+			receipts.push({ noteId:nId, userId:uId, revision, admittedAt:admittedAt.toISOString(), authorized:Boolean(relationManifest&&expectedRatingVersion!==null), weight:savedWeight, evidenceRef:relationManifest&&expectedRatingVersion!==null?`note:${nId}:vote:${uId}:revision:${revision}`:null, relationManifest:relationManifest == null ? null : structuredClone(relationManifest), legacy:false });
+			this.noteVoteAdmissions.set(key, receipts);
+			note.ratingVersion = (note.ratingVersion || 0)+1;
+			if (!this.noteRatingUsersByNote.has(nId)) this.noteRatingUsersByNote.set(nId,new Set());
+			this.noteRatingUsersByNote.get(nId).add(uId);
+		}
+		return this.getRatingsSummary(nId, uId);
+	}
+
+	async getNoteVoteEvidence(noteId) {
+		const nId = Number(noteId);
+		const note=this.communityNotes.get(nId);if(!note)return null;
+		const admissions = [...(this.noteVoteAdmissions || new Map()).values()].flat().filter(row => row.noteId === nId);
+		const ratings = [...(this.noteRatingUsersByNote.get(nId) || [])].map(uid => {
+			const row=this.noteRatings.get(`${nId}:${uid}`);if(!row)return null;
+			const latest=admissions.filter(item=>item.userId===Number(uid)).sort((a,b)=>b.revision-a.revision)[0];
+			return {userId:Number(uid),helpful:row.helpful,weight:row.weight,revision:latest?.legacy?null:latest?.revision??null,castAt:latest?.legacy?null:latest?.admittedAt??null,createdAt:row.createdAt,updatedAt:row.updatedAt};
+		}).filter(Boolean);
+		return { version:note.ratingVersion||0,ratings, admissions: admissions.map(row => ({ ...row })) };
+	}
+
+	async getRatingsSummary(noteIdOrObj, userId = null) {
+		let noteId = noteIdOrObj;
+		let uid = userId;
+		if (noteIdOrObj && typeof noteIdOrObj === 'object') {
+			noteId = noteIdOrObj.noteId ?? noteIdOrObj.id;
+			uid = noteIdOrObj.userId ?? noteIdOrObj.user_id ?? uid;
+		}
+		const nId = Number(noteId);
+		const summary = this._getNoteRatingSummary(nId, uid);
+		return { helpfulCount: summary.helpfulCount, totalRatingCount: summary.totalRatingCount, myRating: summary.myRating };
+	}
+
+
+	async deleteNote(noteId) {
+		const nId = Number(noteId);
+		const note = this.communityNotes.get(nId);
+		if (!note) return false;
+		this.communityNotes.delete(nId);
+		this.noteIdsByPost.get(Number(note.postId))?.delete(nId);
+		this.noteRatingUsersByNote.delete(nId);
+		this.communityNotes.delete(String(nId));
+		for (const k of [...this.noteRatings.keys()]) {
+			if (Number(String(k).split(':')[0]) === nId) this.noteRatings.delete(k);
+		}
+		for (const k of [...this.noteReasonTags.keys()]) {
+			if (Number(String(k).split(':')[0]) === nId) this.noteReasonTags.delete(k);
+		}
+		for (const k of [...this.noteRatingReasons.keys()]) {
+			if (Number(String(k).split(':')[0]) === nId) this.noteRatingReasons.delete(k);
+		}
+		for (const k of [...this.noteDistributions.keys()]) {
+			if (Number(String(k).split(':')[0]) === nId) this.noteDistributions.delete(k);
+		}
+		this.noteDistributionUsersByNote.delete(nId);
+		if (this.noteVoteAdmissions) {
+			for (const k of [...this.noteVoteAdmissions.keys()]) {
+				if (Number(String(k).split(':')[0]) === nId) this.noteVoteAdmissions.delete(k);
+			}
+		}
+		return true;
+	}
+
+	// ===== Phase 2 helpers =====
+	async listEngagedUsersByPost(postId) {
+		const pId = Number(postId);
+		const result = new Set([...(this.likedUserIdsByPost.get(pId) || []),...(this.starredUserIdsByPost.get(pId) || []),...(this.repostsByPost.get(pId) || [])]);
+		for (const replyId of this.replyIdsByParent.get(pId) || []) {const reply=this.posts.get(Number(replyId));if (reply) result.add(Number(reply.userId ?? reply.user_id));}
+		return [...result].filter(Number.isSafeInteger);
+	}
+
+	async listEngagedUsersByPostPage(postId,{afterUserId=0,limit=500}={}) {
+		const pId=Number(postId),ids=new Set([...(this.likedUserIdsByPost.get(pId)||[]),...(this.starredUserIdsByPost.get(pId)||[]),...(this.repostsByPost.get(pId)||[])]);
+		for(const replyId of this.replyIdsByParent.get(pId)||[]){const reply=this.posts.get(Number(replyId));if(reply)ids.add(Number(reply.userId??reply.user_id));}
+		return [...ids].filter(Number.isSafeInteger).filter(id=>id>Number(afterUserId)).sort((a,b)=>a-b).slice(0,Math.min(500,Math.max(1,Number(limit)||500)));
+	}
+
+	async getUserFollows(userId) {
+		return [...(this.followingIdsByUser.get(Number(userId)) || new Set())];
+	}
+
+	async getNoteRelevanceContext(userIds,authorId) {
+		const ids=[...new Set([...userIds.map(Number),Number(authorId)])];const followingByUser=new Map(ids.map(id=>[id,[...(this.followingIdsByUser.get(id)||[])].map(Number)]));const sharedUserIds=new Set();
+		const membershipsByGroup=new Map();for(const membership of this.groupMemberships.values())if(membership.status==='active'){if(!membershipsByGroup.has(String(membership.groupId)))membershipsByGroup.set(String(membership.groupId),new Set());membershipsByGroup.get(String(membership.groupId)).add(Number(membership.userId));}
+		for(const members of membershipsByGroup.values())if(members.has(Number(authorId)))for(const id of userIds.map(Number))if(members.has(id))sharedUserIds.add(id);
+		for(const channel of this.dmChannels.values()){const members=new Set((channel.participants||[]).map(Number));if(members.has(Number(authorId)))for(const id of userIds.map(Number))if(members.has(id))sharedUserIds.add(id);}
+		for(const dm of this.groupDms.values()){const members=new Set((dm.member||[]).map(Number));if(members.has(Number(authorId)))for(const id of userIds.map(Number))if(members.has(id))sharedUserIds.add(id);}
+		const authorFollows=new Set(followingByUser.get(Number(authorId))||[]),relevanceByUser=new Map();
+		for(const id of userIds.map(Number)){const follows=new Set(followingByUser.get(id)||[]),union=new Set([...follows,...authorFollows]);relevanceByUser.set(id,(union.size?[...follows].filter(target=>authorFollows.has(target)).length/union.size:0)+(sharedUserIds.has(id)?0.2:0));}
+		return {users:ids.map(id=>this.users.get(id)).filter(Boolean),relevanceByUser,sharedUserIds};
+	}
+
+	async listGroupDmsForUser(userId) {
+		const dmIds = this.groupDmIdsByMember.get(Number(userId)) || new Set();
+		return [...dmIds].map(String);
+	}
+
+	async createNoteDistribution(data = {}) {
+		const noteId = Number(data.noteId ?? data.note_id);
+		const userId = Number(data.userId ?? data.user_id);
+		const key = `${noteId}:${userId}`;
+		const row = {
+			noteId,
+			userId,
+			tier: Number(data.tier ?? 1),
+			notified: Boolean(data.notified ?? false),
+			createdAt: data.createdAt ? new Date(data.createdAt) : new Date(),
+		};
+		this.noteDistributions.set(key, row);
+		if (!this.noteDistributionUsersByNote.has(noteId)) this.noteDistributionUsersByNote.set(noteId,new Set());
+		this.noteDistributionUsersByNote.get(noteId).add(userId);
+		return { ...row, createdAt: row.createdAt.toISOString() };
+	}
+
+	async getNoteDistribution(noteId, userId) {
+		const key = `${Number(noteId)}:${Number(userId)}`;
+		const row = this.noteDistributions.get(key);
+		if (!row) return null;
+		return { ...row, createdAt: row.createdAt instanceof Date ? row.createdAt.toISOString() : row.createdAt };
+	}
+
+	async getNoteDistributionStates(noteId,userIds) {
+		const ids=new Set(userIds.map(Number));return (await this.listNoteDistributionsByNote(noteId)).filter(row=>ids.has(Number(row.userId)));
+	}
+
+	async listNoteDistributionsByNote(noteId) {
+		const nId = Number(noteId);
+		const out = [];
+		for (const uid of this.noteDistributionUsersByNote.get(nId) || []) {
+			const row=this.noteDistributions.get(`${nId}:${uid}`);
+			if (row) out.push({ ...row, createdAt: row.createdAt instanceof Date ? row.createdAt.toISOString() : row.createdAt });
+		}
+		return out;
+	}
+
+	async listNoteDistributionsByUser(userId) {
+		const uId = Number(userId);
+		const out = [];
+		for (const row of this.noteDistributions.values()) {
+			if (Number(row.userId) === uId) out.push({ ...row, createdAt: row.createdAt instanceof Date ? row.createdAt.toISOString() : row.createdAt });
+		}
+		return out;
+	}
+
+	async updateNoteDistribution(noteId, userId, fields = {}) {
+		const key = `${Number(noteId)}:${Number(userId)}`;
+		const row = this.noteDistributions.get(key);
+		if (!row) return null;
+		if (fields.tier != null) row.tier = Number(fields.tier);
+		if (fields.notified != null) row.notified = Boolean(fields.notified);
+		this.noteDistributions.set(key, row);
+		return { ...row, createdAt: row.createdAt instanceof Date ? row.createdAt.toISOString() : row.createdAt };
+	}
+
+	async upsertNoteDistribution(data = {}) {
+		const noteId = Number(data.noteId ?? data.note_id);
+		const userId = Number(data.userId ?? data.user_id);
+		const key = `${noteId}:${userId}`;
+		const existing = this.noteDistributions.get(key);
+		const row = existing || {
+			noteId, userId, createdAt: new Date(),
+			tier: Number(data.tier ?? 1),
+			notified: Boolean(data.notified ?? false),
+		};
+		if (data.tier != null) row.tier = Number(data.tier);
+		if (data.notified != null) row.notified = Boolean(data.notified);
+		this.noteDistributions.set(key, row);
+		if (!this.noteDistributionUsersByNote.has(noteId)) this.noteDistributionUsersByNote.set(noteId,new Set());
+		this.noteDistributionUsersByNote.get(noteId).add(userId);
+		return { ...row, createdAt: row.createdAt instanceof Date ? row.createdAt.toISOString() : row.createdAt };
+	}
+
+	async upsertNoteDistributions(rows=[]) {
+		const output=[];for(const data of rows){const noteId=Number(data.noteId??data.note_id),userId=Number(data.userId??data.user_id),key=`${noteId}:${userId}`;const existing=this.noteDistributions.get(key);const row=existing||{noteId,userId,createdAt:new Date(),tier:Number(data.tier??1),notified:Boolean(data.notified??false)};if(data.tier!=null)row.tier=Number(data.tier);if(data.notified!=null)row.notified=Boolean(data.notified);this.noteDistributions.set(key,row);if(!this.noteDistributionUsersByNote.has(noteId))this.noteDistributionUsersByNote.set(noteId,new Set());this.noteDistributionUsersByNote.get(noteId).add(userId);output.push({...row,createdAt:row.createdAt instanceof Date?row.createdAt.toISOString():row.createdAt});}return output;
+	}
+
+	async deleteNoteDistribution(noteId, userId = null) {
+		if (userId == null) {
+			const nId = Number(noteId);
+			this.noteDistributionUsersByNote.delete(nId);
+			for (const k of [...this.noteDistributions.keys()]) {
+				if (Number(String(k).split(':')[0]) === nId) this.noteDistributions.delete(k);
+			}
+			return true;
+		}
+		this.noteDistributions.delete(`${Number(noteId)}:${Number(userId)}`);
+		this.noteDistributionUsersByNote.get(Number(noteId))?.delete(Number(userId));
+		return true;
+	}
+
+	async updateNote(noteId, fields = {}) {
+		const note = this.communityNotes.get(Number(noteId));
+		if (!note) return null;
+		if (fields.status != null) note.status = String(fields.status);
+		if (fields.stage != null) note.stage = Number(fields.stage);
+		if (fields.publishedAt != null || fields.published_at != null) {
+			const v = fields.publishedAt ?? fields.published_at;
+			note.publishedAt = v ? new Date(v) : null;
+		}
+		if (fields.tier != null) note.tier = Number(fields.tier);
+		note.updatedAt = new Date();
+		this.communityNotes.set(note.id, note);
+		const summary = this._getNoteRatingSummary(note.id);
+		return this._formatNote(note, summary);
+	}
+
+	// Shared group / DM membership helpers (Phase 2)
+	async getSharedGroupCount(userId1, userId2) {
+		const u1 = Number(userId1);
+		const u2 = Number(userId2);
+		const groups1 = new Set();
+		for (const membership of this.groupMemberships.values()) {
+			const uid = Number(membership?.userId ?? membership?.user_id);
+			const status = String(membership?.status ?? 'active');
+			if (uid === u1 && status === 'active') groups1.add(String(membership.groupId ?? membership.group_id));
+		}
+		let count = 0;
+		for (const membership of this.groupMemberships.values()) {
+			const uid = Number(membership?.userId ?? membership?.user_id);
+			const status = String(membership?.status ?? 'active');
+			const gid = String(membership.groupId ?? membership.group_id);
+			if (uid === u2 && status === 'active' && groups1.has(gid)) count++;
+		}
+		return count;
+	}
+
+	async getSharedDmCount(userId1, userId2) {
+		const u1 = Number(userId1);
+		const u2 = Number(userId2);
+		let count = 0;
+		for (const channel of this.dmChannels.values()) {
+			const participants = Array.isArray(channel?.participants) ? channel.participants.map(Number) : [];
+			if (participants.includes(u1) && participants.includes(u2)) count++;
+		}
+		for (const dm of this.groupDms.values()) {
+			const members = Array.isArray(dm?.member) ? dm.member.map(Number) : [];
+			if (members.includes(u1) && members.includes(u2)) count++;
+		}
+		return count;
+	}
+
+	async getSharedGroupMembership(userId1, userId2) {
+		const groups = await this.getSharedGroupCount(userId1, userId2);
+		const dms = await this.getSharedDmCount(userId1, userId2);
+		const bonus = (groups > 0 || dms > 0) ? 0.2 : 0;
+		return { groups, dms, total: groups + dms, bonus };
+	}
+
+	async sharedGroupCount(...args) { return this.getSharedGroupCount(...args); }
+	async sharedGroupMembership(...args) { return this.getSharedGroupMembership(...args); }
+	async hasSharedGroupMembership(userId1, userId2) {
+		return (await this.getSharedGroupCount(userId1, userId2)) > 0;
+	}
+
+	async updatePostRecommendationPenalty(postId, delta = 0.1, max = 1) {
+		const post = this.posts.get(Number(postId));
+		if (!post) return false;
+		const current = Number(post.recommendation_penalty ?? post.recommendationPenalty ?? 0) || 0;
+		const next = Math.min(Number(max) || 1, Math.max(0, current + (Number(delta) || 0)));
+		post.recommendation_penalty = next;
+		post.recommendationPenalty = next;
+		return true;
+	}
+	async incrementPostRecommendationPenalty(...args) { return this.updatePostRecommendationPenalty(...args); }
+	async addPostRecommendationPenalty(...args) { return this.updatePostRecommendationPenalty(...args); }
+
 }
 
+require('./reputation').installMemory(InMemoryAdapter);
 module.exports = InMemoryAdapter;

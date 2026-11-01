@@ -46,6 +46,7 @@ const {
     applyTrustProxy,
     requestLogger,
     httpCompression,
+    compressedStatic,
 } = require('./middleware/system');
 const { createRateLimiter, generalLimiter, authLimiter } = require('./middleware/rateLimit');
 const healthLimiter = createRateLimiter({ windowMs: 60 * 1000, max: 120 });
@@ -61,6 +62,7 @@ const { startScheduledPostPublisher } = require('./services/ScheduledPostPublish
 const { AccountRecoveryService } = require('./services/auth/AccountRecoveryService');
 const { startAccountRecoveryScheduler } = require('./services/AccountRecoveryScheduler');
 const PostActionQueue = require('./services/PostActionQueue');
+const ReadOnlyRequestQueue = require('./services/ReadOnlyRequestQueue');
 const PostEventOutbox = require('./services/PostEventOutbox');
 const PostKeywordBackfillService = require('./services/PostKeywordBackfillService');
 const { getPublicUrl, getFrontendUrl, getShareUrl } = require('./utils/nyaitterAddress');
@@ -130,7 +132,70 @@ const userFilesStaticOptions = {
 
 // 通常ポートのユーザーファイル配信は、同名のAPIアップロード操作ルートより先に登録する。
 // express.staticはGET/HEAD以外を通過させるため、POST /<api>/uploadsはAPIルートが処理する。
+
+// Timeline payloads reference uploaded user icons by their file URL, which
+// bypasses the /users/:id/icon endpoint. Serve the same kind of resized
+// variant (cap 512px, original file untouched) for the icons/ subpath so
+// avatar-heavy pages do not download multi-megabyte originals. Anything
+// that is not a resizable still image (GIF/SVG/small/animated) falls
+// through to the static handler and is served exactly as before.
+const iconUploadVariantCache = new Map();
+let iconUploadVariantBytes = 0;
+const ICON_UPLOAD_CACHE_LIMIT = 24 * 1024 * 1024;
+const ICON_UPLOAD_TYPES = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.avif': 'image/avif' };
+
+async function resizedIconUpload(req, res, next) {
+    if (req.method !== 'GET' && req.method !== 'HEAD') return next();
+    const rel = String(req.path || '').replace(/^\/+/, '');
+    if (!rel.startsWith('icons/')) return next();
+    const contentType = ICON_UPLOAD_TYPES[path.extname(rel).toLowerCase()];
+    if (!contentType) return next();
+    const filePath = path.resolve(uploadsDir, rel);
+    if (!filePath.startsWith(path.resolve(uploadsDir) + path.sep)) return next();
+    try {
+        const stat = await fs.promises.stat(filePath);
+        if (!stat.isFile()) return next();
+        const cacheKey = `${rel}|${stat.size}|${Math.round(stat.mtimeMs)}`;
+        let entry = iconUploadVariantCache.get(cacheKey);
+        if (!entry) {
+            const buffer = await fs.promises.readFile(filePath);
+            const sharp = require('sharp');
+            const metadata = await sharp(buffer).metadata();
+            if (!metadata.width || !metadata.height) return next();
+            if (metadata.width <= 512 && metadata.height <= 512) return next();
+            if ((metadata.pages || 1) > 1) return next();
+            let pipeline = sharp(buffer).resize({ width: 512, height: 512, fit: 'inside', withoutEnlargement: true });
+            if (contentType === 'image/jpeg') pipeline = pipeline.jpeg({ quality: 85 });
+            else if (contentType === 'image/webp') pipeline = pipeline.webp({ quality: 85 });
+            else if (contentType === 'image/avif') pipeline = pipeline.avif({ quality: 70 });
+            const variant = await pipeline.toBuffer();
+            if (!variant || variant.length >= buffer.length) return next();
+            entry = { buffer: variant };
+            iconUploadVariantCache.set(cacheKey, entry);
+            iconUploadVariantBytes += variant.length;
+            while (iconUploadVariantBytes > ICON_UPLOAD_CACHE_LIMIT && iconUploadVariantCache.size > 1) {
+                const oldestKey = iconUploadVariantCache.keys().next().value;
+                const oldest = iconUploadVariantCache.get(oldestKey);
+                iconUploadVariantCache.delete(oldestKey);
+                if (oldest) iconUploadVariantBytes -= oldest.buffer.length;
+            }
+        }
+        const etag = `"iconup-${require('crypto').createHash('sha256').update(entry.buffer).digest('hex').slice(0, 24)}"`;
+        res.setHeader('Cache-Control', 'public, max-age=86400');
+        res.setHeader('Content-Type', contentType);
+        res.setHeader('ETag', etag);
+        if (req.headers['if-none-match'] === etag) {
+            res.status(304).end();
+            return;
+        }
+        res.send(entry.buffer);
+    } catch (error) {
+        return next();
+    }
+}
+
 if (userFilesEndpoint && !userFilesPort) {
+    app.use(userFilesEndpoint, resizedIconUpload);
     app.use(userFilesEndpoint, express.static(uploadsDir, userFilesStaticOptions));
 }
 
@@ -168,7 +233,10 @@ const healthPaths = new Set([apiPath('/health'), apiPath('/ready')]);
 app.use(API_ENDPOINT, (req, res, next) => {
     const requestPath = String(req.originalUrl || req.url || '').split('?', 1)[0].replace(/\/+$/, '') || '/';
     if (healthPaths.has(requestPath)) return next();
-    return generalLimiter(req, res, next);
+    return generalLimiter(req, res, next).catch((error) => {
+        console.error('[rateLimit] general limiter error:', error.message);
+        if (!res.headersSent) res.status(500).json({ error: 'Internal Server Error' });
+    });
 });
 // Bound deep OFFSET requests before they reach SQL-backed listing routes.
 app.use(API_ENDPOINT, rejectExcessiveOffset);
@@ -392,6 +460,12 @@ realtimeServer.on('connection', (webSocket, _request, principal) => {
         realtimeQueue = realtimeQueue.then(async () => {
             try {
                 if (webSocket.readyState !== 1) return;
+                const { enforceRealtimeAccess } = require('./utils/featureAccess');
+                if (!await enforceRealtimeAccess(app.locals.dbAdapter, principal, message, config.reputation)) {
+                    calls.disconnect(webSocket);
+                    webSocket.send(JSON.stringify({ type: message.type?.startsWith('call:') ? 'call:error' : 'space:error', request_id: message.request_id, message: '現在のアカウント状態ではこの機能を利用できません' }));
+                    return;
+                }
                 await calls.handle(webSocket, principal.guest ? userId : Number(userId), message, principal.guestStageId || null);
                 if (!principal.guest && webSocket.readyState === 1) {
                     await handleRealtimeSpaceMessage(webSocket, userId, message);
@@ -455,6 +529,7 @@ const restRoutes = [
     ['', require('./routes/status')],
     ['posts', require('./routes/posts')],
     ['polls', require('./routes/polls')],
+    ['', require('./routes/notes')],
     ['uploads', require('./routes/uploads')],
     ['url-cards', require('./routes/urlCards')],
     ['ranking', require('./routes/ranking')],
@@ -521,7 +596,16 @@ if (hasStaticPage) {
         // index.html を読めない場合はテンプレート無しで起動する。
     }
 }
-const postPageHtmlTemplate = indexHtmlTemplate?.replace(
+function configurePageCsp(template) {
+    const csp = require('./middleware/auth').buildContentSecurityPolicy();
+    const escapedCsp = csp.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+    const pattern = /<meta\b(?=[^>]*\bhttp-equiv\s*=\s*(["'])Content-Security-Policy\1)[^>]*>/i;
+    const meta = `<meta http-equiv="Content-Security-Policy" content="${escapedCsp}">`;
+    return pattern.test(template) ? template.replace(pattern, meta)
+        : template.replace(/<head(?:\s[^>]*)?>/i, (head) => `${head}${meta}`);
+}
+const configuredIndexHtmlTemplate = indexHtmlTemplate && configurePageCsp(indexHtmlTemplate);
+const postPageHtmlTemplate = configuredIndexHtmlTemplate?.replace(
     /<head(?:\s[^>]*)?>/i,
     (match) => `${match}<base href="/">`,
 );
@@ -540,13 +624,41 @@ const nyaitterUiDir = nyaitterUiDirCandidates.find((dir) => {
         return false;
     }
 });
+// Static cache policy shared by express.static and the compressed static
+// middleware. JS/CSS get the configured short TTL (the Service Worker and the
+// client_version update check still guarantee freshness), binary assets get
+// the configured long TTL, and documents/manifests keep revalidation so app
+// updates and the service worker itself are never stuck behind a stale copy.
+function staticCacheHeaders(res, filePath) {
+    if (filePath.endsWith('/sw.js') || filePath.endsWith('\\sw.js')) {
+        res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+        return;
+    }
+    if (filePath.endsWith('.webmanifest')) {
+        res.setHeader('Content-Type', 'application/manifest+json; charset=utf-8');
+        res.setHeader('Cache-Control', 'public, max-age=0, must-revalidate');
+        return;
+    }
+    const ext = path.extname(filePath).toLowerCase();
+    if (ext === '.js' || ext === '.mjs' || ext === '.css') {
+        res.setHeader('Cache-Control', `public, max-age=${config.static.jsCssCacheMaxAge}`);
+        return;
+    }
+    if (['.png', '.jpg', '.jpeg', '.gif', '.webp', '.avif', '.svg', '.ico', '.woff', '.woff2', '.ttf', '.otf'].includes(ext)) {
+        res.setHeader('Cache-Control', `public, max-age=${config.static.assetCacheMaxAge}`);
+        return;
+    }
+    res.setHeader('Cache-Control', 'public, max-age=0, must-revalidate');
+}
+
 if (nyaitterUiDir) {
+    app.use('/nyaitter-ui', compressedStatic(nyaitterUiDir, staticCacheHeaders));
     app.use(
         '/nyaitter-ui',
         express.static(nyaitterUiDir, {
             etag: true,
             lastModified: true,
-            setHeaders: (res) => res.setHeader('Cache-Control', 'public, max-age=0, must-revalidate'),
+            setHeaders: staticCacheHeaders,
         }),
     );
     console.info('[server] nyaitter-ui served from', nyaitterUiDir);
@@ -554,6 +666,11 @@ if (nyaitterUiDir) {
 
 if (hasStaticPage) {
     const indexRedirects = new Set(['/index', '/index.html', '/page/index', '/page/index.html', '/page', '/page/']);
+
+    app.get('/', (req, res, next) => {
+        if (!indexHtmlTemplate) return next();
+        res.type('html').send(configuredIndexHtmlTemplate);
+    });
 
     app.use((req, res, next) => {
         if (req.method !== 'GET' && req.method !== 'HEAD') {
@@ -705,22 +822,14 @@ if (hasStaticPage) {
         next();
     });
 
+    app.use(compressedStatic(pageDir, staticCacheHeaders));
     app.use(
         express.static(pageDir, {
             index: 'index.html',
             extensions: ['html'],
             etag: true,
             lastModified: true,
-            setHeaders: (res, filePath) => {
-                if (filePath.endsWith('/sw.js') || filePath.endsWith('\\sw.js')) {
-                    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-                    return;
-                }
-                if (filePath.endsWith('.webmanifest')) {
-                    res.setHeader('Content-Type', 'application/manifest+json; charset=utf-8');
-                }
-                res.setHeader('Cache-Control', 'public, max-age=0, must-revalidate');
-            },
+            setHeaders: staticCacheHeaders,
         }),
     );
 } else {
@@ -732,6 +841,7 @@ if (hasStaticPage) {
 if (userFilesEndpoint && userFilesPort) {
     const userFilesApp = express();
     userFilesApp.disable('x-powered-by');
+    userFilesApp.use(userFilesEndpoint, resizedIconUpload);
     userFilesApp.use(userFilesEndpoint, express.static(uploadsDir, userFilesStaticOptions));
     userFilesServer = http.createServer(userFilesApp);
 }
@@ -799,6 +909,7 @@ const autoModerationService = new AutoModerationService({
 });
 const postActionQueue = new PostActionQueue();
 const postKeywordBackfillQueue = new PostActionQueue({ maxPendingJobs: 2000 });
+const readOnlyRequestQueue = new ReadOnlyRequestQueue({ concurrency: 5, maxPending: 100, maxWaitMs: 15000 });
 const postKeywordBackfillService = new PostKeywordBackfillService({ postActionQueue: postKeywordBackfillQueue });
 dbAdapter.postKeywordBackfillService = postKeywordBackfillService;
 postEventOutbox = new PostEventOutbox({
@@ -812,6 +923,7 @@ app.locals.pushNotificationService = pushNotificationService;
 app.locals.moderationReportService = moderationReportService;
 app.locals.autoModerationService = autoModerationService;
 app.locals.postActionQueue = postActionQueue;
+app.locals.readOnlyRequestQueue = readOnlyRequestQueue;
 app.locals.postKeywordBackfillQueue = postKeywordBackfillQueue;
 app.locals.postKeywordBackfillService = postKeywordBackfillService;
 
@@ -939,6 +1051,7 @@ async function shutdown(signal) {
         postKeywordBackfillService.stop();
         postKeywordBackfillQueue.stop();
         postActionQueue.stop();
+        readOnlyRequestQueue.stop();
         postEventOutbox?.stop();
         realtimeConnections.closeAll();
         console.log('[server] Graceful shutdown complete. Exiting.');

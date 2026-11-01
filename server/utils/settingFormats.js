@@ -1,23 +1,23 @@
 'use strict';
 
-function parseIntegerRange(value, { minimum = 0 } = {}) {
+function parseIntegerRange(value, { minimum = 0, maximum = Infinity } = {}) {
   const candidate = String(value ?? '').trim();
   if (!candidate) return null;
 
-  if (/^\d+$/.test(candidate)) {
+  if (/^-?\d+$/.test(candidate)) {
     const exact = Number(candidate);
-    if (!Number.isSafeInteger(exact) || exact < minimum) return null;
+    if (!Number.isSafeInteger(exact) || exact < minimum || exact > maximum) return null;
     return { min: exact, max: exact };
   }
 
-  const match = candidate.match(/^(\d+)?\.\.(\d+)?$/);
+  const match = candidate.match(/^(-?\d+)?\.\.(-?\d+)?$/);
   if (!match || (!match[1] && !match[2])) return null;
 
   const min = match[1] === undefined ? null : Number(match[1]);
   const max = match[2] === undefined ? null : Number(match[2]);
   if (
-    (min !== null && (!Number.isSafeInteger(min) || min < minimum)) ||
-    (max !== null && (!Number.isSafeInteger(max) || max < minimum)) ||
+    (min !== null && (!Number.isSafeInteger(min) || min < minimum || min > maximum)) ||
+    (max !== null && (!Number.isSafeInteger(max) || max < minimum || max > maximum)) ||
     (min !== null && max !== null && min > max)
   ) {
     return null;

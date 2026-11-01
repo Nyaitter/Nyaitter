@@ -5,19 +5,22 @@ const BotTokenManager = require('../services/auth/BotTokenManager');
 const NyaitterAuthManager = require('../services/auth/NyaitterAuthManager');
 const config = require('../config');
 
-function buildContentSecurityPolicy() {
+function buildContentSecurityPolicy(advertisingOrigins = config.security?.advertisingOrigins || {}, clientAssetOrigins = config.security?.clientAssetOrigins || []) {
+  const sourceList = (name) => (advertisingOrigins[name] || []).join(' ');
+  const clientSources = clientAssetOrigins.length ? ` ${clientAssetOrigins.join(' ')}` : '';
   const csp = [
     "default-src 'self'",
     "base-uri 'self'",
     "object-src 'none'",
     "frame-ancestors 'self'",
     "form-action 'self'",
-    "script-src 'self' https://cdn.jsdelivr.net https://challenges.cloudflare.com",
-    "frame-src 'self' https://challenges.cloudflare.com",
-    "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com",
-    "img-src 'self' data: https:",
+    `script-src 'self' https://cdn.jsdelivr.net https://challenges.cloudflare.com${clientSources}${sourceList('script') ? ` ${sourceList('script')}` : ''}`,
+    `frame-src 'self' https://challenges.cloudflare.com${sourceList('frame') ? ` ${sourceList('frame')}` : ''}`,
+    `style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com${clientSources}`,
+    `img-src 'self' data: https:${sourceList('img') ? ` ${sourceList('img')}` : ''}`,
+    "media-src 'self' data: blob: https:",
     "font-src 'self' data: https://fonts.gstatic.com",
-    "connect-src 'self' https: wss:",
+    `connect-src 'self' https: wss:${sourceList('connect') ? ` ${sourceList('connect')}` : ''}`,
     "worker-src 'self'",
     "manifest-src 'self'",
   ];
@@ -69,86 +72,16 @@ function extractToken(req) {
   return cookies.nyaitter_session || cookies.session || null;
 }
 
-const SESSION_CACHE_TTL_MS = 120000; // 2 minutes TTL
-const MAX_SESSION_CACHE_ENTRIES = 2000;
-const sessionPrincipalCache = new Map(); // tokenHash -> { principal, user, expiresAt }
-const sessionPrincipalInflight = new Map(); // tokenHash -> Promise<user|null>
-
-function pruneSessionPrincipalCache(now = Date.now()) {
-  for (const [key, entry] of sessionPrincipalCache) {
-    if (!entry || entry.expiresAt <= now) {
-      sessionPrincipalCache.delete(key);
-    }
-  }
-  while (sessionPrincipalCache.size > MAX_SESSION_CACHE_ENTRIES) {
-    const oldestKey = sessionPrincipalCache.keys().next().value;
-    if (oldestKey === undefined) break;
-    sessionPrincipalCache.delete(oldestKey);
-  }
-}
-
-const sessionCachePruner = setInterval(() => {
-  pruneSessionPrincipalCache();
-}, 30000);
-sessionCachePruner.unref();
-
-function invalidateSessionPrincipalCache(tokenHashOrUserId = null) {
-  if (!tokenHashOrUserId) {
-    sessionPrincipalCache.clear();
-    return;
-  }
-  if (typeof tokenHashOrUserId === 'string') {
-    sessionPrincipalCache.delete(tokenHashOrUserId);
-    return;
-  }
-  const userId = Number(tokenHashOrUserId);
-  if (Number.isInteger(userId)) {
-    for (const [key, entry] of sessionPrincipalCache) {
-      if (entry?.principal?.id === userId) {
-        sessionPrincipalCache.delete(key);
-      }
-    }
-  }
-}
-
-SessionManager.onInvalidate(invalidateSessionPrincipalCache);
-
 async function getSessionPrincipal(req, token) {
   const tokenHash = SessionManager.hashToken(token);
-  const now = Date.now();
-  const cached = sessionPrincipalCache.get(tokenHash);
-  if (cached && cached.expiresAt > now) {
-    const principal = { ...cached.principal };
-    Object.defineProperty(principal, 'visibilityUser', {
-      value: cached.user,
-      enumerable: false,
-    });
-    return principal;
-  }
-
   const db = req.app.locals.dbAdapter;
-  let lookup = sessionPrincipalInflight.get(tokenHash);
-  if (!lookup) {
-    lookup = (async () => {
-      if (typeof db.getUserBySessionToken === 'function') {
-        return db.getUserBySessionToken(tokenHash);
-      }
-      const sessionManager = new SessionManager({ dbAdapter: db });
-      const sessionInfo = await sessionManager.validateToken(token);
+  const user = typeof db.getUserBySessionToken === 'function'
+    ? await db.getUserBySessionToken(tokenHash)
+    : await (async () => {
+      const sessionInfo = await new SessionManager({ dbAdapter: db }).validateToken(token);
       return sessionInfo ? db.getUserById(sessionInfo.userId) : null;
     })();
-    sessionPrincipalInflight.set(tokenHash, lookup);
-  }
-  let user;
-  try {
-    user = await lookup;
-  } finally {
-    if (sessionPrincipalInflight.get(tokenHash) === lookup) {
-      sessionPrincipalInflight.delete(tokenHash);
-    }
-  }
   if (!user) {
-    sessionPrincipalCache.delete(tokenHash);
     return null;
   }
 
@@ -162,21 +95,21 @@ async function getSessionPrincipal(req, token) {
     accountOperation: user.account_operation || null,
   };
 
-  pruneSessionPrincipalCache(now);
-  sessionPrincipalCache.set(tokenHash, {
-    principal,
-    user,
-    expiresAt: now + SESSION_CACHE_TTL_MS,
-  });
-
   Object.defineProperty(principal, 'visibilityUser', {
     value: user,
     enumerable: false,
+    writable: true,
   });
   return principal;
 }
 
 async function getAuthenticatedPrincipal(req) {
+  if (req._principalPromise) return req._principalPromise;
+  req._principalPromise = resolveAuthenticatedPrincipal(req);
+  return req._principalPromise;
+}
+
+async function resolveAuthenticatedPrincipal(req) {
   const token = extractToken(req);
   if (!token) return null;
 
@@ -200,6 +133,7 @@ async function getAuthenticatedPrincipal(req) {
       Object.defineProperty(principal, 'visibilityUser', {
         value: owner,
         enumerable: false,
+        writable: true,
       });
       return principal;
     }
@@ -227,6 +161,7 @@ async function getAuthenticatedPrincipal(req) {
       Object.defineProperty(principal, 'visibilityUser', {
         value: owner,
         enumerable: false,
+        writable: true,
       });
       return principal;
     }
@@ -244,7 +179,14 @@ async function requireAuthAllowFrozen(req, res, next) {
         message: 'この操作にはログインが必要です。',
       });
     }
+    const user = await req.app.locals.dbAdapter.getUserById(principal.id, { fresh: true });
+    if (!user) return res.status(401).json({ error: 'Authentication required' });
+    principal.admin = principal.admin === true && user.admin === true;
+    principal.frozen = Boolean(user.freeze);
+    principal.accountOperation = user.account_operation || null;
+    principal.visibilityUser = user;
     req.user = principal;
+    if (!await require('../services/ReputationService').enforceAccess(req,res,principal)) return;
     return next();
   } catch (error) {
     console.error('[auth] requireAuthAllowFrozen error:', error);
@@ -261,6 +203,12 @@ async function requireAuth(req, res, next) {
         message: 'この操作にはログインが必要です。',
       });
     }
+    const user = await req.app.locals.dbAdapter.getUserById(principal.id, { fresh: true });
+    if (!user) return res.status(401).json({ error: 'Authentication required' });
+    principal.admin = principal.admin === true && user.admin === true;
+    principal.frozen = Boolean(user.freeze);
+    principal.accountOperation = user.account_operation || null;
+    principal.visibilityUser = user;
     if (principal.frozen) {
       return res.status(403).json({
         error: 'Account frozen',
@@ -274,6 +222,7 @@ async function requireAuth(req, res, next) {
       });
     }
     req.user = principal;
+    if (!await require('../services/ReputationService').enforceAccess(req,res,principal)) return;
     return next();
   } catch (error) {
     console.error('[auth] requireAuth error:', error);
@@ -422,5 +371,5 @@ module.exports = {
   extractToken,
   isSameOriginRequest,
   isCorsOriginAllowed,
-  invalidateSessionPrincipalCache,
+  buildContentSecurityPolicy,
 };

@@ -1,6 +1,7 @@
 const { resolvePostSearchQuery } = require('../utils/postSearchQuery');
 const express = require('express');
 const PostService = require('../services/PostService');
+const { assertAuthenticatedUserAccess } = require('../services/auth/PostAsUserService');
 const { applyUserReactionsToPayload } = require('../utils/UserReactionCache');
 const { extractPostKeywords } = require('../services/PostKeywordService');
 const { extractViewContent } = require('../utils/viewContent');
@@ -37,6 +38,7 @@ const {
 	processEditPostAction,
 } = require('../services/PostActionProcessor');
 const timelineCacheManager = require('../utils/TimelineCacheManager');
+const { distributeTimeline } = require('../services/CommunityNoteService');
 const path = require('path');
 const fs = require('fs');
 const { isCrawler, generatePostOgpTags, generatePostHtml } = require('../services/OgpService');
@@ -388,7 +390,7 @@ router.post({
 			repostTo: normalizedRepostTo,
 			replyControl: normalizedReplyControl,
 			postAsUserId: post_as_user_id,
-		}));
+		}), req.trustPolicy);
 		return res.status(202).json({ success: true, queued: true, action_id: actionId });
 	} catch (error) {
 		return res.status(error.statusCode || 503).json({ error: error.message });
@@ -444,6 +446,7 @@ router.get({
 		if (!req.user) {
 			res.set('Cache-Control', 'public, max-age=10, stale-while-revalidate=30');
 		}
+		await distributeTimeline(db,enriched.map(p=>Number(p.id)),currentUserId);
 		res.json({
 			posts: enriched,
 			has_more: !!has_more,
@@ -521,52 +524,72 @@ router.get({
 		return res.json({ posts: [], has_next: false });
 	}
 
-		try {
+	try {
 			const currentUserId = req.user ? req.user.id : null;
 			const knownViewer = req.user?.visibilityUser || null;
-			const {
-				posts: discoveredPosts = [],
-				visibilityContext,
-				has_more,
-				next_cursor,
-			} = await getDiscoverableModePage(db, {
-				mode: 'search',
-				query: q,
-				viewerId: currentUserId,
-				knownViewer,
-				limit,
-				offset,
-				beforeId,
-				cursor: rawCursor,
-				ngWords: getViewerNgWords(req),
-			});
-			const [posts, groupPage] = await Promise.all([
-				serializePostsBatch(
-					db,
-					discoveredPosts,
-					currentUserId,
-					getPublicUrl(req),
-					knownViewer,
-					visibilityContext,
-				),
-				currentUserId != null && typeof db.searchGroupPostIds === 'function'
-					? db.searchGroupPostIds(currentUserId, q, { limit, offset, beforeId, cursor: rawCursor, searchFilters: await resolvePostSearchQuery(db, q) })
-					: Promise.resolve({ ids: [], has_more: false, next_cursor: null }),
-			]);
-			const groupPosts = await serializePostsByIds(
-				db,
-				groupPage.ids || [],
-				currentUserId,
-				getPublicUrl(req),
-				knownViewer,
-			);
+			let queuePriority = 0;
+			const queue = req.app.locals.readOnlyRequestQueue;
+			if (queue && currentUserId != null) {
+				if (req.trustPolicy) {
+					queuePriority = req.user?.admin ? 5 : req.trustPolicy.exempt ? 0 : req.trustPolicy.queuePriority;
+				} else if (req.user?.admin) {
+					queuePriority = 5;
+				} else {
+					// Never perform a DB lookup before admission: that would let authenticated
+					// searches bypass the bounded queue while computing their priority. Without
+					// a policy, use the neutral default rather than treating every user as banned.
+					queuePriority = 0;
+				}
+			}
+			const runSearch = async () => {
+				const [page, groupPage] = await Promise.all([
+					getDiscoverableModePage(db, {
+						mode: 'search',
+						query: q,
+						viewerId: currentUserId,
+						knownViewer,
+						limit,
+						offset,
+						beforeId,
+						cursor: rawCursor,
+						ngWords: getViewerNgWords(req),
+					}),
+					currentUserId != null && typeof db.searchGroupPostIds === 'function'
+						? db.searchGroupPostIds(currentUserId, q, { limit, offset, beforeId, cursor: rawCursor, searchFilters: await resolvePostSearchQuery(db, q) })
+						: Promise.resolve({ ids: [], has_more: false, next_cursor: null }),
+				]);
+				const [posts, groupPosts] = await Promise.all([
+					serializePostsBatch(db, page.posts || [], currentUserId, getPublicUrl(req), knownViewer, page.visibilityContext),
+					serializePostsByIds(db, groupPage.ids || [], currentUserId, getPublicUrl(req), knownViewer),
+				]);
+				return { page, groupPage, posts, groupPosts };
+			};
+			let searchResult;
+			if (queue) {
+				const controller = new AbortController();
+				const onAborted = () => controller.abort();
+				const onClosed = () => { if (!res.writableEnded) controller.abort(); };
+				req.once('aborted', onAborted);
+				res.once('close', onClosed);
+				try {
+					searchResult = await queue.run(queuePriority, controller.signal, runSearch);
+				} finally {
+					req.removeListener('aborted', onAborted);
+					res.removeListener('close', onClosed);
+				}
+			} else {
+				searchResult = await runSearch();
+			}
+			const { page, groupPage, posts, groupPosts } = searchResult;
+			const { has_more, next_cursor } = page;
 				const mergedPosts = [...posts, ...groupPosts]
 					.sort((left, right) => new Date(right.created_at || 0).getTime() - new Date(left.created_at || 0).getTime())
 					.slice(0, limit);
 				res.json({ posts: mergedPosts, has_next: has_more || Boolean(groupPage.has_more), next_cursor: next_cursor || groupPage.next_cursor || null });
 		} catch (err) {
 			console.error('[posts] search error:', err);
-		res.status(err.statusCode === 400 ? 400 : 500).json({ error: err.statusCode === 400 ? err.message : '検索に失敗しました' });
+			if (err.statusCode === 499 || res.destroyed || res.writableEnded) return;
+			res.status([400, 503, 504].includes(err.statusCode) ? err.statusCode : 500).json({ error: err.statusCode === 400 ? err.message : err.statusCode === 504 ? '検索に時間がかかっています。しばらくしてから再試行してください' : err.statusCode === 503 ? '検索が混み合っています。しばらくしてから再試行してください' : '検索に失敗しました' });
 	}
 });
 
@@ -606,6 +629,7 @@ router.get({
 				knownViewer,
 				visibilityContext,
 			);
+			await distributeTimeline(db,posts.map(p=>Number(p.id)),currentUserId);
 			res.json({ posts, has_next: has_more, next_cursor });
 	} catch (err) {
 		console.error('[posts] recommended error:', err);
@@ -621,9 +645,9 @@ router.get({
 	const db = getDbAdapter(req);
 	const mode = String(req.query.mode || 'timeline');
 	if (mode === 'search') {
-		let blocked = false;
-		searchLimiter(req, res, () => {});
-		if (res.headersSent) return;
+		let passed = false;
+		await searchLimiter(req, res, () => { passed = true; });
+		if (!passed) return;
 	}
 	const tab = String(req.query.tab || 'foryou');
 	const isDiscoverableMode = [
@@ -658,6 +682,7 @@ router.get({
 	};
 	const cachedPayload = timelineCacheManager.getPayload(cacheKey);
 	if (cachedPayload) {
+		if (['timeline','recommended'].includes(mode)) await distributeTimeline(db,cachedPayload.posts.map(p=>Number(p.id)),currentUserId);
 		return res.json(await applyUserReactionsToPayload(db,cachedPayload,currentUserId));
 	}
 	const cachedResult = timelineCacheManager.getIds(cacheKey);
@@ -792,6 +817,7 @@ router.get({
 				);
 			const requestedPostCount = discoveredPostIds?.length ?? posts.length;
 		const postContext = collectPostContext(posts);
+		if (['timeline','recommended'].includes(mode)) await distributeTimeline(db,posts.map(p=>Number(p.id)),currentUserId);
 		const contextUsers = Array.from(postContext.authors.values());
 		
 		const payload = {
@@ -807,6 +833,7 @@ router.get({
 					admin: !!user.admin,
 					verify: !!user.verify,
 					group_badges: user.group_badges || [],
+					display_ranks: user.display_ranks || null,
 				})),
 			},
 			meta: {
@@ -1202,6 +1229,7 @@ router.post({
 		if (queue && typeof db.hasUserLikedPost === 'function') {
 			const currentlyLiked = await db.hasUserLikedPost(userId, postId);
 			const actionId = queue.enqueue('like', async () => {
+				await assertAuthenticatedUserAccess(req, db, ['write', 'posts']);
 				const result = await postService.toggleLike(userId, postId);
 				if (result.liked && post.userId !== userId) {
 					await createNotificationIfAllowed(db, {
@@ -1211,7 +1239,7 @@ router.post({
 						target: { kind: 'post', id: postId },
 					});
 				}
-			});
+			}, req.trustPolicy);
 			const count = typeof db.getLikeCount === 'function' ? await db.getLikeCount(postId) : 0;
 			return res.status(202).json({ success: true, queued: true, action_id: actionId, liked: !currentlyLiked, count: Math.max(0, count + (currentlyLiked ? -1 : 1)), updated_likes: null });
 		}
@@ -1274,7 +1302,10 @@ router.post({
 		const queue = req.app.locals.postActionQueue;
 		if (queue && typeof db.hasUserStarredPost === 'function') {
 			const currentlyStarred = await db.hasUserStarredPost(userId, postId);
-			const actionId = queue.enqueue('star', () => postService.toggleStar(userId, postId));
+			const actionId = queue.enqueue('star', async () => {
+				await assertAuthenticatedUserAccess(req, db, ['write', 'posts']);
+				return postService.toggleStar(userId, postId);
+			}, req.trustPolicy);
 			const count = typeof db.getStarCount === 'function' ? await db.getStarCount(postId) : 0;
 			return res.status(202).json({ success: true, queued: true, action_id: actionId, starred: !currentlyStarred, count: Math.max(0, count + (currentlyStarred ? -1 : 1)), updated_stars: null });
 		}
@@ -1316,7 +1347,7 @@ router.delete({
 		const actionId = queue.enqueue('delete', () => processDeletePostAction(
 			context,
 			{ postId, userId },
-		));
+		), req.trustPolicy);
 		return res.status(202).json({ success: true, queued: true, action_id: actionId });
 	} catch (error) {
 		return res.status(error.statusCode || 503).json({ error: error.message });
@@ -1347,7 +1378,7 @@ router.delete({
 		const actionId = queue.enqueue('admin-delete', () => processDeletePostAction(
 			context,
 			{ postId, userId, admin: true },
-		));
+		), req.trustPolicy);
 
 		return res.status(202).json({ success: true, queued: true, action_id: actionId });
 	} catch (error) {
@@ -1563,7 +1594,10 @@ router.post({
 		if (typeof db.dislikePost === 'function') {
 			const queue = req.app.locals.postActionQueue;
 			if (queue) {
-				const actionId = queue.enqueue('dislike', () => db.dislikePost(userId, postId));
+				const actionId = queue.enqueue('dislike', async () => {
+					await assertAuthenticatedUserAccess(req, db, ['write', 'posts']);
+					return db.dislikePost(userId, postId);
+				}, req.trustPolicy);
 				return res.status(202).json({ success: true, queued: true, action_id: actionId });
 			}
 			await db.dislikePost(userId, postId);
@@ -1625,7 +1659,7 @@ router.put({
 			mask,
 			lock,
 			replyControl: normalizedReplyControl,
-		}));
+		}), req.trustPolicy);
 		return res.status(202).json({ success: true, queued: true, action_id: actionId });
 	} catch (error) {
 		return res.status(error.statusCode || 503).json({ error: error.message });
