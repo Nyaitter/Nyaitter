@@ -9,7 +9,22 @@ const router = api.createRouter({
   description: '通報およびモデレーション審査 API',
 });
 
-const reportRateLimiter = createRateLimiter(config.rateLimit.report);
+const reportRateLimiter = createRateLimiter(config.rateLimit.reportCreate);
+
+router.post({path:'/:id/trust-retract',summary:'報告による利用状態への影響を取消',auth:'admin'},requireAuth,requireAdmin,async(req,res)=>{
+  const reportId=Number(req.params.id); const {userId,targetKind,targetId,reporterId,reason}=req.body || {};
+  const validId=id=>typeof id==='number' && Number.isSafeInteger(id) && id>0;
+  if (!Number.isSafeInteger(reportId) || reportId<=0 || [userId,targetId,reporterId].some(id=>id!=null && !validId(id))
+    || (targetKind!=null && !['post','user'].includes(targetKind)) || String(reason || '').trim().length<10) return res.status(400).json({error:'報告と取消理由を指定してください'});
+  try {
+    const db=req.app.locals.dbAdapter;
+    await require('../services/ModLogService').operation(db, 'admin', req.user.id, 'report_trust_processing', 'report', reportId, async () => {
+      await require('../services/ReputationService').retractReportTrust(db,{reportId,userId:userId ?? undefined,targetKind,targetId:targetId ?? undefined,reporterId:reporterId ?? undefined,adminId:req.user.id,reason});
+      return true;
+    }, 'failure');
+    return res.json({success:true});
+  } catch(error) { console.error('[reports] trust retraction:',error.message); return res.status([400,404,409].includes(error.statusCode)?error.statusCode:500).json({error:'影響を取り消せませんでした'}); }
+});
 
 function getModerationService(req) {
   return req.app.locals.moderationReportService || null;

@@ -1,6 +1,7 @@
 const crypto = require('crypto');
 const { createNotificationIfAllowed } = require('./NotificationDeliveryService');
 const config = require('../config');
+const modLog = require('./ModLogService');
 
 const REPORT_TARGET_KINDS = new Set(['user', 'post', 'dm', 'dm_message']);
 const REPORT_DESCRIPTION_MAX_LENGTH = config.moderation?.descriptionMaxLength || 2000;
@@ -212,7 +213,7 @@ class ModerationReportService {
       return this.resolveReport({ reportId: id, adminId, actions });
     }
     if (typeof this.db.updateModerationReport === 'function') {
-      return this.db.updateModerationReport(id, { status, note, updatedAt: this.now().toISOString() });
+      return modLog.operation(this.db, 'admin', adminId, 'update_report_status', 'report', id, () => this.db.updateModerationReport(id, { status, note, updatedAt: this.now().toISOString() }), 'failure');
     }
     return this.getReportById(id);
   }
@@ -318,12 +319,12 @@ class ModerationReportService {
   }
 
   async _notifyAssignment(report) {
-    await createNotificationIfAllowed(this.db, {
+    await modLog.operation(this.db, 'system', null, 'assignment_notice', 'user', report.assignedAdminId, () => createNotificationIfAllowed(this.db, {
       userId: report.assignedAdminId,
       type: 'moderation_assignment',
       message: assignmentNotificationMessage(report),
       target: { kind: 'route', value: `#admin/reports/${report.id}` },
-    });
+    }));
   }
 
   async _deleteCompletedRequest(report) {
@@ -336,11 +337,11 @@ class ModerationReportService {
   }
 
   async _notifyReporter(report, actionTaken) {
-    await createNotificationIfAllowed(this.db, {
+    await modLog.operation(this.db, 'system', null, 'reporter_notice', 'user', report.reporterUserId, () => createNotificationIfAllowed(this.db, {
       userId: report.reporterUserId,
       type: actionTaken ? 'moderation_action_taken' : 'moderation_no_action',
       target: { kind: 'route', value: '#notifications' },
-    });
+    }));
   }
 
   async runAssignmentSweep() {
@@ -381,7 +382,16 @@ class ModerationReportService {
   }
 
   async resolveReport({ reportId, adminId, actions = {} }) {
-    const report = await this.db.getModerationReportById(reportId);
+    let report;
+    try { report = await this.db.getModerationReportById(reportId); } catch (error) {
+      await modLog.record(this.db, 'admin', adminId, 'resolve_report', 'report', reportId, 'failure');
+      throw error;
+    }
+    if (report?.status==='resolved' && Number(report.assignedAdminId)===Number(adminId) && Number(report.resolution?.moderatorId)===Number(adminId)) {
+      await require('./ReputationService').syncReport(this.db,report);
+      await this._deleteCompletedRequest(report);
+      return report;
+    }
     if (!report || report.status !== 'assigned' || Number(report.assignedAdminId) !== Number(adminId)) {
       throw new Error('この報告を対応する権限がありません');
     }
@@ -401,6 +411,8 @@ class ModerationReportService {
       freezeReason: String(actions.freezeReason || '').trim(),
       notice: String(actions.notice || '').trim(),
       targetUserId: actions.targetUserId == null ? null : toSafeInteger(actions.targetUserId, 'targetUserId'),
+      falseReport: actions.falseReport === true,
+      evidence: String(actions.evidence || '').trim(),
     };
     if (normalizedActions.notice.length > this.descriptionMaxLength) {
       throw new Error(`notice must be ${this.descriptionMaxLength} characters or less`);
@@ -408,6 +420,8 @@ class ModerationReportService {
     if (normalizedActions.freeze && !normalizedActions.freezeReason) {
       throw new Error('凍結する場合は理由が必要です');
     }
+    if (normalizedActions.falseReport && normalizedActions.evidence.length<10) throw new Error('虚偽報告の認定には具体的な根拠が必要です');
+    if (normalizedActions.falseReport && ['deletePost','maskPost','makePrivate','searchExclude','freeze'].some(key=>normalizedActions[key])) throw new Error('対応する報告を虚偽報告には認定できません');
     const touchesPost = normalizedActions.deletePost || normalizedActions.maskPost || normalizedActions.makePrivate;
     if (touchesPost && report.targetKind !== 'post') {
       throw new Error('ポスト以外はポストへの対応を実行できません');
@@ -435,21 +449,54 @@ class ModerationReportService {
     };
     if (normalizedActions.deletePost) {
       const postId = Number(report.targetSnapshot?.post?.id || report.targetId);
-      const post = await this.db.getPostById(postId);
-      if (post && await this.db.adminDeletePost(postId)) {
+      let post, notesToDelete;
+      try {
+        post = await this.db.getPostById(postId);
+        notesToDelete = post ? await this.db.listNotesByPost(postId) : [];
+      } catch (error) {
+        await modLog.record(this.db, 'admin', adminId, 'delete_post', 'post', postId, 'failure');
+        throw error;
+      }
+      if (post && await modLog.operation(this.db, 'admin', adminId, 'delete_post', 'post', postId, () => this.db.adminDeletePost(postId))) {
+        await require('./ReputationService').cancelPostEvents(this.db,postId,notesToDelete);
         await this._deletePostAttachments(post.attachments);
         applied.deletePost = true;
+      } else if (!post) {
+        await modLog.record(this.db, 'admin', adminId, 'delete_post', 'post', postId, 'skipped');
       }
     }
 
+    if (applied.deletePost) {
+      const postId = Number(report.targetSnapshot?.post?.id || report.targetId);
+      if (normalizedActions.maskPost) await modLog.record(this.db, 'admin', adminId, 'mask_post', 'post', postId, 'skipped');
+      if (normalizedActions.makePrivate) await modLog.record(this.db, 'admin', adminId, 'make_private', 'post', postId, 'skipped');
+    }
     if (!applied.deletePost && (normalizedActions.maskPost || normalizedActions.makePrivate)) {
       const postId = Number(report.targetSnapshot?.post?.id || report.targetId);
-      const post = await this.db.getPostById(postId);
-      if (!post) throw new Error('対象のポストが見つかりません');
+      let post;
+      try { post = await this.db.getPostById(postId); } catch (error) {
+        if (normalizedActions.maskPost) await modLog.record(this.db, 'admin', adminId, 'mask_post', 'post', postId, 'failure');
+        if (normalizedActions.makePrivate) await modLog.record(this.db, 'admin', adminId, 'make_private', 'post', postId, 'failure');
+        throw error;
+      }
+      if (!post) {
+        if (normalizedActions.maskPost) await modLog.record(this.db, 'admin', adminId, 'mask_post', 'post', postId, 'failure');
+        if (normalizedActions.makePrivate) await modLog.record(this.db, 'admin', adminId, 'make_private', 'post', postId, 'failure');
+        throw new Error('対象のポストが見つかりません');
+      }
       const postUpdates = {};
       if (normalizedActions.maskPost) postUpdates.mask = true;
       if (normalizedActions.makePrivate) postUpdates.lock = true;
-      const updated = await this.db.updatePost(postId, postUpdates);
+      let updated;
+      try {
+        updated = await this.db.updatePost(postId, postUpdates);
+      } catch (error) {
+        if (normalizedActions.maskPost) await modLog.record(this.db, 'admin', adminId, 'mask_post', 'post', postId, 'failure');
+        if (normalizedActions.makePrivate) await modLog.record(this.db, 'admin', adminId, 'make_private', 'post', postId, 'failure');
+        throw error;
+      }
+      if (normalizedActions.maskPost) await modLog.record(this.db, 'admin', adminId, 'mask_post', 'post', postId, updated ? 'success' : 'failure');
+      if (normalizedActions.makePrivate) await modLog.record(this.db, 'admin', adminId, 'make_private', 'post', postId, updated ? 'success' : 'failure');
       if (!updated) throw new Error('ポストの公開範囲を変更できませんでした');
       applied.maskPost = normalizedActions.maskPost;
       applied.makePrivate = normalizedActions.makePrivate;
@@ -459,7 +506,16 @@ class ModerationReportService {
       const updates = {};
       if (normalizedActions.searchExclude) updates.shadow = true;
       if (normalizedActions.freeze) updates.freeze = normalizedActions.freezeReason;
-      const updated = await this.db.updateUserProfile(normalizedActions.targetUserId, updates);
+      let updated;
+      try {
+        updated = await this.db.updateUserProfile(normalizedActions.targetUserId, updates);
+      } catch (error) {
+        if (normalizedActions.searchExclude) await modLog.record(this.db, 'admin', adminId, 'search_exclude', 'user', normalizedActions.targetUserId, 'failure');
+        if (normalizedActions.freeze) await modLog.record(this.db, 'admin', adminId, 'freeze', 'user', normalizedActions.targetUserId, 'failure');
+        throw error;
+      }
+      if (normalizedActions.searchExclude) await modLog.record(this.db, 'admin', adminId, 'search_exclude', 'user', normalizedActions.targetUserId, updated ? 'success' : 'failure');
+      if (normalizedActions.freeze) await modLog.record(this.db, 'admin', adminId, 'freeze', 'user', normalizedActions.targetUserId, updated ? 'success' : 'failure');
       if (!updated) throw new Error('対応対象ユーザーが見つかりません');
       applied.searchExclude = normalizedActions.searchExclude;
       applied.freeze = normalizedActions.freeze;
@@ -475,19 +531,23 @@ class ModerationReportService {
       targetUserId: normalizedActions.targetUserId,
       notice: normalizedActions.notice || null,
       handledAt: this.now().toISOString(),
+      falseReport: normalizedActions.falseReport,
+      evidence: normalizedActions.evidence,
+      moderatorId: Number(adminId),
     };
-    const resolved = await this.db.resolveModerationReport(report.id, adminId, resolution);
+    const resolved = await modLog.operation(this.db, 'admin', adminId, 'resolve_report', 'report', report.id, () => this.db.resolveModerationReport(report.id, adminId, resolution), 'failure');
     if (!resolved) throw new Error('報告はすでに別の管理者により処理されています');
+    await require('./ReputationService').syncReport(this.db,resolved);
 
     if (normalizedActions.notice) {
       // 運営からの通知はブロック関係に関わらず届ける。
-      await createNotificationIfAllowed(this.db, {
+      await modLog.operation(this.db, 'admin', adminId, 'admin_notice', 'user', normalizedActions.targetUserId, () => createNotificationIfAllowed(this.db, {
         userId: normalizedActions.targetUserId,
         type: 'admin_notice',
         fromUserId: adminId,
         message: normalizedActions.notice,
         target: { kind: 'route', value: '#notifications' },
-      }, { bypassBlockCheck: true });
+      }, { bypassBlockCheck: true }));
     }
 
     const contentNotificationMessage = contentModerationNotificationMessage(applied);
@@ -495,7 +555,7 @@ class ModerationReportService {
       const authorId = Number(report.targetSnapshot?.subjectUser?.id);
       if (Number.isSafeInteger(authorId) && authorId > 0) {
         const postId = Number(report.targetSnapshot?.post?.id || report.targetId);
-        await createNotificationIfAllowed(this.db, {
+        await modLog.operation(this.db, 'admin', adminId, 'content_notice', 'user', authorId, () => createNotificationIfAllowed(this.db, {
           userId: authorId,
           type: 'moderation_action',
           fromUserId: null,
@@ -503,7 +563,7 @@ class ModerationReportService {
           target: applied.deletePost || !Number.isSafeInteger(postId) || postId < 1
             ? { kind: 'route', value: '#notifications' }
             : { kind: 'post', id: postId },
-        });
+        }));
       }
     }
 
@@ -513,7 +573,11 @@ class ModerationReportService {
   }
 
   async resolveFreezeAppeal({ reportId, adminId, decision }) {
-    const appeal = await this.db.getModerationReportById(reportId);
+    let appeal;
+    try { appeal = await this.db.getModerationReportById(reportId); } catch (error) {
+      await modLog.record(this.db, 'admin', adminId, 'resolve_appeal', 'report', reportId, 'failure');
+      throw error;
+    }
     if (
       !appeal || appeal.assignmentType !== 'freeze_appeal' || appeal.status !== 'assigned' ||
       Number(appeal.assignedAdminId) !== Number(adminId)
@@ -528,30 +592,36 @@ class ModerationReportService {
     if (!claimed) throw new Error('異議申し立てはすでに別の管理者により処理されています');
 
     const appellantId = Number(appeal.reporterUserId);
-    if (decision === 'approved') {
-      const updated = await this.db.updateUserProfile(appellantId, { freeze: null });
-      if (!updated) throw new Error('異議申し立て対象のユーザーが見つかりません');
-    }
-
-    const resolution = {
+    const action = decision === 'approved' ? 'appeal_approve' : 'appeal_reject';
+    const resolved = await modLog.operation(this.db, 'admin', adminId, action, 'report', appeal.id, async () => {
+      if (decision === 'approved') {
+        const updated = await modLog.operation(this.db, 'admin', adminId, 'unfreeze', 'user', appellantId, () => this.db.updateUserProfile(appellantId, { freeze: null }), 'failure');
+        if (!updated) throw new Error('異議申し立て対象のユーザーが見つかりません');
+      }
+      const resolution = {
       appealDecision: decision,
       actionTaken: decision === 'approved',
       handledAt: this.now().toISOString(),
-    };
-    const resolved = await this.db.resolveModerationReport(appeal.id, adminId, resolution);
+      };
+      return this.db.resolveModerationReport(appeal.id, adminId, resolution);
+    }, 'failure');
     if (!resolved) throw new Error('異議申し立てはすでに別の管理者により処理されています');
 
-    await createNotificationIfAllowed(this.db, {
+    await modLog.operation(this.db, 'admin', adminId, 'appeal_notice', 'user', appellantId, () => createNotificationIfAllowed(this.db, {
       userId: appellantId,
       type: decision === 'approved' ? 'appeal_approved' : 'appeal_rejected',
       target: { kind: 'route', value: '#notifications' },
-    });
+    }));
     await this._deleteCompletedRequest(resolved);
     return resolved;
   }
 
   async resolveVerificationApplication({ reportId, adminId, decision }) {
-    const application = await this.db.getModerationReportById(reportId);
+    let application;
+    try { application = await this.db.getModerationReportById(reportId); } catch (error) {
+      await modLog.record(this.db, 'admin', adminId, 'resolve_verification', 'report', reportId, 'failure');
+      throw error;
+    }
     if (
       !application || application.assignmentType !== 'verification_application' || application.status !== 'assigned' ||
       Number(application.assignedAdminId) !== Number(adminId)
@@ -566,24 +636,26 @@ class ModerationReportService {
     if (!claimed) throw new Error('認証申請はすでに別の管理者により処理されています');
 
     const applicantId = Number(application.reporterUserId);
-    if (decision === 'approved') {
-      const updated = await this.db.updateUserProfile(applicantId, { verify: true });
-      if (!updated) throw new Error('認証申請対象のユーザーが見つかりません');
-    }
-
-    const resolution = {
+    const action = decision === 'approved' ? 'verification_approve' : 'verification_reject';
+    const resolved = await modLog.operation(this.db, 'admin', adminId, action, 'report', application.id, async () => {
+      if (decision === 'approved') {
+        const updated = await modLog.operation(this.db, 'admin', adminId, 'verify_user', 'user', applicantId, () => this.db.updateUserProfile(applicantId, { verify: true }), 'failure');
+        if (!updated) throw new Error('認証申請対象のユーザーが見つかりません');
+      }
+      const resolution = {
       verificationDecision: decision,
       actionTaken: decision === 'approved',
       handledAt: this.now().toISOString(),
-    };
-    const resolved = await this.db.resolveModerationReport(application.id, adminId, resolution);
+      };
+      return this.db.resolveModerationReport(application.id, adminId, resolution);
+    }, 'failure');
     if (!resolved) throw new Error('認証申請はすでに別の管理者により処理されています');
 
-    await createNotificationIfAllowed(this.db, {
+    await modLog.operation(this.db, 'admin', adminId, 'verification_notice', 'user', applicantId, () => createNotificationIfAllowed(this.db, {
       userId: applicantId,
       type: decision === 'approved' ? 'verification_approved' : 'verification_rejected',
       target: { kind: 'route', value: '#notifications' },
-    });
+    }));
     await this._deleteCompletedRequest(resolved);
     return resolved;
   }
