@@ -1,6 +1,7 @@
 const { parseDuration, parseIntegerRange } = require('./utils/settingFormats');
 const { normalizeProviders } = require('./utils/aiSettings');
 const { resolveListenTarget, resolveOptionalHost } = require('./utils/listenAddress');
+const { normalizeAdvertisingSources, normalizeAdvertisingOrigins } = require('./utils/advertisingCsp');
 
 const isProduction = (process.env.NODE_ENV || 'development') === 'production';
 
@@ -869,9 +870,10 @@ const config = {
     const provider = String(readSetting(['AUTOMOD_AI_PROVIDER', 'AUTOMOD_PROVIDER'], ['autoMod.aiProvider', 'autoMod.provider', 'automod.provider'], 'auto')).trim().toLowerCase();
     const model = readSetting(['AUTOMOD_AI_MODEL', 'AUTOMOD_MODEL'], ['autoMod.aiModel', 'autoMod.model', 'automod.model', 'geminiModeration.model'], '');
     const prompt = readSetting(['AUTOMOD_PROMPT', 'AUTOMOD_MOD_PROMPT', 'GEMINI_MOD_PROMPT'], ['autoMod.prompt', 'automod.prompt', 'geminiModeration.prompt'], '');
+    const reasoningEffort = String(readSetting(['AUTOMOD_REASONING_EFFORT'], ['autoMod.reasoningEffort', 'automod.reasoningEffort'], ''));
     const providers = aiProviderSettings();
     return {
-      provider, model, prompt,
+      provider, model, prompt, reasoningEffort,
 		      maxImages: exactIntegerSetting(
 		        'AutoMod max images',
 		        ['AUTOMOD_MAX_IMAGES', 'AUTOMOD_MOD_MAX_IMAGES', 'GEMINI_MOD_MAX_IMAGES'],
@@ -990,7 +992,7 @@ const config = {
       envPrefix: 'NYAITTER_RATE_LIMIT_GENERAL',
       configPath: 'rateLimit.general',
       defaultWindow: '1min',
-      defaultMax: 1000,
+      defaultMax: 800,
       legacyWindowPaths: ['rateLimit.windowMs'],
       legacyMaxPaths: ['rateLimit.max'],
     }),
@@ -1008,35 +1010,35 @@ const config = {
       envPrefix: 'NYAITTER_RATE_LIMIT_POST_WRITE',
       configPath: 'rateLimit.postWrite',
       defaultWindow: '1min',
-      defaultMax: 30,
+      defaultMax: 24,
     }),
     profileUpdate: rateLimitSetting({
       label: 'profile update rate limit',
       envPrefix: 'NYAITTER_RATE_LIMIT_PROFILE_UPDATE',
       configPath: 'rateLimit.profileUpdate',
       defaultWindow: '1min',
-      defaultMax: 20,
+      defaultMax: 16,
     }),
     dmSend: rateLimitSetting({
       label: 'DM send rate limit',
       envPrefix: 'NYAITTER_RATE_LIMIT_DM_SEND',
       configPath: 'rateLimit.dmSend',
       defaultWindow: '1min',
-      defaultMax: 60,
+      defaultMax: 48,
     }),
     upload: rateLimitSetting({
       label: 'upload rate limit',
       envPrefix: 'NYAITTER_RATE_LIMIT_UPLOAD',
       configPath: 'rateLimit.upload',
       defaultWindow: '1min',
-      defaultMax: 30,
+      defaultMax: 24,
     }),
     notification: rateLimitSetting({
       label: 'notification rate limit',
       envPrefix: 'NYAITTER_RATE_LIMIT_NOTIFICATION',
       configPath: 'rateLimit.notification',
       defaultWindow: '1min',
-      defaultMax: 60,
+      defaultMax: 48,
     }),
     reportCreate: rateLimitSetting({
       label: 'report create rate limit',
@@ -1062,6 +1064,19 @@ const config = {
   },
 
   security: {
+    clientAssetOrigins: normalizeAdvertisingOrigins(
+      process.env.NYAITTER_CLIENT_ASSET_CSP_ORIGINS ?? get('security.clientAssetOrigins', []),
+      'security.clientAssetOrigins',
+    ),
+    advertisingOrigins: (() => {
+      let origins = get('security.advertisingOrigins', {});
+      const envValue = process.env.NYAITTER_ADVERTISING_CSP_ORIGINS;
+      if (envValue !== undefined) {
+        try { origins = JSON.parse(envValue); }
+        catch (_) { console.warn('[config] NYAITTER_ADVERTISING_CSP_ORIGINS must be a JSON object; ignoring it.'); origins = {}; }
+      }
+      return normalizeAdvertisingSources(origins);
+    })(),
     hsts: {
       // HTTPS終端を前提とする本番ではHSTSを既定で有効化する。
       enabled: get('security.hsts.enabled', isProduction),
@@ -1210,4 +1225,5 @@ function validateConfig() {
 
 validateConfig();
 
+config.reputation = require('./utils/reputationPolicy').buildPolicy(rawConfig.reputation);
 module.exports = config;

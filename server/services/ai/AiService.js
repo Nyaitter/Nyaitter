@@ -15,9 +15,11 @@ async function requestJson(url, options, timeoutMs = 15000) {
     const response = await fetch(url, { ...options, signal: controller.signal, redirect: 'error' });
     if (!response.ok) {
       let code = '';
+      let param = '';
       try {
         const detail = (await response.json())?.error;
         code = detail?.code || '';
+        param = detail?.param || '';
         if (response.status === 400 && (detail?.param === 'model' || /(?:model.*(?:not supported|not found|unavailable)|unknown model)/i.test(detail?.message || ''))) {
           code = 'AI_MODEL_UNAVAILABLE';
         }
@@ -25,6 +27,7 @@ async function requestJson(url, options, timeoutMs = 15000) {
       const error = new Error(`AI API request failed (${response.status})`);
       error.statusCode = response.status;
       error.code = String(code);
+      error.param = String(param);
       throw error;
     }
     return await response.json();
@@ -55,6 +58,38 @@ function isModelDb(database) {
   return database?.version === 1 && Array.isArray(database.providers)
     && database.providers.every(entry => entry && typeof entry.id === 'string' && Array.isArray(entry.models)
       && entry.models.every(model => typeof model === 'string' && model.length > 0));
+}
+
+// OpenAI reasoning effort (Chat Completions: `reasoning_effort`): the
+// full API vocabulary. The configured value is used exactly as written
+// and never rewritten; which values a given model accepts is decided
+// by the API, not by a table here.
+const REASONING_EFFORT_VALUES = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+
+function resolveReasoningEffort(value) {
+  if (value === undefined || value === null || value === '') return null;
+  return REASONING_EFFORT_VALUES.includes(value) ? value : null;
+}
+
+function isValidReasoningEffort(value) {
+  if (value === undefined || value === null || value === '') return true;
+  return REASONING_EFFORT_VALUES.includes(value);
+}
+
+// Non-reasoning model families reject the parameter itself, so it is
+// omitted for them. For every other model the configured value is sent
+// as-is; if the API rejects the value, the call is retried once without
+// it (see _generateApi).
+function modelOmitsReasoningEffort(model) {
+  const id = String(model || '').toLowerCase();
+  return /^(?:gpt-4|gpt-3\.5|chatgpt-4o)/.test(id);
+}
+
+// True only when the API rejected the reasoning_effort value itself
+// (the error response names the parameter), never for unrelated errors.
+function isReasoningEffortError(error) {
+  return error?.statusCode === 400
+    && (error.param === 'reasoning_effort' || /reasoning_effort/.test(error.code || ''));
 }
 
 class AiService {
@@ -198,13 +233,25 @@ class AiService {
     const content = [{ type: 'text', text: request.text || '' }, ...(request.images || []).map(image => ({
       type: 'image_url', image_url: { url: `data:${image.mimeType};base64,${image.data}` },
     }))];
-    return requestJson(`${baseUrl(provider)}/chat/completions`, {
+    const body = {
+      model, messages: [{ role: 'system', content: request.system || '' }, { role: 'user', content }],
+      [provider.url ? 'max_tokens' : 'max_completion_tokens']: request.maxOutputTokens || 256,
+    };
+    const reasoningEffort = modelOmitsReasoningEffort(model) ? null : resolveReasoningEffort(request.reasoningEffort);
+    if (reasoningEffort) body.reasoning_effort = reasoningEffort;
+    const send = (payload) => requestJson(`${baseUrl(provider)}/chat/completions`, {
       method: 'POST', headers: headers(provider),
-      body: JSON.stringify({
-        model, messages: [{ role: 'system', content: request.system || '' }, { role: 'user', content }],
-        [provider.url ? 'max_tokens' : 'max_completion_tokens']: request.maxOutputTokens || 256,
-      }),
+      body: JSON.stringify(payload),
     }, request.timeoutMs || 45000);
+    if (!reasoningEffort) return send(body);
+    try {
+      return await send(body);
+    } catch (error) {
+      if (!isReasoningEffortError(error)) throw error;
+      console.warn(`[ai] reasoning_effort '${reasoningEffort}' was rejected for model ${model}; retrying without it`);
+      const { reasoning_effort: _dropped, ...retryBody } = body;
+      return send(retryBody);
+    }
   }
 }
 
@@ -214,4 +261,4 @@ function getAiService() {
   return sharedService;
 }
 
-module.exports = { AiService, getAiService };
+module.exports = { AiService, getAiService, REASONING_EFFORT_VALUES, resolveReasoningEffort, isValidReasoningEffort, modelOmitsReasoningEffort, isReasoningEffortError };

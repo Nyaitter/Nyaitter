@@ -6,6 +6,7 @@ const path = require('path');
 const dotenv = require('dotenv');
 const { parseDuration, parseIntegerRange } = require('./utils/settingFormats');
 const { normalizeProviders } = require('./utils/aiSettings');
+const { isValidReasoningEffort } = require('./services/ai/AiService');
 const { isValidHost, parseBindAddress } = require('./utils/listenAddress');
 
 const SERVER_DIR = __dirname;
@@ -144,6 +145,17 @@ function inspect() {
     }
 
     const nodeEnv = String(process.env.NODE_ENV || 'development').toLowerCase();
+    try { require('./utils/reputationPolicy').buildPolicy(config.reputation); }
+    catch(error) { addIssue('error','REPUTATION_CONFIG_INVALID',error.message,'reputation の比率、件数、ランク設定を確認してください。'); }
+    const noteHmacSecret = process.env.NOTE_EVALUATION_HMAC_SECRET || '';
+    if (Buffer.byteLength(noteHmacSecret) < 32) {
+        addIssue(
+            'error',
+            'NOTE_EVALUATION_HMAC_SECRET_MISSING_OR_SHORT',
+            'コミュニティノートの配布・評価に必要な NOTE_EVALUATION_HMAC_SECRET が未設定か、32バイト未満です。この状態ではノートの配布・評価の一部が安全側に制限されます（作成・閲覧は継続できます）。',
+            'server/.env に NOTE_EVALUATION_HMAC_SECRET として32バイト以上のランダムな文字列を設定してください。',
+        );
+    }
     const isProduction = nodeEnv === 'production';
 
     const hostSetting = firstSetting(['NYAITTER_HOST'], config, ['server.host'], '');
@@ -490,6 +502,11 @@ function inspect() {
     } else if (autoModPrompt) {
         const legacyKey = firstSetting(['AUTOMOD_API_KEY', 'GEMINI_API_KEY', 'OPENAI_API_KEY'], config, ['autoMod.apiKey', 'automod.apiKey', 'geminiModeration.apiKey']);
         if (!legacyKey) addIssue('warning', 'AUTOMOD_SETTINGS_INCOMPLETE', 'AutoModのプロバイダーが未設定です。', 'AI_PROVIDERSとAUTOMOD_AI_PROVIDERを設定してください。');
+    }
+
+    const autoModReasoningEffort = firstSetting(['AUTOMOD_REASONING_EFFORT'], config, ['autoMod.reasoningEffort', 'automod.reasoningEffort']);
+    if (autoModReasoningEffort !== undefined && autoModReasoningEffort !== '' && !isValidReasoningEffort(autoModReasoningEffort)) {
+        addIssue('error', 'AUTOMOD_REASONING_EFFORT_INVALID', 'AutoModのreasoning effortの値が不正です。', 'AUTOMOD_REASONING_EFFORT / autoMod.reasoningEffort には none / minimal / low / medium / high / xhigh / max のいずれかを、大文字・小文字を含め正確に設定するか、未設定にしてください。値は変換されません。未設定の場合はパラメータ自体を送信しません。');
     }
 
     // 公開URLは「URLであること」を必須にする。host:port のような指定は受け付けない。
