@@ -163,11 +163,11 @@ console.log('Nyaitter Migration Runner (PostgreSQL)');
 console.log('==================================================');
 
 if (!connectionString) {
-  console.log('No DATABASE_URL found.');
-  console.log('Please run the migrations manually, in filename order:');
-  migrationFiles.forEach((file) => console.log(`psql $DATABASE_URL -f ${path.join(migrationsDir, file)}`));
-  console.log('Or set the connection string and re-run this script (requires the pg package).');
-  process.exit(0);
+  console.error('Migration failed: PostgreSQL is selected, but no connection URL is configured.');
+  console.error('Set DATABASE_URL (or POSTGRES_URL / database.postgres.connectionString) and re-run this script.');
+  console.error('No migrations were applied. For manual application, run each SQL file with psql in filename order:');
+  migrationFiles.forEach((file) => console.error(`  psql "$DATABASE_URL" -f ${path.join(migrationsDir, file)}`));
+  process.exit(1);
 }
 
 function isRetryableTransactionError(error) {
@@ -417,6 +417,10 @@ async function run() {
 }
 
 run().catch((error) => {
-  console.error('\n❌ Migration failed:', error.message);
+  const message = String(error?.message || error);
+  const safeMessage = connectionString
+    ? message.split(connectionString).join('[redacted database URL]')
+    : message;
+  console.error('\n❌ Migration failed:', safeMessage);
   process.exit(1);
 });

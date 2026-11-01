@@ -14,7 +14,8 @@
     "migrate:data": "node server/migrations/migrate-data.js",
     "swagger": "node server/swagger.js",
     "cli": "node server/cli.js",
-    "nscli": "node server/cli.js"
+    "nscli": "node server/cli.js",
+    "test": "node --test server/services/DataMigrationService.test.js server/migrations/migrate.test.js server/adapters/database/repost.test.js server/services/CommunityNoteService.test.js server/services/ai/AiService.test.js server/adapters/database/reputation-claims.test.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1154.0",

@@ -4,39 +4,21 @@ const fs = require('fs/promises');
 const path = require('path');
 const crypto = require('crypto');
 
-const SNAPSHOT_VERSION = 1;
-const TABLES = Object.freeze([
-  'users',
-  'user_auth_providers',
-  'spaces',
-  'space_channels',
-  'space_members',
-  'space_messages',
-  'sessions',
-  'trusted_login_ips',
-  'login_approvals',
-  'bot_tokens',
-  'posts',
-  'likes',
-  'stars',
-  'reposts',
-  'pinned_posts',
-  'follows',
-  'dm_channels',
-  'dm_messages',
-  'group_dms',
-  'groups',
-  'group_roles',
-  'group_memberships',
-  'group_invites',
-  'group_join_requests',
-  'dm_e2e_keys',
-  'notifications',
-  'push_subscriptions',
-  'moderation_reports',
-  'logs',
-  'user_keyword_affinities',
-]);
+const {
+  TABLES,
+  INSERT_ORDER,
+  TABLE_SPECS,
+  EXCLUDED_TABLES,
+  EXCLUDED_TABLE_NAMES,
+  specFor,
+  transferableColumns,
+} = require('./DataMigrationSchema');
+
+// バージョン2: スナップショットが「どのテーブルを実際に含むか」を tables_present で明示する。
+// バージョン1: 旧形式。テーブルの欠落が「空」なのか「未対応」なのか区別できない。
+// 読み取りは両方を受け付けるが、書き出しは常に最新版にする。
+const SNAPSHOT_VERSION = 2;
+const SUPPORTED_SNAPSHOT_VERSIONS = Object.freeze([1, 2]);
 
 const ADAPTER_NAMES = new Set(['memory', 'postgres', 'd1']);
 
@@ -83,6 +65,12 @@ function normalizeInteger(value, fallback = null) {
   return Number.isSafeInteger(parsed) ? parsed : fallback;
 }
 
+function normalizeNumber(value, fallback = null) {
+  if (value == null || value === '') return fallback;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
 function normalizeEpochMilliseconds(value) {
   if (value == null || value === '') return null;
   if (value instanceof Date) return value.getTime();
@@ -121,11 +109,17 @@ function normalizeRow(table, input) {
       icon_data: value.icon_data || null,
       verify: normalizeBoolean(value.verify),
       admin: normalizeBoolean(value.admin),
+      admin_request_excluded: normalizeBoolean(value.admin_request_excluded),
       freeze: value.freeze || null,
       shadow: normalizeBoolean(value.shadow),
       block: parseJson(value.block, []),
       account_operation: value.account_operation || null,
       created_at: normalizeDate(value.created_at ?? value.createdAt),
+      // migration 034。未移行の古い行には無いので既定値へ落とす。
+      note_rank: normalizeInteger(value.note_rank ?? value.noteRank, 0),
+      note_affirmative_score: normalizeNumber(value.note_affirmative_score ?? value.noteAffirmativeScore, 0),
+      note_max_per_day: normalizeInteger(value.note_max_per_day ?? value.noteMaxPerDay, 1),
+      note_min_public_threshold: normalizeNumber(value.note_min_public_threshold ?? value.noteMinPublicThreshold, 0),
     };
   }
 
@@ -145,6 +139,16 @@ function normalizeRow(table, input) {
       group_id: value.group_id ?? value.groupId ?? null,
       group_announcement: normalizeBoolean(value.group_announcement ?? value.groupAnnouncement),
       created_at: normalizeDate(value.created_at ?? value.createdAt),
+      // PostgreSQL にあって D1 に無い列。D1 側は実行時検出で読み飛ばす。
+      view_content: value.view_content === undefined ? null : value.view_content,
+      reply_control: value.reply_control ?? value.replyControl ?? 'everyone',
+      scheduled_at: normalizeDate(value.scheduled_at ?? value.scheduledAt),
+      recommendation_penalty: Math.max(0, normalizeNumber(value.recommendation_penalty ?? value.recommendationPenalty, 0)),
+      // 派生カウンタは移行先で再計算する（投入値は使わない）。
+      like_count: Math.max(0, normalizeInteger(value.like_count ?? value.likeCount, 0)),
+      star_count: Math.max(0, normalizeInteger(value.star_count ?? value.starCount, 0)),
+      repost_count: Math.max(0, normalizeInteger(value.repost_count ?? value.repostCount, 0)),
+      reply_count: Math.max(0, normalizeInteger(value.reply_count ?? value.replyCount, 0)),
     };
   }
 
@@ -219,6 +223,8 @@ function normalizeRow(table, input) {
       ip_hash: value.ip_hash ?? value.ipHash ?? null,
       ip_masked: value.ip_masked ?? value.ipMasked ?? null,
       user_agent: value.user_agent ?? value.userAgent ?? null,
+      // PostgreSQL だけが持つ旧列。D1 には無いので実行時検出で読み飛ばす。
+      ip: value.ip ?? null,
       expires_at: normalizeDate(value.expires_at ?? value.expiresAt),
       created_at: normalizeDate(value.created_at ?? value.createdAt),
     };
@@ -241,12 +247,103 @@ function normalizeRow(table, input) {
       ip_hash: value.ip_hash ?? value.ipHash ?? null,
       ip_masked: value.ip_masked ?? value.ipMasked ?? null,
       user_agent: value.user_agent ?? value.userAgent ?? null,
+      // migration 023: 承認待ちのログイン元プロバイダー。
+      auth_provider: value.auth_provider ?? value.authProvider ?? null,
       poll_token_hash: value.poll_token_hash ?? value.pollTokenHash ?? null,
       status: value.status || 'pending',
       created_at: normalizeDate(value.created_at ?? value.createdAt),
       expires_at: normalizeDate(value.expires_at ?? value.expiresAt),
       decided_at: normalizeDate(value.decided_at ?? value.decidedAt),
       consumed_at: normalizeDate(value.consumed_at ?? value.consumedAt),
+    };
+  }
+
+  // 以降は migration 011/017/023/024 で追加されたテーブル。
+  // 個別の正規化は列定義（DataMigrationSchema）から機械的に決まる。
+  if (table === 'account_recovery_requests') {
+    return {
+      id: value.id == null ? null : String(value.id),
+      user_id: normalizeInteger(value.user_id ?? value.userId),
+      ip_hash: value.ip_hash ?? value.ipHash ?? null,
+      ip_masked: value.ip_masked ?? value.ipMasked ?? null,
+      user_agent: value.user_agent ?? value.userAgent ?? null,
+      auth_provider: value.auth_provider ?? value.authProvider ?? null,
+      request_token_hash: value.request_token_hash ?? value.requestTokenHash ?? null,
+      status: value.status || 'waiting',
+      trust_score: normalizeInteger(value.trust_score ?? value.trustScore, 0),
+      wait_until: normalizeDate(value.wait_until ?? value.waitUntil),
+      started_at: normalizeDate(value.started_at ?? value.startedAt),
+      last_notified_at: normalizeDate(value.last_notified_at ?? value.lastNotifiedAt),
+      notified_count: normalizeInteger(value.notified_count ?? value.notifiedCount, 0),
+      decided_at: normalizeDate(value.decided_at ?? value.decidedAt),
+      decided_by: value.decided_by ?? value.decidedBy ?? null,
+      consumed_at: normalizeDate(value.consumed_at ?? value.consumedAt),
+    };
+  }
+
+  if (table === 'blocked_login_ips') {
+    return {
+      user_id: normalizeInteger(value.user_id ?? value.userId),
+      ip_hash: value.ip_hash ?? value.ipHash ?? null,
+      ip_masked: value.ip_masked ?? value.ipMasked ?? null,
+      reason: value.reason ?? null,
+      source_recovery_id: value.source_recovery_id ?? value.sourceRecoveryId ?? null,
+      created_at: normalizeDate(value.created_at ?? value.createdAt),
+    };
+  }
+
+  if (table === 'polls') {
+    return {
+      // PostgreSQL は TEXT、D1 は INTEGER 主キー。文字列で往復させる。
+      id: value.id == null ? null : String(value.id),
+      post_id: normalizeInteger(value.post_id ?? value.postId),
+      user_id: normalizeInteger(value.user_id ?? value.userId),
+      title: String(value.title ?? ''),
+      options: parseJson(value.options, []),
+      allow_multiple: normalizeBoolean(value.allow_multiple ?? value.allowMultiple),
+      allow_other: normalizeBoolean(value.allow_other ?? value.allowOther),
+      show_results_before_voting: normalizeBoolean(value.show_results_before_voting ?? value.showResultsBeforeVoting ?? true),
+      expires_at: normalizeDate(value.expires_at ?? value.expiresAt),
+      closed: normalizeBoolean(value.closed),
+      closed_notified: normalizeBoolean(value.closed_notified ?? value.closedNotified),
+      created_at: normalizeDate(value.created_at ?? value.createdAt),
+    };
+  }
+
+  if (table === 'poll_votes') {
+    return {
+      id: value.id == null ? null : String(value.id),
+      poll_id: value.poll_id == null && value.pollId == null ? null : String(value.poll_id ?? value.pollId),
+      user_id: normalizeInteger(value.user_id ?? value.userId),
+      option_id: normalizeInteger(value.option_id ?? value.optionId),
+      other_text: value.other_text ?? value.otherText ?? null,
+      created_at: normalizeDate(value.created_at ?? value.createdAt),
+    };
+  }
+
+  if (table === 'authorized_apps') {
+    return {
+      id: normalizeInteger(value.id),
+      user_id: normalizeInteger(value.user_id ?? value.userId),
+      app_id: value.app_id ?? value.appId ?? null,
+      app_token_hash: value.app_token_hash ?? value.appTokenHash ?? null,
+      app_name: String(value.app_name ?? value.appName ?? ''),
+      app_icon_url: value.app_icon_url ?? value.appIconUrl ?? null,
+      scopes: parseJson(value.scopes, []),
+      access_token_id: value.access_token_id ?? value.accessTokenId ?? null,
+      access_token_hash: value.access_token_hash ?? value.accessTokenHash ?? null,
+      created_at: normalizeDate(value.created_at ?? value.createdAt),
+      updated_at: normalizeDate(value.updated_at ?? value.updatedAt),
+      last_used_at: normalizeDate(value.last_used_at ?? value.lastUsedAt),
+    };
+  }
+
+  if (table === 'post_feedback') {
+    return {
+      user_id: normalizeInteger(value.user_id ?? value.userId),
+      post_id: normalizeInteger(value.post_id ?? value.postId),
+      kind: String(value.kind || 'not_interested'),
+      created_at: normalizeDate(value.created_at ?? value.createdAt),
     };
   }
 
@@ -307,14 +404,28 @@ function normalizeRow(table, input) {
 
   if (table === 'group_dms') {
     return {
-      id: value.id || null,
+      id: value.id == null ? null : String(value.id),
       host_id: normalizeInteger(value.host_id ?? value.hostId),
       title: String(value.title || ''),
       member: parseJson(value.member, []).map(Number).filter(Number.isSafeInteger),
       post: parseJson(value.post, []),
-      unread: parseJson(value.unread, {}),
+      unread: { ...parseJson(value.unread, {}), ...(Array.isArray(value.accepted) ? { _accepted: value.accepted } : {}) },
       time: normalizeDate(value.time),
       created_at: normalizeDate(value.created_at ?? value.createdAt),
+      // migration 032 の集約キャッシュ。移行先で post から再計算する。
+      message_count: Math.max(0, normalizeInteger(value.message_count ?? value.messageCount, 0)),
+      latest_message: value.latest_message === undefined ? null : parseJson(value.latest_message, null),
+      state_version: Math.max(0, normalizeInteger(value.state_version, 0)),
+    };
+  }
+
+  if (table === 'group_dm_send_requests') {
+    return {
+      dm_id: String(value.dm_id),
+      sender_id: normalizeInteger(value.sender_id),
+      request_id: String(value.request_id),
+      request_hash: String(value.request_hash),
+      response_message: parseJson(value.response_message, null),
     };
   }
 
@@ -336,6 +447,8 @@ function normalizeRow(table, input) {
       post_id: normalizeInteger(value.post_id ?? value.postId),
       target: parseJson(value.target, null),
       message: value.message || null,
+      // PostgreSQL だけが持つ列。D1 には無いので実行時検出で読み飛ばす。
+      open: value.open ?? null,
       read: normalizeBoolean(value.read),
       clicked: normalizeBoolean(value.clicked),
       created_at: normalizeDate(value.created_at ?? value.createdAt),
@@ -396,6 +509,8 @@ function normalizeRow(table, input) {
       icon_data: value.icon_data ?? value.iconData ?? null,
       header_image: value.header_image ?? value.headerImage ?? null,
       visibility: value.visibility || 'public',
+      // migration 028: グループ限定スペースの参照先。無いDBでは null のまま。
+      group_id: value.group_id ?? value.groupId ?? null,
       created_at: normalizeDate(value.created_at ?? value.createdAt),
       updated_at: normalizeDate(value.updated_at ?? value.updatedAt),
     };
@@ -432,6 +547,19 @@ function normalizeRow(table, input) {
     };
   }
 
+  if (table === 'mod_logs') {
+    return {
+      id: value.id,
+      created_at: value.created_at ?? value.createdAt,
+      actor_type: value.actor_type ?? value.actorType,
+      actor_id: value.actor_id ?? value.actorId ?? null,
+      action: value.action,
+      target_type: value.target_type ?? value.targetType,
+      target_id: value.target_id ?? value.targetId,
+      result: value.result,
+    };
+  }
+
   if (table === 'logs') {
     return {
       id: normalizeInteger(value.id),
@@ -445,44 +573,128 @@ function normalizeRow(table, input) {
   return cloneJson(value);
 }
 
+// スナップショットが実際に含むテーブルを判定する。
+// - version 2: tables_present が唯一の根拠。無いテーブルは「宛先の既存データを保持」。
+// - version 1: 旧形式。キーの有無しか手掛かりが無いため、キーが無いテーブルは
+//   「未対応で省略された」とみなして保持する（mod_logs と同じ扱い）。
+// - mod_logs_present === false は後方互換のため常に「保持」を意味する。
+//
+// version 2 で tables にだけ存在するキー（tables_present に無い）は省略として扱う。
+// ここで「tables のキーなら含む」と寄せてしまうと、createSnapshot が全テーブルの
+// キーを作るため、一度 writeSnapshot → readSnapshot を通した時点で tables_present が
+// 全表に膨らみ、省略したはずのテーブルが宛先で空に上書きされる（v2 の契約が崩れる）。
+function resolvePresentTables(snapshot, sourceTables) {
+  const version = Number(snapshot?.version);
+  const declared = Array.isArray(snapshot?.tables_present) ? snapshot.tables_present : null;
+  const explicit = version >= 2 && declared !== null;
+  const present = new Set();
+  if (explicit) {
+    for (const table of declared) {
+      if (TABLES.includes(table)) present.add(table);
+    }
+  } else {
+    // version 1（および後方互換で tables_present を持たない版）はキーの有無で判定する。
+    for (const table of TABLES) {
+      if (Object.prototype.hasOwnProperty.call(sourceTables, table)) present.add(table);
+    }
+  }
+  if (explicit) {
+    // tables_present に載っていない表の行が混ざっていたら、黙って捨てずに失敗する。
+    for (const [table, rows] of Object.entries(sourceTables)) {
+      if (!TABLES.includes(table) || present.has(table)) continue;
+      if (Array.isArray(rows) && rows.length) {
+        throw new Error(`Migration snapshot table ${table} has rows but is not listed in tables_present`);
+      }
+    }
+  }
+  if (snapshot?.mod_logs_present === false) present.delete('mod_logs');
+  return present;
+}
+
+function validateModLogs(rows) {
+  const ids = new Set();
+  for (const row of rows) {
+    if (typeof row.id !== 'string' || !row.id || ids.has(row.id) ||
+        ['created_at', 'actor_type', 'action', 'target_type', 'target_id', 'result'].some((key) => typeof row[key] !== 'string' || !row[key]) ||
+        (row.actor_id !== null && typeof row.actor_id !== 'string')) {
+      throw new TypeError('Invalid or duplicate mod log in migration snapshot');
+    }
+    ids.add(row.id);
+  }
+}
+
 function normalizeSnapshot(snapshot) {
   if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) {
     throw new TypeError('Migration snapshot must be an object');
   }
-  if (Number(snapshot.version) !== SNAPSHOT_VERSION) {
+  const version = Number(snapshot.version);
+  if (!SUPPORTED_SNAPSHOT_VERSIONS.includes(version)) {
     throw new Error(`Unsupported migration snapshot version: ${snapshot.version}`);
   }
   const sourceTables = snapshot.tables && typeof snapshot.tables === 'object' ? snapshot.tables : {};
+  const present = resolvePresentTables(snapshot, sourceTables);
   const tables = {};
   for (const table of TABLES) {
-    const rows = sourceTables[table] ?? [];
+    const included = present.has(table);
+    const rows = included ? (sourceTables[table] ?? []) : [];
     if (!Array.isArray(rows)) throw new TypeError(`Migration snapshot table ${table} must be an array`);
     tables[table] = rows.map((row) => normalizeRow(table, row));
+    if (table === 'mod_logs' && included) validateModLogs(tables[table]);
+  }
+  const excluded = Array.isArray(snapshot.excluded_tables)
+    ? snapshot.excluded_tables.filter((entry) => entry && typeof entry.table === 'string')
+    : [];
+  // 「このDBには無い列」の記録。ファイル往復やD1境界を越えても失わない。
+  const skippedColumns = {};
+  if (snapshot.skipped_columns && typeof snapshot.skipped_columns === 'object') {
+    for (const [table, columns] of Object.entries(snapshot.skipped_columns)) {
+      if (!TABLES.includes(table) || !Array.isArray(columns)) continue;
+      const names = columns.filter((column) => typeof column === 'string' && column);
+      if (names.length) skippedColumns[table] = names;
+    }
   }
   return {
     version: SNAPSHOT_VERSION,
+    source_version: version,
     created_at: normalizeDate(snapshot.created_at) || new Date().toISOString(),
     source_adapter: snapshot.source_adapter || null,
+    // 後方互換フィールド。新しい判定は tables_present を使う。
+    mod_logs_present: present.has('mod_logs'),
+    // 実際に含むテーブルの一覧。ここに無いテーブルは置換時に保持される。
+    tables_present: TABLES.filter((table) => present.has(table)),
+    excluded_tables: excluded,
+    ...(Object.keys(skippedColumns).length ? { skipped_columns: skippedColumns } : {}),
     tables,
+  };
+}
+
+function signSnapshot(unsignedSnapshot) {
+  return {
+    ...unsignedSnapshot,
+    checksum: crypto.createHash('sha256').update(JSON.stringify(unsignedSnapshot)).digest('hex'),
   };
 }
 
 function createSnapshot(sourceAdapter, rowsByTable) {
   const tables = {};
+  const present = [];
   for (const table of TABLES) {
-    const rows = rowsByTable?.[table] ?? [];
+    const included = Object.prototype.hasOwnProperty.call(rowsByTable || {}, table);
+    if (included) present.push(table);
+    const rows = included ? rowsByTable[table] : [];
     tables[table] = Array.isArray(rows) ? rows.map((row) => normalizeRow(table, row)) : [];
   }
-  const snapshot = {
+  if (present.includes('mod_logs')) validateModLogs(tables.mod_logs);
+  return signSnapshot({
     version: SNAPSHOT_VERSION,
     created_at: new Date().toISOString(),
     source_adapter: normalizeAdapterName(sourceAdapter),
+    // 省略（未対応）と明示的な空配列を区別する。省略されたテーブルは宛先で保持される。
+    tables_present: present,
+    mod_logs_present: present.includes('mod_logs'),
+    excluded_tables: EXCLUDED_TABLES.map((entry) => ({ table: entry.table, reason: entry.reason })),
     tables,
-  };
-  return {
-    ...snapshot,
-    checksum: crypto.createHash('sha256').update(JSON.stringify(snapshot)).digest('hex'),
-  };
+  });
 }
 
 function verifySnapshotChecksum(snapshot) {
@@ -533,10 +745,18 @@ async function readSnapshot(filePath) {
 
 module.exports = {
   SNAPSHOT_VERSION,
+  SUPPORTED_SNAPSHOT_VERSIONS,
   TABLES,
+  INSERT_ORDER,
+  TABLE_SPECS,
+  EXCLUDED_TABLES,
+  EXCLUDED_TABLE_NAMES,
+  specFor,
+  transferableColumns,
   normalizeAdapterName,
   normalizeSnapshot,
   createSnapshot,
+  signSnapshot,
   normalizeEpochMilliseconds,
   verifySnapshotChecksum,
   createAdapter,

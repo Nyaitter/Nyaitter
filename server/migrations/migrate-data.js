@@ -57,11 +57,34 @@ function parseArguments(argv) {
 }
 
 function countTables(snapshot) {
-  return Object.fromEntries(Object.entries(snapshot.tables).map(([table, rows]) => [table, rows.length]));
+  const counts = Object.fromEntries(Object.entries(snapshot.tables).map(([table, rows]) => [table, rows.length]));
+  // スナップショットに含まれないテーブルは宛先で保持される。「0件になる」と誤解しないよう比較対象から外す。
+  const included = Array.isArray(snapshot.tables_present) ? snapshot.tables_present : null;
+  if (included) {
+    for (const table of Object.keys(counts)) if (!included.includes(table)) delete counts[table];
+  } else if (snapshot.mod_logs_present === false) {
+    delete counts.mod_logs;
+  }
+  return counts;
 }
 
 function sameCounts(left, right) {
   return Object.keys(left).every((table) => Number(left[table] || 0) === Number(right[table] || 0));
+}
+
+// 件数比較の詳細。不一致になったテーブルと、比較しなかったテーブルを分けて返す。
+function compareCounts(sourceCounts, destinationCounts, snapshot) {
+  const mismatched = [];
+  const compared = [];
+  for (const [table, count] of Object.entries(sourceCounts)) {
+    compared.push(table);
+    if (Number(count || 0) !== Number(destinationCounts[table] || 0)) {
+      mismatched.push({ table, source: Number(count || 0), destination: Number(destinationCounts[table] || 0) });
+    }
+  }
+  const included = Array.isArray(snapshot?.tables_present) ? snapshot.tables_present : null;
+  const preserved = included ? Object.keys(destinationCounts).filter((table) => !included.includes(table)) : [];
+  return { mismatched, compared, preserved };
 }
 
 function socketFor(prefix) {
@@ -146,23 +169,61 @@ async function main() {
   const snapshotFile = output || input || path.join(os.tmpdir(), `nyaitter-data-migration-${Date.now()}.json`);
   const snapshot = input ? await readSnapshot(input) : await exportFromAdapter(from, snapshotFile);
   const sourceCounts = countTables(snapshot);
+  const preserved = snapshot.tables_present
+    ? Object.keys(snapshot.tables).filter((table) => !snapshot.tables_present.includes(table))
+    : [];
+  const excludedTables = (snapshot.excluded_tables || []).map((entry) => entry.table);
+  const skippedColumns = snapshot.skipped_columns || {};
 
   if (!to) {
-    console.log(JSON.stringify({ action: 'export', snapshot: snapshotFile, counts: sourceCounts }, null, 2));
+    console.log(JSON.stringify({
+      action: 'export',
+      snapshot: snapshotFile,
+      counts: sourceCounts,
+      preserved,
+      excluded_tables: excludedTables,
+      skipped_columns: skippedColumns,
+    }, null, 2));
     return;
   }
 
-  await importToAdapter(to, snapshot, snapshotFile);
+  const importReport = await importToAdapter(to, snapshot, snapshotFile);
   const verificationFile = path.join(os.tmpdir(), `nyaitter-data-migration-verify-${Date.now()}.json`);
   const destinationSnapshot = await exportFromDestination(to, verificationFile);
   const destinationCounts = countTables(destinationSnapshot);
-  if (!sameCounts(sourceCounts, destinationCounts)) {
-    throw new Error(`Destination row-count verification failed: ${JSON.stringify({ sourceCounts, destinationCounts })}`);
+  const comparison = compareCounts(sourceCounts, destinationCounts, snapshot);
+  if (comparison.mismatched.length) {
+    throw new Error(`Destination row-count verification failed: ${JSON.stringify({
+      mismatched: comparison.mismatched,
+      sourceCounts,
+      destinationCounts,
+    })}`);
   }
-  console.log(JSON.stringify({ action: 'migrate', from: from || snapshot.source_adapter, to, snapshot: snapshotFile, counts: destinationCounts }, null, 2));
+  console.log(JSON.stringify({
+    action: 'migrate',
+    from: from || snapshot.source_adapter,
+    to,
+    snapshot: snapshotFile,
+    counts: destinationCounts,
+    compared_tables: comparison.compared.length,
+    // スナップショットに含めず宛先に残したテーブル。件数比較の対象外であることを明示する。
+    preserved_tables: preserved,
+    // 置換で親行が消えたため CASCADE で連鎖削除されたテーブル。
+		cascaded_tables: importReport?.cascaded_tables || [],
+		// 置換/CASCADE とは独立した移行処理で空にしたテーブル。
+		cleared_tables: importReport?.cleared_tables || [],
+    // 移行対象外と決めたテーブル（理由付き）。黙って落ちていないことを示す。
+    excluded_tables: excludedTables,
+    skipped_columns: skippedColumns,
+    import_report: importReport,
+  }, null, 2));
 }
 
-main().catch((error) => {
-  console.error(`Data migration failed: ${error.message}`);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(`Data migration failed: ${error.message}`);
+    process.exit(1);
+  });
+}
+
+module.exports = { countTables, sameCounts, compareCounts };
