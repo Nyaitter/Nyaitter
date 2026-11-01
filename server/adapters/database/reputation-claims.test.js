@@ -111,7 +111,7 @@ test('G-1/G-2 evaluate: InMemory 実アダプタの claim 解放で却下通知�
     async getNoteVoteEvidence() { return evidence; },
     async listNoteDistributionsByNote() { return []; },
     async getReputationProfile() { return {}; },
-    async getWriterQualificationProfile() { return { writer: { score: 0, successes: 0 } }; },
+    async getTrustBasisProfile() { return { trust: { score: 0, successes: 0 } }; },
     async replaceReputationEvents(scope, events, evaluation = null) {
       if (evaluation) state.note.status = evaluation.status;
       return true;
@@ -220,4 +220,39 @@ test('G-1/G-2 D1: アダプタの経路と Worker のハンドラ契約', async 
   const negativeHandler = source.slice(source.indexOf('/negative-reasons$/.test(pathname)'));
   assert.ok(negativeHandler.slice(0, 1600).includes("url.searchParams.get('userIds')"), 'Worker が userIds を読む');
   assert.ok(negativeHandler.slice(0, 1600).includes('r.user_id IN ('), 'Worker が user_id で絞る');
+});
+
+test('統合: reviewer outcome は trust ディメンションで確定し、旧ディメンションは書けない', async () => {
+  const adapter = new InMemoryAdapter();
+  adapter.users.set(11, { id: 11 });
+  adapter.users.set(22, { id: 22 });
+  await adapter.replaceReputationEvents('note:5', [
+    { key: 'reviewer:11', userId: 11, dimension: 'trust', amount: 1, successes: 1, day: '2026-01-02', cap: null, metadata: { authorId: 22, ratedAt: '2026-01-02T00:00:00.000Z' } },
+  ]);
+  const profile = await adapter.getReputationProfile(11);
+  assert.equal(profile.trust.score, 1);
+  assert.equal(profile.trust.successes, 1);
+  assert.equal(profile.writer, undefined);
+  assert.equal(profile.reviewer, undefined);
+  await assert.rejects(adapter.replaceReputationEvents('note:6', [
+    { key: 'writer', userId: 11, dimension: 'writer', amount: 2, successes: 1, day: '2026-01-02', cap: null, metadata: {} },
+  ]));
+});
+
+test('統合: basis は独立ゲートを満たさない note 由来の正の額を数えない', async () => {
+  const adapter = new InMemoryAdapter();
+  adapter.users.set(11, { id: 11 });
+  await adapter.replaceReputationEvents('note:7', [
+    { key: 'writer', userId: 11, dimension: 'trust', amount: 2, successes: 1, day: '2026-01-03', cap: null, metadata: { independentWriter: false } },
+  ]);
+  await adapter.replaceReputationEvents('note:8', [
+    { key: 'writer', userId: 11, dimension: 'trust', amount: 3, successes: 1, day: '2026-01-04', cap: null, metadata: { independentWriter: true } },
+  ]);
+  const full = await adapter.getReputationProfile(11);
+  assert.equal(full.trust.score, 5);
+  const basis = await adapter.getTrustBasisProfile(11);
+  assert.equal(basis.trust.score, 3);
+  assert.equal(basis.trust.successes, 1);
+  const basisExcluded = await adapter.getTrustBasisProfile(11, { excludeScope: 'note:8' });
+  assert.equal(basisExcluded.trust.score, 0);
 });

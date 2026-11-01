@@ -1,20 +1,18 @@
 'use strict';
 
-const { rankOf, trustRank } = require('./reputationPolicy');
+const { trustRank } = require('./reputationPolicy');
 const { reputation: policy } = require('../config');
 const trustOrder = ['Trusted', 'Reliable', 'Credible', 'Neutral'];
 const attachedRanks = new WeakMap();
 
 function actualRanks(profile) {
-  return { trust: trustRank(profile, policy), writer: rankOf(profile.writer, policy.writer), reviewer: rankOf(profile.reviewer, policy.reviewer) };
+  return { trust: trustRank(profile, policy) };
 }
 
 function displayOptions(actual) {
   const index = trustOrder.indexOf(actual.trust);
   return {
     trust: index >= 0 ? trustOrder.slice(index + 1) : [],
-    writer: Array.from({ length: actual.writer }, (_, rank) => rank),
-    reviewer: Array.from({ length: actual.reviewer }, (_, rank) => rank),
   };
 }
 
@@ -38,7 +36,7 @@ function validateDisplaySettings(settings, actual) {
 
 function ownDisplaySettings(settings = {}, actual = null) {
   const overrides = settings.display_ranks;
-  const options = actual ? displayOptions(actual) : { trust: trustOrder, writer: policy.writer.map((_, rank) => rank), reviewer: policy.reviewer.map((_, rank) => rank) };
+  const options = actual ? displayOptions(actual) : { trust: trustOrder };
   return { show_ranks: settings.show_ranks === true, display_ranks: Object.fromEntries(Object.entries(options).map(([key, ranks]) => [key, ranks.includes(overrides?.[key]) ? overrides[key] : null])) };
 }
 

@@ -1220,10 +1220,6 @@ class InMemoryAdapter extends DatabaseAdapter {
 			shadow: false,
 			lock: false,
 			account_operation: null,
-			note_rank: 0,
-			note_affirmative_score: 0,
-			note_max_per_day: 1,
-			note_min_public_threshold: 0,
 			...(user || {}),
 		};
 		normalized.block = normalizeBlockList(normalized.block, normalized.id);

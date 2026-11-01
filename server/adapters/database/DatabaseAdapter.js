@@ -10,7 +10,7 @@ class DatabaseAdapter {
 	async createModLog() { throw new Error('createModLog not implemented'); }
 	async searchModLogs() { throw new Error('searchModLogs not implemented'); }
 	async getReputationProfile(userId, {excludeScope=null}={}) { throw new Error('getReputationProfile() must be implemented'); }
-	async getWriterQualificationProfile(userId, {excludeScope=null}={}) { throw new Error('getWriterQualificationProfile() must be implemented'); }
+	async getTrustBasisProfile(userId, {excludeScope=null}={}) { throw new Error('getTrustBasisProfile() must be implemented'); }
 	async getNoteSelectionKeys(userIds) { throw new Error('getNoteSelectionKeys() must be implemented'); }
 	async getReputationContext(userIds) { throw new Error('getReputationContext() must be implemented'); }
 	async claimNoteNotification(noteId,userId) { throw new Error('claimNoteNotification() must be implemented'); }

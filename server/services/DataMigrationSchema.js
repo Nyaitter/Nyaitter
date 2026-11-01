@@ -22,15 +22,11 @@ const TABLE_SPECS = Object.freeze([
     table: 'users',
     columns: ['id', 'scid', 'name', 'handle', 'nyaitter_address', 'auth_provider', 'provider_domain', 'external_id',
       'external_profile', 'uuid', 'settings', 'bio', 'header_image', 'icon_data', 'verify', 'freeze', 'admin',
-      'admin_request_excluded', 'shadow', 'block', 'account_operation', 'created_at',
-      // migration 034 (community notes) で追加。未適用DBでは実行時検出で除外される。
-      'note_rank', 'note_affirmative_score', 'note_max_per_day', 'note_min_public_threshold'],
+      'admin_request_excluded', 'shadow', 'block', 'account_operation', 'created_at'],
     json: ['external_profile', 'settings', 'block'],
     booleans: ['verify', 'admin', 'admin_request_excluded', 'shadow'],
-    integers: ['id', 'note_rank', 'note_max_per_day'],
-    numbers: ['note_affirmative_score', 'note_min_public_threshold'],
+    integers: ['id'],
     dates: ['created_at'],
-    optionalColumns: ['note_rank', 'note_affirmative_score', 'note_max_per_day', 'note_min_public_threshold'],
   },
   {
     table: 'user_auth_providers',

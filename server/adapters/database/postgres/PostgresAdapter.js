@@ -86,10 +86,6 @@ function normalizeUserRow(row) {
 		shadow: Boolean(row.shadow),
 		block: normalizeBlockList(rawBlock, id),
 		created_at: toIsoString(row.created_at),
-		note_rank: Number.isFinite(Number(row.note_rank)) ? Number(row.note_rank) : 0,
-		note_affirmative_score: Number.isFinite(Number(row.note_affirmative_score)) ? Number(row.note_affirmative_score) : 0,
-		note_max_per_day: Number.isFinite(Number(row.note_max_per_day)) ? Number(row.note_max_per_day) : 1,
-		note_min_public_threshold: Number.isFinite(Number(row.note_min_public_threshold)) ? Number(row.note_min_public_threshold) : 0,
 	};
 }
 

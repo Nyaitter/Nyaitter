@@ -5473,8 +5473,8 @@ export default {
 			if (method === 'GET' && /^\/reputation\/\d+$/.test(pathname)) {
 				const excludeScope=url.searchParams.get('excludeScope');
 				const args=excludeScope===null?[Number(pathname.split('/')[2])]:[Number(pathname.split('/')[2]),excludeScope];
-				const qualification=url.searchParams.get('writerQualification')==='1';
-				const rows=await db.prepare(qualification?reputationStorage.writerQualificationQuery('sqlite'):reputationStorage.reputationProfileQuery('sqlite',false,excludeScope!==null)).bind(...(qualification?[Number(pathname.split('/')[2]),excludeScope]:args)).all();
+				const qualification=url.searchParams.get('trustBasis')==='1';
+				const rows=await db.prepare(qualification?reputationStorage.trustBasisQuery('sqlite'):reputationStorage.reputationProfileQuery('sqlite',false,excludeScope!==null)).bind(...(qualification?[Number(pathname.split('/')[2]),excludeScope]:args)).all();
 				return json(reputationStorage.profileFromRows(rows.results));
 			}
 			if (method === 'POST' && pathname === '/reputation/events') {

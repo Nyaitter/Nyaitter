@@ -1,11 +1,11 @@
 'use strict';
 
-const {noteIdFromScope,reviewerGroup,splitNoteEvents,compareCandidates,isWriterBasis,writerQualificationQuery}=require('../../utils/noteReputation');
+const {noteIdFromScope,reviewerGroup,splitNoteEvents,compareCandidates,isTrustBasis,trustBasisQuery}=require('../../utils/noteReputation');
 
 function normalizeEvents(events) {
   if (!Array.isArray(events) || events.length > 1000) throw new Error('Invalid reputation events');
   return events.map(e => {
-    if (!['trust', 'writer', 'reviewer', 'ban'].includes(e.dimension) || !Number.isSafeInteger(e.userId) || e.userId <= 0
+    if (!['trust', 'ban'].includes(e.dimension) || !Number.isSafeInteger(e.userId) || e.userId <= 0
       || !Number.isFinite(e.amount) || Math.abs(e.amount) > 100 || !(e.cap === null || e.cap === -1 || (Number.isFinite(e.cap) && e.cap >= 0 && e.cap <= 100))
       || ![0, 1].includes(e.successes || 0) || !/^\d{4}-\d{2}-\d{2}$/.test(e.day) || !e.key) throw new Error('Invalid reputation event');
     // SQLのNOT NULL列では、JSONの「上限なし」を-1で保存する。
@@ -107,7 +107,7 @@ function installMemory(Adapter) {
     this.reviewerOutcomeCandidates ||= new Map();
     const groups=new Set();
     for (const e of this.reviewerOutcomeCandidates.values()) if (e.noteId===Number(noteId)) groups.add(reviewerGroup(e));
-    for (const e of this.reputationEvents?.get(`note:${Number(noteId)}`) || []) if (e.dimension==='reviewer') groups.add(reviewerGroup(e));
+    for (const e of this.reputationEvents?.get(`note:${Number(noteId)}`) || []) if (String(e.key).startsWith('reviewer:')) groups.add(reviewerGroup(e));
     // 保存済みの代表も対象に含め、このノートが取り下げられた枠を別のノートへ移す。
     for (const [group,winner] of this.reviewerOutcomeClaims || []) if (Number(winner)===Number(noteId)) groups.add(group);
     return this.refreshReviewerOutcomes([...groups]);
@@ -141,7 +141,7 @@ function installMemory(Adapter) {
     if (removed || !this.communityNotes.has(Number(noteId))) {
       this.reviewerOutcomeCandidates ||= new Map();
       for (const [key,e] of this.reviewerOutcomeCandidates) if (e.noteId===Number(noteId)) this.reviewerOutcomeCandidates.delete(key);
-      await this.replaceReputationEvents(`note:${noteId}`,(this.reputationEvents?.get(`note:${noteId}`) || []).filter(e=>e.dimension!=='reviewer' && e.amount<=0).map(e=>({...e,metadata:JSON.parse(e.metadata)})));
+      await this.replaceReputationEvents(`note:${noteId}`,(this.reputationEvents?.get(`note:${noteId}`) || []).filter(e=>!String(e.key).startsWith('reviewer:') && e.amount<=0).map(e=>({...e,metadata:JSON.parse(e.metadata)})));
       await this.refreshReviewerOutcomesForNote(noteId);
     }
     return removed;
@@ -248,12 +248,12 @@ function installMemory(Adapter) {
     }
     return profile;
   };
-  Adapter.prototype.getWriterQualificationProfile = async function(userId,{excludeScope=null}={}) {
+  Adapter.prototype.getTrustBasisProfile = async function(userId,{excludeScope=null}={}) {
     const days=new Map();
     for (const [scope,events] of this.reputationEvents || []) {
       if (scope===excludeScope) continue;
       for (const e of events) {
-        if (e.userId!==Number(userId) || !isWriterBasis(e,scope)) continue;
+        if (e.userId!==Number(userId) || !isTrustBasis(e,scope)) continue;
         const row=days.get(e.day) || {positive:0,negative:0,successes:0,uncappedPositive:0,uncappedSuccesses:0,cap:-1};
         row.positive+=Math.max(0,e.amount);row.negative+=Math.min(0,e.amount);row.successes+=e.successes;
         if (e.cap===-1) {row.uncappedPositive+=Math.max(0,e.amount);row.uncappedSuccesses+=e.successes;}
@@ -261,9 +261,9 @@ function installMemory(Adapter) {
         days.set(e.day,row);
       }
     }
-    const writer={score:0,successes:0,positiveDays:0};
-    for (const row of days.values()) {const score=scoreOf(row);writer.score+=score;writer.successes+=successesOf(row);if (score>0) writer.positiveDays++;}
-    return {writer};
+    const trust={score:0,successes:0,positiveDays:0};
+    for (const row of days.values()) {const score=scoreOf(row);trust.score+=score;trust.successes+=successesOf(row);if (score>0) trust.positiveDays++;}
+    return {trust};
   };
   Adapter.prototype.replaceReputationEvents = async function(scope, input, evaluation = null) {
     const {noteId,events,candidates}=splitNoteEvents(scope,normalizeEvents(input));
@@ -374,8 +374,8 @@ function installPostgres(Adapter) {
     const args=excludeScope===null?[Number(userId)]:[Number(userId),excludeScope];
     return profileFromRows((await this.pool.query(reputationProfileQuery('postgres',false,excludeScope!==null),args)).rows);
   };
-  Adapter.prototype.getWriterQualificationProfile = async function(userId,{excludeScope=null}={}) {
-    return profileFromRows((await this.pool.query(writerQualificationQuery('postgres'),[Number(userId),excludeScope])).rows);
+  Adapter.prototype.getTrustBasisProfile = async function(userId,{excludeScope=null}={}) {
+    return profileFromRows((await this.pool.query(trustBasisQuery('postgres'),[Number(userId),excludeScope])).rows);
   };
   Adapter.prototype.replaceReputationEvents = async function(scope,input,evaluation=null) {
     const {noteId,events,candidates}=splitNoteEvents(scope,normalizeEvents(input));
@@ -437,9 +437,9 @@ function installD1(Adapter) {
     const query=excludeScope===null?'':`?excludeScope=${encodeURIComponent(excludeScope)}`;
     return this._read(`/reputation/${Number(userId)}${query}`,{cacheSeconds:0});
   };
-  Adapter.prototype.getWriterQualificationProfile = async function(userId,{excludeScope=null}={}) {
+  Adapter.prototype.getTrustBasisProfile = async function(userId,{excludeScope=null}={}) {
     const query=excludeScope===null?'':`&excludeScope=${encodeURIComponent(excludeScope)}`;
-    return this._read(`/reputation/${Number(userId)}?writerQualification=1${query}`,{cacheSeconds:0});
+    return this._read(`/reputation/${Number(userId)}?trustBasis=1${query}`,{cacheSeconds:0});
   };
   Adapter.prototype.replaceReputationEvents = async function(scope,events,evaluation=null) {
     normalizeEvents(events);
@@ -454,4 +454,4 @@ function installD1(Adapter) {
   };
 }
 
-module.exports = { installMemory,installPostgres,installD1,normalizeEvents,profileFromRows,reputationProfileQuery,sqliteReputationStatements,writerQualificationQuery };
+module.exports = { installMemory,installPostgres,installD1,normalizeEvents,profileFromRows,reputationProfileQuery,sqliteReputationStatements,trustBasisQuery };

@@ -46,7 +46,7 @@ function makeDb({ noteStatus = 'limited', votes = [], edges = [], reasons = [] }
     async getNoteVoteEvidence() { return evidence; },
     async listNoteDistributionsByNote() { return []; },
     async getReputationProfile() { return {}; },
-    async getWriterQualificationProfile() { return { writer: { score: 0, successes: 0 } }; },
+    async getTrustBasisProfile() { return { trust: { score: 0, successes: 0 } }; },
     async replaceReputationEvents(scope, events, evaluation = null) {
       if (evaluation && evaluation.version !== evidence.version) return false;
       state.events.set(scope, events);
@@ -172,4 +172,30 @@ test('D-Low: protectedStatus のキー漏れ対策', () => {
   assert.equal(containsProtectedStatus({ display_ranks: ['writer'] }), true);
   assert.equal(containsProtectedStatus({ profile: { note: 'hello' } }), false);
   assert.deepEqual(publicSettings({ TrustScore: 5, bio: 'hi' }), { bio: 'hi' });
+});
+
+test('統合: 公開・却下の reputation イベントは trust ディメンションに一本化される', async () => {
+  const helpfulVotes = [
+    { userId: 1, helpful: true, castAt: '2026-01-02T00:00:00.000Z' },
+    ...[21, 22, 23, 24, 25].map((userId) => ({ userId, helpful: true, castAt: '2026-01-03T00:00:00.000Z' })),
+  ];
+  const pub = makeDb({ votes: helpfulVotes });
+  const publicNote = await notesService.evaluate(1, pub.db);
+  assert.equal(publicNote.status, 'public');
+  const pubEvents = pub.state.events.get('note:1') || [];
+  const writerEvent = pubEvents.find((e) => e.key === 'writer');
+  assert.equal(writerEvent.dimension, 'trust');
+  assert.equal(writerEvent.amount, 2);
+  assert.equal(writerEvent.successes, 1);
+  assert.equal(writerEvent.metadata.independentWriter, true);
+  assert.ok(pubEvents.filter((e) => String(e.key).startsWith('reviewer:')).every((e) => e.dimension === 'trust'));
+
+  const rejectVotes = [41, 42, 43, 44, 45].map((userId, i) => ({
+    userId, helpful: false, castAt: `2026-01-0${i + 2}T00:00:00.000Z`,
+  }));
+  const rej = makeDb({ votes: rejectVotes, reasons: [] });
+  const rejectedNote = await notesService.evaluate(1, rej.db);
+  assert.equal(rejectedNote.status, 'rejected');
+  const rejEvents = rej.state.events.get('note:1') || [];
+  assert.deepEqual(rejEvents.map((e) => [e.key, e.dimension, e.amount]), [['writer', 'trust', -2], ['rejected', 'trust', -2]]);
 });

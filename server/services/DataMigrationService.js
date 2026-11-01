@@ -116,10 +116,6 @@ function normalizeRow(table, input) {
       account_operation: value.account_operation || null,
       created_at: normalizeDate(value.created_at ?? value.createdAt),
       // migration 034。未移行の古い行には無いので既定値へ落とす。
-      note_rank: normalizeInteger(value.note_rank ?? value.noteRank, 0),
-      note_affirmative_score: normalizeNumber(value.note_affirmative_score ?? value.noteAffirmativeScore, 0),
-      note_max_per_day: normalizeInteger(value.note_max_per_day ?? value.noteMaxPerDay, 1),
-      note_min_public_threshold: normalizeNumber(value.note_min_public_threshold ?? value.noteMinPublicThreshold, 0),
     };
   }
 

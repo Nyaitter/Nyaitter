@@ -4,7 +4,7 @@ const api = require('../utils/ApiRegistry');
 const { requireAuth } = require('../middleware/auth');
 const notesService = require('../services/CommunityNoteService');
 const { policy } = require('../services/ReputationService');
-const { rankOf } = require('../utils/reputationPolicy');
+const { trustRank } = require('../utils/reputationPolicy');
 const { canViewPost } = require('../utils/postVisibility');
 
 const router = api.createRouter({
@@ -133,7 +133,7 @@ router.post({
     const post = await db.getPostById(postId);
     if (!post || !await canViewPost(db,post,req.user.id)) return res.status(404).json({error:'投稿が見つかりません'});
     const profile = await db.getReputationProfile(req.user.id);
-    const writerRank = rankOf(profile.writer,policy.writer);
+    const authorRank = trustRank(profile,policy);
 
     // アダプタ間で reasons の受け取り形が異なるため、コード文字列に正規化して渡す
     // (side は定義テーブルを情報源とするため 'create' 固定)。
@@ -144,7 +144,7 @@ router.post({
       sources,
       reasons: reasons.map((code) => ({ side: 'create', code })),
       status: 'limited',
-      dailyLimit: policy.writer[writerRank].dailyNotes,
+      dailyLimit: policy.trust[authorRank].dailyNotes,
       postLimit: policy.notes.maxNotesPerPost,
     });
 
@@ -309,13 +309,13 @@ router.post({
     }
 
     const profile=await db.getReputationProfile(req.user.id);
-    const reviewerRank=rankOf(profile.reviewer,policy.reviewer);
+    const raterRank=trustRank(profile,policy);
     if (note.status==='public' && !await db.getNoteDistribution(note.id,req.user.id)) await db.upsertNoteDistribution({noteId:note.id,userId:req.user.id,tier:0,notified:false});
     let summary;
     for (let attempt=0;attempt<3;attempt++) {
       const admission=await notesService.captureVoteRelations(db,note,req.user.id,post);
       try {
-        summary=await db.rateNote({ noteId,userId:req.user.id,helpful,weight:policy.reviewer[reviewerRank].weight,maxRatings:policy.notes.maxRatings,
+        summary=await db.rateNote({ noteId,userId:req.user.id,helpful,weight:policy.trust[raterRank].ratingWeight,maxRatings:policy.notes.maxRatings,
           expectedRatingVersion:admission.ratingVersion,relationManifest:admission.relationManifest });
         break;
       } catch (error) {

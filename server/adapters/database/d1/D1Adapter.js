@@ -80,10 +80,6 @@ function normalizeUser(user) {
 	return {
 		...user,
 		block: normalizeBlockList(user.block, user.id),
-		note_rank: Number((user.note_rank ?? user.noteRank) ?? 0),
-		note_affirmative_score: Number((user.note_affirmative_score ?? user.noteAffirmativeScore) ?? 0),
-		note_max_per_day: Number((user.note_max_per_day ?? user.noteMaxPerDay) ?? 1),
-		note_min_public_threshold: Number((user.note_min_public_threshold ?? user.noteMinPublicThreshold) ?? 0),
 	};
 }
 

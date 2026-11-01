@@ -1,7 +1,7 @@
 'use strict';
 
 const config = require('../config');
-const { rankOf, trustRank } = require('../utils/reputationPolicy');
+const { trustRank } = require('../utils/reputationPolicy');
 const { canViewPost } = require('../utils/postVisibility');
 const { hasBlockRelationship } = require('../utils/blockRelationship');
 const { isImposter, getImposterMetadata } = require('./ImposterService');
@@ -50,10 +50,15 @@ const trustDescriptions = {
   Banned:'閲覧のみ利用できます。',
 };
 const featureLabels={write:'投稿・反応',posts:'投稿',polls:'アンケート',notes:'ノート作成・評価',uploads:'アップロード',dm:'メッセージ送信',call:'通話',spaces:'スペース',groups:'グループ'};
-const contributionRankNames=['New','Junior','Regular','Senior','Expert','Veteran'];
 const publicSupportPercent=rules=>Number(((policy.notes.publicRatio-rules.publicRatioReduction)*100).toFixed(2));
-const writerDescription='ノートを作成できます。';
-const reviewerDescription='ノートを評価し、公開するかどうかの判断に参加できます。';
+const noteBenefits=rules=>rules.disabledFeatures.includes('notes')?[]:[
+  `公開時の「参考になる」評価の基準は${publicSupportPercent(rules)}%です`,
+  rules.dailyNotes===null?'ノートは1日に何件でも作成できます':`ノートは1日${rules.dailyNotes}件まで作成できます`,
+  `ノートの評価が${rules.ratingWeight}倍の重みで反映されます`,
+  rules.noteVisibility===1?'閲覧できる投稿の公開前のノートをすべて確認できます':rules.noteVisibility>0?'公開前に見られるノートの範囲が広がります':'公開前のノートは一部が表示されます',
+  ...(rules.publicBonus>0?[`作成したノートが公開されると、信頼スコアに${rules.publicBonus}点が追加されます`]:[]),
+];
+const noteRestrictions=['自分のノートは評価できません','同じ投稿にノートを作成できるのは一度だけです',`1つの投稿に作成できるノートは全員で${policy.notes.maxNotesPerPost}件までです`,'公開前のノートの閲覧範囲は、見る人の信頼ランクで広がります','公開後も、投稿の公開範囲やブロックによる閲覧制限は変わりません','反応していない投稿の公開前のノートは通知されません'];
 const rateLimitLabels={general:'全体の操作',auth:'ログイン・認証',postWrite:'投稿',profileUpdate:'プロフィールの変更',dmSend:'メッセージ送信',upload:'アップロード',notification:'通知の確認',reportCreate:'通報',reportAction:'通報への対応',verificationApplication:'認証の申請'};
 
 async function getStatus(db,userId) {
@@ -69,18 +74,10 @@ async function getStatus(db,userId) {
       return `${label}: ${seconds%60===0?`${seconds/60}分`:`${seconds}秒`}あたり${max}回まで`;
     }):[];
     const queue=features.find(f=>f.label===featureLabels.write).allowed?[rules.queuePriority>0?'混雑時も投稿が優先して送信されます':rules.queuePriority<0?'混雑時は投稿の送信をお待ちいただくことがあります':'投稿は通常の順番で送信されます']:[];
-    return {rank,label:`${rank} User`,description:trustDescriptions[rank],requirements:rules.minScore>0?[`信頼スコア${rules.minScore}点以上`]:[],benefits:[...features.filter(f=>f.allowed).map(f=>`${f.label}を利用できます`),...queue, ...limits],restrictions:[...features.filter(f=>!f.allowed).map(f=>`${f.label}は利用できません`),'短時間に操作が集中すると、一時的に利用が制限されることがあります']};
+    return {rank,label:`${rank} User`,description:trustDescriptions[rank],requirements:rules.minScore>0?[`信頼スコア${rules.minScore}点以上`]:[],benefits:[...features.filter(f=>f.allowed).map(f=>`${f.label}を利用できます`),...queue, ...limits, ...noteBenefits(rules)],restrictions:[...features.filter(f=>!f.allowed).map(f=>`${f.label}は利用できません`),...noteRestrictions,'短時間に操作が集中すると、一時的に利用が制限されることがあります']};
   });
-  const writerRanks=policy.writer.map((rules,rank)=>({rank,label:`${contributionRankNames[rank]} Writer`,description:writerDescription,benefits:[`公開時の「参考になる」評価の基準は${publicSupportPercent(rules)}%です`,rules.dailyNotes===null?'ノートは1日に何件でも作成できます':`ノートは1日${rules.dailyNotes}件まで作成できます`],restrictions:['自分のノートは評価できません','同じ投稿にノートを作成できるのは一度だけです',`1つの投稿に作成できるノートは全員で${policy.notes.maxNotesPerPost}件までです`,'短時間に何度も送信することはできません','公開前のノートの閲覧範囲は、見る人のレビュワーランクで広がります','公開後も、投稿の公開範囲やブロックによる閲覧制限は変わりません']})).reverse();
-  const reviewerRanks=policy.reviewer.map((rules,rank)=>({rank,label:`${contributionRankNames[rank]} Reviewer`,description:reviewerDescription,benefits:[`ノートの評価が${rules.weight}倍の重みで反映されます`,policy.reviewerVisibility[rank]===1?'閲覧できる投稿の公開前のノートをすべて確認できます':policy.reviewerVisibility[rank]>0?'公開前に見られるノートの範囲が広がります':'公開前のノートは一部が表示されます',...(rules.writerBonus>0?[`作成したノートが公開されると、ライタースコアに${rules.writerBonus}点が追加されます`]:[])],restrictions:['投稿の公開範囲やブロックによる閲覧制限は変わりません','反応していない投稿の公開前のノートは通知されません']})).reverse();
-  for (const [dimension,ranks] of [['writer',writerRanks],['reviewer',reviewerRanks]]) {
-    for (const entry of ranks) {
-      const rules=policy[dimension][entry.rank];
-      entry.requirements=entry.rank?[`スコア${rules.score}点以上`,`成功実績${rules.successes}件以上`]:[];
-    }
-  }
   const category=(ranks,rank)=>({...ranks.find(r=>r.rank===rank),ranks});
-  return {trust:category(trustRanks,trustRank(profile,policy)),writer:category(writerRanks,rankOf(profile.writer,policy.writer)),reviewer:category(reviewerRanks,rankOf(profile.reviewer,policy.reviewer))};
+  return {trust:category(trustRanks,trustRank(profile,policy))};
 }
 
 async function independenceContext(db,ids) {
@@ -149,7 +146,7 @@ async function syncReport(db,report) {
 }
 
 async function cancelPostEvents(db,postId,notes=[]) {
-  for (const note of notes) await db.replaceReputationEvents(`note:${note.id}`,note.status==='rejected'?[event('writer',note.userId,'writer',-2,0,new Date(note.createdAt).toISOString().slice(0,10)),event('rejected',note.userId,'trust',policy.penalties.rejectedNote,0,new Date(note.createdAt).toISOString().slice(0,10))]:[]);
+  for (const note of notes) await db.replaceReputationEvents(`note:${note.id}`,note.status==='rejected'?[event('writer',note.userId,'trust',-2,0,new Date(note.createdAt).toISOString().slice(0,10)),event('rejected',note.userId,'trust',policy.penalties.rejectedNote,0,new Date(note.createdAt).toISOString().slice(0,10))]:[]);
   await db.replaceReputationEvents(`post-trust:${postId}`,[]);
 }
 

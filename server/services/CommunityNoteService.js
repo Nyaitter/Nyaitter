@@ -3,7 +3,7 @@
 const crypto=require('crypto');
 const {canViewPost}=require('../utils/postVisibility');
 const {hasBlockRelationship,blocksUser}=require('../utils/blockRelationship');
-const {rankOf}=require('../utils/reputationPolicy');
+const {trustRank}=require('../utils/reputationPolicy');
 const {createNotificationIfAllowed}=require('./NotificationDeliveryService');
 const reputation=require('./ReputationService');
 const {policy,event,serialized}=reputation;
@@ -70,7 +70,7 @@ async function computeNoteRelevance(db,note,userId,engaged=false,review=null,sel
   if (review == null) review = ['review','public'].includes(note.status);
   if (Number(userId)===Number(note.userId)) return false;
   const profile=await cachedValue(cache?.profiles,Number(userId),()=>db.getReputationProfile(userId));
-  const coverage=policy.reviewerVisibility[rankOf(profile.reviewer,policy.reviewer)];
+  const coverage=policy.trust[trustRank(profile,policy)].noteVisibility;
   const baseRate=engaged?(review?policy.notes.reviewEngagedRate:policy.notes.engagedRate):(review?policy.notes.reviewIncidentalRate:policy.notes.incidentalRate);
   const rate=baseRate+(1-baseRate)*coverage;
   selectionKey ||= (await db.getNoteSelectionKeys([userId]))[userId];
@@ -340,9 +340,9 @@ async function evaluate(noteId,db,audit=null) {
       const dist=await db.listNoteDistributionsByNote(noteId);
       const quorum=Math.max(policy.notes.minReviewVotes,Math.ceil(dist.length*policy.notes.quorumRate));
       const profile=await db.getReputationProfile(note.userId,{excludeScope:`note:${note.id}`});
-      const basis=await db.getWriterQualificationProfile(note.userId,{excludeScope:`note:${note.id}`});
-      const writerRank=rankOf(basis.writer,policy.writer); const reviewerRank=rankOf(profile.reviewer,policy.reviewer);
-      const publicRatio=policy.notes.publicRatio-policy.writer[writerRank].publicRatioReduction;
+      const basis=await db.getTrustBasisProfile(note.userId,{excludeScope:`note:${note.id}`});
+      const basisRank=trustRank({...profile,trust:basis.trust},policy);
+      const publicRatio=policy.notes.publicRatio-policy.trust[basisRank].publicRatioReduction;
       let status='limited';
       // 公開は割合優先の仕様に基づき、quorum ではなく minPublicSample を最低標本とする意図的な非対称（却下・審査は quorum 必須）。
       if (count>=quorum && (1-ratio)>=policy.notes.rejectRatio && (1-weighted)>=policy.notes.rejectRatio) status='rejected';
@@ -353,9 +353,9 @@ async function evaluate(noteId,db,audit=null) {
       if (empty) status='limited';
       const day=new Date(note.createdAt).toISOString().slice(0,10);
       const events=[];
-      if (status==='public') events.push(event('writer',note.userId,'writer',2+policy.reviewer[reviewerRank].writerBonus,1,day,{independentWriter:count>=policy.notes.minPublicSample && ratio>=policy.notes.publicRatio && weighted>=policy.notes.publicRatio}));
+      if (status==='public') events.push(event('writer',note.userId,'trust',2+policy.trust[basisRank].publicBonus,1,day,{independentWriter:count>=policy.notes.minPublicSample && ratio>=policy.notes.publicRatio && weighted>=policy.notes.publicRatio}));
       if (status==='rejected') {
-        events.push(event('writer',note.userId,'writer',-2,0,day));
+        events.push(event('writer',note.userId,'trust',-2,0,day));
         events.push(event('rejected',note.userId,'trust',policy.penalties.rejectedNote,0,day));
       }
       for (const rating of votes) {
@@ -370,7 +370,7 @@ async function evaluate(noteId,db,audit=null) {
         if (agreement<policy.notes.laterRatio && agreement>1-policy.notes.laterRatio) continue;
         const correct=Boolean(rating.helpful)===(agreement>=policy.notes.laterRatio);
         const ratingDay=new Date(rating.castAt).toISOString().slice(0,10);
-        events.push(event(`reviewer:${uid}`,uid,'reviewer',correct?1:-1,correct?1:0,ratingDay,{authorId:Number(note.userId),noteId:Number(note.id),day:ratingDay,ratedAt:rating.castAt}));
+        events.push(event(`reviewer:${uid}`,uid,'trust',correct?1:-1,correct?1:0,ratingDay,{authorId:Number(note.userId),noteId:Number(note.id),day:ratingDay,ratedAt:rating.castAt}));
       }
       let applied;
       try {
@@ -417,7 +417,7 @@ async function evaluate(noteId,db,audit=null) {
 
 async function deleteNote(db,note,{retract=false,adminId=null}={}) {
   const day=new Date(note.createdAt).toISOString().slice(0,10);
-  const retained=note.status==='rejected' && !retract?[event('writer',note.userId,'writer',-2,0,day),event('rejected',note.userId,'trust',policy.penalties.rejectedNote,0,day)]:[];
+  const retained=note.status==='rejected' && !retract?[event('writer',note.userId,'trust',-2,0,day),event('rejected',note.userId,'trust',policy.penalties.rejectedNote,0,day)]:[];
   let removed=false;
   for (let attempt=0;attempt<3;attempt++) {
     const data=await db.getNoteReviewData(note.id);if (!data) {

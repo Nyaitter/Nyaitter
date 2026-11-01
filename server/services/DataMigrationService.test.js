@@ -150,7 +150,7 @@ test('Postgres import copies the six previously omitted tables and metadata colu
     version: 2,
     tables_present: ['users', 'posts', 'account_recovery_requests', 'blocked_login_ips', 'polls', 'poll_votes', 'authorized_apps', 'post_feedback'],
     tables: {
-      users: [{ id: 1, name: 'u', note_rank: 12, note_max_per_day: 4, note_min_public_threshold: 2 }],
+      users: [{ id: 1, name: 'u' }],
       posts: [{ id: 10, user_id: 1, content: 'x', like_count: 9, reply_control: 'followers', scheduled_at: '2026-01-01T00:00:00.000Z' }],
       account_recovery_requests: [{ id: 'r1', user_id: 1, ip_hash: 'h', request_token_hash: 't', status: 'expired', wait_until: '2026-01-01T00:00:00.000Z' }],
       blocked_login_ips: [{ user_id: 1, ip_hash: 'h', ip_masked: 'm' }],
@@ -166,8 +166,7 @@ test('Postgres import copies the six previously omitted tables and metadata colu
     assert.equal(report.imported[table], 1);
   }
   const userInsert = queries.find((sql) => sql.startsWith('INSERT INTO "users"'));
-  assert.match(userInsert, /"note_rank"/);
-  assert.match(userInsert, /"note_max_per_day"/);
+  assert.match(userInsert, /"name"/);
   const postInsert = queries.find((sql) => sql.startsWith('INSERT INTO "posts"'));
   assert.match(postInsert, /"reply_control"/);
   assert.match(postInsert, /"scheduled_at"/);
@@ -193,13 +192,13 @@ test('Postgres import fails before deleting anything when a snapshot table is mi
 test('Postgres import reports columns the destination does not have instead of dropping them silently', async () => {
   const queries = [];
   const client = fakePostgresClient(queries);
-  // migration 034 未適用の宛先を模す（users に note_* が無い）。
+  // migration 042 未適用の宛先を模す（users に admin_request_excluded が無い）。
   const schemaRows = pgSchemaRows(TABLES);
   const original = client.query.bind(client);
   client.query = async (sql, params) => {
     if (sql.includes('information_schema.columns')) {
       const wanted = new Set(params?.[0] || []);
-      return { rows: schemaRows.filter((row) => wanted.has(row.table_name) && !row.column_name.startsWith('note_')) };
+      return { rows: schemaRows.filter((row) => wanted.has(row.table_name) && row.column_name !== 'admin_request_excluded') };
     }
     return original(sql, params);
   };
@@ -207,9 +206,9 @@ test('Postgres import reports columns the destination does not have instead of d
   const report = await importPostgresSnapshot(pool, {
     version: 2,
     tables_present: ['users'],
-    tables: { users: [{ id: 1, name: 'u', note_rank: 5 }] },
+    tables: { users: [{ id: 1, name: 'u', admin_request_excluded: true }] },
   }, { replace: true });
-  assert.deepEqual(report.skipped_columns.users.sort(), ['note_affirmative_score', 'note_max_per_day', 'note_min_public_threshold', 'note_rank']);
+  assert.deepEqual(report.skipped_columns.users.sort(), ['admin_request_excluded']);
 });
 
 test('D1 adapter forwards legacy omission across the worker boundary', async () => {

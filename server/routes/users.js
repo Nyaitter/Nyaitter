@@ -49,7 +49,7 @@ router.get({path:'/me/status',summary:'自分の利用状態',auth:'required'},r
 	try {
 		const db = getDbAdapter(req);
 		const [status, user] = await Promise.all([reputation.getStatus(db, req.user.id), db.getUserById(req.user.id)]);
-		const actual = { trust: status.trust.rank, writer: status.writer.rank, reviewer: status.reviewer.rank };
+		const actual = { trust: status.trust.rank };
 		res.set('Cache-Control','no-store');
 		return res.json({ ...status, display_ranks: displayRanks(actual, user?.settings?.display_ranks), display_rank_options: displayOptions(actual), display_settings: ownDisplaySettings(user?.settings, actual) });
 	}
