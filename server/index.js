@@ -666,6 +666,23 @@ if (nyaitterUiDir) {
     console.info('[server] nyaitter-ui served from', nyaitterUiDir);
 }
 
+// ── NyaitterIME (patched build) ──────────────────────────────────────────────
+// クライアントには同梱せず、パッチ済みビルドを独立アセットとして配信する。
+// クライアントは manifest の nyaitter_ime（既定は /nyaitter-ime/ 配下）で参照する。
+const nyaitterImeDir = path.join(__dirname, '../nyaitter-ime');
+if (fs.existsSync(nyaitterImeDir) && fs.statSync(nyaitterImeDir).isDirectory()) {
+    app.use('/nyaitter-ime', compressedStatic(nyaitterImeDir, staticCacheHeaders));
+    app.use(
+        '/nyaitter-ime',
+        express.static(nyaitterImeDir, {
+            etag: true,
+            lastModified: true,
+            setHeaders: staticCacheHeaders,
+        }),
+    );
+    console.info('[server] nyaitter-ime served from', nyaitterImeDir);
+}
+
 if (hasStaticPage) {
     const indexRedirects = new Set(['/index', '/index.html', '/page/index', '/page/index.html', '/page', '/page/']);
 
