@@ -26,7 +26,8 @@ const ARRAY_COLUMNS = new Set(['participants', 'member']);
 const DATE_COLUMNS = new Set([
   'created_at', 'updated_at', 'tags_generated_at', 'expires_at', 'last_used_at', 'decided_at', 'consumed_at',
   'sent_at', 'read_at', 'time', 'assigned_at', 'resolved_at', 'claimed_at', 'log_time', 'deleted_at', 'joined_at',
-  'responded_at', 'reviewed_at', 'wait_until', 'started_at', 'last_notified_at', 'scheduled_at',
+  'responded_at', 'reviewed_at', 'wait_until', 'started_at', 'last_notified_at', 'scheduled_at', 'retired_at',
+  'age_estimated_at',
 ]);
 
 function quoteIdentifier(identifier) {

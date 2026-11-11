@@ -22,11 +22,18 @@ const TABLE_SPECS = Object.freeze([
     table: 'users',
     columns: ['id', 'scid', 'name', 'handle', 'nyaitter_address', 'auth_provider', 'provider_domain', 'external_id',
       'external_profile', 'uuid', 'settings', 'bio', 'header_image', 'icon_data', 'verify', 'freeze', 'admin',
-      'admin_request_excluded', 'shadow', 'block', 'account_operation', 'created_at'],
+      'admin_request_excluded', 'shadow', 'block', 'account_operation', 'created_at',
+      'age_estimate', 'age_source', 'age_estimated_at', 'age_samples'],
     json: ['external_profile', 'settings', 'block'],
     booleans: ['verify', 'admin', 'admin_request_excluded', 'shadow'],
+    integers: ['id', 'age_estimate', 'age_samples'],
+    dates: ['created_at', 'age_estimated_at'],
+  },
+  {
+    table: 'retired_user_ids',
+    columns: ['id', 'retired_at'],
     integers: ['id'],
-    dates: ['created_at'],
+    dates: ['retired_at'],
   },
   {
     table: 'user_auth_providers',
@@ -109,14 +116,14 @@ const TABLE_SPECS = Object.freeze([
   },
   {
     table: 'posts',
-    columns: ['id', 'user_id', 'content', 'attachments', 'mask', 'lock', 'announcement', 'reply_to', 'repost_to',
+    columns: ['id', 'user_id', 'content', 'attachments', 'mask', 'lock', 'age_rating', 'announcement', 'reply_to', 'repost_to',
       'tags', 'tags_generated_at', 'group_id', 'group_announcement', 'view_content', 'reply_control', 'scheduled_at',
       'recommendation_penalty', 'created_at',
       // 派生カウンタ。投入後に移行先で再計算する。
       'like_count', 'star_count', 'repost_count', 'reply_count'],
     json: ['attachments', 'tags'],
     booleans: ['mask', 'lock', 'announcement', 'group_announcement'],
-    integers: ['id', 'user_id', 'reply_to', 'repost_to'],
+    integers: ['id', 'user_id', 'reply_to', 'repost_to', 'age_rating'],
     numbers: ['recommendation_penalty'],
     dates: ['tags_generated_at', 'scheduled_at', 'created_at'],
     // コピーせず移行先で再計算する列。
@@ -127,6 +134,13 @@ const TABLE_SPECS = Object.freeze([
     selfReference: { column: 'reply_to', target: 'posts' },
     fk: [{ table: 'users', column: 'user_id' }],
     sequence: 'nyaitter_posts_id_seq',
+  },
+  {
+    table: 'post_age_estimates',
+    columns: ['post_id', 'user_id', 'band', 'created_at'],
+    integers: ['post_id', 'user_id'],
+    dates: ['created_at'],
+    fk: [{ table: 'users', column: 'user_id' }, { table: 'posts', column: 'post_id' }],
   },
   {
     table: 'likes',
@@ -338,6 +352,7 @@ const TABLE_SPECS = Object.freeze([
 // 挿入順は外部キーの依存順。RESET は逆順。
 const INSERT_ORDER = Object.freeze([
   'users',
+  'retired_user_ids',
   'user_auth_providers',
   'spaces',
   'space_channels',
@@ -349,6 +364,7 @@ const INSERT_ORDER = Object.freeze([
   'group_invites',
   'group_join_requests',
   'posts',
+  'post_age_estimates',
   'polls',
   'poll_votes',
   'dm_channels',

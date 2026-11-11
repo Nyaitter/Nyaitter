@@ -540,7 +540,7 @@ async function processCreatePostAction(context, payload) {
       postId: post.id,
     }));
   }
-  if (repostTarget && canNotifyPostRecipient(repostTarget.userId)) {
+  if (isSimpleRepost && repostTarget && canNotifyPostRecipient(repostTarget.userId)) {
     notificationTasks.push(notifyPostAction(context, {
       userId: repostTarget.userId,
       type: 'repost',

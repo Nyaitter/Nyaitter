@@ -509,6 +509,43 @@ function inspect() {
         addIssue('error', 'AUTOMOD_REASONING_EFFORT_INVALID', 'AutoModのreasoning effortの値が不正です。', 'AUTOMOD_REASONING_EFFORT / autoMod.reasoningEffort には none / minimal / low / medium / high / xhigh / max のいずれかを、大文字・小文字を含め正確に設定するか、未設定にしてください。値は変換されません。未設定の場合はパラメータ自体を送信しません。');
     }
 
+    const autoModMode = firstSetting(['AUTOMOD_MODE'], config, ['autoMod.mode', 'automod.mode']);
+    if (autoModMode !== undefined && autoModMode !== '' && !['off', 'legacy', 'v2'].includes(String(autoModMode).trim().toLowerCase())) {
+        addIssue('error', 'AUTOMOD_MODE_INVALID', 'AutoModのモードの値が不正です。', 'AUTOMOD_MODE / autoMod.mode には off / legacy / v2 のいずれかを設定するか、未設定にしてください（未設定時は v2）。');
+    }
+
+    const autoModAuthorAge = firstSetting(['AUTOMOD_AUTHOR_AGE'], config, ['autoMod.authorAge', 'automod.authorAge']);
+    if (autoModAuthorAge !== undefined && autoModAuthorAge !== '' && !['on', 'off'].includes(String(autoModAuthorAge).trim().toLowerCase())) {
+        addIssue('error', 'AUTOMOD_AUTHOR_AGE_INVALID', '投稿者年齢の同時評価の設定値が不正です。', 'AUTOMOD_AUTHOR_AGE / autoMod.authorAge には on / off のいずれかを設定するか、未設定にしてください（未設定時は on）。');
+    }
+
+    const ageVerifyMargin = firstSetting(['AGE_VERIFY_MARGIN'], config, ['ageVerify.margin']);
+    if (ageVerifyMargin !== undefined && ageVerifyMargin !== '' && !(Number.isInteger(Number(ageVerifyMargin)) && Number(ageVerifyMargin) >= 0)) {
+        addIssue('error', 'AGE_VERIFY_MARGIN_INVALID', '年齢確認の安全マージンの値が不正です。', 'AGE_VERIFY_MARGIN / ageVerify.margin には0以上の整数を設定するか、未設定にしてください（未設定時は5）。');
+    }
+
+    const ageVerifyUnknown = firstSetting(['AGE_VERIFY_UNKNOWN'], config, ['ageVerify.unknown']);
+    if (ageVerifyUnknown !== undefined && ageVerifyUnknown !== '' && !['mask', 'none', 'warn'].includes(String(ageVerifyUnknown).trim().toLowerCase())) {
+        addIssue('error', 'AGE_VERIFY_UNKNOWN_INVALID', '年齢不明の閲覧者への扱いの値が不正です。', 'AGE_VERIFY_UNKNOWN / ageVerify.unknown には mask / none のいずれかを設定するか、未設定にしてください（未設定時は mask。warn は mask として扱います）。');
+    }
+
+    const clientCdnBase = firstSetting(['CLIENT_CDN_BASE'], config, ['client.cdnBase']);
+    if (clientCdnBase !== undefined && clientCdnBase !== '') {
+        let cdnUrl = null;
+        try { cdnUrl = new URL(String(clientCdnBase)); } catch (_) { cdnUrl = null; }
+        if (!cdnUrl || !['http:', 'https:'].includes(cdnUrl.protocol) || cdnUrl.username || cdnUrl.password) {
+            addIssue('error', 'CLIENT_CDN_BASE_INVALID', 'クライアント配信ベースURLの値が不正です。', 'CLIENT_CDN_BASE / client.cdnBase には資格情報を含まない http(s) URL を設定するか、未設定にしてください。');
+        }
+    }
+
+    const agePostMinSamples = firstSetting(['AGE_POST_MIN_SAMPLES'], config, ['ageVerify.postMinSamples']);
+    if (agePostMinSamples !== undefined && agePostMinSamples !== '' && Number.isInteger(Number(agePostMinSamples)) && Number(agePostMinSamples) > 50) {
+        addIssue('error', 'AGE_POST_MIN_SAMPLES_TOO_LARGE', '年齢推定の最小サンプル数が大きすぎます。', 'AGE_POST_MIN_SAMPLES / ageVerify.postMinSamples は集約で参照する直近50件以内にしてください（50を超えると推定が反映されません）。');
+    }
+    if (agePostMinSamples !== undefined && agePostMinSamples !== '' && !(Number.isInteger(Number(agePostMinSamples)) && Number(agePostMinSamples) >= 1)) {
+        addIssue('error', 'AGE_POST_MIN_SAMPLES_INVALID', '投稿推定を反映する最小サンプル数の値が不正です。', 'AGE_POST_MIN_SAMPLES / ageVerify.postMinSamples には1以上の整数を設定するか、未設定にしてください（未設定時は5）。');
+    }
+
     // 公開URLは「URLであること」を必須にする。host:port のような指定は受け付けない。
     const publicUrlSettings = [
         {

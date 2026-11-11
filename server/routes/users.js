@@ -21,7 +21,6 @@ const {
 } = require('../utils/postVisibility');
 const { hasBlockRelationship } = require('../utils/blockRelationship');
 const { normalizeBlockList } = require('../utils/blockList');
-const { isOwnedAttachmentKey, normalizeStorageKey } = require('../adapters/storage/safeStoragePath');
 const { ScratchIconService } = require('../services/ScratchIconService');
 const { listOwnedImposters } = require('../services/ImposterService');
 const { assertAuthenticatedUserAccess } = require('../services/auth/PostAsUserService');
@@ -145,54 +144,6 @@ async function deleteOwnedImposterAccounts(req, db, storage, parentId) {
 			throw error;
 		}
 	}
-}
-
-function buildReassignedAttachmentKey(sourceKey, previousUserId, nextUserId) {
-	if (!isOwnedAttachmentKey(sourceKey, previousUserId)) return null;
-	const sourcePrefix = `attachments/${Number(previousUserId)}/`;
-	if (!sourceKey.startsWith(sourcePrefix)) return null;
-	return normalizeStorageKey(`attachments/${Number(nextUserId)}/${sourceKey.slice(sourcePrefix.length)}`);
-}
-
-async function migrateReassignedAccountAttachments(db, storage, previousUserId, nextUserId) {
-	if (!db || typeof db.getAccountAttachmentKeys !== 'function' || typeof db.rewriteAccountAttachmentKeys !== 'function') {
-		throw new Error('Database adapter does not support attachment key rewrite');
-	}
-
-	const plannedCopies = [];
-	for (const sourceKey of await db.getAccountAttachmentKeys(nextUserId)) {
-		let destinationKey;
-		try {
-			destinationKey = buildReassignedAttachmentKey(sourceKey, previousUserId, nextUserId);
-		} catch (_) {
-			continue;
-		}
-		if (destinationKey) plannedCopies.push({ sourceKey, destinationKey });
-	}
-	if (plannedCopies.length === 0) return 0;
-	if (!storage || typeof storage.copy !== 'function') {
-		throw new Error('Storage adapter does not support attachment copy');
-	}
-
-	const replacements = [];
-	for (const { sourceKey, destinationKey } of plannedCopies) {
-		const copied = await storage.copy(sourceKey, destinationKey);
-		replacements.push({
-			sourceKey,
-			destinationKey,
-			url: copied?.url ?? null,
-		});
-	}
-	await db.rewriteAccountAttachmentKeys(nextUserId, replacements);
-	try {
-		const sourceKeys = replacements.map((replacement) => replacement.sourceKey);
-		if (typeof storage.deleteMany === 'function') await storage.deleteMany(sourceKeys);
-		else if (typeof storage.delete === 'function') await Promise.all(sourceKeys.map((sourceKey) => storage.delete(sourceKey)));
-	} catch (error) {
-		// 参照更新後の元キー削除に失敗しても、新しい参照と複製済みファイルは維持する。
-		console.warn('[users] reassigned account attachment cleanup failed:', error.message);
-	}
-	return replacements.length;
 }
 
 function getDbAdapter(req) {
@@ -905,14 +856,17 @@ router.put({
 
 	try {
 		const { shadow } = req.body || {};
-		const status = shadow === undefined
-			? await db.setUserStatus(userId, { shadow })
-			: await require('../services/ModLogService').operation(db, 'admin', req.user.id, shadow ? 'search_exclude' : 'search_include', 'user', userId, () => db.setUserStatus(userId, { shadow }), 'failure');
+		// shadow が真偽値で指定されていない場合は書き込まない（未指定を解除と解釈しない）。
+		if (typeof shadow !== 'boolean') {
+			return res.status(400).json({ error: 'shadow には真偽値を指定してください' });
+		}
+		const status = await require('../services/ModLogService').operation(db, 'admin', req.user.id, shadow ? 'search_exclude' : 'search_include', 'user', userId, () => db.setUserStatus(userId, { shadow }), 'failure');
 		if (!status) {
 			return res.status(404).json({ error: 'User not found' });
 		}
 		invalidateUserBriefCache(userId);
-		timelineCacheManager.updatePostAuthor(userId, { shadow: Boolean(shadow) });
+		timelineCacheManager.updatePostAuthor(userId, { shadow });
+		timelineCacheManager.invalidateAuthorEntries(userId);
 
 		res.json({ success: true, status });
 	} catch (err) {
@@ -1206,55 +1160,6 @@ router.get({
 	} catch (err) {
 		console.error('[users] pin error:', err);
 		res.status(500).json({ error: 'ピン留め取得に失敗しました' });
-	}
-});
-
-router.post({
-	path: '/me/nyaitter-id/reassign',
-	summary: 'NyaitterID の再割り当て',
-	auth: 'session',
-}, requireAuthAllowFrozen, requireInteractiveSession, accountOperationLimiter, async (req, res) => {
-	const db = getDbAdapter(req);
-	const userId = req.user.id;
-	if (req.user.accountOperation) return res.status(409).json({ error: '別のアカウント処理が進行中です。' });
-	let started = null;
-	let operationUserId = userId;
-	try {
-		started = await db.beginAccountOperation(userId, 'reassigning');
-		if (!started) return res.status(409).json({ error: 'NyaitterIDを再割り当てできません。' });
-		req.app.locals.realtime?.closeUser?.(userId, 1012, 'Nyaitter ID reassignment');
-					const updated = await db.reassignUserId(userId);
-			if (!updated) throw new Error('Nyaitter ID reassignment did not complete');
-			const reassignedUserId = Number(updated.id);
-			operationUserId = reassignedUserId;
-			await migrateReassignedAccountAttachments(
-				db,
-				getStorageAdapter(req),
-				userId,
-				reassignedUserId,
-			);
-			const completedUser = await db.finishAccountOperation(reassignedUserId, 'reassigning') || updated;
-			invalidateUserBriefCache(userId);
-			invalidateUserBriefCache(reassignedUserId);
-			updateUserBriefCache(completedUser, getPublicUrl(req));
-			timelineCacheManager.updatePostAuthor(reassignedUserId, {
-				handle: completedUser.handle,
-				name: completedUser.name,
-				icon_data: completedUser.icon_data,
-				nyaitter_id: getUserNyaitterId(completedUser),
-			});
-			await createNotificationIfAllowed(db, {
-				userId: reassignedUserId,
-				type: 'admin_notice',
-				message: `NyaitterIDを${getUserNyaitterId(updated)}へ再割り当てしました。`,
-				target: { kind: 'route', value: '#settings' },
-			});
-			return res.json({ user: await serializeUser(db, completedUser, reassignedUserId, getPublicUrl(req)) });
-
-	} catch (error) {
-		console.error('[users] NyaitterID reassignment failed:', error);
-		if (started) await db.finishAccountOperation(operationUserId, 'reassigning').catch(() => {});
-		return res.status(500).json({ error: 'NyaitterIDの再割り当てに失敗しました。' });
 	}
 });
 

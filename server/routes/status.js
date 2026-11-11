@@ -17,6 +17,18 @@ function getDbAdapter(req) {
 	return req.app.locals.dbAdapter;
 }
 
+function getClientObjectsBase(req) {
+	const configured = String(config.client?.cdnBase || '').trim();
+	if (!configured) return '';
+	try {
+		const url = new URL(configured);
+		if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return '';
+	} catch (_) {
+		return '';
+	}
+	return configured.endsWith('/') ? configured : `${configured}/`;
+}
+
 function getClientApiEndpoint(req) {
 	const endpoint = config.server.apiEndpoint || '/';
 	const base = getApiPublicUrl(req);
@@ -111,6 +123,7 @@ router.get({
 		},
 		client_config: {
 			api_endpoint: getClientApiEndpoint(req),
+			client_objects_base: getClientObjectsBase(req),
 			user_file_endpoint: config.userFiles.endpoint,
 			share_url: getShareUrl(req),
 			post_share_url: getShareUrl(req),

@@ -14,13 +14,8 @@ const BOT_USER_AGENTS = [
 	'slackbot',
 	'telegrambot',
 	'linespider',
-	'mastodon',
-	'misskey',
-	'pleroma',
 	'applebot',
-	'whatsapp',
 	'linkedinbot',
-	'pinterest',
 	'googlebot',
 	'bingbot',
 	'yandexbot',
@@ -33,10 +28,22 @@ const BOT_USER_AGENTS = [
 	'w3c_validator',
 ];
 
+// アプリ名のトークンはプレビュー取得（素のUA）とアプリ内ブラウザ（ブラウザUA＋アプリ名）の
+// 両方に現れるため、エンジン署名のないUAのときだけクローラーとみなす。
+const APP_NAME_USER_AGENTS = [
+	'mastodon',
+	'misskey',
+	'pleroma',
+	'whatsapp',
+	'pinterest',
+];
+
 function isCrawler(userAgent) {
 	if (!userAgent || typeof userAgent !== 'string') return false;
 	const lower = userAgent.toLowerCase();
-	return BOT_USER_AGENTS.some((bot) => lower.includes(bot));
+	if (BOT_USER_AGENTS.some((bot) => lower.includes(bot))) return true;
+	if (!APP_NAME_USER_AGENTS.some((app) => lower.includes(app))) return false;
+	return !(lower.includes('applewebkit') || lower.includes('gecko'));
 }
 
 function escapeHtml(str) {
@@ -333,8 +340,10 @@ function generatePostOgpTags({ post, author, publicUrl }) {
 	const title = userDisplayId ? `${authorName} (${userDisplayId}) on Nyaitter` : `${authorName} on Nyaitter`;
 
 	const cleanContent = extractViewContent(post?.content || '');
+	// 対象年齢が付いた投稿は、OGP でも本文・添付を出さない。
+	const ageRestricted = Number(post?.age_rating ?? post?.ageRating ?? 0) > 0;
 	let description = cleanContent;
-	if (post?.mask) {
+	if (post?.mask || ageRestricted) {
 		description = '🔒 [この投稿はマスクされています]';
 	} else if (!description && post?.attachments?.length > 0) {
 		description = `[添付ファイル ${post.attachments.length}件]`;
@@ -348,7 +357,9 @@ function generatePostOgpTags({ post, author, publicUrl }) {
 
 	const postUrl = `${publicUrl}/posts/${post?.id}`;
 	const avatarUrl = resolveAuthorAvatar(author, publicUrl);
-	const { images, videos, audios } = extractMediaAttachments(post?.attachments, publicUrl);
+	const { images, videos, audios } = ageRestricted
+		? { images: [], videos: [], audios: [] }
+		: extractMediaAttachments(post?.attachments, publicUrl);
 
 	const firstImage = images[0]?.url || null;
 	const firstVideo = videos[0] || null;
@@ -498,9 +509,12 @@ function generatePostHtml({ post, author, publicUrl, frontendUrl = null }) {
 	const authorName = author?.name || 'Unknown User';
 	const userDisplayId = formatUserDisplayId(author);
 	const avatarUrl = resolveAuthorAvatar(author, publicUrl);
-	const { images, videos, audios } = extractMediaAttachments(post?.attachments, publicUrl);
+	const ageRestricted = Number(post?.age_rating ?? post?.ageRating ?? 0) > 0;
+	const { images, videos, audios } = ageRestricted
+		? { images: [], videos: [], audios: [] }
+		: extractMediaAttachments(post?.attachments, publicUrl);
 
-	const content = post?.mask ? '🔒 [この投稿はマスクされています]' : (post?.content || '');
+	const content = post?.mask || ageRestricted ? '🔒 [この投稿はマスクされています]' : (post?.content || '');
 	const decoratedContentHtml = renderDecoratedContentHtml(content, publicUrl);
 	const safeAuthor = escapeHtml(authorName);
 	const safeDisplayId = escapeHtml(userDisplayId);

@@ -199,9 +199,6 @@ class DatabaseAdapter {
 	async finishAccountOperation(userId, operation) {
 		throw new Error('finishAccountOperation() must be implemented');
 	}
-	async reassignUserId(userId) {
-		throw new Error('reassignUserId() must be implemented');
-	}
 	async deleteAccount(userId) {
 		throw new Error('deleteAccount() must be implemented');
 	}
@@ -211,10 +208,6 @@ class DatabaseAdapter {
 	async getAccountAttachmentKeys(userId) {
 		throw new Error('getAccountAttachmentKeys() must be implemented');
 	}
-	async rewriteAccountAttachmentKeys(userId, replacements) {
-		throw new Error('rewriteAccountAttachmentKeys() must be implemented');
-	}
-
 	// 全アダプター間のデータ移行に使う中立スナップショット。
 	async exportDataSnapshot() {
 		throw new Error('exportDataSnapshot() must be implemented');
@@ -712,6 +705,18 @@ class DatabaseAdapter {
 	
 	async updateUserProfile(userId, profileData) {
 		throw new Error('updateUserProfile() must be implemented');
+	}
+
+	async recordPostAgeEstimate(postId, userId, band) {
+		throw new Error('recordPostAgeEstimate() must be implemented');
+	}
+
+	async getPostAgeBands(userId, limit = 50) {
+		throw new Error('getPostAgeBands() must be implemented');
+	}
+
+	async updateUserAgeEstimate(userId, fields) {
+		throw new Error('updateUserAgeEstimate() must be implemented');
 	}
 
 	

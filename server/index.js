@@ -643,6 +643,11 @@ function staticCacheHeaders(res, filePath) {
     }
     const ext = path.extname(filePath).toLowerCase();
     if (ext === '.js' || ext === '.mjs' || ext === '.css') {
+        // 開発時は再検証を必ずサーバーへ届かせ、古い JS/CSS がブラウザや SW に残らないようにする。
+        if (process.env.NODE_ENV === 'development') {
+            res.setHeader('Cache-Control', 'public, max-age=0, must-revalidate');
+            return;
+        }
         res.setHeader('Cache-Control', `public, max-age=${config.static.jsCssCacheMaxAge}`);
         return;
     }
@@ -925,6 +930,7 @@ const autoModerationService = new AutoModerationService({
     dbAdapter,
     storageAdapter,
     moderationConfig: config.autoMod,
+    ageVerifyConfig: config.ageVerify,
 });
 const postActionQueue = new PostActionQueue();
 const postKeywordBackfillQueue = new PostActionQueue({ maxPendingJobs: 2000 });

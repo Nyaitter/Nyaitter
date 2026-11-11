@@ -275,6 +275,35 @@ class TimelineCacheManager {
 		}
 	}
 
+	/**
+	 * Drops cached entries that contain the given author's posts, so a
+	 * visibility change for that author (e.g. search exclusion) takes
+	 * effect immediately instead of at TTL expiry. Entries whose posts
+	 * cannot be attributed are left to expire.
+	 */
+	invalidateAuthorEntries(userId) {
+		const targetUserId = Number(userId);
+		if (!Number.isInteger(targetUserId) || targetUserId <= 0) return;
+		const authorOf = (post) => Number(post?.userId ?? post?.user_id ?? post?.userid ?? post?.author?.id ?? post?.user?.id);
+		for (const [key, entry] of this.cache.entries()) {
+			if (entry.payload) {
+				const posts = entry.payload.posts || [];
+				if (posts.some((post) => authorOf(post) === targetUserId)) {
+					this._deleteTracked(key);
+				}
+				continue;
+			}
+			if (entry.postsById) {
+				for (const post of entry.postsById.values()) {
+					if (authorOf(post) === targetUserId) {
+						this._deleteTracked(key);
+						break;
+					}
+				}
+			}
+		}
+	}
+
 	updatePostAuthor(userId, authorPatch = {}) {
 		const targetUserId = Number(userId);
 		if (!Number.isInteger(targetUserId) || targetUserId <= 0 || !authorPatch) return;

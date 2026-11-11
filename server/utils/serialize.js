@@ -14,6 +14,38 @@ const { getUserReactions, invalidateUserReactions } = require('./UserReactionCac
 const { getVisibleDmUnreadCount } = require('../services/DmVisibilityService');
 const { publicSettings } = require('./protectedStatus');
 const { attachDisplayRanks, publicDisplayRanks, ownDisplaySettingsForUser } = require('./rankDisplay');
+const { computeAgePenalty, isAgeFeaturesActive } = require('../services/AgeEstimateService');
+
+function getAgeDisplayConfig() {
+	try {
+		const config = require('../config');
+		return { autoMod: config.autoMod || {}, ageVerify: config.ageVerify || {} };
+	} catch (_) {
+		return { autoMod: {}, ageVerify: {} };
+	}
+}
+
+// 対象年齢と年齢制限の段階を閲覧者ごとに合成する（段階自体は外へ出さない）。投稿の保存値は変更しない。
+function ageFieldsForPost(post, authorId, viewerUser, viewerId) {
+	const { autoMod, ageVerify } = getAgeDisplayConfig();
+	const rating = Number(post?.age_rating ?? post?.ageRating ?? 0) || 0;
+	if (!isAgeFeaturesActive(autoMod)) {
+		return { age_rating: 0, age_penalty: 'none' };
+	}
+	const viewer = viewerUser
+		? { id: viewerUser.id, ageEstimate: viewerUser.age_estimate, ageSource: viewerUser.age_source }
+		: (viewerId != null ? { id: viewerId, ageEstimate: null, ageSource: null } : null);
+	return {
+		age_rating: rating,
+		age_penalty: computeAgePenalty({
+			rating,
+			authorId,
+			viewer,
+			margin: ageVerify.margin,
+			unknown: ageVerify.unknown,
+		}),
+	};
+}
 
 const USER_BRIEF_CACHE_LIMIT = 5000;
 const userBriefCache = new Map();
@@ -864,6 +896,19 @@ async function serializePostsBatch(
 		usersById,
 		knownViewer,
 	);
+	let ageViewerUser = knownViewer || visibilityContext?.viewer || null;
+	// 閲覧者レコードに年齢推定が含まれない経路では、完全なレコードを取り直す
+	// （年齢不明として扱うと hide 判定が mask に化けてしまうため）。
+	if (normalizedViewerId != null
+		&& isAgeFeaturesActive(getAgeDisplayConfig().autoMod)
+		&& (ageViewerUser == null || ageViewerUser.age_estimate === undefined)
+		&& typeof db.getUserById === 'function') {
+		try {
+			ageViewerUser = await db.getUserById(normalizedViewerId);
+		} catch (_) {
+			// 取得できない場合は年齢不明として扱う。
+		}
+	}
 	const visibleByPostId = new Map(allPosts.map((post) => [
 		Number(post.id),
 		canViewPostWithContext(post, visibilityContext),
@@ -1042,9 +1087,18 @@ async function serializePostsBatch(
 			}
 		}
 
+		const ageFields = ageFieldsForPost(post, authorId, ageViewerUser, normalizedViewerId);
+		if (ageFields.age_penalty === 'hide') {
+			// 年齢制限で見せない投稿はサーバー側で除外し、存在自体を秘匿する。
+			visitingPostIds.delete(postId);
+			return null;
+		}
+
 		const brief = getBriefUser(author);
 		const serialized = {
 			...base,
+			// 年齢による mask は通常のクッションと区別がつかないよう mask へ畳む。
+			mask: !!base.mask || ageFields.age_penalty === 'mask',
 			group_id: post.groupId ?? post.group_id ?? null,
 			scheduled_at: post.scheduledAt ?? post.scheduled_at ?? null,
 			group_announcement: Boolean(post.groupAnnouncement ?? post.group_announcement),
@@ -1069,6 +1123,7 @@ async function serializePostsBatch(
 			// コミュニティノート公開時の推薦スコア減衰。キャッシュ対象外の値なので
 			// 毎回投稿から読み直す。
 			recommendation_penalty: Math.max(0, Math.min(1, Number(post.recommendation_penalty ?? post.recommendationPenalty) || 0)),
+			age_rating: ageFields.age_rating,
 			poll: pollsByPostId.get(postId) || null,
 			community_notes: noteSummariesByPostId.get(postId)?.notes || [],
 			community_notes_eligible: noteSummariesByPostId.get(postId)?.eligible || false,
@@ -1101,20 +1156,25 @@ async function serializePost(
 
 async function serializeReply(db, post, currentUserId = null, publicUrl = null) {
 	if (!post || !(await canViewPost(db, post, currentUserId))) return null;
-	const [author, parent] = await Promise.all([
+	const [author, parent, replyViewer] = await Promise.all([
 		db.getUserById ? db.getUserById(post.userId) : null,
 		post.replyTo && db.getPostById ? db.getPostById(post.replyTo) : null,
+		currentUserId != null && Number(post.age_rating ?? post.ageRating ?? 0) > 0 && db.getUserById ? db.getUserById(currentUserId) : null,
 	]);
 	const replyToUser = parent && db.getUserById ? await db.getUserById(parent.userId) : null;
+
+	const ageFields = ageFieldsForPost(post, post.userId, replyViewer, currentUserId);
+	if (ageFields.age_penalty === 'hide') return null;
 
 	return {
 			id: post.id,
 			userid: post.userId,
 				content: post.content,
 				tags: Array.isArray(post.tags) ? post.tags : [],
-				mask: !!post.mask,
+				mask: !!post.mask || ageFields.age_penalty === 'mask',
 			lock: !!post.lock,
 			announcement: !!post.announcement,
+			age_rating: ageFields.age_rating,
 			private: isPrivatePost(post, author),
 			attachments: post.attachments || [],
 		reply_id: post.replyTo || null,

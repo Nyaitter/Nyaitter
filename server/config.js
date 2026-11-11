@@ -2,6 +2,7 @@ const { parseDuration, parseIntegerRange } = require('./utils/settingFormats');
 const { normalizeProviders } = require('./utils/aiSettings');
 const { resolveListenTarget, resolveOptionalHost } = require('./utils/listenAddress');
 const { normalizeAdvertisingSources, normalizeAdvertisingOrigins } = require('./utils/advertisingCsp');
+const { resolveAutoModMode } = require('./services/AgeEstimateService');
 
 const isProduction = (process.env.NODE_ENV || 'development') === 'production';
 
@@ -397,6 +398,7 @@ const config = {
     ]),
     // 公開UI設定。未設定でも空オブジェクトでクライアントは既定表示のまま動く。
     ui: get('client.ui', {}),
+    cdnBase: readSetting(['CLIENT_CDN_BASE'], ['client.cdnBase'], ''),
   },
 
   cors: {
@@ -871,9 +873,15 @@ const config = {
     const model = readSetting(['AUTOMOD_AI_MODEL', 'AUTOMOD_MODEL'], ['autoMod.aiModel', 'autoMod.model', 'automod.model', 'geminiModeration.model'], '');
     const prompt = readSetting(['AUTOMOD_PROMPT', 'AUTOMOD_MOD_PROMPT', 'GEMINI_MOD_PROMPT'], ['autoMod.prompt', 'automod.prompt', 'geminiModeration.prompt'], '');
     const reasoningEffort = String(readSetting(['AUTOMOD_REASONING_EFFORT'], ['autoMod.reasoningEffort', 'automod.reasoningEffort'], ''));
+    const modeRaw = String(readSetting(['AUTOMOD_MODE'], ['autoMod.mode', 'automod.mode'], 'v2')).trim().toLowerCase();
+    const mode = resolveAutoModMode({ mode: modeRaw });
+    if (mode !== modeRaw) console.warn(`[config] AUTOMOD_MODE must be off, legacy, or v2; using off.`);
+    const authorAgeRaw = String(readSetting(['AUTOMOD_AUTHOR_AGE'], ['autoMod.authorAge', 'automod.authorAge'], 'on')).trim().toLowerCase();
+    if (!['on', 'off'].includes(authorAgeRaw)) console.warn(`[config] AUTOMOD_AUTHOR_AGE must be on or off; using on.`);
     const providers = aiProviderSettings();
     return {
-      provider, model, prompt, reasoningEffort,
+      provider, model, prompt, reasoningEffort, mode,
+      authorAge: authorAgeRaw !== 'off',
 		      maxImages: exactIntegerSetting(
 		        'AutoMod max images',
 		        ['AUTOMOD_MAX_IMAGES', 'AUTOMOD_MOD_MAX_IMAGES', 'GEMINI_MOD_MAX_IMAGES'],
@@ -889,6 +897,28 @@ const config = {
 		        1,
 		      ),
       enabled: Boolean(prompt && providers.some(item => provider === 'auto' || item.type === provider || item.id.toLowerCase() === provider)),
+    };
+  })(),
+
+  ageVerify: (() => {
+    const unknownRaw = String(readSetting(['AGE_VERIFY_UNKNOWN'], ['ageVerify.unknown'], 'mask')).trim().toLowerCase();
+    if (!['mask', 'none', 'warn'].includes(unknownRaw)) console.warn(`[config] AGE_VERIFY_UNKNOWN must be mask or none; using mask.`);
+    return {
+      margin: exactIntegerSetting(
+        'Age verify margin',
+        ['AGE_VERIFY_MARGIN'],
+        ['ageVerify.margin'],
+        5,
+        0,
+      ),
+      unknown: unknownRaw === 'none' ? 'none' : 'mask',
+      postMinSamples: exactIntegerSetting(
+        'Age post min samples',
+        ['AGE_POST_MIN_SAMPLES'],
+        ['ageVerify.postMinSamples'],
+        5,
+        1,
+      ),
     };
   })(),
 

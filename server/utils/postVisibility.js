@@ -14,6 +14,12 @@ function getReplyToPostId(post) {
 	return Number.isInteger(id) && id > 0 ? id : null;
 }
 
+function getRepostToPostId(post) {
+	const value = post?.repostTo ?? post?.repost_to ?? post?.repost_id;
+	const id = Number(value);
+	return Number.isInteger(id) && id > 0 ? id : null;
+}
+
 function getPostGroupId(post) {
 	const groupId = post?.groupId ?? post?.group_id ?? null;
 	return typeof groupId === 'string' && groupId.trim() ? groupId.trim() : null;
@@ -413,14 +419,53 @@ async function filterDiscoverablePosts(db, posts, viewerId = null, visibilityCon
 	const values = (posts || []).filter(Boolean);
 	const context = visibilityContext || await createPostVisibilityContext(db, values, viewerId);
 	const activeNgWords = ngWords instanceof Set ? ngWords : normalizeNgWords(ngWords);
+	const isExcludedAuthor = (author, authorId, followingIds) => {
+		if (!author?.shadow) return false;
+		if (context.viewerId == null) return true;
+		return context.viewerId !== authorId && !followingIds.has(authorId);
+	};
+	// リポスト・引用は、元投稿の著者が検索除外なら同じ規則で一覧から外す。
+	// 元投稿を確認できない場合は判定できないため、リポスト・引用は載せない。
+	const repostAuthorByPostId = new Map();
+	let repostFollowingIds = new Set();
+	let repostCheckAvailable = false;
+	const repostTargetIds = [...new Set(values.map((post) => getRepostToPostId(post)).filter((id) => id != null))];
+	if (repostTargetIds.length > 0 && typeof db?.getPostsByIds === 'function') {
+		repostCheckAvailable = true;
+		try {
+			const originals = (await db.getPostsByIds(repostTargetIds)) || [];
+			if (originals.length > 0) {
+				const originalAuthors = await getAuthorsById(db, originals);
+				const originalAuthorIds = [...new Set(originals
+					.map((post) => getPostAuthorId(post))
+					.filter((id) => id != null))];
+				const snapshot = await getFollowRelationshipSnapshot(db, context.viewerId, originalAuthorIds);
+				repostFollowingIds = snapshot.followingIds;
+				for (const original of originals) {
+					repostAuthorByPostId.set(Number(original.id), originalAuthors.get(getPostAuthorId(original)) || null);
+				}
+			}
+		} catch (err) {
+			console.warn('[postVisibility] repost original lookup failed:', err?.message || err);
+			// 取得自体が失敗した場合は判定材料が無いため、従来どおり通す
+			// （取得できたが元投稿が無い場合は下で除外する）。
+			repostCheckAvailable = false;
+		}
+	}
 	return values.filter((post) => {
 		// allでは現在の参加者だけにグループ投稿を公開する。
 		if (getPostGroupId(post) && (!includeJoinedGroups || !canViewPostWithContext(post, context))) return false;
 		const authorId = getPostAuthorId(post);
 		const author = context.authorsById?.get(authorId) || null;
-		if (author?.shadow) {
-			if (context.viewerId == null) return false;
-			if (context.viewerId !== authorId && !context.followingIds.has(authorId)) return false;
+		if (isExcludedAuthor(author, authorId, context.followingIds)) return false;
+		const repostTargetId = getRepostToPostId(post);
+		if (repostTargetId != null && repostCheckAvailable) {
+			if (!repostAuthorByPostId.has(repostTargetId)) return false;
+			const originalAuthor = repostAuthorByPostId.get(repostTargetId);
+			// 元投稿はあるのに著者を解決できない場合も、判定不能として載せない。
+			if (!originalAuthor) return false;
+			const originalAuthorId = Number(originalAuthor.id);
+			if (isExcludedAuthor(originalAuthor, originalAuthorId, new Set([...context.followingIds, ...repostFollowingIds]))) return false;
 		}
 		if (activeNgWords.size > 0) {
 			const text = getPostSearchText(post);
@@ -443,6 +488,7 @@ module.exports = {
 	getFollowRelationshipSnapshot,
 	getPostAuthorId,
 	getReplyToPostId,
+	getRepostToPostId,
 	getPostGroupId,
 	getAuthorsById,
 	isPrivatePost,

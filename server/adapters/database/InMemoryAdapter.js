@@ -7,11 +7,8 @@ const {
 } = require('../../utils/nyaitterAddress');
 const { normalizeTarget } = require('../../utils/notification');
 const { normalizeBlockList } = require('../../utils/blockList');
-const {
-	createAttachmentReplacementMap,
-	rewriteAttachmentReferences,
-} = require('../../utils/attachmentKeys');
 const { scoreRecommendedPosts, buildAffinityProfile } = require('../../utils/recommendation');
+const { isAgeFeaturesActive } = require('../../services/AgeEstimateService');
 const { extractViewContent } = require('../../utils/viewContent');
 const { isFuzzyMatch, calculateStringSimilarity } = require('../../utils/fuzzySearch');
 const { encodePostCursor, decodePostCursor } = require('../../utils/postCursor');
@@ -39,6 +36,8 @@ class InMemoryAdapter extends DatabaseAdapter {
 	constructor() {
 		super();
 		this.users = new Map(); // id -> user
+		this.retiredUserIds = new Set();
+		this.postAgeEstimates = new Map(); // postId -> { post_id, user_id, band, created_at }
 		this.scidToId = new Map(); // scid -> id
 					this.sessions = new Map(); // token -> { userId, expiresAt, ... }
 			this.trustedLoginIps = new Map(); // `${userId}:${ipHash}` -> trust record
@@ -145,6 +144,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 		const { createSnapshot } = require('../../services/DataMigrationService');
 		const rows = {
 			users: [...this.users.values()],
+			retired_user_ids: [...this.retiredUserIds].map((id) => ({ id })),
 			user_auth_providers: [...this.userAuthProviders.values()],
 			spaces: [...this.spaces.values()],
 			space_channels: [...this.spaceChannels.values()],
@@ -157,6 +157,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 			blocked_login_ips: [...this.blockedLoginIps.values()],
 			bot_tokens: [...this.botTokens.values()],
 							posts: [...this.posts.values()],
+			post_age_estimates: [...this.postAgeEstimates.values()],
 				groups: [...this.groups.values()],
 				group_roles: [...this.groupRoles.values()],
 				group_memberships: [...this.groupMemberships.values()],
@@ -276,6 +277,8 @@ class InMemoryAdapter extends DatabaseAdapter {
 		if (!included.has('poll_votes')) preserved.poll_votes = this.pollVotes;
 		if (!included.has('authorized_apps')) preserved.authorized_apps = this.authorizedApps;
 		if (!included.has('post_feedback')) preserved.post_feedback = this.postFeedbackByUser;
+		if (!included.has('retired_user_ids')) preserved.retired_user_ids = this.retiredUserIds;
+		if (!included.has('post_age_estimates')) preserved.post_age_estimates = this.postAgeEstimates;
 		const empty = new InMemoryAdapter();
 		Object.assign(this, empty);
 		Object.assign(this, preservedNoteState);
@@ -285,6 +288,8 @@ class InMemoryAdapter extends DatabaseAdapter {
 		if (preserved.poll_votes) this.pollVotes = preserved.poll_votes;
 		if (preserved.authorized_apps) this.authorizedApps = preserved.authorized_apps;
 		if (preserved.post_feedback) this.postFeedbackByUser = preserved.post_feedback;
+		if (preserved.retired_user_ids) this.retiredUserIds = preserved.retired_user_ids;
+		if (preserved.post_age_estimates) this.postAgeEstimates = preserved.post_age_estimates;
 		this.modLogs = Object.prototype.hasOwnProperty.call(preserved, 'mod_logs')
 			? preserved.mod_logs
 			: data.tables.mod_logs.map(require('./modLogs').mapRow);
@@ -300,6 +305,9 @@ class InMemoryAdapter extends DatabaseAdapter {
 			if (user.auth_provider && user.external_id != null) {
 				this.externalAuthToId.set(`${String(user.auth_provider).toLowerCase()}:${String(user.external_id)}`, user.id);
 			}
+		}
+		for (const row of data.tables.retired_user_ids) {
+			if (Number.isSafeInteger(row.id) && row.id > 0) this.retiredUserIds.add(row.id);
 		}
 		for (const row of data.tables.user_auth_providers) {
 			if (!row.user_id || !row.provider || row.provider_user_id == null) continue;
@@ -414,6 +422,8 @@ class InMemoryAdapter extends DatabaseAdapter {
 				tags: Array.isArray(row.tags) ? row.tags : [],
 				tagsGeneratedAt: row.tags_generated_at ?? row.tagsGeneratedAt ?? null, attachments: row.attachments,
 				mask: Boolean(row.mask), lock: Boolean(row.lock), announcement: Boolean(row.announcement),
+				ageRating: Number(row.age_rating ?? row.ageRating ?? 0) || 0,
+				age_rating: Number(row.age_rating ?? row.ageRating ?? 0) || 0,
 				groupId: row.group_id ?? row.groupId ?? null,
 				groupAnnouncement: Boolean(row.group_announcement ?? row.groupAnnouncement),
 				replyTo,
@@ -433,6 +443,18 @@ class InMemoryAdapter extends DatabaseAdapter {
 			this.posts.set(post.id, post);
 			this._addPostIndexes(post);
 			this.nextPostId = Math.max(this.nextPostId, Number(post.id) + 1);
+		}
+		for (const row of data.tables.post_age_estimates || []) {
+			const postId = Number(row.post_id ?? row.postId);
+			const userId = Number(row.user_id ?? row.userId);
+			if (!Number.isSafeInteger(postId) || postId <= 0 || !Number.isSafeInteger(userId) || userId <= 0) continue;
+			if (typeof row.band !== 'string' || !row.band) continue;
+			this.postAgeEstimates.set(postId, {
+				post_id: postId,
+				user_id: userId,
+				band: row.band,
+				created_at: row.created_at ? new Date(row.created_at) : new Date(),
+			});
 		}
 			for (const row of data.tables.groups || []) {
 				this.groups.set(String(row.id), {
@@ -883,9 +905,9 @@ class InMemoryAdapter extends DatabaseAdapter {
 
 			async getPostFeedbackForUser(userId) {
 				const uId = Number(userId);
-				if (!Number.isInteger(uId)) return { postIds: [], authorIds: [] };
+				if (!Number.isInteger(uId)) return { postIds: [], authorIds: [], authorCounts: new Map(), tagCounts: new Map() };
 				const feedbacks = this.postFeedbackByUser.get(uId);
-				if (!feedbacks || feedbacks.size === 0) return { postIds: [], authorIds: [] };
+				if (!feedbacks || feedbacks.size === 0) return { postIds: [], authorIds: [], authorCounts: new Map(), tagCounts: new Map() };
 				// Postgres/D1 と揃え、新しい「興味なし」500件だけを使う（Map は古い順なので末尾を取る）。
 				// kind で絞ってから切る。先に切ると他の kind が混在したとき件数がずれる。
 				const recentFeedback = [...feedbacks.entries()]
@@ -894,13 +916,22 @@ class InMemoryAdapter extends DatabaseAdapter {
 					.reverse();
 				const postIds = [];
 				const authorIds = new Set();
+				const authorCounts = new Map();
+				const tagCounts = new Map();
 				for (const [postId] of recentFeedback) {
 					postIds.push(Number(postId));
 					const post = this.posts.get(Number(postId));
 					const authorId = Number(post?.userId ?? post?.user_id);
-					if (Number.isInteger(authorId)) authorIds.add(authorId);
+					if (Number.isInteger(authorId)) {
+						authorIds.add(authorId);
+						authorCounts.set(authorId, (authorCounts.get(authorId) || 0) + 1);
+					}
+					// 同一投稿内の重複タグは1回として数える（1回の操作で発動させない）。
+					for (const key of new Set((post?.tags || []).map((tag) => String(tag || '').trim()).filter(Boolean))) {
+						tagCounts.set(key, (tagCounts.get(key) || 0) + 1);
+					}
 				}
-				return { postIds, authorIds: [...authorIds] };
+				return { postIds, authorIds: [...authorIds], authorCounts, tagCounts };
 			}
 
 			async getUserRecommendationProfile(userId) {
@@ -943,6 +974,8 @@ class InMemoryAdapter extends DatabaseAdapter {
 					reacted: [...reacted],
 					dislikedPostIds: feedback.postIds,
 					dislikedAuthors: feedback.authorIds,
+					dislikedAuthorCounts: feedback.authorCounts || new Map(),
+					negativeTagCounts: feedback.tagCounts || new Map(),
 					blockedAuthors: normalizeBlockList(user?.block, id),
 				};
 			}
@@ -1220,6 +1253,10 @@ class InMemoryAdapter extends DatabaseAdapter {
 			shadow: false,
 			lock: false,
 			account_operation: null,
+			age_estimate: null,
+			age_source: null,
+			age_estimated_at: null,
+			age_samples: 0,
 			...(user || {}),
 		};
 		normalized.block = normalizeBlockList(normalized.block, normalized.id);
@@ -1272,13 +1309,17 @@ class InMemoryAdapter extends DatabaseAdapter {
 		const upperBound = 10 ** digits;
 		for (let attempt = 0; attempt < 100; attempt += 1) {
 			const id = crypto.randomInt(0, upperBound);
-			if (!this.users.has(id)) return id;
+			if (!this.users.has(id) && !this.retiredUserIds.has(id)) return id;
 		}
 		for (let id = 0; id < upperBound; id += 1) {
-			if (!this.users.has(id)) return id;
+			if (!this.users.has(id) && !this.retiredUserIds.has(id)) return id;
 		}
 		digits += 1;
-		return crypto.randomInt(0, 10 ** digits);
+		let fallbackId = crypto.randomInt(0, 10 ** digits);
+		while (this.users.has(fallbackId) || this.retiredUserIds.has(fallbackId)) {
+			fallbackId = crypto.randomInt(0, 10 ** digits);
+		}
+		return fallbackId;
 	}
 
 	
@@ -2563,6 +2604,8 @@ class InMemoryAdapter extends DatabaseAdapter {
 				attachments: postData.attachments || null,
 			mask: !!postData.mask,
 			lock: !!postData.lock,
+			ageRating: Number(postData.ageRating ?? postData.age_rating ?? 0) || 0,
+			age_rating: Number(postData.ageRating ?? postData.age_rating ?? 0) || 0,
 			announcement: !!postData.announcement,
 			groupId: postData.groupId ?? postData.group_id ?? null,
 			scheduledAt: postData.scheduledAt ?? postData.scheduled_at ?? null,
@@ -2798,6 +2841,10 @@ class InMemoryAdapter extends DatabaseAdapter {
 			if (fields.attachments !== undefined) post.attachments = fields.attachments;
 					if (fields.mask !== undefined) post.mask = !!fields.mask;
 			if (fields.lock !== undefined) post.lock = !!fields.lock;
+			if (fields.age_rating !== undefined || fields.ageRating !== undefined) {
+				post.ageRating = Number(fields.ageRating ?? fields.age_rating ?? 0) || 0;
+				post.age_rating = post.ageRating;
+			}
 			if (fields.reply_control !== undefined || fields.replyControl !== undefined) {
 				post.replyControl = String(fields.reply_control ?? fields.replyControl ?? 'everyone');
 				post.reply_control = post.replyControl;
@@ -3535,6 +3582,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 		}
 
 		this.posts.delete(postId);
+		this.postAgeEstimates.delete(Number(postId));
 		this._removePostIndexes(post);
 		if (post.repostTo != null) {
 			const repostKey = `${post.userId}:${post.repostTo}`;
@@ -3581,6 +3629,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 		if (!post) return false;
 
 		this.posts.delete(postId);
+		this.postAgeEstimates.delete(Number(postId));
 		this._removePostIndexes(post);
 		if (post.repostTo != null) {
 			const repostKey = `${post.userId}:${post.repostTo}`;
@@ -4611,7 +4660,8 @@ class InMemoryAdapter extends DatabaseAdapter {
 
 			const extendedFollowIds = new Set();
 			const dislikedPostIds = new Set();
-			const dislikedAuthors = new Set();
+			const dislikedAuthorCounts = new Map();
+			const negativeTagCounts = new Map();
 			const blockedAuthors = new Set();
 			if (normalizedViewerId != null) {
 				for (const followedId of directFollowIds) {
@@ -4632,7 +4682,11 @@ class InMemoryAdapter extends DatabaseAdapter {
 						dislikedPostIds.add(normalizedPostId);
 						const post = this.posts.get(normalizedPostId);
 						const authorId = Number(post?.userId ?? post?.user_id);
-						if (Number.isInteger(authorId)) dislikedAuthors.add(authorId);
+						if (Number.isInteger(authorId)) dislikedAuthorCounts.set(authorId, (dislikedAuthorCounts.get(authorId) || 0) + 1);
+						for (const tag of post?.tags || []) {
+							const key = String(tag || '').trim();
+							if (key) negativeTagCounts.set(key, (negativeTagCounts.get(key) || 0) + 1);
+						}
 					}
 				}
 				const viewer = this.users.get(normalizedViewerId);
@@ -4644,6 +4698,16 @@ class InMemoryAdapter extends DatabaseAdapter {
 				}
 			}
 
+			const ageActive = isAgeFeaturesActive(config.autoMod);
+			const viewerAgeEstimate = !ageActive || normalizedViewerId == null ? null : (this.users.get(normalizedViewerId)?.age_estimate ?? null);
+			const authorAgeEstimates = new Map();
+			for (const post of ageActive ? candidates : []) {
+				const authorId = Number(post.userId ?? post.user_id);
+				if (!Number.isSafeInteger(authorId) || authorAgeEstimates.has(authorId)) continue;
+				const authorAge = this.users.get(authorId)?.age_estimate;
+				if (authorAge != null) authorAgeEstimates.set(authorId, Number(authorAge));
+			}
+
 			const scored = scoreRecommendedPosts(candidates, {
 				viewerId: normalizedViewerId,
 				keywordProfile: keywordAffinities,
@@ -4651,8 +4715,11 @@ class InMemoryAdapter extends DatabaseAdapter {
 				extendedFollows: extendedFollowIds,
 				reactedPostIds,
 				dislikedPostIds,
-				dislikedAuthors,
+				dislikedAuthorCounts,
+				negativeTagCounts,
 				blockedAuthors,
+				viewerAgeEstimate,
+				authorAgeEstimates,
 				limit: normalizedLimit,
 			});
 
@@ -4904,7 +4971,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 	}
 
 	async beginAccountOperation(userId, operation) {
-		if (!['reassigning', 'deleting'].includes(operation)) throw new Error('Invalid account operation');
+		if (!['deleting'].includes(operation)) throw new Error('Invalid account operation');
 		const user = this.users.get(Number(userId));
 		if (!user || user.auth_provider === 'nyaitter' || user.account_operation) return null;
 		user.account_operation = operation;
@@ -4918,257 +4985,6 @@ class InMemoryAdapter extends DatabaseAdapter {
 		return user;
 	}
 
-		async reassignUserId(userId) {
-			const previousId = Number(userId);
-			const user = this.users.get(previousId);
-			if (!user || user.auth_provider === 'nyaitter' || user.account_operation !== 'reassigning') return null;
-
-			const nextId = this._allocateUserId();
-			if (!Number.isInteger(nextId) || nextId < 0 || nextId === previousId) {
-				throw new Error('Could not allocate a unique Nyaitter ID');
-			}
-
-			this.users.delete(previousId);
-			user.id = nextId;
-			user.handle = formatNyaitterId(nextId);
-			this.users.set(nextId, user);
-			for (const note of this.communityNotes.values()) if (Number(note.userId)===previousId) note.userId=nextId;
-			for (const map of [this.noteRatings,this.noteDistributions]) for (const [key,row] of [...map]) if (Number(row.userId)===previousId) {map.delete(key);row.userId=nextId;map.set(`${row.noteId}:${nextId}`,row);}
-			for (const [key,row] of [...this.noteRatingReasons]) if (Number(row.userId)===previousId) {this.noteRatingReasons.delete(key);row.userId=nextId;this.noteRatingReasons.set(`${row.noteId}:${nextId}:${row.code}`,row);}
-			if (this.reputationProfiles?.has(previousId)) {this.reputationProfiles.set(nextId,this.reputationProfiles.get(previousId));this.reputationProfiles.delete(previousId);}
-			if (this.noteSelectionKeys?.has(previousId)) {this.noteSelectionKeys.set(nextId,this.noteSelectionKeys.get(previousId));this.noteSelectionKeys.delete(previousId);}
-			if (this.noteCreationDaysByUser.has(previousId)) {this.noteCreationDaysByUser.set(nextId,this.noteCreationDaysByUser.get(previousId));this.noteCreationDaysByUser.delete(previousId);}
-			for (const index of [this.likedUserIdsByPost,this.starredUserIdsByPost,this.noteRatingUsersByNote,this.noteDistributionUsersByNote]) for (const ids of index.values()) if (ids.delete(previousId)) ids.add(nextId);
-			for (const [key,row] of [...(this.reputationDaily || [])]) if (key.startsWith(`${previousId}:`)) {this.reputationDaily.delete(key);this.reputationDaily.set(`${nextId}:${key.slice(String(previousId).length+1)}`,row);}
-			for (const [scope,events] of [...(this.reputationEvents || [])]) {
-				for (const e of events) if (e.userId===previousId) e.userId=nextId;
-				for (const prefix of ['manual-ban:','false-report-penalty:','moderation-user:']) if (scope===`${prefix}${previousId}${prefix==='moderation-user:'?':target':''}`) {this.reputationEvents.delete(scope);this.reputationEvents.set(`${prefix}${nextId}${prefix==='moderation-user:'?':target':''}`,events);}
-			}
-			for (const [key,claim] of [...(this.noteCreationClaims || [])]) if (claim.userId===previousId) {this.noteCreationClaims.delete(key);claim.userId=nextId;this.noteCreationClaims.set(`${key.split(':')[0]}:${nextId}`,claim);}
-			for (const [key,noteId] of [...(this.reviewerOutcomeClaims || [])]) {const [uid,author,...day]=key.split(':');if (Number(uid)===previousId || Number(author)===previousId) {this.reviewerOutcomeClaims.delete(key);this.reviewerOutcomeClaims.set(`${Number(uid)===previousId?nextId:uid}:${Number(author)===previousId?nextId:author}:${day.join(':')}`,noteId);}}
-			if (user.scid) this.scidToId.set(user.scid, nextId);
-			if (user.nyaitter_address) this.nyaitterAddressToId.set(user.nyaitter_address, nextId);
-
-			for (const session of this.sessions.values()) {
-				if (Number(session.userId) === previousId) session.userId = nextId;
-			}
-			const updatedTrustedLoginIps = new Map();
-			for (const record of this.trustedLoginIps.values()) {
-				const updated = Number(record.userId) === previousId
-					? { ...record, userId: nextId }
-					: record;
-				updatedTrustedLoginIps.set(`${updated.userId}:${updated.ipHash}`, updated);
-			}
-			this.trustedLoginIps = updatedTrustedLoginIps;
-			for (const approval of this.loginApprovals.values()) {
-				if (Number(approval.userId) === previousId) approval.userId = nextId;
-			}
-			for (const request of this.accountRecoveryRequests.values()) {
-				if (Number(request.userId) === previousId) request.userId = nextId;
-			}
-			const updatedBlockedLoginIps = new Map();
-			for (const record of this.blockedLoginIps.values()) {
-				const updated = Number(record.userId) === previousId ? { ...record, userId: nextId } : record;
-				updatedBlockedLoginIps.set(`${updated.userId}:${updated.ipHash}`, updated);
-			}
-			this.blockedLoginIps = updatedBlockedLoginIps;
-			for (const token of this.botTokens.values()) {
-				if (Number(token.userId) === previousId) token.userId = nextId;
-			}
-
-			const postIds = [];
-			for (const post of this.posts.values()) {
-				if (Number(post.userId) === previousId) {
-					post.userId = nextId;
-					postIds.push(Number(post.id));
-				}
-			}
-			this.postIdsByUser.delete(previousId);
-			if (postIds.length > 0) {
-				postIds.sort((left, right) => this.postIdsNewest.indexOf(left) - this.postIdsNewest.indexOf(right));
-				this.postIdsByUser.set(nextId, postIds);
-			}
-
-			const rekeyUserPostMap = (map) => {
-				for (const [key, value] of [...map.entries()]) {
-					const [ownerId, postId] = String(key).split(':');
-					if (Number(ownerId) !== previousId) continue;
-					map.delete(key);
-					map.set(`${nextId}:${postId}`, value);
-				}
-			};
-			rekeyUserPostMap(this.likes);
-			rekeyUserPostMap(this.stars);
-			rekeyUserPostMap(this.reposts);
-			rekeyUserPostMap(this.pinnedPosts);
-			this._rebuildRepostIndexes();
-			for (const index of [this.likedPostIdsByUser, this.starredPostIdsByUser]) {
-				const values = index.get(previousId);
-				if (values) {
-					index.delete(previousId);
-					index.set(nextId, values);
-				}
-			}
-
-			for (const channel of this.dmChannels.values()) {
-				channel.participants = (channel.participants || []).map((id) => Number(id) === previousId ? nextId : Number(id));
-				channel.messages = (channel.messages || []).map((message) => {
-					if (Number(message?.senderId) !== previousId && Number(message?.userid) !== previousId) return message;
-					const updated = { ...message };
-					if (Number(updated.senderId) === previousId) updated.senderId = nextId;
-					if (Number(updated.userid) === previousId) updated.userid = nextId;
-					return updated;
-				});
-			}
-			for (const dm of this.groupDms.values()) {
-				const previousState = JSON.stringify([dm.host_id, dm.member, dm.accepted]);
-				this._removeGroupDmMemberIndexes(dm);
-				dm.host_id = Number(dm.host_id) === previousId ? nextId : Number(dm.host_id);
-				dm.member = (dm.member || []).map((id) => Number(id) === previousId ? nextId : Number(id));
-				if (Array.isArray(dm.accepted)) dm.accepted = dm.accepted.map((id) => Number(id) === previousId ? nextId : Number(id));
-				if (Array.isArray(dm.unread?._accepted)) dm.unread._accepted = dm.unread._accepted.map((id) => Number(id) === previousId ? nextId : Number(id));
-				if (previousState !== JSON.stringify([dm.host_id, dm.member, dm.accepted])) dm.state_version = (dm.state_version ?? 0) + 1;
-				dm.post = (dm.post || []).map((message) => (
-					Number(message?.userid) === previousId ? { ...message, userid: nextId } : message
-				));
-				if (dm.unread && Object.prototype.hasOwnProperty.call(dm.unread, String(previousId))) {
-					dm.unread[String(nextId)] = dm.unread[String(previousId)];
-					delete dm.unread[String(previousId)];
-				}
-				this._addGroupDmMemberIndexes(dm);
-			}
-			for (const [key, createdAt] of [...this.follows]) {
-				const [followerId, followingId] = String(key).split(':').map(Number);
-				if (followerId !== previousId && followingId !== previousId) continue;
-				this.follows.delete(key);
-				this.follows.set(`${followerId === previousId ? nextId : followerId}:${followingId === previousId ? nextId : followingId}`, createdAt);
-			}
-			this.followingIdsByUser.clear();
-			this.followerIdsByUser.clear();
-			for (const key of this.follows.keys()) {
-				const [followerId, followingId] = String(key).split(':').map(Number);
-				this._updateFollowIndexes(followerId, followingId, true);
-			}
-			for (const candidate of this.users.values()) {
-				candidate.block = normalizeBlockList((candidate.block || []).map((id) => (
-					Number(id) === previousId ? nextId : id
-				)), candidate.id);
-			}
-
-			const updatedNotifications = new Map();
-			for (const [ownerId, notifications] of this.notifications.entries()) {
-				for (const notification of notifications) {
-					if (Number(notification.userId) === previousId) notification.userId = nextId;
-					if (Number(notification.fromUserId) === previousId) notification.fromUserId = nextId;
-					if (notification.target?.kind === 'user' && Number(notification.target.id) === previousId) {
-						notification.target = { ...notification.target, id: nextId };
-					}
-				}
-				updatedNotifications.set(Number(ownerId) === previousId ? nextId : Number(ownerId), notifications);
-			}
-			this.notifications = updatedNotifications;
-			if (this.unreadNotificationCounts.has(previousId)) {
-				const unread = this.unreadNotificationCounts.get(previousId);
-				this.unreadNotificationCounts.delete(previousId);
-				this.unreadNotificationCounts.set(nextId, unread);
-			}
-			if (this.dmE2EKeys.has(previousId)) {
-				const key = this.dmE2EKeys.get(previousId);
-				this.dmE2EKeys.delete(previousId);
-				this.dmE2EKeys.set(nextId, key);
-			}
-			if (this.pushSubscriptions.has(previousId)) {
-				const subscriptions = this.pushSubscriptions.get(previousId);
-				this.pushSubscriptions.delete(previousId);
-				this.pushSubscriptions.set(nextId, subscriptions);
-			}
-			for (const report of this.moderationReports.values()) {
-				if (Number(report.reporterUserId) === previousId) report.reporterUserId = nextId;
-				if (Number(report.assignedAdminId) === previousId) report.assignedAdminId = nextId;
-				if (report.targetKind === 'user' && Number(report.targetId) === previousId) report.targetId = String(nextId);
-				if (Number(report.targetSnapshot?.subjectUser?.id) === previousId) report.targetSnapshot.subjectUser.id = nextId;
-				for (const member of report.targetSnapshot?.dm?.members || []) {
-					if (Number(member?.id) === previousId) member.id = nextId;
-				}
-				report.excludedAdminIds = (report.excludedAdminIds || []).map((id) => Number(id) === previousId ? nextId : Number(id));
-			}
-			for (const log of this.logs) {
-				if (Number(log.nyaitter_id) === previousId) log.nyaitter_id = nextId;
-			}
-
-			// groups and memberships
-			for (const group of this.groups.values()) {
-				if (Number(group.owner_id) === previousId) group.owner_id = nextId;
-			}
-			const updatedMemberships = new Map();
-			for (const [key, membership] of this.groupMemberships.entries()) {
-				if (Number(membership.user_id) === previousId) {
-					membership.user_id = nextId;
-					updatedMemberships.set(`${membership.group_id}:${nextId}`, membership);
-				} else {
-					updatedMemberships.set(key, membership);
-				}
-			}
-			this.groupMemberships = updatedMemberships;
-			this.groupIdsByUser.clear();
-			this.groupMemberIdsByGroup.clear();
-			for (const membership of this.groupMemberships.values()) {
-				const membershipUserId = Number(membership.user_id ?? membership.userId);
-				const membershipGroupId = String(membership.group_id ?? membership.groupId);
-				if (!Number.isInteger(membershipUserId) || !membershipGroupId) continue;
-				if (!this.groupIdsByUser.has(membershipUserId)) this.groupIdsByUser.set(membershipUserId, new Set());
-				this.groupIdsByUser.get(membershipUserId).add(membershipGroupId);
-				if (!this.groupMemberIdsByGroup.has(membershipGroupId)) this.groupMemberIdsByGroup.set(membershipGroupId, new Set());
-				this.groupMemberIdsByGroup.get(membershipGroupId).add(membershipUserId);
-			}
-
-			for (const invite of this.groupInvites.values()) {
-				if (Number(invite.inviter_id) === previousId) invite.inviter_id = nextId;
-				if (Number(invite.invitee_id) === previousId) invite.invitee_id = nextId;
-			}
-			for (const request of this.groupJoinRequests.values()) {
-				if (Number(request.user_id) === previousId) request.user_id = nextId;
-				if (Number(request.reviewed_by) === previousId) request.reviewed_by = nextId;
-			}
-
-			// authorized apps and affinities
-			this.authorizedAppLookup.clear();
-			for (const [id, app] of this.authorizedApps.entries()) {
-				if (Number(app.userId) === previousId) app.userId = nextId;
-				this.authorizedAppLookup.set(`${app.userId}:${app.appId}:${app.appTokenHash}`, id);
-			}
-
-			if (this.userKeywordAffinityByUser.has(previousId)) {
-				const affinityMap = this.userKeywordAffinityByUser.get(previousId);
-				this.userKeywordAffinityByUser.delete(previousId);
-				this.userKeywordAffinityByUser.set(nextId, affinityMap);
-			}
-			if (this.postFeedbackByUser.has(previousId)) {
-				const feedbackMap = this.postFeedbackByUser.get(previousId);
-				this.postFeedbackByUser.delete(previousId);
-				this.postFeedbackByUser.set(nextId, feedbackMap);
-			}
-
-			// imposter parent_id and members
-			for (const candidate of this.users.values()) {
-				if (candidate?.settings?.imposter && typeof candidate.settings.imposter === 'object') {
-					if (Number(candidate.settings.imposter.parent_id) === previousId) {
-						candidate.settings.imposter.parent_id = nextId;
-					}
-					if (Array.isArray(candidate.settings.imposter.members)) {
-						candidate.settings.imposter.members = candidate.settings.imposter.members.map((m) => {
-							if (Number(m?.user_id) === previousId) {
-								return { ...m, user_id: nextId };
-							}
-							return m;
-						});
-					}
-				}
-			}
-
-			return user;
-		}
-
 	async getAccountAttachmentKeys(userId) {
 		const keys = new Set();
 		for (const post of this.posts.values()) {
@@ -5181,20 +4997,6 @@ class InMemoryAdapter extends DatabaseAdapter {
 		return [...keys];
 	}
 
-	async rewriteAccountAttachmentKeys(userId, replacements) {
-		const replacementMap = createAttachmentReplacementMap(replacements);
-		if (replacementMap.size === 0) return 0;
-		let updatedCount = 0;
-		for (const post of this.posts.values()) {
-			if (Number(post.userId) !== Number(userId)) continue;
-			const { attachments, changed } = rewriteAttachmentReferences(post.attachments, replacementMap);
-			if (!changed) continue;
-			post.attachments = attachments;
-			updatedCount += 1;
-		}
-		return updatedCount;
-	}
-
 	async deleteAccount(userId) {
 		const normalizedUserId = Number(userId);
 		const user = this.users.get(normalizedUserId);
@@ -5203,6 +5005,11 @@ class InMemoryAdapter extends DatabaseAdapter {
 		const ownedPostIds = new Set([...this.posts.values()]
 			.filter((post) => Number(post.userId) === normalizedUserId)
 			.map((post) => Number(post.id)));
+		for (const [postId, record] of this.postAgeEstimates) {
+			if (Number(record.user_id) === normalizedUserId || ownedPostIds.has(Number(postId))) {
+				this.postAgeEstimates.delete(postId);
+			}
+		}
 		for (const post of this.posts.values()) {
 			if (ownedPostIds.has(Number(post.id))) continue;
 			if (ownedPostIds.has(Number(post.repostTo))) post.repostTo = null;
@@ -5281,6 +5088,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 		if (user.scid) this.scidToId.delete(user.scid);
 		if (user.nyaitter_address) this.nyaitterAddressToId.delete(user.nyaitter_address);
 		this.users.delete(normalizedUserId);
+		this.retiredUserIds.add(normalizedUserId);
 		return true;
 	}
 
@@ -6032,6 +5840,51 @@ class InMemoryAdapter extends DatabaseAdapter {
 	async sharedGroupMembership(...args) { return this.getSharedGroupMembership(...args); }
 	async hasSharedGroupMembership(userId1, userId2) {
 		return (await this.getSharedGroupCount(userId1, userId2)) > 0;
+	}
+
+	async recordPostAgeEstimate(postId, userId, band) {
+		const normalizedPostId = Number(postId);
+		const normalizedUserId = Number(userId);
+		if (!Number.isSafeInteger(normalizedPostId) || normalizedPostId <= 0) return null;
+		if (!Number.isSafeInteger(normalizedUserId) || normalizedUserId <= 0) return null;
+		if (!['under13', '13-15', '16-17', '18-24', '25-34', '35over'].includes(band)) return null;
+		const record = {
+			post_id: normalizedPostId,
+			user_id: normalizedUserId,
+			band,
+			created_at: new Date(),
+		};
+		this.postAgeEstimates.set(normalizedPostId, record);
+		return record;
+	}
+
+	async getPostAgeBands(userId, limit = 50) {
+		const normalizedUserId = Number(userId);
+		const safeLimit = Math.max(1, Math.min(Number(limit) || 50, 500));
+		return [...this.postAgeEstimates.values()]
+			.filter((record) => record.user_id === normalizedUserId)
+			.sort((a, b) => (b.created_at - a.created_at) || (b.post_id - a.post_id))
+			.slice(0, safeLimit)
+			.map((record) => record.band);
+	}
+
+	async updateUserAgeEstimate(userId, fields = {}) {
+		const user = this.users.get(Number(userId));
+		if (!user) return null;
+		if (fields.ageEstimate !== undefined) {
+			const estimate = fields.ageEstimate == null ? null : Number(fields.ageEstimate);
+			if (estimate == null || (Number.isFinite(estimate) && estimate >= 0 && estimate <= 120)) {
+				user.age_estimate = estimate;
+			}
+		}
+		if (fields.ageSource !== undefined) user.age_source = ['post', 'ondevice', 'api'].includes(fields.ageSource) ? fields.ageSource : null;
+		if (fields.ageSamples !== undefined) user.age_samples = Math.max(0, Number(fields.ageSamples) || 0);
+		if (fields.ageEstimatedAt !== undefined) {
+			user.age_estimated_at = fields.ageEstimatedAt == null
+				? null
+				: (fields.ageEstimatedAt instanceof Date ? fields.ageEstimatedAt.toISOString() : String(fields.ageEstimatedAt));
+		}
+		return user;
 	}
 
 	async updatePostRecommendationPenalty(postId, delta = 0.1, max = 1) {

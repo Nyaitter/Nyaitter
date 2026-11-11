@@ -707,6 +707,10 @@ function normalizeUserRow(row) {
 		freeze: row.freeze || null,
 		shadow: Boolean(row.shadow),
 		block: normalizeBlockList(parseJsonSafe(row.block, []), row.id),
+		age_estimate: row.age_estimate != null ? Number(row.age_estimate) : null,
+		age_source: row.age_source || null,
+		age_estimated_at: row.age_estimated_at || null,
+		age_samples: Math.max(0, Number(row.age_samples) || 0),
 		created_at: row.created_at,
 	};
 }
@@ -824,6 +828,8 @@ function normalizePostRow(row) {
 		attachments: parseJsonSafe(row.attachments, []),
 		mask: Boolean(row.mask),
 		lock: Boolean(row.lock),
+		ageRating: Number(row.age_rating ?? row.ageRating ?? 0) || 0,
+		age_rating: Number(row.age_rating ?? row.ageRating ?? 0) || 0,
 		announcement: Boolean(row.announcement),
 		groupId: row.group_id ?? null,
 		group_id: row.group_id ?? null,
@@ -1654,7 +1660,15 @@ export default {
 				const countRow = await db.prepare('SELECT COUNT(*) as count FROM users').first();
 				const count = Number(countRow?.count || 0);
 				const digits = Math.max(4, String(Math.max(count, 1)).length);
-				const id = Math.floor(Math.random() * (10 ** digits));
+				let id = null;
+				for (let attempt = 0; attempt < 20 && id === null; attempt += 1) {
+					const candidate = Math.floor(Math.random() * (10 ** digits));
+					const collision = await db.prepare('SELECT 1 FROM users WHERE id = ? LIMIT 1').bind(candidate).first();
+					if (collision) continue;
+					const retired = await db.prepare('SELECT 1 FROM retired_user_ids WHERE id = ? LIMIT 1').bind(candidate).first();
+					if (!retired) id = candidate;
+				}
+				if (id === null) return badRequest('Could not allocate unique Nyaitter ID');
 				const now = new Date().toISOString();
 
 				await db.prepare(
@@ -1682,6 +1696,8 @@ export default {
 					const count = Number(countRow?.count || 0);
 					const digits = Math.max(4, String(Math.max(count, 1)).length);
 						const id = Math.floor(Math.random() * (10 ** digits));
+						const retired = await db.prepare('SELECT 1 FROM retired_user_ids WHERE id = ? LIMIT 1').bind(id).first();
+						if (retired) continue;
 						const handle = provider === 'nyaitter' && userData.external_id != null
 							? formatNyaitterId(userData.external_id)
 							: formatNyaitterId(id);
@@ -1778,7 +1794,7 @@ export default {
 
 				const placeholders = ids.map(() => '?').join(', ');
 				const columns = body.projection === 'post_author'
-					? 'id, auth_provider, external_id, name, scid, icon_data, bio, header_image, verify, admin, settings, block'
+					? 'id, auth_provider, external_id, name, scid, icon_data, bio, header_image, verify, admin, settings, block, shadow'
 					: '*';
 				const { results } = await db.prepare(
 					`SELECT ${columns} FROM users WHERE id IN (${placeholders})`
@@ -1804,7 +1820,7 @@ export default {
 					const userId = Number(pathname.split('/')[2]);
 					const body = await request.json();
 					const operation = String(body.operation || '');
-					if (!['reassigning', 'deleting'].includes(operation)) return badRequest('Invalid account operation');
+					if (!['deleting'].includes(operation)) return badRequest('Invalid account operation');
 					const result = await db.prepare(
 						`UPDATE users SET account_operation = ?
 						 WHERE id = ? AND auth_provider <> 'nyaitter' AND account_operation IS NULL`
@@ -1822,158 +1838,6 @@ export default {
 					if (result.meta.changes === 0) return json(null);
 					return json(normalizeUserRow(await db.prepare('SELECT * FROM users WHERE id = ?').bind(userId).first()));
 				}
-
-					if (method === 'POST' && pathname.match(/^\/users\/(\d+)\/nyaitter-id\/reassign$/)) {
-						const previousId = Number(pathname.split('/')[2]);
-						const user = await db.prepare(
-							`SELECT * FROM users WHERE id = ? AND auth_provider <> 'nyaitter' AND account_operation = 'reassigning'`
-						).bind(previousId).first();
-						if (!user) return json(null);
-
-						const countRow = await db.prepare('SELECT COUNT(*) AS count FROM users').first();
-						const upperBound = 10 ** Math.max(4, String(Math.max(Number(countRow?.count) || 1, 1)).length);
-						let nextId = null;
-						for (let attempt = 0; attempt < 100; attempt += 1) {
-							const candidate = Math.floor(Math.random() * upperBound);
-							if (candidate === previousId) continue;
-							const collision = await db.prepare('SELECT 1 FROM users WHERE id = ? LIMIT 1').bind(candidate).first();
-							if (!collision) {
-								nextId = candidate;
-								break;
-							}
-						}
-						if (nextId == null) throw new Error('Could not allocate a unique Nyaitter ID');
-
-													const [{ results: channels }, { results: groups }, { results: blockedUsers }, { results: reports }] = await db.batch([
-								db.prepare('SELECT id, participants FROM dm_channels WHERE participants LIKE ?').bind(`%${previousId}%`),
-								db.prepare('SELECT id, host_id, member, post, unread FROM group_dms WHERE host_id = ? OR member LIKE ? OR unread LIKE ?').bind(previousId, `%${previousId}%`, `%\"${previousId}\"%`),
-								db.prepare('SELECT id, block FROM users WHERE block LIKE ?').bind(`%${previousId}%`),
-								db.prepare('SELECT id, target_kind, target_id, target_snapshot, excluded_admin_ids FROM moderation_reports'),
-							]);
-
-						const statements = [
-							db.prepare(
-								`INSERT INTO users (id, scid, name, handle, nyaitter_address, auth_provider, provider_domain, external_id, external_profile, uuid, settings, block, bio, header_image, icon_data, verify, admin, freeze, shadow, created_at, account_operation, admin_request_excluded)
-								 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-							).bind(
-								nextId, user.scid, user.name, formatNyaitterId(nextId), user.nyaitter_address,
-								user.auth_provider, user.provider_domain, user.external_id, user.external_profile,
-								user.uuid, user.settings, user.block, user.bio, user.header_image, user.icon_data,
-								user.verify, user.admin, user.freeze, user.shadow, user.created_at, user.account_operation, user.admin_request_excluded,
-							),
-							db.prepare('UPDATE sessions SET user_id = ? WHERE user_id = ?').bind(nextId, previousId),
-							db.prepare('UPDATE trusted_login_ips SET user_id = ? WHERE user_id = ?').bind(nextId, previousId),
-							db.prepare('UPDATE login_approvals SET user_id = ? WHERE user_id = ?').bind(nextId, previousId),
-							db.prepare('UPDATE account_recovery_requests SET user_id = ? WHERE user_id = ?').bind(nextId, previousId),
-							db.prepare('UPDATE blocked_login_ips SET user_id = ? WHERE user_id = ?').bind(nextId, previousId),
-							db.prepare('UPDATE bot_tokens SET user_id = ? WHERE user_id = ?').bind(nextId, previousId),
-							db.prepare('UPDATE posts SET user_id = ? WHERE user_id = ?').bind(nextId, previousId),
-							...['community_notes','note_ratings','note_rating_reasons','note_distribution','note_creation_claims','note_selection_identities','reputation_events','reputation_daily','reputation_profiles','reviewer_outcome_claims'].map(table=>db.prepare(`UPDATE ${table} SET user_id=? WHERE user_id=?`).bind(nextId,previousId)),
-							db.prepare('UPDATE reviewer_outcome_claims SET author_id=? WHERE author_id=?').bind(nextId,previousId),
-							db.prepare('UPDATE reviewer_outcome_candidates SET user_id=? WHERE user_id=?').bind(nextId,previousId),
-							db.prepare('UPDATE reviewer_outcome_candidates SET author_id=? WHERE author_id=?').bind(nextId,previousId),
-							...['manual-ban:','false-report-penalty:','moderation-user:'].map(prefix=>db.prepare('UPDATE reputation_events SET scope=? WHERE scope=?').bind(`${prefix}${nextId}${prefix==='moderation-user:'?':target':''}`,`${prefix}${previousId}${prefix==='moderation-user:'?':target':''}`)),
-							db.prepare('UPDATE likes SET user_id = ? WHERE user_id = ?').bind(nextId, previousId),
-							db.prepare('UPDATE stars SET user_id = ? WHERE user_id = ?').bind(nextId, previousId),
-							db.prepare('UPDATE reposts SET user_id = ? WHERE user_id = ?').bind(nextId, previousId),
-							db.prepare('UPDATE pinned_posts SET user_id = ? WHERE user_id = ?').bind(nextId, previousId),
-							db.prepare('UPDATE dm_messages SET sender_id = ? WHERE sender_id = ?').bind(nextId, previousId),
-							db.prepare('UPDATE follows SET follower_id = ? WHERE follower_id = ?').bind(nextId, previousId),
-							db.prepare('UPDATE follows SET following_id = ? WHERE following_id = ?').bind(nextId, previousId),
-							db.prepare('UPDATE dm_e2e_keys SET user_id = ? WHERE user_id = ?').bind(nextId, previousId),
-							db.prepare('UPDATE notifications SET user_id = ? WHERE user_id = ?').bind(nextId, previousId),
-							db.prepare('UPDATE notifications SET from_user_id = ? WHERE from_user_id = ?').bind(nextId, previousId),
-							db.prepare(`UPDATE notifications SET target = json_set(target, '$.id', ?)
-								WHERE json_extract(target, '$.kind') = 'user' AND CAST(json_extract(target, '$.id') AS INTEGER) = ?`).bind(nextId, previousId),
-							db.prepare('UPDATE push_subscriptions SET user_id = ? WHERE user_id = ?').bind(nextId, previousId),
-
-							// groups and memberships
-							db.prepare('UPDATE groups SET owner_id = ? WHERE owner_id = ?').bind(nextId, previousId),
-							db.prepare('UPDATE group_memberships SET user_id = ? WHERE user_id = ?').bind(nextId, previousId),
-							db.prepare('UPDATE group_invites SET inviter_id = ? WHERE inviter_id = ?').bind(nextId, previousId),
-							db.prepare('UPDATE group_invites SET invitee_id = ? WHERE invitee_id = ?').bind(nextId, previousId),
-							db.prepare('UPDATE group_join_requests SET user_id = ? WHERE user_id = ?').bind(nextId, previousId),
-							db.prepare('UPDATE group_join_requests SET reviewed_by = ? WHERE reviewed_by = ?').bind(nextId, previousId),
-
-							// authorized apps and affinities
-							db.prepare('UPDATE authorized_apps SET user_id = ? WHERE user_id = ?').bind(nextId, previousId),
-							db.prepare('UPDATE user_keyword_affinities SET user_id = ? WHERE user_id = ?').bind(nextId, previousId),
-							// PK(user_id, post_id, kind) の衝突を避けつつ移行する
-							db.prepare('UPDATE OR IGNORE post_feedback SET user_id = ? WHERE user_id = ?').bind(nextId, previousId),
-							db.prepare('DELETE FROM post_feedback WHERE user_id = ?').bind(previousId),
-
-							db.prepare('UPDATE moderation_reports SET reporter_user_id = ? WHERE reporter_user_id = ?').bind(nextId, previousId),
-							db.prepare('UPDATE moderation_reports SET assigned_admin_id = ? WHERE assigned_admin_id = ?').bind(nextId, previousId),
-							db.prepare('UPDATE logs SET nyaitter_id = ? WHERE nyaitter_id = ?').bind(nextId, previousId),
-						];
-						for (const channel of channels || []) {
-							const participants = parseJsonSafe(channel.participants, []).map((id) => Number(id) === previousId ? nextId : Number(id));
-							statements.push(db.prepare('UPDATE dm_channels SET participants = ? WHERE id = ?').bind(JSON.stringify(participants), channel.id));
-						}
-						for (const group of groups || []) {
-							const member = parseJsonSafe(group.member, []).map((id) => Number(id) === previousId ? nextId : Number(id));
-							const post = parseJsonSafe(group.post, []).map((message) => (
-								Number(message?.userid) === previousId ? { ...message, userid: nextId } : message
-							));
-							const unread = { ...parseJsonSafe(group.unread, {}) };
-							if (Array.isArray(unread._accepted)) unread._accepted = unread._accepted.map((id) => Number(id) === previousId ? nextId : Number(id));
-							if (Object.prototype.hasOwnProperty.call(unread, String(previousId))) {
-								unread[String(nextId)] = unread[String(previousId)];
-								delete unread[String(previousId)];
-							}
-							statements.push(
-								db.prepare('UPDATE group_dms SET host_id = ?, member = ?, post = ?, unread = ? WHERE id = ?')
-									.bind(Number(group.host_id) === previousId ? nextId : Number(group.host_id), JSON.stringify(member), JSON.stringify(post), JSON.stringify(unread), group.id),
-							);
-						}
-						for (const blockedUser of blockedUsers || []) {
-							const block = normalizeBlockList(parseJsonSafe(blockedUser.block, []).map((id) => Number(id) === previousId ? nextId : id), Number(blockedUser.id) === previousId ? nextId : blockedUser.id);
-							statements.push(db.prepare('UPDATE users SET block = ? WHERE id = ?').bind(JSON.stringify(block), blockedUser.id));
-						}
-													for (const report of reports || []) {
-								const targetSnapshot = parseJsonSafe(report.target_snapshot, {});
-								let snapshotChanged = false;
-								if (Number(targetSnapshot?.subjectUser?.id) === previousId) {
-									targetSnapshot.subjectUser.id = nextId;
-									snapshotChanged = true;
-								}
-								for (const member of targetSnapshot?.dm?.members || []) {
-									if (Number(member?.id) !== previousId) continue;
-									member.id = nextId;
-									snapshotChanged = true;
-								}
-								const targetId = report.target_kind === 'user' && Number(report.target_id) === previousId
-									? String(nextId)
-									: report.target_id;
-								const excluded = parseJsonSafe(report.excluded_admin_ids, []).map((id) => Number(id) === previousId ? nextId : Number(id));
-								const excludedChanged = excluded.some((id, index) => Number(id) !== Number(parseJsonSafe(report.excluded_admin_ids, [])[index]));
-								if (!snapshotChanged && targetId === report.target_id && !excludedChanged) continue;
-								statements.push(
-									db.prepare('UPDATE moderation_reports SET target_id = ?, target_snapshot = ?, excluded_admin_ids = ? WHERE id = ?')
-										.bind(targetId, JSON.stringify(targetSnapshot), JSON.stringify(excluded), report.id),
-								);
-							}
-
-						statements.push(db.prepare('DELETE FROM users WHERE id = ? AND account_operation = ?').bind(previousId, 'reassigning'));
-						await db.batch(statements);
-						return json(normalizeUserRow(await db.prepare('SELECT * FROM users WHERE id = ?').bind(nextId).first()));
-					}
-
-					if (method === 'POST' && pathname.match(/^\/users\/(\d+)\/account\/attachments\/rewrite$/)) {
-						const userId = Number(pathname.split('/')[2]);
-						const body = await request.json();
-						const replacementMap = createAttachmentReplacementMap(body?.replacements);
-						if (replacementMap.size === 0) return json({ updatedCount: 0 });
-						const { results } = await db.prepare('SELECT id, attachments FROM posts WHERE user_id = ?').bind(userId).all();
-						const statements = [];
-						for (const row of results || []) {
-							const { attachments, changed } = rewriteAttachmentReferences(parseJsonSafe(row.attachments, []), replacementMap);
-							if (!changed) continue;
-							statements.push(db.prepare('UPDATE posts SET attachments = ? WHERE id = ?').bind(JSON.stringify(attachments), row.id));
-						}
-						if (statements.length > 0) await db.batch(statements);
-						return json({ updatedCount: statements.length });
-					}
 
 					if (method === 'GET' && pathname.match(/^\/users\/(\d+)\/account\/attachments$/)) {
 						const userId = Number(pathname.split('/')[2]);
@@ -2033,6 +1897,8 @@ export default {
 						db.prepare('DELETE FROM push_subscriptions WHERE user_id = ?').bind(userId),
 						db.prepare('DELETE FROM post_feedback WHERE user_id = ?').bind(userId),
 						db.prepare('DELETE FROM moderation_reports WHERE reporter_user_id = ?').bind(userId),
+						db.prepare('DELETE FROM post_age_estimates WHERE user_id = ?').bind(userId),
+						db.prepare('INSERT OR IGNORE INTO retired_user_ids (id, retired_at) VALUES (?, ?)').bind(userId, new Date().toISOString()),
 						db.prepare('DELETE FROM users WHERE id = ?').bind(userId),
 					);
 					await db.batch(statements);
@@ -2049,6 +1915,11 @@ export default {
 			if (method === 'POST' && pathname.match(/^\/users\/(\d+)\/status$/)) {
 				const userId = Number(pathname.split('/')[2]);
 				const body = await request.json();
+				// shadow が指定されていない場合は現状を返すだけ（未指定を false と解釈して上書きしない）。
+				if (body.shadow === undefined) {
+					const row = await db.prepare('SELECT shadow FROM users WHERE id = ?').bind(userId).first();
+					return json(row ? { shadow: Boolean(row.shadow) } : null);
+				}
 				const shadow = Boolean(body.shadow);
 				await db.prepare('UPDATE users SET shadow = ? WHERE id = ?').bind(shadow ? 1 : 0, userId).run();
 				return json({ shadow });
@@ -2183,6 +2054,57 @@ export default {
 				const row = await db.prepare('SELECT * FROM users WHERE id = ?').bind(userId).first();
 				return json(normalizeUserRow(row));
 			}
+
+				if (method === 'POST' && pathname === '/users/age-estimates') {
+					const body = await request.json();
+					const ids = [...new Set((Array.isArray(body.ids) ? body.ids : [])
+						.map(Number)
+						.filter((id) => Number.isSafeInteger(id) && id > 0))].slice(0, 1000);
+					if (ids.length === 0) return json({ users: [] });
+					const placeholders = ids.map(() => '?').join(', ');
+					const { results } = await db.prepare(
+						`SELECT id, age_estimate FROM users WHERE id IN (${placeholders})`,
+					).bind(...ids).all();
+					return json({
+						users: (results || []).map((row) => ({
+							id: Number(row.id),
+							age_estimate: row.age_estimate == null ? null : Number(row.age_estimate),
+						})),
+					});
+				}
+
+				if (method === 'GET' && pathname.match(/^\/users\/(\d+)\/age-estimates$/)) {
+					const userId = Number(pathname.split('/')[2]);
+					const limit = Math.max(1, Math.min(Number(url.searchParams.get('limit') || 50), 500));
+					const { results } = await db.prepare(
+						'SELECT band FROM post_age_estimates WHERE user_id = ? ORDER BY created_at DESC, post_id DESC LIMIT ?',
+					).bind(userId, limit).all();
+					return json({ bands: (results || []).map((row) => row.band) });
+				}
+
+				if (method === 'POST' && pathname.match(/^\/users\/(\d+)\/age-estimate$/)) {
+					const userId = Number(pathname.split('/')[2]);
+					const body = await request.json();
+					const sets = [];
+					const values = [];
+					if (body.ageEstimate !== undefined) {
+						const estimate = body.ageEstimate == null ? null : Number(body.ageEstimate);
+						if (estimate != null && (!Number.isFinite(estimate) || estimate < 0 || estimate > 120)) return badRequest('Invalid age estimate');
+						sets.push('age_estimate = ?'); values.push(estimate);
+					}
+					if (body.ageSource !== undefined) {
+						if (body.ageSource != null && !['post', 'ondevice', 'api'].includes(body.ageSource)) return badRequest('Invalid age source');
+						sets.push('age_source = ?'); values.push(body.ageSource || null);
+					}
+					if (body.ageSamples !== undefined) { sets.push('age_samples = ?'); values.push(Math.max(0, Number(body.ageSamples) || 0)); }
+					if (body.ageEstimatedAt !== undefined) { sets.push('age_estimated_at = ?'); values.push(body.ageEstimatedAt == null ? null : String(body.ageEstimatedAt)); }
+					if (sets.length > 0) {
+						values.push(userId);
+						await db.prepare(`UPDATE users SET ${sets.join(', ')} WHERE id = ?`).bind(...values).run();
+					}
+					const row = await db.prepare('SELECT * FROM users WHERE id = ?').bind(userId).first();
+					return json(normalizeUserRow(row));
+				}
 
 				if (method === 'GET' && pathname.match(/^\/users\/(\d+)$/)) {
 					const userId = Number(pathname.split('/')[2]);
@@ -3439,6 +3361,7 @@ export default {
 				if (fields.attachments !== undefined) { sets.push('attachments = ?'); values.push(fields.attachments ? JSON.stringify(fields.attachments) : null); }
 				if (fields.mask !== undefined) { sets.push('mask = ?'); values.push(fields.mask ? 1 : 0); }
 				if (fields.lock !== undefined) { sets.push('lock = ?'); values.push(fields.lock ? 1 : 0); }
+				if (fields.age_rating !== undefined || fields.ageRating !== undefined) { sets.push('age_rating = ?'); values.push(Number(fields.ageRating ?? fields.age_rating ?? 0) || 0); }
 
 				if (sets.length > 0) {
 					values.push(postId);
@@ -3450,6 +3373,21 @@ export default {
 					await adjustUserKeywordAffinitiesForTags(db, existing.user_id, row.tags, 1);
 				}
 				return json(normalizePostRow(row));
+			}
+
+			if (method === 'POST' && pathname.match(/^\/posts\/(\d+)\/age-estimate$/)) {
+				const postId = Number(pathname.split('/')[2]);
+				const body = await request.json();
+				const userId = Number(body.userId);
+				const band = typeof body.band === 'string' ? body.band : '';
+				const AGE_BAND_VALUES = ['under13', '13-15', '16-17', '18-24', '25-34', '35over'];
+				if (!Number.isSafeInteger(userId) || userId <= 0 || !AGE_BAND_VALUES.includes(band)) return badRequest('Invalid age estimate');
+				const post = await db.prepare('SELECT user_id FROM posts WHERE id = ?').bind(postId).first();
+				if (!post || Number(post.user_id) !== userId) return badRequest('Age estimate author mismatch');
+				await db.prepare(
+					'INSERT INTO post_age_estimates (post_id, user_id, band, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(post_id) DO UPDATE SET user_id = excluded.user_id, band = excluded.band, created_at = excluded.created_at',
+				).bind(postId, userId, band, new Date().toISOString()).run();
+				return json({ success: true });
 			}
 
 			if (method === 'POST' && pathname.match(/^\/posts\/(\d+)\/delete$/)) {
@@ -3466,6 +3404,7 @@ export default {
 				await db.prepare('DELETE FROM reposts WHERE post_id = ?').bind(postId).run();
 				await db.prepare('DELETE FROM pinned_posts WHERE post_id = ?').bind(postId).run();
 				await db.prepare('DELETE FROM post_feedback WHERE post_id = ?').bind(postId).run();
+				await db.prepare('DELETE FROM post_age_estimates WHERE post_id = ?').bind(postId).run();
 				await db.prepare('DELETE FROM posts WHERE id = ?').bind(postId).run();
 				return json({ success: true });
 			}
@@ -3477,6 +3416,7 @@ export default {
 				await db.prepare('DELETE FROM reposts WHERE post_id = ?').bind(postId).run();
 				await db.prepare('DELETE FROM pinned_posts WHERE post_id = ?').bind(postId).run();
 				await db.prepare('DELETE FROM post_feedback WHERE post_id = ?').bind(postId).run();
+				await db.prepare('DELETE FROM post_age_estimates WHERE post_id = ?').bind(postId).run();
 				await db.prepare('DELETE FROM posts WHERE id = ?').bind(postId).run();
 				return json({ success: true });
 			}
@@ -3740,7 +3680,7 @@ export default {
 								UNION ALL
 								(SELECT post_id, created_at FROM reposts WHERE user_id = ? ORDER BY created_at DESC LIMIT 100)
 							) _r`).bind(profileUserId, profileUserId, profileUserId).all(),
-						db.prepare(`SELECT pf.post_id, p.user_id AS author_id
+						db.prepare(`SELECT pf.post_id, p.user_id AS author_id, p.tags
 							FROM post_feedback pf JOIN posts p ON p.id = pf.post_id
 							WHERE pf.user_id = ? AND pf.kind = 'not_interested'
 							ORDER BY pf.created_at DESC LIMIT 500`).bind(profileUserId).all(),
@@ -3758,10 +3698,18 @@ export default {
 					const reacted = [...new Set((reactedRows.results || []).map((row) => Number(row.post_id)).filter(Number.isSafeInteger))];
 					const dislikedPostIds = [];
 					const dislikedAuthorsSet = new Set();
+					const dislikedAuthorCounts = {};
+					const negativeTagCounts = {};
 					for (const row of feedbackRows.results || []) {
 						dislikedPostIds.push(Number(row.post_id));
 						const authorId = Number(row.author_id);
-						if (Number.isSafeInteger(authorId)) dislikedAuthorsSet.add(authorId);
+						if (Number.isSafeInteger(authorId)) {
+							dislikedAuthorsSet.add(authorId);
+							dislikedAuthorCounts[authorId] = (dislikedAuthorCounts[authorId] || 0) + 1;
+						}
+						for (const tag of normalizePostTags(row.tags)) {
+							negativeTagCounts[tag] = (negativeTagCounts[tag] || 0) + 1;
+						}
 					}
 					const extendedFollows = (extendedRows.results || []).map((row) => Number(row.user_id)).filter(Number.isSafeInteger);
 					let blockedAuthors = [];
@@ -3774,6 +3722,8 @@ export default {
 						reacted,
 						dislikedPostIds,
 						dislikedAuthors: [...dislikedAuthorsSet],
+						dislikedAuthorCounts,
+						negativeTagCounts,
 						blockedAuthors,
 					});
 				}

@@ -517,6 +517,13 @@ class ModerationReportService {
       if (normalizedActions.searchExclude) await modLog.record(this.db, 'admin', adminId, 'search_exclude', 'user', normalizedActions.targetUserId, updated ? 'success' : 'failure');
       if (normalizedActions.freeze) await modLog.record(this.db, 'admin', adminId, 'freeze', 'user', normalizedActions.targetUserId, updated ? 'success' : 'failure');
       if (!updated) throw new Error('対応対象ユーザーが見つかりません');
+      if (normalizedActions.searchExclude) {
+        // 検索除外は著者情報のキャッシュにも即時反映する（管理画面の状態変更と同じ経路）。
+        require('../utils/serialize').invalidateUserBriefCache(normalizedActions.targetUserId);
+        const timelineCacheManager = require('../utils/TimelineCacheManager');
+        timelineCacheManager.updatePostAuthor(normalizedActions.targetUserId, { shadow: true });
+        timelineCacheManager.invalidateAuthorEntries(normalizedActions.targetUserId);
+      }
       applied.searchExclude = normalizedActions.searchExclude;
       applied.freeze = normalizedActions.freeze;
     }

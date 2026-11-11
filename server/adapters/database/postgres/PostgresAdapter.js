@@ -13,15 +13,12 @@ const MemoryBoundedCache = require('../../../utils/MemoryBoundedCache');
 const { normalizeTarget } = require('../../../utils/notification');
 const { normalizeBlockList } = require('../../../utils/blockList');
 const {
-	createAttachmentReplacementMap,
-	rewriteAttachmentReferences,
-} = require('../../../utils/attachmentKeys');
-const {
 	exportPostgresSnapshot,
 	importPostgresSnapshot,
 } = require('../../../services/DataMigrationSql');
 const { normalizeSnapshot } = require('../../../services/DataMigrationService');
 const { scoreRecommendedPosts, buildAffinityProfile } = require('../../../utils/recommendation');
+const { isAgeFeaturesActive } = require('../../../services/AgeEstimateService');
 const { extractViewContent } = require('../../../utils/viewContent');
 const { isFuzzyMatch, calculateStringSimilarity } = require('../../../utils/fuzzySearch');
 const { encodePostCursor, decodePostCursor } = require('../../../utils/postCursor');
@@ -85,6 +82,10 @@ function normalizeUserRow(row) {
 		freeze: row.freeze || null,
 		shadow: Boolean(row.shadow),
 		block: normalizeBlockList(rawBlock, id),
+		age_estimate: row.age_estimate != null ? Number(row.age_estimate) : null,
+		age_source: row.age_source || null,
+		age_estimated_at: toIsoString(row.age_estimated_at),
+		age_samples: Math.max(0, Number(row.age_samples) || 0),
 		created_at: toIsoString(row.created_at),
 	};
 }
@@ -149,6 +150,8 @@ function normalizePostRow(row) {
 		attachments,
 		mask: Boolean(row.mask),
 		lock: Boolean(row.lock),
+		ageRating: Number(row.age_rating ?? row.ageRating ?? 0) || 0,
+		age_rating: Number(row.age_rating ?? row.ageRating ?? 0) || 0,
 		announcement: Boolean(row.announcement),
 		groupId: groupId == null ? null : String(groupId),
 		group_id: groupId == null ? null : String(groupId),
@@ -645,22 +648,6 @@ class PostgresAdapter extends DatabaseAdapter {
 		return result;
 	}
 
-	_reassignReportSnapshotUserIds(snapshot, previousId, nextId) {
-		if (!snapshot || typeof snapshot !== 'object') return { snapshot, changed: false };
-		const updated = JSON.parse(JSON.stringify(snapshot));
-		let changed = false;
-		if (Number(updated?.subjectUser?.id) === previousId) {
-			updated.subjectUser.id = nextId;
-			changed = true;
-		}
-		for (const member of updated?.dm?.members || []) {
-			if (Number(member?.id) !== previousId) continue;
-			member.id = nextId;
-			changed = true;
-		}
-		return { snapshot: updated, changed };
-	}
-
 	_isRetryableTransactionError(error) {
 		if (!error) return false;
 		if (error.code === '40001' || error.code === '40P01') return true;
@@ -843,7 +830,7 @@ class PostgresAdapter extends DatabaseAdapter {
 
 		const { rows } = await this.pool.query(
 			`SELECT id, auth_provider, external_id, name, scid, icon_data, bio, header_image,
-					verify, admin, settings, block
+					verify, admin, settings, block, shadow
 			 FROM users
 			 WHERE id = ANY($1::int[])`,
 			[ids],
@@ -1104,6 +1091,8 @@ class PostgresAdapter extends DatabaseAdapter {
 			const count = Number(countResult.rows[0].count);
 			const digits = Math.max(4, String(Math.max(count, 1)).length);
 			const id = crypto.randomInt(1, 10 ** digits);
+			const { rows: retiredRows } = await this.pool.query('SELECT 1 FROM retired_user_ids WHERE id = $1', [id]);
+			if (retiredRows.length > 0) continue;
 			const handle = provider === 'nyaitter' && userData.external_id != null
 				? formatNyaitterId(userData.external_id)
 				: formatNyaitterId(id);
@@ -1283,6 +1272,8 @@ class PostgresAdapter extends DatabaseAdapter {
 			reacted: [...new Set((reactionResult.rows || []).map((row) => Number(row.post_id)).filter(Number.isSafeInteger))],
 			dislikedPostIds: feedback?.postIds || [],
 			dislikedAuthors: feedback?.authorIds || [],
+			dislikedAuthorCounts: feedback?.authorCounts || new Map(),
+			negativeTagCounts: feedback?.tagCounts || new Map(),
 			blockedAuthors: normalizeBlockList(user?.block, id),
 		};
 	}
@@ -1297,7 +1288,9 @@ class PostgresAdapter extends DatabaseAdapter {
 	}
 
 	async setUserStatus(userId, status) {
-		const shadow = Boolean(status && status.shadow);
+		// shadow が指定されていない場合は現状を返すだけ（未指定を false と解釈して上書きしない）。
+		if (!status || status.shadow === undefined) return this.getUserStatus(userId);
+		const shadow = Boolean(status.shadow);
 		const { rows } = await this.pool.query(
 			'UPDATE users SET shadow = $2 WHERE id = $1 RETURNING shadow',
 			[Number(userId), shadow],
@@ -1367,8 +1360,66 @@ class PostgresAdapter extends DatabaseAdapter {
 		return user;
 	}
 
+	async recordPostAgeEstimate(postId, userId, band) {
+		const normalizedPostId = Number(postId);
+		const normalizedUserId = Number(userId);
+		if (!Number.isSafeInteger(normalizedPostId) || normalizedPostId <= 0) return null;
+		if (!Number.isSafeInteger(normalizedUserId) || normalizedUserId <= 0) return null;
+		if (!['under13', '13-15', '16-17', '18-24', '25-34', '35over'].includes(band)) return null;
+		const { rows } = await this.pool.query(
+			`INSERT INTO post_age_estimates (post_id, user_id, band)
+			 VALUES ($1, $2, $3)
+			 ON CONFLICT (post_id) DO UPDATE SET user_id = EXCLUDED.user_id, band = EXCLUDED.band, created_at = now()
+			 RETURNING *`,
+			[normalizedPostId, normalizedUserId, band],
+		);
+		return rows[0] || null;
+	}
+
+	async getPostAgeBands(userId, limit = 50) {
+		const safeLimit = Math.max(1, Math.min(Number(limit) || 50, 500));
+		const { rows } = await this.pool.query(
+			'SELECT band FROM post_age_estimates WHERE user_id = $1 ORDER BY created_at DESC, post_id DESC LIMIT $2',
+			[Number(userId), safeLimit],
+		);
+		return rows.map((row) => row.band);
+	}
+
+	async updateUserAgeEstimate(userId, fields = {}) {
+		const sets = [];
+		const values = [];
+		if (fields.ageEstimate !== undefined) {
+			const estimate = fields.ageEstimate == null ? null : Number(fields.ageEstimate);
+			if (estimate == null || (Number.isFinite(estimate) && estimate >= 0 && estimate <= 120)) {
+				values.push(estimate);
+				sets.push(`age_estimate = $${values.length}`);
+			}
+		}
+		if (fields.ageSource !== undefined) {
+			values.push(['post', 'ondevice', 'api'].includes(fields.ageSource) ? fields.ageSource : null);
+			sets.push(`age_source = $${values.length}`);
+		}
+		if (fields.ageSamples !== undefined) {
+			values.push(Math.max(0, Number(fields.ageSamples) || 0));
+			sets.push(`age_samples = $${values.length}`);
+		}
+		if (fields.ageEstimatedAt !== undefined) {
+			values.push(fields.ageEstimatedAt == null ? null : toIsoString(fields.ageEstimatedAt));
+			sets.push(`age_estimated_at = $${values.length}`);
+		}
+		if (sets.length === 0) return this.getUserById(userId);
+		values.push(Number(userId));
+		const { rows } = await this.pool.query(
+			`UPDATE users SET ${sets.join(', ')} WHERE id = $${values.length} RETURNING *`,
+			values,
+		);
+		const user = normalizeUserRow(rows[0]);
+		this._setCachedUser(user);
+		return user;
+	}
+
 	async beginAccountOperation(userId, operation) {
-		if (!['reassigning', 'deleting'].includes(operation)) throw new Error('Invalid account operation');
+		if (!['deleting'].includes(operation)) throw new Error('Invalid account operation');
 		const { rows } = await this.pool.query(
 			`UPDATE users
 			 SET account_operation = $2
@@ -1395,205 +1446,6 @@ class PostgresAdapter extends DatabaseAdapter {
 		return user;
 	}
 
-	async reassignUserId(userId) {
-		return this._withTransaction(async (client) => {
-			const { rows: userRows } = await client.query(
-				`SELECT * FROM users
-				 WHERE id = $1 AND auth_provider <> 'nyaitter' AND account_operation = 'reassigning'
-				 FOR UPDATE`,
-				[Number(userId)],
-			);
-			const user = userRows[0];
-			if (!user) return null;
-
-			const previousId = Number(user.id);
-			const { rows: countRows } = await client.query('SELECT COUNT(*)::bigint AS count FROM users');
-			const digits = Math.max(4, String(Math.max(Number(countRows[0]?.count) || 1, 1)).length);
-			const upperBound = 10 ** digits;
-			let nextId = null;
-			for (let attempt = 0; attempt < 100; attempt += 1) {
-				const candidate = crypto.randomInt(1, upperBound);
-				if (candidate === previousId) continue;
-				const { rows } = await client.query('SELECT 1 FROM users WHERE id = $1 LIMIT 1', [candidate]);
-				if (rows.length === 0) {
-					nextId = candidate;
-					break;
-				}
-			}
-			if (nextId == null) throw new Error('Could not allocate a unique Nyaitter ID');
-
-			// Update users table first so ON UPDATE CASCADE foreign keys cascade automatically
-			const { rows } = await client.query(
-				`UPDATE users
-				 SET id = $2, handle = $3
-				 WHERE id = $1
-				 RETURNING *`,
-				[previousId, nextId, formatNyaitterId(nextId)],
-			);
-
-			// 外部キーが自動追従しない参照列は、ID 変更に合わせて明示的に付け替える。
-			await client.query('UPDATE sessions SET user_id = $2 WHERE user_id = $1', [previousId, nextId]);
-			await client.query('UPDATE trusted_login_ips SET user_id = $2 WHERE user_id = $1', [previousId, nextId]);
-			await client.query('UPDATE login_approvals SET user_id = $2 WHERE user_id = $1', [previousId, nextId]);
-			await client.query('UPDATE account_recovery_requests SET user_id = $2 WHERE user_id = $1', [previousId, nextId]);
-			await client.query('UPDATE blocked_login_ips SET user_id = $2 WHERE user_id = $1', [previousId, nextId]);
-			await client.query('UPDATE bot_tokens SET user_id = $2 WHERE user_id = $1', [previousId, nextId]);
-			await client.query('UPDATE posts SET user_id = $2 WHERE user_id = $1', [previousId, nextId]);
-			await client.query('UPDATE likes SET user_id = $2 WHERE user_id = $1', [previousId, nextId]);
-			await client.query('UPDATE stars SET user_id = $2 WHERE user_id = $1', [previousId, nextId]);
-			await client.query('UPDATE reposts SET user_id = $2 WHERE user_id = $1', [previousId, nextId]);
-			await client.query('UPDATE pinned_posts SET user_id = $2 WHERE user_id = $1', [previousId, nextId]);
-			await client.query('UPDATE dm_messages SET sender_id = $2 WHERE sender_id = $1', [previousId, nextId]);
-			await client.query('UPDATE follows SET follower_id = $2 WHERE follower_id = $1', [previousId, nextId]);
-			await client.query('UPDATE follows SET following_id = $2 WHERE following_id = $1', [previousId, nextId]);
-			await client.query('UPDATE dm_e2e_keys SET user_id = $2 WHERE user_id = $1', [previousId, nextId]);
-			await client.query('UPDATE notifications SET user_id = $2 WHERE user_id = $1', [previousId, nextId]);
-			await client.query('UPDATE notifications SET from_user_id = $2 WHERE from_user_id = $1', [previousId, nextId]);
-			await client.query('UPDATE push_subscriptions SET user_id = $2 WHERE user_id = $1', [previousId, nextId]);
-			await client.query('UPDATE moderation_reports SET reporter_user_id = $2 WHERE reporter_user_id = $1', [previousId, nextId]);
-			await client.query('UPDATE moderation_reports SET assigned_admin_id = $2 WHERE assigned_admin_id = $1', [previousId, nextId]);
-			await client.query('UPDATE logs SET nyaitter_id = $2 WHERE nyaitter_id = $1', [previousId, nextId]);
-			for (const prefix of ['manual-ban:','false-report-penalty:','moderation-user:']) {
-				await client.query('UPDATE reputation_events SET scope=$2 WHERE scope=$1',[`${prefix}${previousId}${prefix==='moderation-user:'?':target':''}`,`${prefix}${nextId}${prefix==='moderation-user:'?':target':''}`]);
-			}
-
-			// groups and memberships
-			await client.query('UPDATE groups SET owner_id = $2 WHERE owner_id = $1', [previousId, nextId]);
-			await client.query('UPDATE group_memberships SET user_id = $2 WHERE user_id = $1', [previousId, nextId]);
-			await client.query('UPDATE group_invites SET inviter_id = $2 WHERE inviter_id = $1', [previousId, nextId]);
-			await client.query('UPDATE group_invites SET invitee_id = $2 WHERE invitee_id = $1', [previousId, nextId]);
-			await client.query('UPDATE group_join_requests SET user_id = $2 WHERE user_id = $1', [previousId, nextId]);
-			await client.query('UPDATE group_join_requests SET reviewed_by = $2 WHERE reviewed_by = $1', [previousId, nextId]);
-
-			// authorized apps and affinities
-			await client.query('UPDATE authorized_apps SET user_id = $2 WHERE user_id = $1', [previousId, nextId]);
-			await client.query('UPDATE user_keyword_affinities SET user_id = $2 WHERE user_id = $1', [previousId, nextId]);
-
-			// dm_channels participants
-			const { rows: channels } = await client.query(
-				'SELECT id, participants FROM dm_channels WHERE participants @> ARRAY[$1]::int[]',
-				[previousId],
-			);
-			for (const channel of channels) {
-				const participants = (channel.participants || []).map((id) => (Number(id) === previousId ? nextId : Number(id)));
-				await client.query('UPDATE dm_channels SET participants = $2::int[] WHERE id = $1', [channel.id, participants]);
-			}
-
-			// group_dms
-			const { rows: groups } = await client.query(
-				'SELECT id, host_id, member, post, unread FROM group_dms WHERE host_id = $1::int OR member @> ARRAY[$1]::int[]',
-				[previousId],
-			);
-			for (const group of groups) {
-				const member = (group.member || []).map((id) => (Number(id) === previousId ? nextId : Number(id)));
-				const rawPost = Array.isArray(group.post) ? group.post : parseJsonSafe(group.post, []);
-				const post = rawPost.map((msg) => (
-					Number(msg?.userid) === previousId ? { ...msg, userid: nextId } : msg
-				));
-				const unread = { ...(typeof group.unread === 'object' && group.unread !== null ? group.unread : parseJsonSafe(group.unread, {})) };
-				if (Array.isArray(unread._accepted)) unread._accepted = unread._accepted.map((id) => Number(id) === previousId ? nextId : Number(id));
-				if (Object.prototype.hasOwnProperty.call(unread, String(previousId))) {
-					unread[String(nextId)] = unread[String(previousId)];
-					delete unread[String(previousId)];
-				}
-				const hostId = Number(group.host_id) === previousId ? nextId : Number(group.host_id);
-				await client.query(
-					'UPDATE group_dms SET host_id = $2, member = $3::int[], post = $4::jsonb, unread = $5::jsonb WHERE id = $1',
-					[group.id, hostId, member, JSON.stringify(post), JSON.stringify(unread)],
-				);
-			}
-
-			// blocked users
-			const { rows: blockedUsers } = await client.query(
-				'SELECT id, "block" FROM users WHERE "block" @> $1::jsonb',
-				[JSON.stringify([previousId])],
-			);
-			for (const bu of blockedUsers) {
-				const rawBlock = Array.isArray(bu.block) ? bu.block : parseJsonSafe(bu.block, []);
-				const block = normalizeBlockList(rawBlock.map((id) => (Number(id) === previousId ? nextId : id)), bu.id);
-				await client.query('UPDATE users SET "block" = $2::jsonb WHERE id = $1', [bu.id, JSON.stringify(block)]);
-			}
-
-			// notifications target
-			const { rows: notifs } = await client.query(
-				"SELECT id, target FROM notifications WHERE target->>'kind' = 'user' AND target->>'id' = $1",
-				[String(previousId)],
-			);
-			for (const notif of notifs) {
-				const target = typeof notif.target === 'object' && notif.target !== null ? notif.target : parseJsonSafe(notif.target, {});
-				target.id = nextId;
-				await client.query('UPDATE notifications SET target = $2::jsonb WHERE id = $1', [notif.id, JSON.stringify(target)]);
-			}
-
-			// moderation reports snapshot
-			const { rows: reportRows } = await client.query('SELECT id, target_kind, target_id, target_snapshot, excluded_admin_ids FROM moderation_reports FOR UPDATE');
-			for (const report of reportRows) {
-				const rawSnapshot = typeof report.target_snapshot === 'object' && report.target_snapshot !== null ? report.target_snapshot : parseJsonSafe(report.target_snapshot, {});
-				const { snapshot, changed } = this._reassignReportSnapshotUserIds(rawSnapshot, previousId, nextId);
-				const targetId = report.target_kind === 'user' && String(report.target_id) === String(previousId)
-					? String(nextId)
-					: report.target_id;
-				const rawExcluded = Array.isArray(report.excluded_admin_ids) ? report.excluded_admin_ids : parseJsonSafe(report.excluded_admin_ids, []);
-				const excluded = rawExcluded.map((id) => (Number(id) === previousId ? nextId : Number(id)));
-				const excludedChanged = excluded.some((id, index) => Number(id) !== Number(rawExcluded[index]));
-				if (!changed && targetId === report.target_id && !excludedChanged) continue;
-				await client.query(
-					'UPDATE moderation_reports SET target_id = $2, target_snapshot = $3::jsonb, excluded_admin_ids = $4::jsonb WHERE id = $1',
-					[report.id, targetId, JSON.stringify(snapshot || {}), JSON.stringify(excluded || [])],
-				);
-			}
-
-			// imposter parent_id and members
-			const { rows: imposterUsers } = await client.query(
-				"SELECT id, settings FROM users WHERE settings::text LIKE '%imposter%' OR auth_provider = 'imposter'",
-			);
-			for (const imp of imposterUsers) {
-				const impSettings = typeof imp.settings === 'object' && imp.settings !== null ? imp.settings : parseJsonSafe(imp.settings, {});
-				if (!impSettings || typeof impSettings !== 'object') continue;
-				let changed = false;
-				if (impSettings.imposter && typeof impSettings.imposter === 'object') {
-					if (Number(impSettings.imposter.parent_id) === previousId) {
-						impSettings.imposter.parent_id = nextId;
-						changed = true;
-					}
-					if (Array.isArray(impSettings.imposter.members)) {
-						impSettings.imposter.members = impSettings.imposter.members.map((m) => {
-							if (Number(m?.user_id) === previousId) {
-								changed = true;
-								return { ...m, user_id: nextId };
-							}
-							return m;
-						});
-					}
-				}
-				if (changed) {
-					await client.query('UPDATE users SET settings = $2::jsonb WHERE id = $1', [imp.id, JSON.stringify(impSettings)]);
-				}
-			}
-
-			this._invalidateUserCache(previousId);
-			this._invalidateUserCache(nextId);
-
-			if (this._affinityCache instanceof Map) {
-				const userAffinity = this._affinityCache.get(previousId);
-				this._affinityCache.delete(previousId);
-				if (userAffinity) this._affinityCache.set(nextId, userAffinity);
-			}
-			if (this._followCache instanceof Map) {
-				const userFollows = this._followCache.get(previousId);
-				this._followCache.delete(previousId);
-				if (userFollows) this._followCache.set(nextId, userFollows);
-			}
-			if (Array.isArray(this._candidatePostsCache?.posts)) {
-				for (const post of this._candidatePostsCache.posts) {
-					if (Number(post.user_id) === previousId) post.user_id = nextId;
-				}
-			}
-
-			return normalizeUserRow(rows[0] || null);
-		});
-	}
-
 	async deleteAccount(userId) {
 		this._invalidateUserCache(userId);
 		return this._withTransaction(async (client) => {
@@ -1603,6 +1455,7 @@ class PostgresAdapter extends DatabaseAdapter {
 			);
 			if (!userRows[0]) return false;
 
+			await client.query('DELETE FROM post_age_estimates WHERE user_id = $1 OR post_id IN (SELECT id FROM posts WHERE user_id = $1)', [userId]);
 			const { rows: postRows } = await client.query('SELECT id, reply_to, repost_to FROM posts WHERE user_id = $1', [userId]);
 			const postIds = postRows.map((row) => Number(row.id));
 			if (postIds.length > 0) {
@@ -1689,6 +1542,9 @@ class PostgresAdapter extends DatabaseAdapter {
 			await client.query('DELETE FROM moderation_reports WHERE reporter_user_id = $1', [userId]);
 			await client.query('DELETE FROM logs WHERE nyaitter_id = $1', [Number(userId)]);
 			const result = await client.query('DELETE FROM users WHERE id = $1', [userId]);
+			if (result.rowCount > 0) {
+				await client.query('INSERT INTO retired_user_ids (id) VALUES ($1) ON CONFLICT (id) DO NOTHING', [userId]);
+			}
 			return result.rowCount > 0;
 		});
 	}
@@ -1707,33 +1563,6 @@ class PostgresAdapter extends DatabaseAdapter {
 			}
 		}
 		return [...keys];
-	}
-
-	async rewriteAccountAttachmentKeys(userId, replacements) {
-		const replacementMap = createAttachmentReplacementMap(replacements);
-		if (replacementMap.size === 0) return 0;
-		return this._withTransaction(async (client) => {
-			const { rows } = await client.query(
-				'SELECT id, attachments FROM posts WHERE user_id = $1 FOR UPDATE',
-				[Number(userId)],
-			);
-			let updatedCount = 0;
-			for (const row of rows) {
-				const rawAttachments = Array.isArray(row.attachments) ? row.attachments : parseJsonSafe(row.attachments, []);
-				const { attachments, changed } = rewriteAttachmentReferences(rawAttachments, replacementMap);
-				if (!changed) continue;
-				await client.query(
-					'UPDATE posts SET attachments = $2::jsonb WHERE id = $1',
-					[row.id, JSON.stringify(attachments)],
-				);
-				const cachedPost = this._getPostCache()?.get(row.id);
-				if (cachedPost) {
-					this._getPostCache()?.set(row.id, { ...cachedPost, attachments });
-				}
-				updatedCount += 1;
-			}
-			return updatedCount;
-		});
 	}
 
 	// ==================== Sessions ====================
@@ -3835,6 +3664,10 @@ class PostgresAdapter extends DatabaseAdapter {
 			values.push(Boolean(fields.lock));
 			sets.push(`lock = $${values.length}`);
 		}
+		if (fields.age_rating !== undefined || fields.ageRating !== undefined) {
+			values.push(Number(fields.ageRating ?? fields.age_rating ?? 0) || 0);
+			sets.push(`age_rating = $${values.length}`);
+		}
 		if (fields.reply_control !== undefined || fields.replyControl !== undefined) {
 			values.push(String(fields.reply_control ?? fields.replyControl ?? 'everyone'));
 			sets.push(`reply_control = $${values.length}`);
@@ -3876,6 +3709,7 @@ class PostgresAdapter extends DatabaseAdapter {
 				return false;
 			}
 			const post = rows[0];
+			await client.query('DELETE FROM post_age_estimates WHERE post_id = $1', [targetId]);
 			if (post.reply_to) {
 				const parentId = Number(post.reply_to);
 				await client.query('UPDATE posts SET reply_count = GREATEST(0, reply_count - 1) WHERE id = $1', [parentId]);
@@ -4199,6 +4033,8 @@ class PostgresAdapter extends DatabaseAdapter {
 		let reactedPostIds = new Set();
 		let dislikedPostIds = new Set();
 		let dislikedAuthors = new Set();
+		let dislikedAuthorCounts = new Map();
+		let negativeTagCounts = new Map();
 		let blockedAuthors = new Set();
 
 		if (validViewerId != null) {
@@ -4215,6 +4051,8 @@ class PostgresAdapter extends DatabaseAdapter {
 			if (cachedFeedback && cachedFeedback.expiresAt > now) {
 				dislikedPostIds = cachedFeedback.postIds;
 				dislikedAuthors = cachedFeedback.authorIds;
+				dislikedAuthorCounts = cachedFeedback.authorCounts || new Map();
+				negativeTagCounts = cachedFeedback.tagCounts || new Map();
 			}
 			if (cachedExtended && cachedExtended.expiresAt > now) extendedFollows = cachedExtended.follows;
 			if (cachedBlock && cachedBlock.expiresAt > now) blockedAuthors = cachedBlock.blocks;
@@ -4297,10 +4135,14 @@ class PostgresAdapter extends DatabaseAdapter {
 				if (needsFeedback && feedbackRows) {
 					dislikedPostIds = new Set((feedbackRows.postIds || []).map(Number).filter(Number.isInteger));
 					dislikedAuthors = new Set((feedbackRows.authorIds || []).map(Number).filter(Number.isInteger));
+					dislikedAuthorCounts = feedbackRows.authorCounts instanceof Map ? feedbackRows.authorCounts : new Map();
+					negativeTagCounts = feedbackRows.tagCounts instanceof Map ? feedbackRows.tagCounts : new Map();
 					if (this._feedbackCache.size >= 2000) this._feedbackCache.clear();
 					this._feedbackCache.set(validViewerId, {
 						postIds: dislikedPostIds,
 						authorIds: dislikedAuthors,
+						authorCounts: dislikedAuthorCounts,
+						tagCounts: negativeTagCounts,
 						expiresAt: Date.now() + 60000,
 					});
 				}
@@ -4320,7 +4162,10 @@ class PostgresAdapter extends DatabaseAdapter {
 		// ブロック・「興味なし」著者を候補クエリの段階で除外し、候補枠の浪費を防ぐ。
 		// NOT IN はリテラル連結なので、フォロー補完チャネルと同じ300件上限でSQL自体を有界化する。
 		// 削れても採点側でブロック・嫌い著者は完全に除外されるため、これは候補確保の最適化に過ぎない。
-		const excludedAuthorIds = [...new Set([...blockedAuthors, ...dislikedAuthors])]
+		const hardDislikedAuthors = [...dislikedAuthorCounts.entries()]
+			.filter(([, count]) => count >= 2)
+			.map(([id]) => id);
+		const excludedAuthorIds = [...new Set([...blockedAuthors, ...hardDislikedAuthors])]
 			.filter((id) => Number.isSafeInteger(id) && id > 0)
 			.slice(0, 300);
 		const exclusionSql = excludedAuthorIds.length > 0
@@ -4466,6 +4311,27 @@ class PostgresAdapter extends DatabaseAdapter {
 				.slice(0, candidateLimit - 1);
 		}
 
+		// 年齢近接ボーナス用に、閲覧者と候補の投稿者の推定年齢をまとめて引く。
+		// 列が無い旧 DB 等で失敗しても、おすすめ自体は止めない。
+		let viewerAgeEstimate = null;
+		let authorAgeEstimates = new Map();
+		if (isAgeFeaturesActive(appConfig.autoMod) && validViewerId != null && candidateRows.length > 0) {
+			try {
+				const authorIds = [...new Set(candidateRows.map((row) => Number(row.user_id)).filter((id) => Number.isSafeInteger(id) && id > 0))];
+				const { rows: ageRows } = await this.pool.query(
+					'SELECT id, age_estimate FROM users WHERE id = ANY($1::int[])',
+					[[validViewerId, ...authorIds]],
+				);
+				authorAgeEstimates = new Map((ageRows || []).filter((row) => row.age_estimate != null).map((row) => [Number(row.id), Number(row.age_estimate)]));
+				viewerAgeEstimate = authorAgeEstimates.get(validViewerId) ?? null;
+				authorAgeEstimates.delete(validViewerId);
+			} catch (err) {
+				console.warn('[recommendations] Postgres age lookup failed:', err?.message || err);
+				viewerAgeEstimate = null;
+				authorAgeEstimates = new Map();
+			}
+		}
+
 		// 共通の採点ユーティリティで Node.js サーバー上で高速にスコアリングする。
 		const scored = scoreRecommendedPosts(candidateRows, {
 			viewerId: validViewerId,
@@ -4474,8 +4340,11 @@ class PostgresAdapter extends DatabaseAdapter {
 			extendedFollows,
 			reactedPostIds,
 			dislikedPostIds,
-			dislikedAuthors,
+			dislikedAuthorCounts,
+			negativeTagCounts,
 			blockedAuthors,
+			viewerAgeEstimate,
+			authorAgeEstimates,
 			now,
 			limit: normalizedLimit,
 		});
@@ -5127,10 +4996,10 @@ class PostgresAdapter extends DatabaseAdapter {
 
 	async getPostFeedbackForUser(userId) {
 		const uId = Number(userId);
-		if (!Number.isInteger(uId)) return { postIds: [], authorIds: [] };
+		if (!Number.isInteger(uId)) return { postIds: [], authorIds: [], authorCounts: new Map(), tagCounts: new Map() };
 		// 古い「興味なし」は自然退役させる。フォローと同じ500件、新着順に絞る。
 		const { rows } = await this.pool.query(
-			`SELECT pf.post_id, p.user_id AS author_id
+			`SELECT pf.post_id, p.user_id AS author_id, p.tags
 			 FROM post_feedback pf
 			 JOIN posts p ON p.id = pf.post_id
 			 WHERE pf.user_id = $1 AND pf.kind = 'not_interested'
@@ -5139,12 +5008,20 @@ class PostgresAdapter extends DatabaseAdapter {
 		);
 		const postIds = [];
 		const authorIds = new Set();
+		const authorCounts = new Map();
+		const tagCounts = new Map();
 		for (const row of rows || []) {
 			postIds.push(Number(row.post_id));
 			const authorId = Number(row.author_id);
-			if (Number.isInteger(authorId)) authorIds.add(authorId);
+			if (Number.isInteger(authorId)) {
+				authorIds.add(authorId);
+				authorCounts.set(authorId, (authorCounts.get(authorId) || 0) + 1);
+			}
+			for (const tag of normalizePostTags(row.tags)) {
+				tagCounts.set(tag, (tagCounts.get(tag) || 0) + 1);
+			}
 		}
-		return { postIds, authorIds: [...authorIds] };
+		return { postIds, authorIds: [...authorIds], authorCounts, tagCounts };
 	}
 
 	async toggleLike(userId, postId) {

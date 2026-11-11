@@ -689,6 +689,7 @@ router.get({
 
 	try {
 		let result;
+		let fromRingBuffer = false;
 		if (cachedResult) {
 			result = cachedResult;
 		} else if (
@@ -702,6 +703,7 @@ router.get({
 			const ringResult = timelineCacheManager.getPublicRingBufferPage(limit, beforeId);
 			if (ringResult && ringResult.ids.length >= limit) {
 				result = ringResult;
+				fromRingBuffer = true;
 			}
 		}
 
@@ -777,6 +779,31 @@ router.get({
 			if (Array.isArray(result.ids)) {
 				result.ids = result.ids.filter((id) => Number(id) > rawSinceId);
 			}
+		}
+
+		// リングバッファは著者情報を持たないため、検索除外（shadow）とNGワードの
+		// 発見可能性フィルタはここで明示的に適用する（通常経路は取得時に適用済み）。
+		if (fromRingBuffer && Array.isArray(result.ids) && result.ids.length > 0) {
+			const ringPosts = await db.getPostsByIds(result.ids);
+			const discoverableRingPosts = await filterDiscoverablePosts(
+				db,
+				ringPosts,
+				currentUserId,
+				null,
+				{ ngWords, includeJoinedGroups: tab === 'all' },
+			);
+			const discoverableIds = new Set(discoverableRingPosts.map((post) => Number(post.id)));
+			// 通常はリングバッファ側のカーソルを引き継ぐ。カーソルが無い経路では
+			// フィルタ前の末尾IDで補い、ページ全件が除外されても次へ進めるようにする。
+			const pageEndCursor = result.has_more && result.next_cursor == null && result.ids.length > 0
+				? result.ids[result.ids.length - 1]
+				: result.next_cursor;
+			result = {
+				...result,
+				ids: result.ids.filter((id) => discoverableIds.has(Number(id))),
+				posts: discoverableRingPosts,
+				next_cursor: pageEndCursor,
+			};
 		}
 
 			const nextCursor = result.next_cursor ?? (
@@ -1121,6 +1148,10 @@ router.get({
 		if (!isApiRequest) {
 			if (isCrawler(userAgent)) {
 				// Serve OGP HTML for crawlers / embed bots
+				// クローラー向けでも公開範囲は通常表示と同じにし、見られない投稿は秘匿する。
+				if (!(await canViewPost(db, post, currentUserId, null, null, req.user?.visibilityUser || null))) {
+					return res.status(404).json({ error: 'Post not found' });
+				}
 				const author = await db.getUserById(post.userId ?? post.user_id);
 				const publicUrl = getPublicUrl(req);
 				const frontendUrl = getFrontendUrl(req);

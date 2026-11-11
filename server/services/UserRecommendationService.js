@@ -1,6 +1,8 @@
 'use strict';
 
 const { buildAffinityProfile, scoreRecommendedPosts } = require('../utils/recommendation');
+const { isAgeFeaturesActive } = require('./AgeEstimateService');
+const appConfig = require('../config');
 const { normalizeBlockList } = require('../utils/blockList');
 
 const DEFAULT_LIMIT = 3;
@@ -16,6 +18,8 @@ function emptyProfile() {
 		reacted: [],
 		dislikedPostIds: [],
 		dislikedAuthors: [],
+		dislikedAuthorCounts: {},
+		negativeTagCounts: {},
 		blockedAuthors: [],
 	};
 }
@@ -50,7 +54,19 @@ async function getRecommendedUsers(db, viewerId, limit = DEFAULT_LIMIT) {
 
 	const profile = await db.getUserRecommendationProfile(parsedViewerId).catch(() => emptyProfile());
 	const following = normalizeIds(profile.follows);
-	const dislikedAuthors = normalizeIds(profile.dislikedAuthors);
+	// 「興味なし」は2回以上で初めて著者ごと除外し、1回は採点側のペナルティに留める。
+	// 回数情報が無い旧プロファイルでは従来どおり著者リストを除外に使う。
+	const dislikedAuthorCounts = profile.dislikedAuthorCounts || null;
+	// アダプタにより Map の場合とプレーンオブジェクトの場合があるため両対応にする。
+	// 空の回数情報は「情報なし」として扱い、著者リスト側の従来動作へ落とす。
+	const rawCountEntries = dislikedAuthorCounts instanceof Map
+		? [...dislikedAuthorCounts.entries()]
+		: (dislikedAuthorCounts ? Object.entries(dislikedAuthorCounts) : null);
+	const dislikedCountEntries = rawCountEntries && rawCountEntries.length > 0 ? rawCountEntries : null;
+	const dislikedAuthors = dislikedCountEntries
+		? new Set(dislikedCountEntries.filter(([, count]) => Number(count) >= 2).map(([id]) => Number(id)).filter((id) => Number.isSafeInteger(id) && id > 0))
+		: normalizeIds(profile.dislikedAuthors);
+	const negativeTagCounts = profile.negativeTagCounts || {};
 	const viewerBlocks = normalizeIds(profile.blockedAuthors);
 	const recentPosts = await db.getRecentPosts(100);
 
@@ -85,6 +101,21 @@ async function getRecommendedUsers(db, viewerId, limit = DEFAULT_LIMIT) {
 	const visibleCandidates = candidates.filter((candidate) => !following.has(Number(candidate.user.id)));
 	if (visibleCandidates.length === 0) return [];
 	const keywordProfile = buildAffinityProfile(profile.affinities, { limit: 25 });
+	let viewerAgeEstimate = null;
+	if (!isAgeFeaturesActive(appConfig.autoMod)) {
+		// AutoMod V2 が無効なら年齢系は使わない。
+	} else try {
+		const viewerUser = typeof db.getUserById === 'function' ? await db.getUserById(parsedViewerId) : null;
+		if (viewerUser?.age_estimate != null) viewerAgeEstimate = Number(viewerUser.age_estimate);
+	} catch (err) {
+		console.warn('[recommendations] viewer age lookup failed:', err?.message || err);
+	}
+	const authorAgeEstimates = new Map();
+	if (viewerAgeEstimate != null) {
+		for (const [authorId, user] of usersById.entries()) {
+			if (user?.age_estimate != null) authorAgeEstimates.set(authorId, Number(user.age_estimate));
+		}
+	}
 	const scoringOptions = {
 		viewerId: parsedViewerId,
 		keywordProfile,
@@ -93,7 +124,11 @@ async function getRecommendedUsers(db, viewerId, limit = DEFAULT_LIMIT) {
 		reactedPostIds: normalizeIds(profile.reacted),
 		dislikedPostIds: normalizeIds(profile.dislikedPostIds),
 		dislikedAuthors,
+		dislikedAuthorCounts: dislikedAuthorCounts || {},
+		negativeTagCounts,
 		blockedAuthors: viewerBlocks,
+		viewerAgeEstimate,
+		authorAgeEstimates,
 		limit: RECOMMENDED_POSTS_PER_USER,
 	};
 

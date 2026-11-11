@@ -4,6 +4,8 @@ const { normalizeBlockList } = require('../../../utils/blockList');
 const { extractViewContent } = require('../../../utils/viewContent');
 const { encodePostCursor, decodePostCursor } = require('../../../utils/postCursor');
 const { scoreRecommendedPosts, buildAffinityProfile } = require('../../../utils/recommendation');
+const { isAgeFeaturesActive } = require('../../../services/AgeEstimateService');
+const appConfig = require('../../../config');
 
 const RETRYABLE_STATUS_CODES = new Set([408, 425, 429, 500, 502, 503, 504]);
 
@@ -79,6 +81,9 @@ function normalizeUser(user) {
 	if (!user) return null;
 	return {
 		...user,
+		age_estimate: user.age_estimate != null ? Number(user.age_estimate) : null,
+		age_source: user.age_source || null,
+		age_samples: Math.max(0, Number(user.age_samples) || 0),
 		block: normalizeBlockList(user.block, user.id),
 	};
 }
@@ -95,6 +100,8 @@ function normalizePost(post) {
 	post.tags_generated_at = post.tagsGeneratedAt;
 	post.mask = !!post.mask;
 	post.lock = !!post.lock;
+	post.ageRating = Number(post.ageRating ?? post.age_rating ?? 0) || 0;
+	post.age_rating = post.ageRating;
 	post.announcement = !!post.announcement;
 	post.groupId = post.groupId ?? post.group_id ?? null;
 	post.group_id = post.groupId;
@@ -1022,6 +1029,26 @@ class D1Adapter extends DatabaseAdapter {
 		return Array.isArray(users) ? users.map(normalizeUser).filter(Boolean) : [];
 	}
 
+	// おすすめの年齢近接専用に、id と推定年齢だけを軽量に引く。
+	async getUserAgeEstimatesByIds(userIds) {
+		const ids = this._normalizeIds(userIds);
+		if (ids.length === 0) return new Map();
+		try {
+			const raw = await this._read('/users/age-estimates', { body: { ids }, cacheSeconds: 0 });
+			if (!raw || typeof raw !== 'object') throw new Error('Malformed age estimates response');
+			const users = Array.isArray(raw) ? raw : (raw?.users || []);
+			return new Map(users
+				.filter((user) => user?.age_estimate != null)
+				.map((user) => [Number(user.id), Number(user.age_estimate)]));
+		} catch (_) {
+			// 旧ワーカーには専用エンドポイントが無いため、全行取得へ後退する。
+			const users = await this.getUsersByIds(ids);
+			return new Map(users
+				.filter((user) => user?.age_estimate != null)
+				.map((user) => [Number(user.id), Number(user.age_estimate)]));
+		}
+	}
+
 	async getPostAuthorsByIds(userIds) {
 		const ids = this._normalizeIds(userIds);
 		if (ids.length === 0) return [];
@@ -1080,23 +1107,9 @@ class D1Adapter extends DatabaseAdapter {
 		));
 	}
 
-	async reassignUserId(userId) {
-		return normalizeUser(await this._write(
-			`/users/${requireId(userId, 'userId')}/nyaitter-id/reassign`,
-		));
-	}
-
 	async getAccountAttachmentKeys(userId) {
 		const keys = await this._read(`/users/${requireId(userId, 'userId')}/account/attachments`, { cacheSeconds: 0 });
 		return Array.isArray(keys) ? keys.filter((key) => typeof key === 'string') : [];
-	}
-
-	async rewriteAccountAttachmentKeys(userId, replacements) {
-		const result = await this._write(
-			`/users/${requireId(userId, 'userId')}/account/attachments/rewrite`,
-			{ replacements: Array.isArray(replacements) ? replacements : [] },
-		);
-		return Math.max(0, Number(result?.updatedCount) || 0);
 	}
 
 	async deleteAccount(userId) {
@@ -1108,6 +1121,38 @@ class D1Adapter extends DatabaseAdapter {
 		return normalizeUser(await this._write(
 			`/users/${requireId(userId, 'userId')}/profile`,
 			profileData,
+		));
+	}
+
+	async recordPostAgeEstimate(postId, userId, band) {
+		if (!['under13', '13-15', '16-17', '18-24', '25-34', '35over'].includes(band)) return null;
+		return this._write(`/posts/${requireId(postId, 'postId', 1)}/age-estimate`, {
+			userId: requireId(userId, 'userId'),
+			band,
+		});
+	}
+
+	async getPostAgeBands(userId, limit = 50) {
+		const result = await this._read(this._query(
+			`/users/${requireId(userId, 'userId')}/age-estimates`,
+			{ limit: Math.max(1, Math.min(Number(limit) || 50, 500)) },
+		), { cacheSeconds: 0 });
+		return Array.isArray(result?.bands) ? result.bands : [];
+	}
+
+	async updateUserAgeEstimate(userId, fields = {}) {
+		const sanitized = { ...fields };
+		if (sanitized.ageEstimate != null) {
+			const estimate = Number(sanitized.ageEstimate);
+			if (!Number.isFinite(estimate) || estimate < 0 || estimate > 120) delete sanitized.ageEstimate;
+			else sanitized.ageEstimate = estimate;
+		}
+		if (sanitized.ageSource !== undefined && !['post', 'ondevice', 'api'].includes(sanitized.ageSource)) {
+			sanitized.ageSource = null;
+		}
+		return normalizeUser(await this._write(
+			`/users/${requireId(userId, 'userId')}/age-estimate`,
+			sanitized,
 		));
 	}
 
@@ -1794,8 +1839,11 @@ class D1Adapter extends DatabaseAdapter {
 		let extendedFollows = new Set();
 		let reactedPostIds = new Set();
 		let dislikedPostIds = new Set();
-		let dislikedAuthors = new Set();
+		let dislikedAuthorCounts = new Map();
+		let negativeTagCounts = new Map();
 		let blockedAuthors = new Set();
+		let viewerAgeEstimate = null;
+		let authorAgeEstimates = new Map();
 
 		if (viewerId != null) {
 			const profile = await this._read(
@@ -1808,8 +1856,29 @@ class D1Adapter extends DatabaseAdapter {
 				extendedFollows = new Set((profile.extendedFollows || []).map(Number).filter(Number.isSafeInteger));
 				reactedPostIds = new Set((profile.reacted || []).map(Number).filter(Number.isSafeInteger));
 				dislikedPostIds = new Set((profile.dislikedPostIds || []).map(Number).filter(Number.isSafeInteger));
-				dislikedAuthors = new Set((profile.dislikedAuthors || []).map(Number).filter(Number.isSafeInteger));
+				dislikedAuthorCounts = new Map(Object.entries(profile.dislikedAuthorCounts || {}).map(([id, count]) => [Number(id), Number(count) || 0]).filter(([id]) => Number.isSafeInteger(id)));
+				if (dislikedAuthorCounts.size === 0 && Array.isArray(profile.dislikedAuthors)) {
+					// 回数情報が無い旧ワーカーでは、従来どおり著者リストを除外として扱う。
+					for (const id of profile.dislikedAuthors) {
+						const authorId = Number(id);
+						if (Number.isSafeInteger(authorId) && authorId > 0) dislikedAuthorCounts.set(authorId, 2);
+					}
+				}
+				negativeTagCounts = new Map(Object.entries(profile.negativeTagCounts || {}).map(([tag, count]) => [tag, Number(count) || 0]));
 				blockedAuthors = new Set((profile.blockedAuthors || []).map(Number).filter(Number.isSafeInteger));
+			}
+		}
+
+		if (isAgeFeaturesActive(appConfig.autoMod) && viewerId != null && candidates.length > 0) {
+			try {
+				const authorIds = [...new Set(candidates.map((post) => Number(post.user_id ?? post.userId)).filter((id) => Number.isSafeInteger(id) && id > 0))];
+				authorAgeEstimates = await this.getUserAgeEstimatesByIds([Number(viewerId), ...authorIds]);
+				viewerAgeEstimate = authorAgeEstimates.get(Number(viewerId)) ?? null;
+				authorAgeEstimates.delete(Number(viewerId));
+			} catch (err) {
+				console.warn('[recommendations] D1 age lookup failed:', err?.message || err);
+				viewerAgeEstimate = null;
+				authorAgeEstimates = new Map();
 			}
 		}
 
@@ -1820,8 +1889,11 @@ class D1Adapter extends DatabaseAdapter {
 			extendedFollows,
 			reactedPostIds,
 			dislikedPostIds,
-			dislikedAuthors,
+			dislikedAuthorCounts,
+			negativeTagCounts,
 			blockedAuthors,
+			viewerAgeEstimate,
+			authorAgeEstimates,
 			limit: normalizedLimit,
 		});
 
@@ -1857,6 +1929,8 @@ class D1Adapter extends DatabaseAdapter {
 			authorIds: Array.isArray(profile?.dislikedAuthors)
 				? profile.dislikedAuthors.map(Number).filter(Number.isInteger)
 				: [],
+			authorCounts: profile?.dislikedAuthorCounts && typeof profile.dislikedAuthorCounts === 'object' ? profile.dislikedAuthorCounts : {},
+			tagCounts: profile?.negativeTagCounts && typeof profile.negativeTagCounts === 'object' ? profile.negativeTagCounts : {},
 		};
 	}
 
@@ -1872,6 +1946,8 @@ class D1Adapter extends DatabaseAdapter {
 			reacted: Array.isArray(profile?.reacted) ? profile.reacted.map(Number).filter(Number.isInteger) : [],
 			dislikedPostIds: Array.isArray(profile?.dislikedPostIds) ? profile.dislikedPostIds.map(Number).filter(Number.isInteger) : [],
 			dislikedAuthors: Array.isArray(profile?.dislikedAuthors) ? profile.dislikedAuthors.map(Number).filter(Number.isInteger) : [],
+			dislikedAuthorCounts: profile?.dislikedAuthorCounts && typeof profile.dislikedAuthorCounts === 'object' ? profile.dislikedAuthorCounts : {},
+			negativeTagCounts: profile?.negativeTagCounts && typeof profile.negativeTagCounts === 'object' ? profile.negativeTagCounts : {},
 			blockedAuthors: Array.isArray(profile?.blockedAuthors) ? profile.blockedAuthors.map(Number).filter(Number.isInteger) : [],
 		};
 	}

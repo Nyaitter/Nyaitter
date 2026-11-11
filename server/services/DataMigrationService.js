@@ -115,7 +115,11 @@ function normalizeRow(table, input) {
       block: parseJson(value.block, []),
       account_operation: value.account_operation || null,
       created_at: normalizeDate(value.created_at ?? value.createdAt),
-      // migration 034。未移行の古い行には無いので既定値へ落とす。
+      // 年齢確認（migration 047）。未移行の古い行には無いので既定値へ落とす。
+      age_estimate: value.age_estimate == null ? null : normalizeInteger(value.age_estimate),
+      age_source: value.age_source || null,
+      age_estimated_at: normalizeDate(value.age_estimated_at ?? value.ageEstimatedAt),
+      age_samples: Math.max(0, normalizeInteger(value.age_samples ?? value.ageSamples, 0)),
     };
   }
 
@@ -127,6 +131,7 @@ function normalizeRow(table, input) {
       attachments: parseJson(value.attachments, []),
       mask: normalizeBoolean(value.mask),
       lock: normalizeBoolean(value.lock),
+      age_rating: Math.max(0, normalizeInteger(value.age_rating ?? value.ageRating, 0)),
       announcement: normalizeBoolean(value.announcement),
       reply_to: normalizeInteger(value.reply_to ?? value.replyTo),
       repost_to: normalizeInteger(value.repost_to ?? value.repostTo),
@@ -566,6 +571,25 @@ function normalizeRow(table, input) {
     };
   }
 
+  if (table === 'retired_user_ids') {
+    return {
+      id: normalizeInteger(value.id),
+      // 退役時刻を持たないアダプタがあるため、欠けた場合は正規化時刻で補う（PG の retired_at は NOT NULL）。
+      retired_at: normalizeDate(value.retired_at ?? value.retiredAt) || new Date().toISOString(),
+    };
+  }
+
+  if (table === 'post_age_estimates') {
+    // 帯はホワイトリスト外なら行ごと落とす（移行先の CHECK 制約で失敗させない）。
+    if (!['under13', '13-15', '16-17', '18-24', '25-34', '35over'].includes(value.band)) return null;
+    return {
+      post_id: normalizeInteger(value.post_id ?? value.postId),
+      user_id: normalizeInteger(value.user_id ?? value.userId),
+      band: String(value.band),
+      created_at: normalizeDate(value.created_at ?? value.createdAt) || new Date().toISOString(),
+    };
+  }
+
   return cloneJson(value);
 }
 
@@ -634,7 +658,7 @@ function normalizeSnapshot(snapshot) {
     const included = present.has(table);
     const rows = included ? (sourceTables[table] ?? []) : [];
     if (!Array.isArray(rows)) throw new TypeError(`Migration snapshot table ${table} must be an array`);
-    tables[table] = rows.map((row) => normalizeRow(table, row));
+    tables[table] = rows.map((row) => normalizeRow(table, row)).filter(Boolean);
     if (table === 'mod_logs' && included) validateModLogs(tables[table]);
   }
   const excluded = Array.isArray(snapshot.excluded_tables)
@@ -678,7 +702,7 @@ function createSnapshot(sourceAdapter, rowsByTable) {
     const included = Object.prototype.hasOwnProperty.call(rowsByTable || {}, table);
     if (included) present.push(table);
     const rows = included ? rowsByTable[table] : [];
-    tables[table] = Array.isArray(rows) ? rows.map((row) => normalizeRow(table, row)) : [];
+    tables[table] = Array.isArray(rows) ? rows.map((row) => normalizeRow(table, row)).filter(Boolean) : [];
   }
   if (present.includes('mod_logs')) validateModLogs(tables.mod_logs);
   return signSnapshot({

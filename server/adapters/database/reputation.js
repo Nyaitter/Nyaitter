@@ -84,25 +84,6 @@ function sqliteReputationStatements(db, scope, input, evaluation) {
 }
 
 function installMemory(Adapter) {
-  const reassignUserId=Adapter.prototype.reassignUserId;
-  if (reassignUserId) Adapter.prototype.reassignUserId=async function(userId) {
-    const previousId=Number(userId);const user=await reassignUserId.call(this,userId);
-    if (!user) return user;
-    for (const [key,e] of [...(this.reviewerOutcomeCandidates || [])]) {
-      if (e.userId!==previousId && e.authorId!==previousId) continue;
-      this.reviewerOutcomeCandidates.delete(key);
-      if (e.userId===previousId) e.userId=Number(user.id);
-      if (e.authorId===previousId) e.authorId=Number(user.id);
-      e.metadata=JSON.stringify({...JSON.parse(e.metadata),authorId:e.authorId});
-      this.reviewerOutcomeCandidates.set(`${e.noteId}:${e.userId}`,e);
-    }
-    for (const [scope,events] of [...(this.reputationEvents || [])]) {
-      if (!scope.startsWith('reviewer-outcome:')) continue;
-      for (const e of events) {const metadata=JSON.parse(e.metadata);if (Number(metadata.authorId)===previousId) e.metadata=JSON.stringify({...metadata,authorId:Number(user.id)});}
-      if (events.length) {this.reputationEvents.delete(scope);this.reputationEvents.set(`reviewer-outcome:${reviewerGroup(events[0])}`,events);}
-    }
-    return user;
-  };
   Adapter.prototype.refreshReviewerOutcomesForNote = async function(noteId) {
     this.reviewerOutcomeCandidates ||= new Map();
     const groups=new Set();
