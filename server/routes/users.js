@@ -224,6 +224,7 @@ async function sendScratchFallbackIcon(req, res, scid) {
 // through untouched so animation/vectors keep working exactly as before.
 const ICON_MAX_DIMENSION = 512;
 const ICON_CACHE_LIMIT = 24 * 1024 * 1024;
+const STORED_ICON_CACHE_TTL_MS = 60 * 60 * 1000;
 const iconVariantCache = new Map();
 let iconVariantCacheBytes = 0;
 
@@ -273,6 +274,23 @@ async function buildIconVariant(buffer, contentType) {
 }
 
 async function sendStoredIcon(req, res, fileId) {
+	const sendEntry = (entry) => {
+		res.setHeader('Cache-Control', 'public, max-age=21600, stale-while-revalidate=86400');
+		res.setHeader('Content-Type', entry.contentType);
+		res.setHeader('ETag', entry.etag);
+		if (req.headers['if-none-match'] === entry.etag) {
+			res.status(304).end();
+		} else {
+			res.send(entry.buffer);
+		}
+		return true;
+	};
+
+	// 保存キーはアップロードごとに一意なので、キー単位でキャッシュすれば
+	// ストレージ読み直しなしで配信できる。
+	const cachedEntry = iconCacheGet(fileId);
+	if (cachedEntry && cachedEntry.expiresAt > Date.now()) return sendEntry(cachedEntry);
+
 	const storage = getStorageAdapter(req);
 	if (!storage || typeof storage.read !== 'function') return false;
 	try {
@@ -280,33 +298,23 @@ async function sendStoredIcon(req, res, fileId) {
 		const contentType = String(file?.contentType || '').split(';', 1)[0].trim().toLowerCase();
 		const buffer = Buffer.isBuffer(file?.buffer) ? file.buffer : Buffer.from(file?.buffer || '');
 		if (!contentType.startsWith('image/') || buffer.length === 0) return false;
-		const sourceHash = require('crypto').createHash('sha256').update(buffer).digest('hex').slice(0, 24);
 		let outgoing = buffer;
 		if (contentType !== 'image/gif' && contentType !== 'image/svg+xml') {
-			const cacheKey = `${fileId}|${sourceHash}`;
-			const cached = iconCacheGet(cacheKey);
-			if (cached) {
-				outgoing = cached.buffer;
-			} else {
-				try {
-					const variant = await buildIconVariant(buffer, contentType);
-					if (variant) outgoing = variant;
-				} catch (error) {
-					console.warn('[users/icon] resize failed, serving original:', error.message);
-				}
-				iconCacheSet(cacheKey, { buffer: outgoing });
+			try {
+				const variant = await buildIconVariant(buffer, contentType);
+				if (variant) outgoing = variant;
+			} catch (error) {
+				console.warn('[users/icon] resize failed, serving original:', error.message);
 			}
 		}
-		const etag = `"icon-${require('crypto').createHash('sha256').update(outgoing).digest('hex').slice(0, 24)}"`;
-		res.setHeader('Cache-Control', 'public, max-age=21600, stale-while-revalidate=86400');
-		res.setHeader('Content-Type', contentType);
-		res.setHeader('ETag', etag);
-		if (req.headers['if-none-match'] === etag) {
-			res.status(304).end();
-			return true;
-		}
-		res.send(outgoing);
-		return true;
+		const entry = {
+			buffer: outgoing,
+			contentType,
+			etag: `"icon-${require('crypto').createHash('sha256').update(outgoing).digest('hex').slice(0, 24)}"`,
+			expiresAt: Date.now() + STORED_ICON_CACHE_TTL_MS,
+		};
+		iconCacheSet(fileId, entry);
+		return sendEntry(entry);
 	} catch (error) {
 		console.warn('[users/icon] stored icon read failed:', error.message);
 		return false;

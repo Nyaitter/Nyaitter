@@ -7,6 +7,9 @@ const crypto = require('crypto');
 const DEFAULT_MAX_SOURCE_BYTES = 2 * 1024 * 1024;
 const DEFAULT_FAILURE_CACHE_MS = 60 * 1000;
 const DEFAULT_MAX_FAILURE_CACHE_ENTRIES = 500;
+const DEFAULT_ICON_CACHE_MS = 6 * 60 * 60 * 1000;
+const DEFAULT_MAX_ICON_CACHE_ENTRIES = 500;
+const DEFAULT_MAX_ICON_CACHE_BYTES = 16 * 1024 * 1024;
 const ALLOWED_SCRATCH_IMAGE_HOSTS = new Set([
   'uploads.scratch.mit.edu',
   'cdn2.scratch.mit.edu',
@@ -57,6 +60,53 @@ class ScratchIconService {
       Number(options.maxFailureCacheEntries || DEFAULT_MAX_FAILURE_CACHE_ENTRIES),
     );
     this.failureCache = new Map();
+    this.iconCacheMs = Math.max(
+      1000,
+      Number(options.iconCacheMs || DEFAULT_ICON_CACHE_MS),
+    );
+    this.maxIconCacheEntries = Math.max(
+      1,
+      Number(options.maxIconCacheEntries || DEFAULT_MAX_ICON_CACHE_ENTRIES),
+    );
+    this.maxIconCacheBytes = Math.max(
+      1,
+      Number(options.maxIconCacheBytes || DEFAULT_MAX_ICON_CACHE_BYTES),
+    );
+    this.iconCache = new Map();
+    this.iconCacheBytes = 0;
+  }
+
+  _getCachedIcon(scid, now) {
+    const entry = this.iconCache.get(scid);
+    if (!entry) return null;
+    if (entry.expiresAt <= now) {
+      this.iconCache.delete(scid);
+      this.iconCacheBytes -= entry.buffer.length;
+      return null;
+    }
+    this.iconCache.delete(scid);
+    this.iconCache.set(scid, entry);
+    return entry.value;
+  }
+
+  _setCachedIcon(scid, value, now) {
+    const existing = this.iconCache.get(scid);
+    if (existing) {
+      this.iconCache.delete(scid);
+      this.iconCacheBytes -= existing.buffer.length;
+    }
+    this.iconCache.set(scid, { value, buffer: value.buffer, expiresAt: now + this.iconCacheMs });
+    this.iconCacheBytes += value.buffer.length;
+    while (
+      (this.iconCache.size > this.maxIconCacheEntries || this.iconCacheBytes > this.maxIconCacheBytes)
+      && this.iconCache.size > 1
+    ) {
+      const oldestScid = this.iconCache.keys().next().value;
+      if (oldestScid === undefined) break;
+      const oldest = this.iconCache.get(oldestScid);
+      this.iconCache.delete(oldestScid);
+      if (oldest) this.iconCacheBytes -= oldest.buffer.length;
+    }
   }
 
   _pruneFailureCache(now = Date.now()) {
@@ -119,18 +169,23 @@ class ScratchIconService {
     const retryAt = this.failureCache.get(normalizedScid);
     if (retryAt && retryAt > now) return null;
 
+    const cached = this._getCachedIcon(normalizedScid, now);
+    if (cached) return cached;
+
     try {
       const sourceUrl = await resolveSourceUrl(normalizedScid);
       if (!isAllowedScratchImageUrl(sourceUrl)) {
         throw new Error('Scratch icon source URL is not allowed');
       }
       const source = await this._fetchSourceImage(sourceUrl);
-      return {
+      const entry = {
         sourceUrl: source.sourceUrl,
         buffer: source.buffer,
         contentType: source.contentType,
         etag: `"scratch-icon-${crypto.createHash('sha256').update(source.buffer).digest('hex')}"`,
       };
+      this._setCachedIcon(normalizedScid, entry, now);
+      return entry;
     } catch (error) {
       this._pruneFailureCache(now);
       this.failureCache.set(normalizedScid, now + this.failureCacheMs);
