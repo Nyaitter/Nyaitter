@@ -1,0 +1,175 @@
+const webpush = require('web-push');
+const config = require('../config');
+const { isAllowedPushEndpoint } = require('../utils/pushEndpoint');
+const { getApiPublicUrl } = require('../utils/nyaitterAddress');
+const { getNotificationText, getNotificationActionText, getNotificationBodyText, getNotificationTargetHash } = require('../utils/notification');
+
+function getPushNotificationUrl(notification) {
+  const isCall = notification?.type === 'dm_call' || notification?.type === 'group_call';
+  if (isCall && notification?.target?.kind === 'dm') {
+    const id = encodeURIComponent(String(notification.target.id));
+    return `/?push_open_type=dm_call&push_open_target=${id}#dm/${id}`;
+  }
+  return getNotificationTargetHash(notification?.target, notification?.from?.id);
+}
+
+function getPushIconUrl(notification, publicUrl = null) {
+  const fromUserId = Number(notification?.from?.id);
+  if (!Number.isInteger(fromUserId) || fromUserId < 1) return null;
+
+  const origin = getApiPublicUrl();
+  const apiEndpoint = config.server?.apiEndpoint === '/'
+    ? ''
+    : String(config.server?.apiEndpoint || '/server').replace(/\/+$/, '');
+  return `${origin}${apiEndpoint}/api/users/${encodeURIComponent(String(fromUserId))}/icon`;
+}
+
+class PushNotificationService {
+  constructor({ dbAdapter, pushConfig = {}, realtime = null }) {
+    this.dbAdapter = dbAdapter;
+    this.config = pushConfig;
+    this.realtime = realtime;
+    this.enabled = Boolean(
+      pushConfig.vapidSubject
+      && pushConfig.vapidPublicKey
+      && pushConfig.vapidPrivateKey,
+    );
+
+    if (this.enabled) {
+      try {
+        webpush.setVapidDetails(
+          pushConfig.vapidSubject,
+          pushConfig.vapidPublicKey,
+          pushConfig.vapidPrivateKey,
+        );
+      } catch (error) {
+        this.enabled = false;
+        console.warn('[push] Web Push configuration is invalid:', error.message);
+      }
+    } else {
+      console.warn('[push] Web Push is disabled: VAPID_SUBJECT, VAPID_PUBLIC_KEY, and VAPID_PRIVATE_KEY are required.');
+    }
+  }
+
+  getPublicConfiguration() {
+    return {
+      enabled: this.enabled,
+      vapid_public_key: this.enabled ? this.config.vapidPublicKey : null,
+    };
+  }
+
+  async sendNotificationToUser(userId, notification, { publicUrl = null } = {}) {
+    if (!this.enabled) return { attempted: 0, delivered: 0, removed: 0 };
+
+    let subscriptions;
+    try {
+      subscriptions = await this.dbAdapter.getPushSubscriptions(userId);
+    } catch (error) {
+      console.warn('[push] Failed to load subscriptions:', error.message);
+      return { attempted: 0, delivered: 0, removed: 0 };
+    }
+
+    const actionText = getNotificationActionText(notification);
+    const bodyText = getNotificationBodyText(notification);
+    const payload = JSON.stringify({
+      title: actionText.slice(0, 100),
+      body: bodyText.slice(0, 200),
+      tag: notification?.id ? `notification-${notification.id}` : 'notification',
+      url: getPushNotificationUrl(notification),
+      user_id: userId,
+      notification_id: notification?.id || null,
+      icon: getPushIconUrl(notification, publicUrl),
+      target_post: notification?.target_post ? {
+        id: notification.target_post.id,
+        content: typeof notification.target_post.content === 'string'
+          ? notification.target_post.content.slice(0, 200)
+          : null,
+      } : null,
+    });
+
+    const result = { attempted: subscriptions.length, delivered: 0, removed: 0, skipped: 0 };
+    const sessionChecks = new Map();
+    const sendSubscription = async (subscription) => {
+      if (!isAllowedPushEndpoint(subscription.endpoint)) {
+        result.skipped += 1;
+        return;
+      }
+      if (!sessionChecks.has(subscription.sessionToken)) {
+        sessionChecks.set(subscription.sessionToken,
+          this._getSessionStatus(userId, subscription.sessionToken));
+      }
+      const sessionStatus = await sessionChecks.get(subscription.sessionToken);
+      if (sessionStatus !== 'valid') {
+        result.skipped += 1;
+        if (sessionStatus === 'invalid') {
+          try {
+            await this.dbAdapter.deletePushSubscription(userId, subscription.endpoint);
+            result.removed += 1;
+          } catch (deleteError) {
+            console.warn('[push] Failed to remove stale subscription:', deleteError.message);
+          }
+        }
+        return;
+      }
+
+      // 同じブラウザーセッションがWebSocketで接続中なら、画面内のリアルタイム通知で
+      // 受信できるため、その購読へのWeb Pushは送らない。他セッションの購読は維持する。
+      if (this.realtime?.hasActiveSession?.(userId, subscription.sessionToken)) {
+        result.skipped += 1;
+        return;
+      }
+
+      try {
+        await webpush.sendNotification(subscription, payload, {
+          TTL: 300,
+          urgency: 'normal',
+          timeout: 10000,
+          topic: notification?.id ? `nyaitter-${notification.id}`.slice(0, 32) : 'nyaitter-notification',
+        });
+        result.delivered += 1;
+      } catch (error) {
+        const statusCode = Number(error?.statusCode || 0);
+        if (statusCode === 404 || statusCode === 410) {
+          try {
+            await this.dbAdapter.deletePushSubscription(userId, subscription.endpoint);
+            result.removed += 1;
+          } catch (deleteError) {
+            console.warn('[push] Failed to remove expired subscription:', deleteError.message);
+          }
+          return;
+        }
+        console.warn('[push] Delivery failed:', error.message || error);
+      }
+    };
+    let nextIndex = 0;
+    await Promise.all(Array.from({ length: Math.min(4, subscriptions.length) }, async () => {
+      while (nextIndex < subscriptions.length) {
+        const subscription = subscriptions[nextIndex++];
+        await sendSubscription(subscription);
+      }
+    }));
+
+    return result;
+  }
+
+  async _getSessionStatus(userId, sessionToken) {
+    // 旧形式など、セッションに紐付かない購読には送信しない。
+    if (!sessionToken) return 'invalid';
+    if (typeof this.dbAdapter.getSessionByToken !== 'function') {
+      console.warn('[push] Session validation is not supported by the active database adapter.');
+      return 'unknown';
+    }
+
+    try {
+      const session = await this.dbAdapter.getSessionByToken(sessionToken);
+      if (!session || Number(session.userId) !== Number(userId)) return 'invalid';
+      return 'valid';
+    } catch (error) {
+      // DBの一時障害時に誤送信しない。購読自体は回復後に利用できるよう削除しない。
+      console.warn('[push] Session validation failed:', error.message);
+      return 'unknown';
+    }
+  }
+}
+
+module.exports = PushNotificationService;

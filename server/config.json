@@ -1,0 +1,228 @@
+{
+	"reputation": {
+		"featureAccess": {},
+		"notes": {
+			"engagedRate": 0.25, "incidentalRate": 0.05,
+			"reviewEngagedRate": 0.5, "reviewIncidentalRate": 0.15,
+			"relevanceLimit": 0.7, "reviewRelevanceLimit": 0.9,
+			"minReviewVotes": 5, "minPublicSample": 5, "quorumRate": 0.1,
+			"reviewRatio": 0.7, "publicRatio": 0.75, "rejectRatio": 0.7,
+			"minIndependentAgeDays": 7, "minLaterVotes": 5, "laterRatio": 0.7,
+			"maxWeight": 1.3, "maxRatings": 200, "maxCandidates": 500,
+			"maxNotesPerPost": 20, "penalty": 0.1
+		},
+		"dailyCaps":{"trust":null,"ban":1},
+		"positivePost":{"minUsers":5,"minAgeDays":30,"minTrust":0,"award":2},
+		"penalties":{"publicNote":-3,"rejectedNote":-2,"approvedReport":-5,"falseReports":-3,"falseReportRepeat":3},
+		"trust": {
+			"Trusted":{"minScore":900,"rateMultiplier":1.5,"queuePriority":3,"disabledFeatures":[],"rateLimits":{},"publicRatioReduction":0.05,"dailyNotes":null,"ratingWeight":1.3,"publicBonus":1,"noteVisibility":1},
+			"Reliable":{"minScore":600,"rateMultiplier":1.3,"queuePriority":2,"disabledFeatures":[],"rateLimits":{},"publicRatioReduction":0.04,"dailyNotes":null,"ratingWeight":1.2,"publicBonus":0.5,"noteVisibility":0.5},
+			"Credible":{"minScore":300,"rateMultiplier":1.1,"queuePriority":1,"disabledFeatures":[],"rateLimits":{},"publicRatioReduction":0.02,"dailyNotes":null,"ratingWeight":1.1,"publicBonus":0.25,"noteVisibility":0.25},
+			"Neutral":{"minScore":0,"rateMultiplier":1,"queuePriority":0,"disabledFeatures":[],"rateLimits":{},"publicRatioReduction":0,"dailyNotes":null,"ratingWeight":1,"publicBonus":0,"noteVisibility":0},
+			"Questionable":{"minScore":-10,"rateMultiplier":0.75,"queuePriority":-1,"disabledFeatures":["notes"],"rateLimits":{},"publicRatioReduction":0,"dailyNotes":null,"ratingWeight":1,"publicBonus":0,"noteVisibility":0},
+			"Suspicious":{"minScore":-1000000,"rateMultiplier":0.5,"queuePriority":-2,"disabledFeatures":["notes","uploads"],"rateLimits":{},"publicRatioReduction":0,"dailyNotes":null,"ratingWeight":1,"publicBonus":0,"noteVisibility":0},
+			"Banned":{"minScore":-1000001,"rateMultiplier":0.25,"queuePriority":-3,"disabledFeatures":["write","notes","uploads"],"rateLimits":{},"publicRatioReduction":0,"dailyNotes":null,"ratingWeight":1,"publicBonus":0,"noteVisibility":0}
+		}
+	},
+	"server": {
+		"port": 3000,
+		"jsonBodyLimit": "7mb",
+		"trustProxy": false,
+		"apiEndpoint": "/server"
+	},
+	"userFiles": {
+		"port": null
+	},
+	"static": {
+		"jsCssCacheMaxAge": 3600,
+		"assetCacheMaxAge": 86400
+	},
+	"client": {
+		"repository": "Nyaitter/Client"
+	},
+	"cors": {
+		"allowedOrigins": ["http://localhost:3000", "http://127.0.0.1:3000"],
+		"allowUnknownClient": false,
+		"credentials": false,
+		"preflightMaxAge": 600
+	},
+	"limits": {
+		"postContentLength": "..1000",
+		"dmContentLength": "..2000",
+		"dmE2eEphemeralKeyLength": "1..1024",
+		"dmE2eCiphertextLength": "1..16384",
+		"dmE2ePayloadLength": "..65536",
+		"userNameLength": "1..50",
+		"profileBioLength": "..500",
+		"scratchUsernameLength": "3..20",
+			"timelinePageSize": 30,
+			"impostersPerParent": 5,
+			"userSearchPageSize": "1..100",
+		"userSearchDefaultLimit": 20,
+		"dmMessagesPageSize": "1..100",
+		"dmMessagesDefaultLimit": 50,
+		"followingPageSize": 100,
+		"parentPostPreviewLength": 100,
+		"maxFileUploadSizeMB": 5,
+		"fileDeleteBatchSize": 1000,
+		"postBatchSize": 100,
+		"storageListPageSize": 500
+		},
+		"dm": {
+			"e2eEnabled": false
+		},
+				"imageUpload": {
+			"maxWidth": 2560,
+			"maxHeight": 2560,
+			"maxPixels": 40000000,
+			"maxOutputSizeMB": 5,
+			"webpQuality": 82,
+			"minWebpQuality": 60
+		},
+		"geminiModeration": {
+			"apiKey": "",
+			"model": "",
+			"prompt": "",
+			"maxImages": 0
+		},
+		"auth": {
+			"sessionExpiryDays": 30,
+			"verificationCodeExpiryMinutes": 15,
+			"botTokenPrefix": "bot_",
+			"sessionTokenBytes": 32,
+			"botTokenIdBytes": 16,
+			"verificationCodeBytes": 4,
+			"methods": {
+				"scratch": {
+					"enabled": true,
+					"verificationProjectId": "1239738451",
+					"ipRestrictionEnabled": true,
+					"rejectNewScratcher": true,
+					"rejectStudentAccounts": true,
+					"minQualifiedFollowers": 25
+				},
+				"passkey": {
+					"enabled": false,
+					"rpName": "Nyaitter",
+					"rpId": "localhost",
+					"origin": "http://localhost:3000"
+				},
+				"email": {
+					"enabled": true,
+					"codeExpiryMinutes": 10,
+					"codeLength": 6,
+					"smtp": {
+						"host": "",
+						"port": 587,
+						"secure": false,
+						"user": "",
+						"pass": "",
+						"from": "noreply@localhost"
+					},
+					"embeddedServer": {
+						"enabled": false,
+						"port": 2525,
+						"host": "0.0.0.0",
+						"directDelivery": false,
+						"hostname": "localhost"
+					}
+				},
+				"oauth": {
+					"enabled": false,
+					"providers": {}
+				},
+				"password": {
+					"enabled": false
+				}
+			},
+			"accountRecovery": {
+				"enabled": true,
+				"minWaitHours": 24,
+				"maxWaitHours": 168,
+				"notificationIntervalHours": 24
+			},
+			"scratchVerification": {
+				"ipRestrictionEnabled": true,
+				"rejectNewScratcher": true,
+				"rejectStudentAccounts": true,
+				"minQualifiedFollowers": 25
+			}
+		},
+	"inMemory": {
+		"initialUserId": 0
+	},
+	"database": {
+		"adapter": "memory",
+					"postgres": {
+				"connectionString": "postgres://user:pass@localhost:5432/nyaitter",
+				"poolSize": 25,
+				"poolMin": 5,
+					"poolIdleTimeoutMs": 60000,
+					"poolMaxLifetimeSeconds": 1800,
+					"connectionTimeoutMs": 15000,
+				"transactionRetries": 5,
+				"retryBaseDelayMs": 50,
+				"ssl": false,
+				"sslCa": ""
+			},
+			"d1": {
+
+			"workerUrl": "",
+			"authToken": ""
+		}
+	},
+		"storage": {
+			"adapter": "local",
+			"userQuotaMB": 1024,
+		"local": {
+			"uploadDir": "./uploads"
+		},
+		"r2": {
+			"accountId": "",
+			"bucket": "nyaitter-uploads",
+			"accessKeyId": "",
+			"secretAccessKey": "",
+			"publicDomain": ""
+		}
+	},
+	"logging": {
+		"level": "info",
+		"pretty": true,
+		"requestIdHeader": "x-request-id"
+	},
+	"rateLimit": {
+		"enabled": true,
+		"general": { "window": "1min", "max": 800 },
+		"auth": { "window": "1min", "max": 120 },
+		"postWrite": { "window": "1min", "max": 24 },
+		"profileUpdate": { "window": "1min", "max": 16 },
+		"dmSend": { "window": "1min", "max": 48 },
+		"upload": { "window": "1min", "max": 24 },
+		"notification": { "window": "1min", "max": 48 },
+		"reportCreate": { "window": "1min", "max": 10 },
+		"reportAction": { "window": "1min", "max": 30 },
+		"verificationApplication": { "window": "1min", "max": 5 }
+		},
+	"security": {
+		"hsts": {
+			"enabled": true,
+				"maxAge": 31536000,
+			"includeSubDomains": true
+		},
+		"helmet": {
+			"enabled": false
+		}
+	},
+	"health": {
+		"detailed": false
+	},
+	"rules": {
+		"filePath": "rule.nd"
+	},
+	"federation": {
+		"publicUrl": "",
+		"domain": "example.com",
+		"allow_external_login": false,
+		"trusted_servers": []
+	}
+}

@@ -1,0 +1,82 @@
+'use strict';
+
+const { createNotificationIfAllowed } = require('./NotificationDeliveryService');
+
+function startPollExpirationScheduler(
+  dbAdapter,
+  { intervalMs = 60 * 1000, logger = console, autoStart = true } = {},
+) {
+  let running = false;
+
+  const run = async () => {
+    if (running || !dbAdapter || typeof dbAdapter.getExpiredUnnotifiedPolls !== 'function') return;
+    running = true;
+    try {
+      const expiredPolls = await dbAdapter.getExpiredUnnotifiedPolls();
+      if (!Array.isArray(expiredPolls) || expiredPolls.length === 0) return;
+
+      for (const poll of expiredPolls) {
+        const pollId = Number(poll.id);
+        const postId = Number(poll.post_id);
+        const authorId = Number(poll.user_id);
+        const title = String(poll.title || '投票');
+
+        // 通知送信より先にフラグをセット。失敗した場合はこの投票をスキップして再送を防ぐ
+        try {
+          await dbAdapter.markPollClosedNotified(pollId);
+        } catch (markErr) {
+          logger.warn?.(`[polls] markPollClosedNotified failed for poll #${pollId}, skipping:`, markErr.message);
+          continue;
+        }
+
+        const voters = typeof dbAdapter.getPollVoters === 'function'
+          ? await dbAdapter.getPollVoters(pollId)
+          : [];
+
+        // 1. ポスト主への通知
+        try {
+          await createNotificationIfAllowed(dbAdapter, {
+            userId: authorId,
+            type: 'poll_ended',
+            fromUserId: authorId,
+            target: { kind: 'post', id: postId },
+            message: `投票「${title}」が終了しました。結果を確認しましょう！`,
+          });
+        } catch (err) {
+          logger.warn?.('[polls] failed to notify author:', err.message);
+        }
+
+        // 2. 投票者への通知
+        const recipientVoters = voters.filter((vId) => Number(vId) !== authorId);
+        for (const voterId of recipientVoters) {
+          try {
+            await createNotificationIfAllowed(dbAdapter, {
+              userId: voterId,
+              type: 'poll_ended',
+              fromUserId: authorId,
+              target: { kind: 'post', id: postId },
+              message: `あなたが投票した「${title}」の投票が終了しました。結果を確認しましょう！`,
+            });
+          } catch (err) {
+            logger.warn?.('[polls] failed to notify voter:', err.message);
+          }
+        }
+      }
+    } catch (error) {
+      logger.error?.('[polls] Poll expiration sweep failed:', error.message);
+    } finally {
+      running = false;
+    }
+  };
+
+  if (autoStart) void run();
+  const timer = setInterval(() => void run(), intervalMs);
+  timer.unref?.();
+
+  return {
+    run,
+    stop: () => clearInterval(timer),
+  };
+}
+
+module.exports = { startPollExpirationScheduler };

@@ -1,0 +1,7858 @@
+'use strict';
+
+const { buildPostSearchSql } = require('../../../utils/postSearchQuery');
+
+const { Pool } = require('pg');
+const crypto = require('crypto');
+const DatabaseAdapter = require('../DatabaseAdapter');
+const {
+	formatNyaitterId,
+} = require('../../../utils/nyaitterAddress');
+const appConfig = require('../../../config');
+const MemoryBoundedCache = require('../../../utils/MemoryBoundedCache');
+const { normalizeTarget } = require('../../../utils/notification');
+const { normalizeBlockList } = require('../../../utils/blockList');
+const {
+	exportPostgresSnapshot,
+	importPostgresSnapshot,
+} = require('../../../services/DataMigrationSql');
+const { normalizeSnapshot } = require('../../../services/DataMigrationService');
+const { scoreRecommendedPosts, buildAffinityProfile } = require('../../../utils/recommendation');
+const { isAgeFeaturesActive } = require('../../../services/AgeEstimateService');
+const { extractViewContent } = require('../../../utils/viewContent');
+const { isFuzzyMatch, calculateStringSimilarity } = require('../../../utils/fuzzySearch');
+const { encodePostCursor, decodePostCursor } = require('../../../utils/postCursor');
+
+const GROUP_DM_READ_CACHE_TTL_MS = 2000;
+const GROUP_DM_READ_CACHE_MAX_ENTRIES = 1000;
+
+// migration 032 で追加した集約カラムが未作成の DB かどうか。
+// コードだけ先にデプロイされた環境でも DM 一覧を 500 にしないための判定。
+function isMissingGroupDmSummaryColumn(error) {
+	return error?.code === '42703'
+		|| /column .*message_count.* does not exist/i.test(error?.message || '')
+		|| /column .*latest_message.* does not exist/i.test(error?.message || '');
+}
+
+
+function parseJsonSafe(value, fallback = null) {
+	if (value === null || value === undefined) return fallback;
+	if (typeof value === 'object') return value;
+	if (typeof value !== 'string') return fallback;
+	try {
+		return JSON.parse(value);
+	} catch (_) {
+		return fallback;
+	}
+}
+
+function toIsoString(value, fallback = null) {
+	if (value === null || value === undefined) return fallback;
+	if (value instanceof Date) {
+		return Number.isNaN(value.getTime()) ? fallback : value.toISOString();
+	}
+	if (typeof value === 'string') return value;
+	return fallback;
+}
+
+function normalizeUserRow(row) {
+	if (!row) return null;
+	const id = Number(row.id);
+	const rawBlock = parseJsonSafe(row.block, []);
+	return {
+		id,
+		account_operation: row.account_operation || null,
+		scid: row.scid || null,
+		name: row.name || '',
+		handle: row.handle || formatNyaitterId(id),
+		nyaitter_address: row.nyaitter_address || null,
+		auth_provider: row.auth_provider || 'local',
+		provider_domain: row.provider_domain || null,
+		external_id: row.external_id || null,
+		external_profile: parseJsonSafe(row.external_profile, null),
+		uuid: row.uuid || null,
+		settings: parseJsonSafe(row.settings, {}),
+		bio: row.bio || '',
+		me: row.me ?? row.bio ?? '',
+		header_image: row.header_image || null,
+		icon_data: row.icon_data || null,
+		verify: Boolean(row.verify),
+		admin: Boolean(row.admin),
+		admin_request_excluded: Boolean(row.admin_request_excluded),
+		freeze: row.freeze || null,
+		shadow: Boolean(row.shadow),
+		block: normalizeBlockList(rawBlock, id),
+		age_estimate: row.age_estimate != null ? Number(row.age_estimate) : null,
+		age_source: row.age_source || null,
+		age_estimated_at: toIsoString(row.age_estimated_at),
+		age_samples: Math.max(0, Number(row.age_samples) || 0),
+		created_at: toIsoString(row.created_at),
+	};
+}
+
+function normalizePostTags(value) {
+	const rawTags = parseJsonSafe(value, Array.isArray(value) ? value : []);
+	if (!Array.isArray(rawTags)) return [];
+	return [...new Set(rawTags
+		.map((tag) => String(tag || '').trim().toLocaleLowerCase('ja-JP'))
+		.filter((tag) => tag.length > 0 && tag.length <= 48))]
+		.slice(0, 10);
+}
+
+function normalizePostRow(row) {
+	if (!row) return null;
+	const id = Number(row.id);
+	const userId = Number(row.user_id ?? row.userId);
+	const replyTo = row.reply_to ?? row.replyTo;
+	const repostTo = row.repost_to ?? row.repostTo;
+	const createdAt = toIsoString(row.created_at ?? row.createdAt);
+	const tagsGeneratedAt = toIsoString(row.tags_generated_at ?? row.tagsGeneratedAt);
+	const rawAttachments = parseJsonSafe(row.attachments, []);
+	const attachments = Array.isArray(rawAttachments)
+		? rawAttachments
+		: (rawAttachments ? [rawAttachments] : []);
+	const tags = normalizePostTags(row.tags);
+	const groupId = row.group_id ?? row.groupId ?? null;
+	const groupAnnouncement = Boolean(row.group_announcement ?? row.groupAnnouncement);
+	const viewContent = row.view_content ?? row.viewContent ?? extractViewContent(row.content || '');
+	const replyControl = row.reply_control ?? row.replyControl ?? 'everyone';
+
+	let author = null;
+	if (row.author_id != null) {
+		author = normalizeUserRow({
+			id: row.author_id,
+			name: row.author_name,
+			scid: row.author_scid,
+			handle: row.author_handle,
+			icon_data: row.author_icon_data,
+			bio: row.author_bio,
+			header_image: row.author_header_image,
+			settings: row.author_settings,
+			block: row.author_block,
+			verify: row.author_verify,
+			admin: row.author_admin,
+			created_at: row.author_created_at,
+		});
+	} else if (row.author && typeof row.author === 'object') {
+		author = normalizeUserRow(row.author);
+	}
+
+	return {
+		id,
+		userId,
+		user_id: userId,
+		content: row.content || '',
+		viewContent,
+		view_content: viewContent,
+		tags,
+		tagsGeneratedAt,
+		tags_generated_at: tagsGeneratedAt,
+		attachments,
+		mask: Boolean(row.mask),
+		lock: Boolean(row.lock),
+		ageRating: Number(row.age_rating ?? row.ageRating ?? 0) || 0,
+		age_rating: Number(row.age_rating ?? row.ageRating ?? 0) || 0,
+		announcement: Boolean(row.announcement),
+		groupId: groupId == null ? null : String(groupId),
+		group_id: groupId == null ? null : String(groupId),
+		groupAnnouncement,
+		scheduledAt: toIsoString(row.scheduled_at ?? row.scheduledAt),
+		group_announcement: groupAnnouncement,
+		replyControl,
+		reply_control: replyControl,
+		replyTo: replyTo == null ? null : Number(replyTo),
+		reply_to: replyTo == null ? null : Number(replyTo),
+		repostTo: repostTo == null ? null : Number(repostTo),
+		repost_to: repostTo == null ? null : Number(repostTo),
+		like_count: Math.max(0, Number(row.like_count ?? row.likeCount) || 0),
+		likeCount: Math.max(0, Number(row.like_count ?? row.likeCount) || 0),
+		star_count: Math.max(0, Number(row.star_count ?? row.starCount) || 0),
+		starCount: Math.max(0, Number(row.star_count ?? row.starCount) || 0),
+		repost_count: Math.max(0, Number(row.repost_count ?? row.repostCount) || 0),
+		repostCount: Math.max(0, Number(row.repost_count ?? row.repostCount) || 0),
+		reply_count: Math.max(0, Number(row.reply_count ?? row.replyCount) || 0),
+		replyCount: Math.max(0, Number(row.reply_count ?? row.replyCount) || 0),
+		recommendation_penalty: Number(row.recommendation_penalty ?? row.recommendationPenalty ?? 0) || 0,
+		recommendationPenalty: Number(row.recommendation_penalty ?? row.recommendationPenalty ?? 0) || 0,
+		...(row.liked_by_me !== undefined ? { liked_by_me: Boolean(row.liked_by_me) } : {}),
+		...(row.starred_by_me !== undefined ? { starred_by_me: Boolean(row.starred_by_me) } : {}),
+		...(author ? { author } : {}),
+		createdAt,
+		created_at: createdAt,
+	};
+}
+
+function normalizeGroupRow(row) {
+	if (!row) return null;
+	const id = String(row.id);
+	const ownerId = Number(row.owner_id ?? row.ownerId);
+	const createdAt = toIsoString(row.created_at ?? row.createdAt);
+	const updatedAt = toIsoString(row.updated_at ?? row.updatedAt);
+	const deletedAt = toIsoString(row.deleted_at ?? row.deletedAt);
+	return {
+		id,
+		ownerId,
+		owner_id: ownerId,
+		name: row.name || '',
+		description: row.description || '',
+		iconData: row.icon_data ?? row.iconData ?? null,
+		icon_data: row.icon_data ?? row.iconData ?? null,
+		headerImage: row.header_image ?? row.headerImage ?? null,
+		header_image: row.header_image ?? row.headerImage ?? null,
+		visibility: row.visibility || 'open',
+		memberCount: Math.max(0, Number(row.member_count ?? row.memberCount) || 0),
+		member_count: Math.max(0, Number(row.member_count ?? row.memberCount) || 0),
+		createdAt,
+		created_at: createdAt,
+		updatedAt,
+		updated_at: updatedAt,
+		deletedAt,
+		deleted_at: deletedAt,
+	};
+}
+
+function normalizeSpaceRow(row) {
+	if (!row) return null;
+	const id = String(row.id);
+	const ownerId = Number(row.owner_id ?? row.ownerId);
+	const createdAt = toIsoString(row.created_at ?? row.createdAt);
+	const updatedAt = toIsoString(row.updated_at ?? row.updatedAt);
+	const memberCount = Math.max(0, Number(row.member_count ?? row.memberCount) || 0);
+	return {
+		id, ownerId, owner_id: ownerId,
+		name: row.name || '',
+		description: row.description || '',
+		iconData: row.icon_data ?? row.iconData ?? null,
+		icon_data: row.icon_data ?? row.iconData ?? null,
+		headerImage: row.header_image ?? row.headerImage ?? null,
+		header_image: row.header_image ?? row.headerImage ?? null,
+		visibility: row.visibility || 'public',
+		groupId: row.group_id ?? row.groupId ?? null,
+		group_id: row.group_id ?? row.groupId ?? null,
+		stage_settings: row.stage_settings ?? row.stageSettings ?? null,
+		memberCount, member_count: memberCount,
+		createdAt, created_at: createdAt,
+		updatedAt, updated_at: updatedAt,
+	};
+}
+
+function normalizeSpaceChannelRow(row) {
+	if (!row) return null;
+	const id = String(row.id);
+	const spaceId = String(row.space_id ?? row.spaceId);
+	const sortOrder = Number(row.sort_order ?? row.sortOrder) || 0;
+	const createdAt = toIsoString(row.created_at ?? row.createdAt);
+	return {
+		id, spaceId, space_id: spaceId,
+		name: row.name || '',
+		kind: row.kind || 'text',
+		sortOrder, sort_order: sortOrder,
+		createdAt, created_at: createdAt,
+	};
+}
+
+function normalizeSpaceMemberRow(row) {
+	if (!row) return null;
+	const spaceId = String(row.space_id ?? row.spaceId);
+	const userId = Number(row.user_id ?? row.userId);
+	const joinedAt = toIsoString(row.joined_at ?? row.joinedAt);
+	return { spaceId, space_id: spaceId, userId, user_id: userId, role: row.role || 'member', joinedAt, joined_at: joinedAt };
+}
+
+function normalizeSpaceMessageRow(row) {
+	if (!row) return null;
+	const id = Number(row.id);
+	const spaceId = String(row.space_id ?? row.spaceId);
+	const channelId = String(row.channel_id ?? row.channelId);
+	const userId = Number(row.user_id ?? row.userId);
+	const createdAt = toIsoString(row.created_at ?? row.createdAt);
+	return {
+		 id, spaceId, space_id: spaceId, channelId, channel_id: channelId,
+		 userId, user_id: userId, content: row.content || '', createdAt, created_at: createdAt,
+	};
+}
+
+function normalizeGroupRoleRow(row) {
+	if (!row) return null;
+	const groupId = String(row.group_id ?? row.groupId);
+	const permissions = parseJsonSafe(row.permissions, []);
+	const createdAt = toIsoString(row.created_at ?? row.createdAt);
+	const updatedAt = toIsoString(row.updated_at ?? row.updatedAt);
+	return {
+		id: String(row.id),
+		groupId,
+		group_id: groupId,
+		name: row.name || '',
+		permissions: Array.isArray(permissions) ? permissions.map(String) : [],
+		isSystem: Boolean(row.is_system ?? row.isSystem),
+		is_system: Boolean(row.is_system ?? row.isSystem),
+		sortOrder: Number(row.sort_order ?? row.sortOrder) || 0,
+		sort_order: Number(row.sort_order ?? row.sortOrder) || 0,
+		createdAt,
+		created_at: createdAt,
+		updatedAt,
+		updated_at: updatedAt,
+	};
+}
+
+function normalizeGroupMembershipRow(row) {
+	if (!row) return null;
+	const groupId = String(row.group_id ?? row.groupId);
+	const userId = Number(row.user_id ?? row.userId);
+	const roleId = row.role_id ?? row.roleId ?? null;
+	const joinedAt = toIsoString(row.joined_at ?? row.joinedAt);
+	const updatedAt = toIsoString(row.updated_at ?? row.updatedAt);
+	return {
+		groupId,
+		group_id: groupId,
+		userId,
+		user_id: userId,
+		roleId: roleId == null ? null : String(roleId),
+		role_id: roleId == null ? null : String(roleId),
+		status: row.status || 'active',
+		joinedAt,
+		joined_at: joinedAt,
+		updatedAt,
+		updated_at: updatedAt,
+	};
+}
+
+function normalizeGroupInviteRow(row) {
+	if (!row) return null;
+	const groupId = String(row.group_id ?? row.groupId);
+	const inviterId = Number(row.inviter_id ?? row.inviterId);
+	const inviteeId = Number(row.invitee_id ?? row.inviteeId);
+	const createdAt = toIsoString(row.created_at ?? row.createdAt);
+	const respondedAt = toIsoString(row.responded_at ?? row.respondedAt);
+	return {
+		id: String(row.id), groupId, group_id: groupId, inviterId, inviter_id: inviterId,
+		inviteeId, invitee_id: inviteeId, status: row.status || 'pending',
+		createdAt, created_at: createdAt, respondedAt, responded_at: respondedAt,
+	};
+}
+
+function normalizeGroupJoinRequestRow(row) {
+	if (!row) return null;
+	const groupId = String(row.group_id ?? row.groupId);
+	const userId = Number(row.user_id ?? row.userId);
+	const reviewedBy = row.reviewed_by ?? row.reviewedBy ?? null;
+	const createdAt = toIsoString(row.created_at ?? row.createdAt);
+	const reviewedAt = toIsoString(row.reviewed_at ?? row.reviewedAt);
+	return {
+		id: String(row.id), groupId, group_id: groupId, userId, user_id: userId,
+		status: row.status || 'pending',
+		reviewedBy: reviewedBy == null ? null : Number(reviewedBy),
+		reviewed_by: reviewedBy == null ? null : Number(reviewedBy),
+		createdAt, created_at: createdAt, reviewedAt, reviewed_at: reviewedAt,
+	};
+}
+
+function normalizeGroupDmRow(row, viewerId = null) {
+	if (!row) return null;
+	const member = parseJsonSafe(row.member, []);
+	const unread = parseJsonSafe(row.unread, {});
+	const time = toIsoString(row.time);
+	const createdAt = toIsoString(row.created_at);
+	const memberList = Array.isArray(member) ? member.map(Number).filter(Number.isInteger) : [];
+	const accepted = Array.isArray(unread?._accepted)
+		? unread._accepted.map(Number).filter(Number.isInteger)
+		: memberList;
+
+	// 一覧取得(getGroupDmsForUser)では post 全履歴を読まず、集約カラム
+	// (message_count / latest_message)だけを受け取る。row.post がある経路
+	// (getGroupDm など)は従来どおり全 post を返す。
+	let post;
+	if (row.post !== undefined) {
+		const parsedPost = parseJsonSafe(row.post, []);
+		post = Array.isArray(parsedPost) ? parsedPost : [];
+	} else {
+		const latest = row.latest_message !== undefined ? row.latest_message : row.latest_post;
+		post = latest == null ? [] : [latest];
+	}
+
+	const rawMessageCount = row.message_count !== undefined && row.message_count !== null
+		? Number(row.message_count)
+		: post.length;
+	const messageCount = Number.isFinite(rawMessageCount) ? rawMessageCount : post.length;
+
+	const res = {
+		id: String(row.id),
+		host_id: Number(row.host_id ?? row.hostId),
+		state_version: String(row.state_version),
+		title: row.title || '',
+		member: memberList,
+		accepted,
+		unread: typeof unread === 'object' && unread !== null ? unread : {},
+		post,
+		message_count: messageCount,
+		time,
+		created_at: createdAt,
+	};
+	if (viewerId != null) {
+		res.unread_count = Number(res.unread[viewerId] ?? res.unread[String(viewerId)] ?? 0);
+	}
+	return res;
+}
+
+function normalizeModerationReportRow(row) {
+	if (!row) return null;
+	const excluded = parseJsonSafe(row.excluded_admin_ids ?? row.excludedAdminIds, []);
+	const assignedAdminId = row.assigned_admin_id ?? row.assignedAdminId;
+	return {
+		id: Number(row.id),
+		reporterUserId: Number(row.reporter_user_id ?? row.reporterUserId),
+		targetKind: String(row.target_kind ?? row.targetKind),
+		targetId: String(row.target_id ?? row.targetId),
+		description: row.description || '',
+		targetSnapshot: parseJsonSafe(row.target_snapshot ?? row.targetSnapshot, {}),
+		assignmentType: String(row.assignment_type ?? row.assignmentType ?? 'report'),
+		status: String(row.status || 'pending'),
+		assignedAdminId: assignedAdminId == null ? null : Number(assignedAdminId),
+		assignedAt: toIsoString(row.assigned_at ?? row.assignedAt),
+		excludedAdminIds: Array.isArray(excluded) ? excluded.map(Number).filter(Number.isInteger) : [],
+		resolution: parseJsonSafe(row.resolution, null),
+		createdAt: toIsoString(row.created_at ?? row.createdAt),
+		resolvedAt: toIsoString(row.resolved_at ?? row.resolvedAt),
+		claimedAt: toIsoString(row.claimed_at ?? row.claimedAt),
+	};
+}
+
+function mapSession(session) {
+	if (!session) return null;
+	const id = String(session.session_id || session.id);
+	const userId = Number(session.user_id ?? session.userId);
+	const expiresAt = toIsoString(session.expires_at || session.expiresAt);
+	const createdAt = toIsoString(session.created_at || session.createdAt);
+	const ipHash = session.ip_hash ?? session.ipHash ?? null;
+	const ipMasked = session.ip_masked ?? session.ipMasked ?? '旧セッション';
+	const userAgent = session.user_agent ?? session.userAgent ?? '不明な端末';
+
+	return {
+		id,
+		session_id: id,
+		token: session.token,
+		userId,
+		user_id: userId,
+		expiresAt,
+		expires_at: expiresAt,
+		createdAt,
+		created_at: createdAt,
+		ipHash,
+		ip_hash: ipHash,
+		ipMasked,
+		ip_masked: ipMasked,
+		userAgent,
+		user_agent: userAgent,
+	};
+}
+
+function mapLoginApproval(approval) {
+	if (!approval) return null;
+	return {
+		id: String(approval.id),
+		userId: Number(approval.user_id ?? approval.userId),
+		ipHash: approval.ip_hash ?? approval.ipHash ?? null,
+		ipMasked: approval.ip_masked ?? approval.ipMasked ?? '不明なIPアドレス',
+		userAgent: approval.user_agent ?? approval.userAgent ?? '不明な端末',
+		authProvider: approval.auth_provider ?? approval.authProvider ?? null,
+		pollTokenHash: String(approval.poll_token_hash ?? approval.pollTokenHash ?? ''),
+		status: String(approval.status || 'pending'),
+		createdAt: toIsoString(approval.created_at ?? approval.createdAt),
+		expiresAt: toIsoString(approval.expires_at ?? approval.expiresAt),
+		decidedAt: toIsoString(approval.decided_at ?? approval.decidedAt),
+		consumedAt: toIsoString(approval.consumed_at ?? approval.consumedAt),
+	};
+}
+
+function mapAccountRecovery(row) {
+	if (!row) return null;
+	return {
+		id: String(row.id),
+		userId: Number(row.user_id ?? row.userId),
+		ipHash: row.ip_hash ?? row.ipHash ?? null,
+		ipMasked: row.ip_masked ?? row.ipMasked ?? '不明なIPアドレス',
+		userAgent: row.user_agent ?? row.userAgent ?? '不明な端末',
+		authProvider: row.auth_provider ?? row.authProvider ?? null,
+		requestTokenHash: String(row.request_token_hash ?? row.requestTokenHash ?? ''),
+		status: String(row.status || 'waiting'),
+		trustScore: Number(row.trust_score ?? row.trustScore ?? 0),
+		waitUntil: toIsoString(row.wait_until ?? row.waitUntil),
+		startedAt: toIsoString(row.started_at ?? row.startedAt),
+		lastNotifiedAt: toIsoString(row.last_notified_at ?? row.lastNotifiedAt),
+		notifiedCount: Number(row.notified_count ?? row.notifiedCount ?? 0),
+		decidedAt: toIsoString(row.decided_at ?? row.decidedAt),
+		decidedBy: row.decided_by ?? row.decidedBy ?? null,
+		consumedAt: toIsoString(row.consumed_at ?? row.consumedAt),
+	};
+}
+
+function mapBlockedLoginIp(row) {
+	if (!row) return null;
+	return {
+		userId: Number(row.user_id ?? row.userId),
+		ipHash: row.ip_hash ?? row.ipHash ?? null,
+		ipMasked: row.ip_masked ?? row.ipMasked ?? '不明なIPアドレス',
+		reason: row.reason ?? null,
+		sourceRecoveryId: row.source_recovery_id ?? row.sourceRecoveryId ?? null,
+		createdAt: toIsoString(row.created_at ?? row.createdAt),
+	};
+}
+
+class PostgresAdapter extends DatabaseAdapter {
+	async createModLog(input) {
+		const m = require('../modLogs'); const row = m.normalizeRecord(input, crypto.randomUUID());
+		const inserted = await this.pool.query('INSERT INTO mod_logs (id, created_at, actor_type, actor_id, action, target_type, target_id, result) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (id) DO NOTHING RETURNING id', [row.id,row.createdAt,row.actorType,row.actorId,row.action,row.targetType,row.targetId,row.result]);
+		if (!inserted.rowCount) {
+			const { rows } = await this.pool.query('SELECT id,created_at AS "createdAt",actor_type AS "actorType",actor_id AS "actorId",action,target_type AS "targetType",target_id AS "targetId",result FROM mod_logs WHERE id=$1', [row.id]);
+			if (!rows[0] || !m.sameRecord(rows[0], row)) throw new Error('Mod log ID conflict');
+		}
+		return row;
+	}
+	async searchModLogs(input = {}) {
+		const m = require('../modLogs'); const q = m.query(input, 'postgres');
+		const { rows } = await this.pool.query(q.sql, q.args);
+		return m.page(rows.map(m.mapRow), q.limit);
+	}
+	constructor(options = {}) {
+		super();
+		this.config = options;
+		this.pool = null;
+		this.transactionRetries = Math.max(
+			0,
+			Math.min(10, Math.floor(Number(options.transactionRetries) || 5)),
+		);
+		this.retryBaseDelayMs = Math.max(
+			10,
+			Math.min(5000, Math.floor(Number(options.retryBaseDelayMs) || 50)),
+		);
+		this.groupDmReadCache = new Map();
+		this.groupDmReadCacheGeneration = 0;
+		this.supportsGroupDmSendIdempotency = true;
+	}
+
+	async connect() {
+		const connectionString = String(
+			this.config.connectionString || process.env.DATABASE_URL || '',
+		).trim();
+
+		if (!connectionString) {
+			throw new Error('PostgreSQL connection string is required (DATABASE_URL or config.database.postgres.connectionString)');
+		}
+
+		let parsedConnectionString;
+		try {
+			parsedConnectionString = new URL(connectionString);
+		} catch (_) {
+			throw new Error('Invalid PostgreSQL connection string. Set DATABASE_URL to a complete postgres:// or postgresql:// URL.');
+		}
+		if (!['postgres:', 'postgresql:'].includes(parsedConnectionString.protocol)) {
+			throw new Error('Invalid PostgreSQL connection string protocol. DATABASE_URL must start with postgres:// or postgresql://.');
+		}
+		if (!parsedConnectionString.hostname && !parsedConnectionString.searchParams.get('host')) {
+			throw new Error('Invalid PostgreSQL connection string host. Set a hostname in DATABASE_URL, or use the host query parameter for a local Unix socket.');
+		}
+		const sslMode = parsedConnectionString.searchParams.get('sslmode');
+		if (
+			sslMode &&
+			!['disable', 'allow', 'prefer', 'require', 'verify-ca', 'verify-full', 'no-verify'].includes(sslMode)
+		) {
+			throw new Error('Invalid PostgreSQL sslmode. Use disable, allow, prefer, require, verify-ca, verify-full, or no-verify.');
+		}
+
+		// poolMax は config 側で安全上限に丸め済み。アダプターを直接構築した場合も
+		// 明示指定がなければ 10 を上限にして migration 等の接続枠を残す。
+		const explicitPoolMax = Math.floor(Number(this.config.poolMax));
+		const requestedPoolMax = Number.isFinite(explicitPoolMax) && explicitPoolMax > 0
+			? explicitPoolMax
+			: Math.min(Math.floor(Number(this.config.poolSize)) || 10, 10);
+		const poolMax = Math.max(1, Math.min(100, requestedPoolMax));
+		const poolMin = Math.min(poolMax, Math.max(1, Number(this.config.poolMin) || 2));
+		const poolOptions = {
+			connectionString,
+			max: poolMax,
+			min: poolMin,
+			idleTimeoutMillis: this.config.poolIdleTimeoutMs || 300000,
+			connectionTimeoutMillis: this.config.connectionTimeoutMs || 10000,
+			maxLifetimeSeconds: this.config.poolMaxLifetimeSeconds || 1800,
+			keepAlive: true,
+			keepAliveInitialDelayMillis: 10000,
+		};
+		if (this.config.sslCa) {
+			poolOptions.ssl = { ca: this.config.sslCa, rejectUnauthorized: true };
+		} else if (this.config.ssl === true) {
+			poolOptions.ssl = { rejectUnauthorized: false };
+		} else if (sslMode && ['verify-full', 'verify-ca', 'require', 'prefer', 'allow'].includes(sslMode)) {
+			// verify-full/verify-ca では明示的なCA証明書なしに pg v8 がハングするため、
+			// システムのCA束を優先し、なければ Node.js のデフォルトに委ねる。
+			const fs = require('fs');
+			const SYSTEM_CA_PATHS = [
+				'/etc/ssl/certs/ca-certificates.crt',   // Debian/Ubuntu
+				'/etc/pki/tls/certs/ca-bundle.crt',     // RHEL/CentOS
+				'/etc/ssl/ca-bundle.pem',                // OpenSUSE
+			];
+			let systemCa = null;
+			for (const caPath of SYSTEM_CA_PATHS) {
+				try { systemCa = fs.readFileSync(caPath); break; } catch (_) {}
+			}
+			poolOptions.ssl = systemCa
+				? { ca: systemCa, rejectUnauthorized: ['verify-full', 'verify-ca'].includes(sslMode) }
+				: { rejectUnauthorized: false };
+		}
+		this.pool = new Pool(poolOptions);
+
+		let client;
+		const warmupClients = [];
+		try {
+			client = await this.pool.connect();
+			await client.query('SELECT 1');
+			client.release();
+			client = null;
+
+			await Promise.all(Array.from({ length: poolMin }, async () => {
+				const warmupClient = await this.pool.connect();
+				warmupClients.push(warmupClient);
+			}));
+			for (const warmupClient of warmupClients.splice(0)) warmupClient.release();
+		} catch (error) {
+			await this.pool.end();
+			this.pool = null;
+			if (['EAI_AGAIN', 'ENOTFOUND'].includes(error?.code)) {
+				throw new Error(`PostgreSQL host "${error.hostname || 'unknown'}" could not be resolved. Check DATABASE_URL and set the complete database connection URL, not a name such as "base".`);
+			}
+			throw error;
+		} finally {
+			client?.release();
+			for (const warmupClient of warmupClients.splice(0)) warmupClient.release();
+		}
+
+		console.log(`[PostgresAdapter] Connected to PostgreSQL (pool ${poolMin}-${poolMax})`);
+	}
+
+	async disconnect() {
+		if (this.pool) {
+			await this.pool.end();
+			this.pool = null;
+			console.log('[PostgresAdapter] Disconnected from PostgreSQL');
+		}
+	}
+
+	async exportDataSnapshot() {
+		if (!this.pool) throw new Error('PostgreSQL adapter is not connected');
+		return exportPostgresSnapshot(this.pool, 'postgres');
+	}
+
+	async importDataSnapshot(snapshot, options = {}) {
+		if (!this.pool) throw new Error('PostgreSQL adapter is not connected');
+		const result = await importPostgresSnapshot(this.pool, normalizeSnapshot(snapshot), options);
+		this._clearGroupDmReadCache();
+		return result;
+	}
+
+	_isRetryableTransactionError(error) {
+		if (!error) return false;
+		if (error.code === '40001' || error.code === '40P01') return true;
+		const msg = String(error.message || '');
+		return /restart transaction|transaction retry|retry transaction|could not serialize|deadlock detected/i.test(msg);
+	}
+
+	async _waitForTransactionRetry(attempt) {
+		const jitter = Math.floor(Math.random() * 50);
+		const delay = Math.min(
+			2000,
+			this.retryBaseDelayMs * (2 ** Math.max(0, attempt - 1)) + jitter,
+		);
+		await new Promise((resolve) => setTimeout(resolve, delay));
+	}
+
+	async _withTransaction(operation) {
+		let lastError;
+		for (let attempt = 0; attempt <= this.transactionRetries; attempt += 1) {
+			const client = await this.pool.connect();
+			let started = false;
+			try {
+				await client.query('BEGIN');
+				started = true;
+				const result = await operation(client);
+				await client.query('COMMIT');
+				return result;
+			} catch (error) {
+				lastError = error;
+				if (started) {
+					try {
+						await client.query('ROLLBACK');
+					} catch (_) {
+						// Ignored to preserve original error
+					}
+				}
+				if (
+					!this._isRetryableTransactionError(error) ||
+					attempt >= this.transactionRetries
+				) {
+					throw error;
+				}
+				await this._waitForTransactionRetry(attempt + 1);
+			} finally {
+				client.release();
+			}
+		}
+		throw lastError;
+	}
+
+	_normalizeUserBlockList(user) {
+		return normalizeUserRow(user);
+	}
+
+	_normalizePost(post) {
+		return normalizePostRow(post);
+	}
+
+	// ==================== User Methods ====================
+
+	async getUserByScid(scid) {
+		if (!scid) return null;
+		const { rows } = await this.pool.query(
+			'SELECT * FROM users WHERE LOWER(scid) = LOWER($1) LIMIT 1',
+			[String(scid)],
+		);
+		const user = normalizeUserRow(rows[0]);
+		if (user) this._setCachedUser(user);
+		return user;
+	}
+
+	_setCachedUser(user) {
+		const cache = this._getUserCache();
+		if (!cache || !user) return;
+		cache.set(user.id, user);
+	}
+
+	_updateCachedUser(userId, patch) {
+		const cache = this._getUserCache();
+		const current = cache?.get(Number(userId));
+		if (!cache || !current) return;
+		cache.set(Number(userId), { ...current, ...patch, id: Number(userId) });
+	}
+
+	_getUserCache() {
+		if (!this._userCache) {
+			const cacheCfg = appConfig.cache || {};
+			if (cacheCfg.userCacheEnabled !== false) {
+				this._userCache = new MemoryBoundedCache({
+					maxSize: cacheCfg.userCacheMaxSize || 3000,
+					ttlMs: cacheCfg.userCacheTtlMs || 300000,
+					maxHeapMb: cacheCfg.memoryCacheMaxHeapMb || 0,
+				});
+			}
+		}
+		return this._userCache;
+	}
+
+	_getProfileStatsCache() {
+		if (!this._profileStatsCache) {
+			this._profileStatsCache = new MemoryBoundedCache({
+				maxSize: 3000,
+				ttlMs: 30000,
+			});
+		}
+		return this._profileStatsCache;
+	}
+
+	_invalidateProfileStatsCache(userId) {
+		if (this._profileStatsCache) {
+			if (userId != null) {
+				this._profileStatsCache.delete(Number(userId));
+			} else {
+				this._profileStatsCache.clear();
+			}
+		}
+	}
+
+	async getUserById(id, { fresh = false } = {}) {
+		if (id == null) return null;
+		const userId = Number(id);
+		if (!Number.isSafeInteger(userId) || userId <= 0) return null;
+
+		const cache = this._getUserCache();
+		const cached = fresh ? null : cache?.get(userId);
+		if (cached) return cached;
+
+		const { rows } = await this.pool.query(
+			'SELECT * FROM users WHERE id = $1 LIMIT 1',
+			[userId],
+		);
+		const user = normalizeUserRow(rows[0]);
+		if (user) {
+			this._setCachedUser(user);
+		} else if (fresh) {
+			cache?.delete(userId);
+		}
+		return user;
+	}
+
+	async getUsersByIds(userIds) {
+		const ids = [...new Set((userIds || []).map(Number)
+			.filter((id) => Number.isSafeInteger(id) && id > 0))];
+		if (ids.length === 0) return [];
+
+		const cache = this._getUserCache();
+		const userMap = new Map();
+		const missingIds = [];
+
+		for (const id of ids) {
+			const cached = cache?.get(id);
+			if (cached) {
+				userMap.set(id, cached);
+			} else {
+				missingIds.push(id);
+			}
+		}
+
+		if (missingIds.length > 0) {
+			const { rows } = await this.pool.query(
+				'SELECT * FROM users WHERE id = ANY($1::int[])',
+				[missingIds],
+			);
+			for (const row of rows) {
+				const user = normalizeUserRow(row);
+				if (user) {
+					this._setCachedUser(user);
+					userMap.set(user.id, user);
+				}
+			}
+		}
+
+		return ids.map((id) => userMap.get(id)).filter(Boolean);
+	}
+
+	async getPostAuthorsByIds(userIds) {
+		const ids = [...new Set((userIds || []).map(Number)
+			.filter((id) => Number.isSafeInteger(id) && id > 0))];
+		if (ids.length === 0) return [];
+
+		const { rows } = await this.pool.query(
+			`SELECT id, auth_provider, external_id, name, scid, icon_data, bio, header_image,
+					verify, admin, settings, block, shadow
+			 FROM users
+			 WHERE id = ANY($1::int[])`,
+			[ids],
+		);
+		return rows.map(normalizeUserRow).filter(Boolean);
+	}
+
+	_invalidateUserCache(userId) {
+		if (this._userCache) {
+			if (userId != null) {
+				this._userCache.delete(Number(userId));
+			} else {
+				this._userCache.clear();
+			}
+		}
+		if (this._affinityCache) {
+			if (userId != null) {
+				this._affinityCache.delete(Number(userId));
+			} else {
+				this._affinityCache.clear();
+			}
+		}
+		if (this._followCache) {
+			if (userId != null) {
+				this._followCache.delete(Number(userId));
+			} else {
+				this._followCache.clear();
+			}
+		}
+		this._invalidateProfileStatsCache(userId);
+	}
+
+	async getUserByExternalId(authProvider, externalId) {
+		if (!authProvider || externalId == null) return null;
+		const { rows } = await this.pool.query(
+			'SELECT * FROM users WHERE auth_provider = $1 AND external_id = $2 LIMIT 1',
+			[String(authProvider), String(externalId)],
+		);
+		const user = normalizeUserRow(rows[0]);
+		if (user) this._setCachedUser(user);
+		return user;
+	}
+
+	async getUserAuthProviders(userId) {
+		const targetId = Number(userId);
+		const user = await this.getUserById(targetId);
+		if (!user) return [];
+
+		const { rows } = await this.pool.query(
+			'SELECT id, user_id AS "userId", provider, provider_user_id AS "providerUserId", provider_profile AS "providerProfile", created_at AS "createdAt" FROM user_auth_providers WHERE user_id = $1 ORDER BY id ASC',
+			[targetId],
+		);
+
+		const records = rows.map((r) => ({
+			id: r.id,
+			userId: r.userId,
+			provider: r.provider,
+			providerUserId: r.providerUserId,
+			providerProfile: typeof r.providerProfile === 'string' ? JSON.parse(r.providerProfile) : (r.providerProfile || {}),
+			createdAt: r.createdAt,
+		}));
+
+		const hasScratch = records.some((r) => String(r.provider).toLowerCase() === 'scratch');
+		if (!hasScratch && user.scid) {
+			records.unshift({
+				id: 0,
+				userId: targetId,
+				provider: 'scratch',
+				providerUserId: user.scid,
+				providerProfile: { username: user.scid },
+				isPrimary: records.length === 0,
+				createdAt: user.created_at || new Date(),
+			});
+		}
+		// users の auth_provider/external_id も、紐づけ行が無い場合の有効なログイン方法として一覧に含める。
+		// 一覧から消すと、解除ガードや設定画面の表示が実態とズレる。
+		const hasExternal = records.some((r) => String(r.provider).toLowerCase() === String(user.auth_provider || '').toLowerCase()
+			&& String(r.providerUserId) === String(user.external_id));
+		if (!hasExternal && user.auth_provider && user.external_id) {
+			records.push({
+				id: 0,
+				userId: targetId,
+				provider: user.auth_provider,
+				providerUserId: user.external_id,
+				providerProfile: user.external_profile || {},
+				isPrimary: records.length === 0,
+				createdAt: user.created_at || new Date(),
+			});
+		}
+
+		return records;
+	}
+
+	async findUserByAuthProvider(provider, providerUserId) {
+		if (!provider || providerUserId == null) return null;
+		const normProvider = String(provider).toLowerCase();
+		const normUserId = String(providerUserId).trim();
+
+		const { rows } = await this.pool.query(
+			`SELECT u.* FROM users u
+			 JOIN user_auth_providers p ON u.id = p.user_id
+			 WHERE LOWER(p.provider) = $1 AND LOWER(p.provider_user_id) = $2
+			 LIMIT 1`,
+			[normProvider, normUserId.toLowerCase()],
+		);
+
+		if (rows.length > 0) return normalizeUserRow(rows[0]);
+
+		if (normProvider === 'scratch' || normProvider === 'local') {
+			const userByScid = await this.getUserByScid(normUserId);
+			if (userByScid) return userByScid;
+		}
+
+		const userByExt = await this.getUserByExternalId(normProvider, normUserId);
+		if (userByExt) return userByExt;
+
+		return null;
+	}
+
+	async linkAuthProvider(userId, provider, providerUserId, providerProfile = {}) {
+		const targetId = Number(userId);
+		const normProvider = String(provider).toLowerCase();
+		const normUserId = String(providerUserId).trim();
+
+		const existingUser = await this.findUserByAuthProvider(normProvider, normUserId);
+		if (existingUser && existingUser.id !== targetId) {
+			const err = new Error('この認証情報は既に他のアカウントに紐付けられています。');
+			err.status = 409;
+			err.code = 'auth_provider_already_linked';
+			throw err;
+		}
+
+		const profileJson = JSON.stringify(providerProfile || {});
+		const { rows } = await this.pool.query(
+			`INSERT INTO user_auth_providers (user_id, provider, provider_user_id, provider_profile, created_at)
+			 VALUES ($1, $2, $3, $4::jsonb, NOW())
+			 ON CONFLICT (provider, provider_user_id) DO UPDATE SET provider_profile = EXCLUDED.provider_profile
+			 RETURNING id, user_id AS "userId", provider, provider_user_id AS "providerUserId", provider_profile AS "providerProfile", created_at AS "createdAt"`,
+			[targetId, normProvider, normUserId, profileJson],
+		);
+
+		if (normProvider === 'scratch') {
+			await this.pool.query(
+				'UPDATE users SET scid = COALESCE(scid, $1) WHERE id = $2',
+				[normUserId, targetId],
+			);
+		}
+		if (normProvider === 'scratch') this._updateCachedUser(targetId, { scid: normUserId });
+
+		const r = rows[0];
+		return {
+			id: r.id,
+			userId: r.userId,
+			provider: r.provider,
+			providerUserId: r.providerUserId,
+			providerProfile: typeof r.providerProfile === 'string' ? JSON.parse(r.providerProfile) : (r.providerProfile || {}),
+			createdAt: r.createdAt,
+		};
+	}
+
+	async unlinkAuthProvider(userId, provider, providerUserId = null) {
+		const targetId = Number(userId);
+		const normProvider = String(provider).toLowerCase();
+		const linkedProviders = await this.getUserAuthProviders(targetId);
+
+		if (linkedProviders.length <= 1) {
+			const err = new Error('最後のログイン方法を解除することはできません。アカウントには最低1つのログイン方法が必要です。');
+			err.status = 400;
+			err.code = 'cannot_unlink_last_provider';
+			throw err;
+		}
+
+		if (providerUserId != null) {
+			await this.pool.query(
+				'DELETE FROM user_auth_providers WHERE user_id = $1 AND LOWER(provider) = $2 AND LOWER(provider_user_id) = $3',
+				[targetId, normProvider, String(providerUserId).toLowerCase()],
+			);
+		} else {
+			await this.pool.query(
+				'DELETE FROM user_auth_providers WHERE user_id = $1 AND LOWER(provider) = $2',
+				[targetId, normProvider],
+			);
+		}
+
+		if (normProvider === 'scratch') {
+			await this.pool.query(
+				'UPDATE users SET scid = NULL WHERE id = $1',
+				[targetId],
+			);
+		}
+		if (normProvider === 'scratch') this._updateCachedUser(targetId, { scid: null });
+
+		return { success: true };
+	}
+
+	async revokeAuthProvider(userId, provider) {
+		const targetId = Number(userId);
+		const normProvider = String(provider || '').toLowerCase();
+		if (!normProvider) return { revoked: false, reason: 'invalid_provider' };
+
+		const linkedProviders = await this.getUserAuthProviders(targetId);
+		const remaining = linkedProviders.filter((p) => String(p.provider).toLowerCase() !== normProvider);
+		if (linkedProviders.length <= 1 || remaining.length < 1) {
+			return { revoked: false, reason: 'last_provider' };
+		}
+
+		await this.pool.query(
+			'DELETE FROM user_auth_providers WHERE user_id = $1 AND LOWER(provider) = $2',
+			[targetId, normProvider],
+		);
+
+		const user = await this.getUserById(targetId);
+		const fallback = remaining[0];
+		const sets = [];
+		const values = [];
+		let idx = 1;
+		if (normProvider === 'scratch' && user?.scid) {
+			sets.push('scid = NULL');
+		}
+		// primaryの外部IDが残ると、連携解除後も同じプロバイダーで再ログインできてしまうため無効化する。
+		if (user && String(user.auth_provider || '').toLowerCase() === normProvider) {
+			sets.push(`auth_provider = $${idx++}`);
+			values.push(String(fallback.provider).toLowerCase());
+			sets.push('external_id = NULL');
+			sets.push('provider_domain = NULL');
+			sets.push(`external_profile = $${idx++}::jsonb`);
+			values.push(JSON.stringify(fallback.providerProfile || {}));
+		}
+		if (sets.length > 0) {
+			values.push(targetId);
+			await this.pool.query(`UPDATE users SET ${sets.join(', ')} WHERE id = $${idx}`, values);
+			const cacheUpdate = {};
+			if (normProvider === 'scratch' && user?.scid) {
+				cacheUpdate.scid = null;
+			}
+			if (user && String(user.auth_provider || '').toLowerCase() === normProvider) {
+				cacheUpdate.auth_provider = String(fallback.provider).toLowerCase();
+				cacheUpdate.external_id = null;
+				cacheUpdate.provider_domain = null;
+				cacheUpdate.external_profile = fallback.providerProfile || {};
+			}
+			if (Object.keys(cacheUpdate).length > 0) this._updateCachedUser(targetId, cacheUpdate);
+		}
+
+		return {
+			revoked: true,
+			provider: normProvider,
+			remainingProviders: remaining.map((p) => p.provider),
+		};
+	}
+
+	async createUser(userData) {
+		const provider = userData.auth_provider || 'local';
+		const now = new Date().toISOString();
+
+		for (let attempt = 0; attempt < 20; attempt += 1) {
+			const countResult = await this.pool.query('SELECT COUNT(*)::bigint AS count FROM users');
+			const count = Number(countResult.rows[0].count);
+			const digits = Math.max(4, String(Math.max(count, 1)).length);
+			const id = crypto.randomInt(1, 10 ** digits);
+			const { rows: retiredRows } = await this.pool.query('SELECT 1 FROM retired_user_ids WHERE id = $1', [id]);
+			if (retiredRows.length > 0) continue;
+			const handle = provider === 'nyaitter' && userData.external_id != null
+				? formatNyaitterId(userData.external_id)
+				: formatNyaitterId(id);
+
+			const address = userData.nyaitter_address || null;
+			try {
+				const { rows } = await this.pool.query(
+					`INSERT INTO users (id, scid, name, handle, nyaitter_address, auth_provider, provider_domain, external_id, external_profile, uuid, settings, "block", bio, header_image, icon_data, created_at)
+					 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::jsonb, $12::jsonb, $13, $14, $15, $16) RETURNING *`,
+					[
+						id,
+						userData.scid || null,
+						userData.name || userData.scid || handle,
+						handle,
+						address,
+						provider,
+						userData.provider_domain || null,
+						userData.external_id || null,
+						userData.external_profile ? JSON.stringify(userData.external_profile) : null,
+						userData.uuid || null,
+						userData.settings ? JSON.stringify(userData.settings) : '{}',
+						JSON.stringify(normalizeBlockList(userData.block, id)),
+						userData.bio || userData.me || '',
+						userData.header_image || null,
+						userData.icon_data || null,
+						now,
+					],
+				);
+				const user = normalizeUserRow(rows[0]);
+				if (user) this._setCachedUser(user);
+				return user;
+			} catch (error) {
+				if (error.code === '23505') continue;
+				throw error;
+			}
+		}
+		throw new Error('Could not allocate a unique Nyaitter ID');
+	}
+
+	async searchUsers(query, limit = 20, offset = 0, { cursor = null, withNextCursor = false } = {}) {
+		const q = String(query || '').trim();
+		if (!q) return withNextCursor ? { users: [], has_more: false, next_cursor: null } : [];
+		const safeLimit = Math.min(Math.max(Number(limit) || 20, 1), 100);
+		const decodedCursor = typeof cursor === 'string' && cursor.trim() ? decodePostCursor(cursor.trim()) : null;
+		const targetId = decodedCursor ? Number(decodedCursor.id) : null;
+		const digits = q.replace(/^#/, '').replace(/\D/g, '');
+		const pattern = `%${q}%`;
+
+		let sql = `SELECT * FROM users WHERE (name ILIKE $1 OR scid ILIKE $1 OR handle ILIKE $1 OR bio ILIKE $1`;
+		const values = [pattern];
+
+		if (digits) {
+			values.push(`%${digits}%`);
+			sql += ` OR CAST(id AS TEXT) LIKE $${values.length}`;
+		}
+		sql += `)`;
+
+		if (targetId != null) {
+			values.push(targetId);
+			sql += ` AND id > $${values.length}`;
+		}
+
+		values.push(safeLimit + 1);
+		const limitIdx = values.length;
+
+		let offsetSql = '';
+		if (targetId == null) {
+			const safeOffset = Math.max(Number(offset) || 0, 0);
+			if (safeOffset > 0) {
+				values.push(safeOffset);
+				offsetSql = ` OFFSET $${values.length}`;
+			}
+		}
+
+		sql += ` ORDER BY id ASC LIMIT $${limitIdx}${offsetSql}`;
+
+		const { rows } = await this.pool.query(sql, values);
+		const users = rows.map(normalizeUserRow);
+		const hasMore = users.length > safeLimit;
+		const slice = users.slice(0, safeLimit);
+		const lastUser = slice.length > 0 ? slice[slice.length - 1] : null;
+		const nextCursor = hasMore && lastUser
+			? encodePostCursor({ id: lastUser.id, created_at: lastUser.created_at || new Date(0).toISOString() })
+			: null;
+
+		if (withNextCursor) {
+			return { users: slice, has_more: hasMore, next_cursor: nextCursor };
+		}
+		return slice;
+	}
+
+	async getAllUsers() {
+		const { rows } = await this.pool.query('SELECT * FROM users ORDER BY id ASC');
+		return rows.map(normalizeUserRow);
+	}
+
+	async getImposterUsers() {
+		const { rows } = await this.pool.query(
+			`SELECT * FROM users
+			 WHERE auth_provider = 'imposter'
+			    OR (settings IS NOT NULL AND jsonb_typeof(settings) = 'object' AND settings ? 'imposter')
+			 ORDER BY id ASC`,
+		);
+		return rows.map(normalizeUserRow);
+	}
+
+	async getRecommendedUsers(limit = 3, excludedUserId = null) {
+		const normalizedLimit = Math.min(Math.max(Number(limit) || 3, 1), 100);
+		const values = [normalizedLimit];
+		const exclusion = excludedUserId != null && Number.isSafeInteger(Number(excludedUserId))
+			? `WHERE id <> $${values.push(Number(excludedUserId))}`
+			: '';
+		const { rows } = await this.pool.query(
+			`SELECT *
+			 FROM users
+			 ${exclusion}
+			 ORDER BY created_at DESC, id ASC
+			 LIMIT $1`,
+			values,
+		);
+		return rows.map(normalizeUserRow);
+	}
+
+	async getUserRecommendationProfile(userId) {
+		const id = Number(userId);
+		if (!Number.isSafeInteger(id) || id <= 0) {
+			return {
+				affinities: [], follows: [], extendedFollows: [], reacted: [],
+				dislikedPostIds: [], dislikedAuthors: [], blockedAuthors: [],
+			};
+		}
+		const [affinityResult, followResult, extendedResult, reactionResult, feedback, user] = await Promise.all([
+			this.pool.query(
+				'SELECT keyword, score, updated_at FROM user_keyword_affinities WHERE user_id = $1 ORDER BY score DESC LIMIT 200',
+				[id],
+			),
+			this.pool.query(
+				'SELECT following_id FROM follows WHERE follower_id = $1 ORDER BY created_at DESC LIMIT 500',
+				[id],
+			),
+			this.pool.query(
+				`SELECT DISTINCT f2.following_id AS user_id
+				 FROM follows f1
+				 JOIN follows f2 ON f2.follower_id = f1.following_id
+				 WHERE f1.follower_id = $1 AND f2.following_id <> $1
+				 LIMIT 1000`,
+				[id],
+			),
+			this.pool.query(
+				`SELECT post_id FROM (
+					(SELECT post_id, created_at FROM likes WHERE user_id = $1 ORDER BY created_at DESC LIMIT 100)
+					UNION ALL
+					(SELECT post_id, created_at FROM stars WHERE user_id = $1 ORDER BY created_at DESC LIMIT 100)
+					UNION ALL
+					(SELECT post_id, created_at FROM reposts WHERE user_id = $1 ORDER BY created_at DESC LIMIT 100)
+				) _r`,
+				[id],
+			),
+			this.getPostFeedbackForUser(id).catch(() => ({ postIds: [], authorIds: [] })),
+			this.getUserById(id).catch(() => null),
+		]);
+		const follows = (followResult.rows || []).map((row) => Number(row.following_id));
+		const directFollows = new Set(follows);
+		const extendedFollows = new Set();
+		for (const row of extendedResult.rows || []) {
+			const candidateId = Number(row.user_id);
+			if (Number.isSafeInteger(candidateId) && !directFollows.has(candidateId)) extendedFollows.add(candidateId);
+		}
+		return {
+			affinities: (affinityResult.rows || []).map((row) => ({
+				keyword: row.keyword,
+				score: Number(row.score) || 0,
+				updated_at: row.updated_at,
+			})),
+			follows,
+			extendedFollows: [...extendedFollows],
+			reacted: [...new Set((reactionResult.rows || []).map((row) => Number(row.post_id)).filter(Number.isSafeInteger))],
+			dislikedPostIds: feedback?.postIds || [],
+			dislikedAuthors: feedback?.authorIds || [],
+			dislikedAuthorCounts: feedback?.authorCounts || new Map(),
+			negativeTagCounts: feedback?.tagCounts || new Map(),
+			blockedAuthors: normalizeBlockList(user?.block, id),
+		};
+	}
+
+	async getUserStatus(userId) {
+		const { rows } = await this.pool.query(
+			'SELECT shadow FROM users WHERE id = $1',
+			[Number(userId)],
+		);
+		if (!rows[0]) return null;
+		return { shadow: Boolean(rows[0].shadow) };
+	}
+
+	async setUserStatus(userId, status) {
+		// shadow が指定されていない場合は現状を返すだけ（未指定を false と解釈して上書きしない）。
+		if (!status || status.shadow === undefined) return this.getUserStatus(userId);
+		const shadow = Boolean(status.shadow);
+		const { rows } = await this.pool.query(
+			'UPDATE users SET shadow = $2 WHERE id = $1 RETURNING shadow',
+			[Number(userId), shadow],
+		);
+		if (!rows[0]) return null;
+		this._updateCachedUser(userId, { shadow });
+		return { shadow: Boolean(rows[0].shadow) };
+	}
+
+	async updateUserProfile(userId, profileData) {
+		const fields = [];
+		const values = [];
+		let idx = 1;
+
+		if (profileData.name !== undefined) {
+			fields.push(`name = $${idx++}`);
+			values.push(profileData.name);
+		}
+		if (profileData.bio !== undefined) {
+			fields.push(`bio = $${idx++}`);
+			values.push(profileData.bio);
+		} else if (profileData.me !== undefined) {
+			fields.push(`bio = $${idx++}`);
+			values.push(profileData.me);
+		}
+		if (profileData.header_image !== undefined) {
+			fields.push(`header_image = $${idx++}`);
+			values.push(profileData.header_image);
+		}
+		if (profileData.icon_data !== undefined) {
+			fields.push(`icon_data = $${idx++}`);
+			values.push(profileData.icon_data);
+		}
+		if (profileData.settings !== undefined) {
+			fields.push(`settings = $${idx++}::jsonb`);
+			values.push(JSON.stringify(profileData.settings || {}));
+		}
+		if (profileData.block !== undefined) {
+			fields.push(`"block" = $${idx++}::jsonb`);
+			values.push(JSON.stringify(normalizeBlockList(profileData.block, userId)));
+		}
+		if (profileData.verify !== undefined) {
+			fields.push(`verify = $${idx++}`);
+			values.push(Boolean(profileData.verify));
+		}
+		if (profileData.freeze !== undefined) {
+			fields.push(`"freeze" = $${idx++}`);
+			values.push(profileData.freeze || null);
+		}
+		if (profileData.admin !== undefined) {
+			fields.push(`admin = $${idx++}`);
+			values.push(Boolean(profileData.admin));
+		}
+		if (profileData.shadow !== undefined) {
+			fields.push(`shadow = $${idx++}`);
+			values.push(Boolean(profileData.shadow));
+		}
+		if (fields.length === 0) return this.getUserById(userId);
+
+		values.push(Number(userId));
+		const { rows } = await this.pool.query(
+			`UPDATE users SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`,
+			values,
+		);
+		const user = normalizeUserRow(rows[0]);
+		this._setCachedUser(user);
+		return user;
+	}
+
+	async recordPostAgeEstimate(postId, userId, band) {
+		const normalizedPostId = Number(postId);
+		const normalizedUserId = Number(userId);
+		if (!Number.isSafeInteger(normalizedPostId) || normalizedPostId <= 0) return null;
+		if (!Number.isSafeInteger(normalizedUserId) || normalizedUserId <= 0) return null;
+		if (!['under13', '13-15', '16-17', '18-24', '25-34', '35over'].includes(band)) return null;
+		const { rows } = await this.pool.query(
+			`INSERT INTO post_age_estimates (post_id, user_id, band)
+			 VALUES ($1, $2, $3)
+			 ON CONFLICT (post_id) DO UPDATE SET user_id = EXCLUDED.user_id, band = EXCLUDED.band, created_at = now()
+			 RETURNING *`,
+			[normalizedPostId, normalizedUserId, band],
+		);
+		return rows[0] || null;
+	}
+
+	async getPostAgeBands(userId, limit = 50) {
+		const safeLimit = Math.max(1, Math.min(Number(limit) || 50, 500));
+		const { rows } = await this.pool.query(
+			'SELECT band FROM post_age_estimates WHERE user_id = $1 ORDER BY created_at DESC, post_id DESC LIMIT $2',
+			[Number(userId), safeLimit],
+		);
+		return rows.map((row) => row.band);
+	}
+
+	async updateUserAgeEstimate(userId, fields = {}) {
+		const sets = [];
+		const values = [];
+		if (fields.ageEstimate !== undefined) {
+			const estimate = fields.ageEstimate == null ? null : Number(fields.ageEstimate);
+			if (estimate == null || (Number.isFinite(estimate) && estimate >= 0 && estimate <= 120)) {
+				values.push(estimate);
+				sets.push(`age_estimate = $${values.length}`);
+			}
+		}
+		if (fields.ageSource !== undefined) {
+			values.push(['post', 'ondevice', 'api'].includes(fields.ageSource) ? fields.ageSource : null);
+			sets.push(`age_source = $${values.length}`);
+		}
+		if (fields.ageSamples !== undefined) {
+			values.push(Math.max(0, Number(fields.ageSamples) || 0));
+			sets.push(`age_samples = $${values.length}`);
+		}
+		if (fields.ageEstimatedAt !== undefined) {
+			values.push(fields.ageEstimatedAt == null ? null : toIsoString(fields.ageEstimatedAt));
+			sets.push(`age_estimated_at = $${values.length}`);
+		}
+		if (sets.length === 0) return this.getUserById(userId);
+		values.push(Number(userId));
+		const { rows } = await this.pool.query(
+			`UPDATE users SET ${sets.join(', ')} WHERE id = $${values.length} RETURNING *`,
+			values,
+		);
+		const user = normalizeUserRow(rows[0]);
+		this._setCachedUser(user);
+		return user;
+	}
+
+	async beginAccountOperation(userId, operation) {
+		if (!['deleting'].includes(operation)) throw new Error('Invalid account operation');
+		const { rows } = await this.pool.query(
+			`UPDATE users
+			 SET account_operation = $2
+			 WHERE id = $1
+			   AND auth_provider <> 'nyaitter'
+			   AND account_operation IS NULL
+			 RETURNING *`,
+			[Number(userId), operation],
+		);
+		const user = normalizeUserRow(rows[0] || null);
+		this._setCachedUser(user);
+		return user;
+	}
+
+	async finishAccountOperation(userId, operation) {
+		const { rows } = await this.pool.query(
+			`UPDATE users SET account_operation = NULL
+			 WHERE id = $1 AND account_operation = $2
+			 RETURNING *`,
+			[Number(userId), operation],
+		);
+		const user = normalizeUserRow(rows[0] || null);
+		this._setCachedUser(user);
+		return user;
+	}
+
+	async deleteAccount(userId) {
+		this._invalidateUserCache(userId);
+		return this._withTransaction(async (client) => {
+			const { rows: userRows } = await client.query(
+				`SELECT id FROM users WHERE id = $1 AND account_operation = 'deleting' FOR UPDATE`,
+				[Number(userId)],
+			);
+			if (!userRows[0]) return false;
+
+			await client.query('DELETE FROM post_age_estimates WHERE user_id = $1 OR post_id IN (SELECT id FROM posts WHERE user_id = $1)', [userId]);
+			const { rows: postRows } = await client.query('SELECT id, reply_to, repost_to FROM posts WHERE user_id = $1', [userId]);
+			const postIds = postRows.map((row) => Number(row.id));
+			if (postIds.length > 0) {
+				// Decrement reply/repost counters on parents of posts created by this user
+				for (const p of postRows) {
+					if (p.reply_to) {
+						await client.query('UPDATE posts SET reply_count = GREATEST(0, reply_count - 1) WHERE id = $1', [Number(p.reply_to)]);
+					}
+					if (p.repost_to) {
+						await client.query('UPDATE posts SET repost_count = GREATEST(0, repost_count - 1) WHERE id = $1', [Number(p.repost_to)]);
+					}
+				}
+				await client.query('UPDATE posts SET repost_to = NULL WHERE repost_to = ANY($1::int[])', [postIds]);
+			}
+
+			// Decrement like counters for posts liked by this user
+			const { rows: userLikes } = await client.query('SELECT post_id FROM likes WHERE user_id = $1', [userId]);
+			const likedPostIds = userLikes.map((r) => Number(r.post_id)).filter((id) => !postIds.includes(id));
+			if (likedPostIds.length > 0) {
+				await client.query('UPDATE posts SET like_count = GREATEST(0, like_count - 1) WHERE id = ANY($1::int[])', [likedPostIds]);
+			}
+
+			// Decrement star counters for posts starred by this user
+			const { rows: userStars } = await client.query('SELECT post_id FROM stars WHERE user_id = $1', [userId]);
+			const starredPostIds = userStars.map((r) => Number(r.post_id)).filter((id) => !postIds.includes(id));
+			if (starredPostIds.length > 0) {
+				await client.query('UPDATE posts SET star_count = GREATEST(0, star_count - 1) WHERE id = ANY($1::int[])', [starredPostIds]);
+			}
+
+			const { rows: channelRows } = await client.query(
+				`SELECT id, participants FROM dm_channels WHERE participants @> ARRAY[$1]::int[] FOR UPDATE`,
+				[userId],
+			);
+			for (const channel of channelRows) {
+				const participants = (channel.participants || []).map(Number).filter((id) => id !== Number(userId));
+				if (participants.length < 2) await client.query('DELETE FROM dm_channels WHERE id = $1', [channel.id]);
+				else await client.query('UPDATE dm_channels SET participants = $2::int[] WHERE id = $1', [channel.id, participants]);
+			}
+
+			const { rows: groupRows } = await client.query(
+`SELECT id, host_id, member, post, unread
+					 FROM group_dms
+					 WHERE host_id = $1 OR member @> ARRAY[$1]::int[]
+					 FOR UPDATE`,
+				[userId],
+			);
+			for (const group of groupRows) {
+				const members = (group.member || []).map(Number).filter((id) => id !== Number(userId));
+				if (members.length === 0) {
+					await client.query('DELETE FROM group_dms WHERE id = $1', [group.id]);
+					continue;
+				}
+				const rawPost = Array.isArray(group.post) ? group.post : parseJsonSafe(group.post, []);
+				const messages = rawPost.filter((message) => Number(message?.userid) !== Number(userId));
+				const unread = { ...(typeof group.unread === 'object' && group.unread !== null ? group.unread : parseJsonSafe(group.unread, {})) };
+				if (Array.isArray(unread._accepted)) unread._accepted = unread._accepted.filter((id) => Number(id) !== Number(userId));
+				delete unread[String(userId)];
+				const hostId = Number(group.host_id) === Number(userId) ? members[0] : Number(group.host_id);
+				await client.query(
+					`UPDATE group_dms
+					 SET host_id = $2, member = $3::int[], post = $4::jsonb, unread = $5::jsonb
+					 WHERE id = $1`,
+					[group.id, hostId, members, JSON.stringify(messages), JSON.stringify(unread)],
+				);
+			}
+
+			const { rows: blockedUsers } = await client.query(
+				'SELECT id, "block" FROM users WHERE "block" @> $1::jsonb',
+				[JSON.stringify([Number(userId)])],
+			);
+			for (const bu of blockedUsers) {
+				const rawBlock = Array.isArray(bu.block) ? bu.block : parseJsonSafe(bu.block, []);
+				const block = normalizeBlockList(rawBlock.filter((id) => Number(id) !== Number(userId)), bu.id);
+				await client.query('UPDATE users SET "block" = $2::jsonb WHERE id = $1', [bu.id, JSON.stringify(block)]);
+			}
+
+			await client.query('DELETE FROM sessions WHERE user_id = $1', [userId]);
+			await client.query('DELETE FROM bot_tokens WHERE user_id = $1', [userId]);
+			await client.query('DELETE FROM trusted_login_ips WHERE user_id = $1', [userId]);
+			await client.query('DELETE FROM login_approvals WHERE user_id = $1', [userId]);
+			await client.query('DELETE FROM account_recovery_requests WHERE user_id = $1', [userId]);
+			await client.query('DELETE FROM blocked_login_ips WHERE user_id = $1', [userId]);
+			await client.query('DELETE FROM push_subscriptions WHERE user_id = $1', [userId]);
+			await client.query('DELETE FROM moderation_reports WHERE reporter_user_id = $1', [userId]);
+			await client.query('DELETE FROM logs WHERE nyaitter_id = $1', [Number(userId)]);
+			const result = await client.query('DELETE FROM users WHERE id = $1', [userId]);
+			if (result.rowCount > 0) {
+				await client.query('INSERT INTO retired_user_ids (id) VALUES ($1) ON CONFLICT (id) DO NOTHING', [userId]);
+			}
+			return result.rowCount > 0;
+		});
+	}
+
+	async getAccountAttachmentKeys(userId) {
+		const { rows } = await this.pool.query(
+			'SELECT attachments FROM posts WHERE user_id = $1',
+			[Number(userId)],
+		);
+		const keys = new Set();
+		for (const row of rows) {
+			const attachments = Array.isArray(row.attachments) ? row.attachments : parseJsonSafe(row.attachments, []);
+			for (const attachment of attachments) {
+				const key = attachment?.id || attachment?.key;
+				if (typeof key === 'string' && key.startsWith('attachments/')) keys.add(key);
+			}
+		}
+		return [...keys];
+	}
+
+	// ==================== Sessions ====================
+
+	async createSession(userId, meta = {}) {
+		const token = typeof meta.token === 'string' && meta.token
+			? meta.token
+			: crypto.randomBytes(appConfig.auth.sessionTokenBytes).toString('hex');
+		const sessionId = typeof meta.sessionId === 'string' && meta.sessionId
+			? meta.sessionId
+			: crypto.randomBytes(16).toString('base64url');
+		const expiresAt = meta.expiresAt
+			? toIsoString(meta.expiresAt)
+			: new Date(Date.now() + appConfig.auth.sessionExpiryDays * 24 * 60 * 60 * 1000).toISOString();
+		const createdAt = new Date().toISOString();
+		const ipHash = meta.ipHash || null;
+		const ipMasked = meta.ipMasked || '不明なIPアドレス';
+		const userAgent = meta.userAgent || '不明な端末';
+
+		const { rows } = await this.pool.query(
+			`INSERT INTO sessions (session_id, token, user_id, expires_at, created_at, ip_hash, ip_masked, user_agent)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			 RETURNING *`,
+			[sessionId, token, Number(userId), expiresAt, createdAt, ipHash, ipMasked, userAgent],
+		);
+		return mapSession(rows[0]);
+	}
+
+	async getSessionByToken(token) {
+		if (!token) return null;
+		const now = new Date().toISOString();
+		const { rows } = await this.pool.query(
+			`SELECT * FROM sessions WHERE token = $1 AND expires_at > $2 LIMIT 1`,
+			[String(token), now],
+		);
+		if (!rows[0]) {
+			await this.pool.query('DELETE FROM sessions WHERE token = $1 AND expires_at <= $2', [String(token), now]);
+			return null;
+		}
+		return mapSession(rows[0]);
+	}
+
+	async getUserBySessionToken(token) {
+		if (!token) return null;
+		const now = new Date().toISOString();
+		const { rows } = await this.pool.query(
+			`SELECT u.*, s.token AS session_token, s.expires_at AS session_expires_at, s.session_id, s.ip_hash, s.ip_masked, s.user_agent
+			 FROM sessions AS s
+			 INNER JOIN users AS u ON u.id = s.user_id
+			 WHERE s.token = $1 AND s.expires_at > $2
+			 LIMIT 1`,
+			[String(token), now],
+		);
+		if (!rows[0]) return null;
+		return normalizeUserRow(rows[0]);
+	}
+
+	async getUsersAndSessionsByTokens(tokens) {
+		const safeTokens = [...new Set((tokens || []).map(String).filter(Boolean))];
+		if (safeTokens.length === 0) return [];
+		const now = new Date().toISOString();
+		const { rows } = await this.pool.query(
+			`SELECT u.*, s.token AS session_token, s.expires_at AS session_expires_at, s.session_id, s.ip_hash, s.ip_masked, s.user_agent
+			 FROM sessions AS s
+			 INNER JOIN users AS u ON u.id = s.user_id
+			 WHERE s.token = ANY($1::text[]) AND s.expires_at > $2`,
+			[safeTokens, now],
+		);
+		return rows.map((row) => ({
+			session: {
+				id: row.session_id,
+				token: row.session_token,
+				userId: Number(row.id),
+				expiresAt: toIsoString(row.session_expires_at),
+				ipHash: row.ip_hash || null,
+				ipMasked: row.ip_masked || '不明なIPアドレス',
+				userAgent: row.user_agent || '不明な端末',
+			},
+			user: normalizeUserRow(row),
+		}));
+	}
+
+	async invalidateSession(token) {
+		if (!token) return false;
+		const { rowCount } = await this.pool.query('DELETE FROM sessions WHERE token = $1', [String(token)]);
+		return rowCount > 0;
+	}
+
+	async invalidateUserSessionById(userId, sessionId) {
+		const now = new Date().toISOString();
+		const { rows } = await this.pool.query(
+			`DELETE FROM sessions
+			 WHERE user_id = $1 AND session_id = $2 AND expires_at > $3
+			 RETURNING token`,
+			[Number(userId), String(sessionId), now],
+		);
+		return rows[0]?.token || null;
+	}
+
+	async revokeUserSessionsBySessionId(userId, sessionId) {
+		return this._withTransaction(async (client) => {
+			const now = new Date().toISOString();
+			const { rows: targetRows } = await client.query(
+				`SELECT ip_hash FROM sessions WHERE user_id = $1 AND session_id = $2 AND expires_at > $3`,
+				[Number(userId), String(sessionId), now],
+			);
+			const target = targetRows[0];
+			if (!target) {
+				return { found: false, ipHash: null, tokens: [], invalidated: 0, trustRevoked: false };
+			}
+			const ipHash = target.ip_hash;
+			let trustRevoked = false;
+			let tokens = [];
+			let invalidated = 0;
+
+			if (ipHash) {
+				const revokedResult = await client.query(
+					'DELETE FROM trusted_login_ips WHERE user_id = $1 AND ip_hash = $2',
+					[Number(userId), ipHash],
+				);
+				trustRevoked = revokedResult.rowCount > 0;
+
+				const invalidatedResult = await client.query(
+					'DELETE FROM sessions WHERE user_id = $1 AND ip_hash = $2 RETURNING token',
+					[Number(userId), ipHash],
+				);
+				tokens = invalidatedResult.rows.map((r) => r.token);
+				invalidated = invalidatedResult.rowCount;
+			} else {
+				const singleDel = await client.query(
+					'DELETE FROM sessions WHERE user_id = $1 AND session_id = $2 RETURNING token',
+					[Number(userId), String(sessionId)],
+				);
+				tokens = singleDel.rows.map((r) => r.token);
+				invalidated = singleDel.rowCount;
+			}
+
+			return {
+				found: true,
+				ipHash,
+				tokens,
+				invalidated,
+				trustRevoked,
+			};
+		});
+	}
+
+	async getUserSessions(userId) {
+		const now = new Date().toISOString();
+		const { rows } = await this.pool.query(
+			`SELECT * FROM sessions WHERE user_id = $1 AND expires_at > $2 ORDER BY created_at DESC`,
+			[Number(userId), now],
+		);
+		return rows.map(mapSession);
+	}
+
+	async invalidateAllSessions(userId) {
+		const { rowCount } = await this.pool.query('DELETE FROM sessions WHERE user_id = $1', [Number(userId)]);
+		return Number(rowCount || 0);
+	}
+
+	async invalidateSessionsByIp(userId, ipHash) {
+		const { rowCount } = await this.pool.query(
+			'DELETE FROM sessions WHERE user_id = $1 AND ip_hash = $2',
+			[Number(userId), String(ipHash)],
+		);
+		return Number(rowCount || 0);
+	}
+
+	// ==================== Trusted Login IPs ====================
+
+	async trustLoginIp(userId, { ipHash, ipMasked }) {
+		const now = new Date().toISOString();
+		const { rows } = await this.pool.query(
+			`INSERT INTO trusted_login_ips (user_id, ip_hash, ip_masked, created_at, last_used_at)
+			 VALUES ($1, $2, $3, $4, $4)
+			 ON CONFLICT (user_id, ip_hash) DO UPDATE SET ip_masked = EXCLUDED.ip_masked, last_used_at = EXCLUDED.last_used_at
+			 RETURNING *`,
+			[Number(userId), String(ipHash), ipMasked || '不明なIPアドレス', now],
+		);
+		return {
+			userId: Number(rows[0].user_id),
+			ipHash: rows[0].ip_hash,
+			ipMasked: rows[0].ip_masked,
+			createdAt: toIsoString(rows[0].created_at),
+			lastUsedAt: toIsoString(rows[0].last_used_at),
+		};
+	}
+
+	async getTrustedLoginIp(userId, ipHash) {
+		const { rows } = await this.pool.query(
+			'SELECT * FROM trusted_login_ips WHERE user_id = $1 AND ip_hash = $2',
+			[Number(userId), String(ipHash)],
+		);
+		if (!rows[0]) return null;
+		return {
+			userId: Number(rows[0].user_id),
+			ipHash: rows[0].ip_hash,
+			ipMasked: rows[0].ip_masked,
+			createdAt: toIsoString(rows[0].created_at),
+			lastUsedAt: toIsoString(rows[0].last_used_at),
+		};
+	}
+
+	async countTrustedLoginIps(userId) {
+		const { rows } = await this.pool.query(
+			'SELECT COUNT(*)::int AS count FROM trusted_login_ips WHERE user_id = $1',
+			[Number(userId)],
+		);
+		return Number(rows[0]?.count || 0);
+	}
+
+	async revokeTrustedLoginIp(userId, ipHash) {
+		const { rowCount } = await this.pool.query(
+			'DELETE FROM trusted_login_ips WHERE user_id = $1 AND ip_hash = $2',
+			[Number(userId), String(ipHash)],
+		);
+		return rowCount > 0;
+	}
+
+	// ==================== Login Approvals ====================
+
+	async createLoginApproval(approvalData) {
+		const id = approvalData.id || crypto.randomUUID();
+		const now = new Date().toISOString();
+		const expiresAt = approvalData.expiresAt ? toIsoString(approvalData.expiresAt) : new Date(Date.now() + 10 * 60000).toISOString();
+		const { rows } = await this.pool.query(
+			`INSERT INTO login_approvals (id, user_id, ip_hash, ip_masked, user_agent, auth_provider, poll_token_hash, status, expires_at, created_at)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9)
+			 RETURNING *`,
+			[
+				id,
+				Number(approvalData.userId),
+				approvalData.ipHash || null,
+				approvalData.ipMasked || '不明なIPアドレス',
+				approvalData.userAgent || '不明な端末',
+				approvalData.authProvider ? String(approvalData.authProvider).toLowerCase() : null,
+				String(approvalData.pollTokenHash),
+				expiresAt,
+				now,
+			],
+		);
+		return mapLoginApproval(rows[0]);
+	}
+
+	async getLoginApproval(id) {
+		if (!id) return null;
+		const now = new Date().toISOString();
+		await this.pool.query(
+			"UPDATE login_approvals SET status = 'expired' WHERE id = $1 AND status = 'pending' AND expires_at <= $2",
+			[String(id), now],
+		);
+		const { rows } = await this.pool.query('SELECT * FROM login_approvals WHERE id = $1', [String(id)]);
+		return mapLoginApproval(rows[0]);
+	}
+
+	async getLoginApprovalByPollToken(id, pollTokenHash) {
+		if (!id || !pollTokenHash) return null;
+		const now = new Date().toISOString();
+		await this.pool.query(
+			"UPDATE login_approvals SET status = 'expired' WHERE id = $1 AND status = 'pending' AND expires_at <= $2",
+			[String(id), now],
+		);
+		const { rows } = await this.pool.query(
+			'SELECT * FROM login_approvals WHERE id = $1 AND poll_token_hash = $2',
+			[String(id), String(pollTokenHash)],
+		);
+		return mapLoginApproval(rows[0]);
+	}
+
+	async decideLoginApproval(userId, id, decision) {
+		const status = (decision === 'approve' || decision === 'approved') ? 'approved' : 'denied';
+		const now = new Date().toISOString();
+		const { rows } = await this.pool.query(
+			`UPDATE login_approvals SET status = $3, decided_at = $4
+			 WHERE id = $1 AND user_id = $2 AND status = 'pending' AND expires_at > $4
+			 RETURNING *`,
+			[String(id), Number(userId), status, now],
+		);
+		if (rows[0]) return mapLoginApproval(rows[0]);
+		const existing = await this.getLoginApproval(id);
+		return existing && Number(existing.userId) === Number(userId) ? existing : null;
+	}
+
+	async consumeLoginApproval(id, pollTokenHash) {
+		const now = new Date().toISOString();
+		const { rows } = await this.pool.query(
+			`UPDATE login_approvals SET status = 'consumed', consumed_at = $3
+			 WHERE id = $1 AND poll_token_hash = $2 AND status = 'approved' AND expires_at > $3
+			 RETURNING *`,
+			[String(id), String(pollTokenHash), now],
+		);
+		return mapLoginApproval(rows[0]);
+	}
+
+	// ==================== Account Recovery ====================
+
+	async createAccountRecoveryRequest(data) {
+		const id = data.id || crypto.randomUUID();
+		const now = new Date().toISOString();
+		const { rows } = await this.pool.query(
+			`INSERT INTO account_recovery_requests
+			 (id, user_id, ip_hash, ip_masked, user_agent, auth_provider, request_token_hash, status, trust_score, wait_until, started_at, last_notified_at, notified_count)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, 'waiting', $8, $9, $10, $10, 1)
+			 RETURNING *`,
+			[
+				id,
+				Number(data.userId),
+				String(data.ipHash),
+				data.ipMasked || '不明なIPアドレス',
+				data.userAgent || '不明な端末',
+				String(data.authProvider || '').toLowerCase(),
+				String(data.requestTokenHash),
+				Number(data.trustScore || 0),
+				toIsoString(data.waitUntil),
+				now,
+			],
+		);
+		return mapAccountRecovery(rows[0]);
+	}
+
+	async getAccountRecoveryRequest(id) {
+		if (!id) return null;
+		const { rows } = await this.pool.query('SELECT * FROM account_recovery_requests WHERE id = $1', [String(id)]);
+		return mapAccountRecovery(rows[0]);
+	}
+
+	async getAccountRecoveryRequestByToken(id, tokenHash) {
+		if (!id || !tokenHash) return null;
+		const { rows } = await this.pool.query(
+			'SELECT * FROM account_recovery_requests WHERE id = $1 AND request_token_hash = $2',
+			[String(id), String(tokenHash)],
+		);
+		return mapAccountRecovery(rows[0]);
+	}
+
+	async getActiveAccountRecoveryRequest(userId, ipHash) {
+		if (!ipHash) return null;
+		const { rows } = await this.pool.query(
+			`SELECT * FROM account_recovery_requests
+			 WHERE user_id = $1 AND ip_hash = $2 AND status = 'waiting'
+			 ORDER BY started_at DESC LIMIT 1`,
+			[Number(userId), String(ipHash)],
+		);
+		return mapAccountRecovery(rows[0]);
+	}
+
+	async getOpenAccountRecoveryRequest(userId) {
+		const { rows } = await this.pool.query(
+			`SELECT * FROM account_recovery_requests
+			 WHERE user_id = $1 AND status IN ('waiting', 'approved')
+			 ORDER BY started_at DESC LIMIT 1`,
+			[Number(userId)],
+		);
+		return mapAccountRecovery(rows[0]);
+	}
+
+	async rotateAccountRecoveryToken(id, tokenHash) {
+		const { rows } = await this.pool.query(
+			`UPDATE account_recovery_requests SET request_token_hash = $2
+			 WHERE id = $1 AND status = 'waiting'
+			 RETURNING *`,
+			[String(id), String(tokenHash)],
+		);
+		return mapAccountRecovery(rows[0]);
+	}
+
+	// 待機行の処理は 1 サイクル 50 件まで。D1 proxy と同じ上限にして、バックエンドごとに
+	// 自動承認の速さを変えない。
+	async listAccountRecoveryRequestsToNotify(cutoff) {
+		const { rows } = await this.pool.query(
+			`SELECT * FROM account_recovery_requests
+			 WHERE status = 'waiting' AND (last_notified_at IS NULL OR last_notified_at <= $1)
+			 ORDER BY started_at ASC
+			 LIMIT 50`,
+			[toIsoString(cutoff)],
+		);
+		return rows.map(mapAccountRecovery);
+	}
+
+	async markAccountRecoveryNotified(id, notifiedAt) {
+		await this.pool.query(
+			`UPDATE account_recovery_requests
+			 SET last_notified_at = $2, notified_count = notified_count + 1
+			 WHERE id = $1`,
+			[String(id), toIsoString(notifiedAt || new Date())],
+		);
+	}
+
+	async listDueAccountRecoveryRequests(now) {
+		const { rows } = await this.pool.query(
+			`SELECT * FROM account_recovery_requests
+			 WHERE status = 'waiting' AND wait_until <= $1
+			 ORDER BY wait_until ASC
+			 LIMIT 50`,
+			[toIsoString(now)],
+		);
+		return rows.map(mapAccountRecovery);
+	}
+
+	async decideAccountRecoveryRequest(userId, id, decision) {
+		if (decision !== 'approve' && decision !== 'block') return null;
+		const status = decision === 'approve' ? 'approved' : 'blocked';
+		const now = new Date().toISOString();
+		const { rows } = await this.pool.query(
+			`UPDATE account_recovery_requests SET status = $3, decided_at = $4, decided_by = 'user'
+			 WHERE id = $1 AND user_id = $2
+			   AND (status = 'waiting' OR (status = 'approved' AND $3 = 'blocked'))
+			 RETURNING *`,
+			[String(id), Number(userId), status, now],
+		);
+		if (rows[0]) return mapAccountRecovery(rows[0]);
+		const existing = await this.getAccountRecoveryRequest(id);
+		return existing && Number(existing.userId) === Number(userId) ? existing : null;
+	}
+
+	async expireAccountRecoveryRequest(id) {
+		const { rows } = await this.pool.query(
+			`UPDATE account_recovery_requests
+			 SET status = 'expired', decided_at = COALESCE(decided_at, NOW())
+			 WHERE id = $1 AND status = 'approved'
+			 RETURNING *`,
+			[String(id)],
+		);
+		return mapAccountRecovery(rows[0]);
+	}
+
+	async approveDueAccountRecoveryRequest(id, decidedBy = 'timeout') {
+		const now = new Date().toISOString();
+		const { rows } = await this.pool.query(
+			`UPDATE account_recovery_requests SET status = 'approved', decided_at = $2, decided_by = $3
+			 WHERE id = $1 AND status = 'waiting' AND wait_until <= $2
+			 RETURNING *`,
+			[String(id), now, String(decidedBy)],
+		);
+		return mapAccountRecovery(rows[0]);
+	}
+
+	async consumeAccountRecoveryRequest(id, tokenHash) {
+		const now = new Date().toISOString();
+		const { rows } = await this.pool.query(
+			`UPDATE account_recovery_requests SET status = 'consumed', consumed_at = $3
+			 WHERE id = $1 AND request_token_hash = $2 AND status = 'approved'
+			 RETURNING *`,
+			[String(id), String(tokenHash), now],
+		);
+		return mapAccountRecovery(rows[0]);
+	}
+
+	async blockLoginIp(userId, { ipHash, ipMasked, reason = null, sourceRecoveryId = null } = {}) {
+		if (!ipHash) throw new Error('ipHash is required');
+		const now = new Date().toISOString();
+		const { rows } = await this.pool.query(
+			`INSERT INTO blocked_login_ips (user_id, ip_hash, ip_masked, reason, source_recovery_id, created_at)
+			 VALUES ($1, $2, $3, $4, $5, $6)
+			 ON CONFLICT (user_id, ip_hash) DO UPDATE
+			   SET ip_masked = EXCLUDED.ip_masked, reason = EXCLUDED.reason, source_recovery_id = EXCLUDED.source_recovery_id
+			 RETURNING *`,
+			[Number(userId), String(ipHash), ipMasked || '不明なIPアドレス', reason, sourceRecoveryId, now],
+		);
+		return mapBlockedLoginIp(rows[0]);
+	}
+
+	async getBlockedLoginIp(userId, ipHash) {
+		if (!ipHash) return null;
+		const { rows } = await this.pool.query(
+			'SELECT * FROM blocked_login_ips WHERE user_id = $1 AND ip_hash = $2',
+			[Number(userId), String(ipHash)],
+		);
+		return mapBlockedLoginIp(rows[0]);
+	}
+
+	async listBlockedLoginIps(userId) {
+		const { rows } = await this.pool.query(
+			'SELECT * FROM blocked_login_ips WHERE user_id = $1 ORDER BY created_at DESC',
+			[Number(userId)],
+		);
+		return rows.map(mapBlockedLoginIp);
+	}
+
+	// 恒久ブロックは誤操作だと自己ロックアウトになり得るため、所有者が自分で解除できる経路を保つ。
+	async unblockLoginIp(userId, ipHash) {
+		if (!ipHash) return false;
+		const { rowCount } = await this.pool.query(
+			'DELETE FROM blocked_login_ips WHERE user_id = $1 AND ip_hash = $2',
+			[Number(userId), String(ipHash)],
+		);
+		return rowCount > 0;
+	}
+
+	// ==================== Bot Tokens ====================
+
+	async createBotToken(userId, tokenId, tokenHash, name) {
+		const now = new Date().toISOString();
+		const { rows } = await this.pool.query(
+			`INSERT INTO bot_tokens (token_id, user_id, token_hash, name, created_at)
+			 VALUES ($1, $2, $3, $4, $5)
+			 RETURNING *`,
+			[String(tokenId), Number(userId), String(tokenHash), String(name || ''), now],
+		);
+		return {
+			tokenId: rows[0].token_id,
+			userId: Number(rows[0].user_id),
+			tokenHash: rows[0].token_hash,
+			name: rows[0].name,
+			createdAt: toIsoString(rows[0].created_at),
+			lastUsedAt: toIsoString(rows[0].last_used_at),
+		};
+	}
+
+	async getBotTokenById(tokenId) {
+		if (!tokenId) return null;
+		const { rows } = await this.pool.query(
+			'SELECT * FROM bot_tokens WHERE token_id = $1',
+			[String(tokenId)],
+		);
+		if (!rows[0]) return null;
+		return {
+			tokenId: rows[0].token_id,
+			userId: Number(rows[0].user_id),
+			tokenHash: rows[0].token_hash,
+			name: rows[0].name,
+			createdAt: toIsoString(rows[0].created_at),
+			lastUsedAt: toIsoString(rows[0].last_used_at),
+		};
+	}
+
+	async getUserBotTokens(userId) {
+		const { rows } = await this.pool.query(
+			'SELECT token_id, name, created_at, last_used_at FROM bot_tokens WHERE user_id = $1 ORDER BY created_at DESC',
+			[Number(userId)],
+		);
+		return rows.map((r) => ({
+			tokenId: r.token_id,
+			name: r.name,
+			createdAt: toIsoString(r.created_at),
+			lastUsedAt: toIsoString(r.last_used_at),
+		}));
+	}
+
+	async revokeBotToken(userId, tokenId) {
+		const { rowCount } = await this.pool.query(
+			'DELETE FROM bot_tokens WHERE user_id = $1 AND token_id = $2',
+			[Number(userId), String(tokenId)],
+		);
+		return rowCount > 0;
+	}
+
+	async updateBotTokenLastUsed(tokenId) {
+		if (!tokenId) return;
+		const now = new Date().toISOString();
+		await this.pool.query(
+			'UPDATE bot_tokens SET last_used_at = $2 WHERE token_id = $1',
+			[String(tokenId), now],
+		);
+	}
+
+	// ==================== Authorized Apps (NyaitterAuth) ====================
+
+	async createAuthorizedApp(userId, appId, appTokenHash, appName, appIconUrl, scopes, accessTokenId = null, accessTokenHash = null) {
+		const now = new Date().toISOString();
+		const scopesJson = JSON.stringify(Array.isArray(scopes) ? scopes : []);
+		const { rows } = await this.pool.query(
+			`INSERT INTO authorized_apps (user_id, app_id, app_token_hash, app_name, app_icon_url, scopes, access_token_id, access_token_hash, created_at, updated_at)
+			 VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $9)
+			 ON CONFLICT (user_id, app_id, app_token_hash)
+			 DO UPDATE SET
+			   app_name = EXCLUDED.app_name,
+			   app_icon_url = EXCLUDED.app_icon_url,
+			   scopes = EXCLUDED.scopes,
+			   access_token_id = COALESCE(EXCLUDED.access_token_id, authorized_apps.access_token_id),
+			   access_token_hash = COALESCE(EXCLUDED.access_token_hash, authorized_apps.access_token_hash),
+			   updated_at = EXCLUDED.updated_at
+			 RETURNING *`,
+			[Number(userId), String(appId), String(appTokenHash), String(appName), appIconUrl ? String(appIconUrl) : null, scopesJson, accessTokenId, accessTokenHash, now],
+		);
+		return this._mapAuthorizedApp(rows[0]);
+	}
+
+	async getAuthorizedAppByUserAndAppToken(userId, appId, appTokenHash) {
+		const { rows } = await this.pool.query(
+			'SELECT * FROM authorized_apps WHERE user_id = $1 AND app_id = $2 AND app_token_hash = $3',
+			[Number(userId), String(appId), String(appTokenHash)],
+		);
+		return this._mapAuthorizedApp(rows[0]);
+	}
+
+	async getAuthorizedAppByAccessTokenId(accessTokenId) {
+		if (!accessTokenId) return null;
+		const { rows } = await this.pool.query(
+			'SELECT * FROM authorized_apps WHERE access_token_id = $1',
+			[String(accessTokenId)],
+		);
+		return this._mapAuthorizedApp(rows[0]);
+	}
+
+	async getUserAuthorizedApps(userId) {
+		const { rows } = await this.pool.query(
+			'SELECT * FROM authorized_apps WHERE user_id = $1 ORDER BY created_at DESC',
+			[Number(userId)],
+		);
+		return rows.map((r) => this._mapAuthorizedApp(r));
+	}
+
+	async getAuthorizedAppById(id, userId = null) {
+		const query = userId !== null
+			? 'SELECT * FROM authorized_apps WHERE id = $1 AND user_id = $2'
+			: 'SELECT * FROM authorized_apps WHERE id = $1';
+		const params = userId !== null ? [String(id), Number(userId)] : [String(id)];
+		const { rows } = await this.pool.query(query, params);
+		return this._mapAuthorizedApp(rows[0]);
+	}
+
+	async updateAuthorizedAppScopes(id, userId, scopes, accessTokenId = null, accessTokenHash = null) {
+		const now = new Date().toISOString();
+		const scopesJson = JSON.stringify(Array.isArray(scopes) ? scopes : []);
+		const query = userId !== null
+			? `UPDATE authorized_apps
+			   SET scopes = $3::jsonb, access_token_id = $4, access_token_hash = $5, updated_at = $6
+			   WHERE id = $1 AND user_id = $2
+			   RETURNING *`
+			: `UPDATE authorized_apps
+			   SET scopes = $2::jsonb, access_token_id = $3, access_token_hash = $4, updated_at = $5
+			   WHERE id = $1
+			   RETURNING *`;
+		const params = userId !== null
+			? [String(id), Number(userId), scopesJson, accessTokenId, accessTokenHash, now]
+			: [String(id), scopesJson, accessTokenId, accessTokenHash, now];
+		const { rows } = await this.pool.query(query, params);
+		return this._mapAuthorizedApp(rows[0]);
+	}
+
+	async updateAuthorizedAppLastUsed(id) {
+		const now = new Date().toISOString();
+		await this.pool.query(
+			'UPDATE authorized_apps SET last_used_at = $2 WHERE id = $1',
+			[String(id), now],
+		);
+		return true;
+	}
+
+	async deleteAuthorizedApp(id, userId = null) {
+		const query = userId !== null
+			? 'DELETE FROM authorized_apps WHERE id = $1 AND user_id = $2'
+			: 'DELETE FROM authorized_apps WHERE id = $1';
+		const params = userId !== null ? [String(id), Number(userId)] : [String(id)];
+		const { rowCount } = await this.pool.query(query, params);
+		return (rowCount || 0) > 0;
+	}
+
+	_mapAuthorizedApp(row) {
+		if (!row) return null;
+		let parsedScopes = [];
+		if (Array.isArray(row.scopes)) {
+			parsedScopes = row.scopes;
+		} else if (typeof row.scopes === 'string') {
+			try { parsedScopes = JSON.parse(row.scopes); } catch (_) { parsedScopes = []; }
+		}
+		return {
+			id: row.id,
+			userId: Number(row.user_id),
+			appId: row.app_id,
+			appTokenHash: row.app_token_hash,
+			appName: row.app_name,
+			appIconUrl: row.app_icon_url || null,
+			scopes: Array.isArray(parsedScopes) ? parsedScopes : [],
+			accessTokenId: row.access_token_id || null,
+			accessTokenHash: row.access_token_hash || null,
+			createdAt: row.created_at,
+			updatedAt: row.updated_at,
+			lastUsedAt: row.last_used_at || null,
+		};
+	}
+
+	// ==================== Groups ====================
+
+	async createGroup(groupData) {
+		const now = groupData.createdAt ? toIsoString(groupData.createdAt) : new Date().toISOString();
+		const { rows } = await this.pool.query(
+			`INSERT INTO groups (id, owner_id, name, description, icon_data, header_image, visibility, created_at, updated_at)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8) RETURNING *`,
+			[
+				String(groupData.id), Number(groupData.ownerId), String(groupData.name || ''),
+				String(groupData.description || ''), groupData.iconData ?? null, groupData.headerImage ?? null,
+				String(groupData.visibility || 'open'), now,
+			],
+		);
+		return normalizeGroupRow(rows[0] || null);
+	}
+
+	async getGroupById(groupId) {
+		const { rows } = await this.pool.query(
+			`SELECT g.*, (
+				SELECT COUNT(*)::int FROM group_memberships gm
+				WHERE gm.group_id = g.id AND gm.status = 'active'
+			) AS member_count
+			FROM groups g WHERE g.id = $1 AND g.deleted_at IS NULL LIMIT 1`,
+			[String(groupId)],
+		);
+		return normalizeGroupRow(rows[0] || null);
+	}
+
+	async getGroupsByIds(groupIds) {
+		const ids = [...new Set((groupIds || []).map(String).filter(Boolean))];
+		if (ids.length === 0) return [];
+		const { rows } = await this.pool.query(
+			`SELECT g.*, (
+				SELECT COUNT(*)::int FROM group_memberships gm
+				WHERE gm.group_id = g.id AND gm.status = 'active'
+			) AS member_count
+			FROM groups g WHERE g.id = ANY($1::uuid[]) AND g.deleted_at IS NULL`,
+			[ids],
+		);
+		return rows.map((row) => normalizeGroupRow(row)).filter(Boolean);
+	}
+
+	async updateGroup(groupId, fields) {
+		const fieldMap = {
+			name: 'name', description: 'description', iconData: 'icon_data', icon_data: 'icon_data',
+			headerImage: 'header_image', header_image: 'header_image', visibility: 'visibility',
+		};
+		const sets = [];
+		const values = [];
+		const assigned = new Set();
+		for (const [key, column] of Object.entries(fieldMap)) {
+			if (fields[key] === undefined || assigned.has(column)) continue;
+			assigned.add(column);
+			values.push(fields[key] == null && ['icon_data', 'header_image'].includes(column) ? null : String(fields[key]));
+			sets.push(`${column} = $${values.length}`);
+		}
+		if (sets.length === 0) return this.getGroupById(groupId);
+		sets.push(`updated_at = NOW()`);
+		values.push(String(groupId));
+		const { rows } = await this.pool.query(
+			`UPDATE groups SET ${sets.join(', ')} WHERE id = $${values.length} AND deleted_at IS NULL RETURNING *`,
+			values,
+		);
+		if (rows[0]) {
+			this._groupBadgesCache?.clear();
+		}
+		return normalizeGroupRow(rows[0] || null);
+	}
+
+	async deleteGroup(groupId) {
+		return this._withTransaction(async (client) => {
+			const normalizedGroupId = String(groupId);
+			const { rows } = await client.query(
+				`UPDATE groups SET deleted_at = NOW(), updated_at = NOW()
+				 WHERE id = $1 AND deleted_at IS NULL RETURNING *`,
+				[normalizedGroupId],
+			);
+			if (!rows[0]) return null;
+
+			const { rows: postRows } = await client.query(
+				'SELECT id FROM posts WHERE group_id = $1 FOR UPDATE',
+				[normalizedGroupId],
+			);
+			const postIds = postRows.map((post) => Number(post.id));
+			if (postIds.length > 0) {
+				await client.query('UPDATE posts SET repost_to = NULL WHERE repost_to = ANY($1::int[])', [postIds]);
+				await client.query('DELETE FROM likes WHERE post_id = ANY($1::int[])', [postIds]);
+				await client.query('DELETE FROM stars WHERE post_id = ANY($1::int[])', [postIds]);
+				await client.query('DELETE FROM reposts WHERE post_id = ANY($1::int[])', [postIds]);
+				await client.query('DELETE FROM pinned_posts WHERE post_id = ANY($1::int[])', [postIds]);
+				await client.query('DELETE FROM posts WHERE id = ANY($1::int[])', [postIds]);
+				for (const pId of postIds) {
+					this._getPostCache()?.delete(pId);
+					this._getPostMetricsCache()?.delete(pId);
+				}
+			}
+
+			this._groupBadgesCache?.clear();
+			return normalizeGroupRow(rows[0]);
+		});
+	}
+
+	async transferGroupOwnership(groupId, newOwnerId) {
+		const { rows } = await this.pool.query(
+			`UPDATE groups SET owner_id = $1, updated_at = NOW()
+			 WHERE id = $2 AND deleted_at IS NULL RETURNING *`,
+			[Number(newOwnerId), String(groupId)],
+		);
+		this._groupBadgesCache?.delete(Number(newOwnerId));
+		return normalizeGroupRow(rows[0] || null);
+	}
+
+	async getGroupsByVisibility({ query = '', visibility = ['open', 'open_invite'], limit = 20, offset = 0 } = {}) {
+		const safeLimit = Math.max(1, Math.min(Number(limit) || 20, 100));
+		const safeOffset = Math.max(0, Number(offset) || 0);
+		const visibilities = (Array.isArray(visibility) ? visibility : [visibility])
+			.map((item) => String(item || '').trim())
+			.filter(Boolean);
+		if (visibilities.length === 0) return [];
+		const values = [visibilities];
+		const clauses = ['g.deleted_at IS NULL', 'g.visibility = ANY($1::text[])'];
+		const normalizedQuery = String(query || '').trim().toLowerCase();
+		if (normalizedQuery) {
+			values.push(`%${normalizedQuery}%`);
+			clauses.push(`(LOWER(g.name) LIKE $${values.length} OR LOWER(g.description) LIKE $${values.length})`);
+		}
+		values.push(safeLimit, safeOffset);
+		const { rows } = await this.pool.query(
+			`SELECT g.*, (
+				SELECT COUNT(*)::int FROM group_memberships gm
+				WHERE gm.group_id = g.id AND gm.status = 'active'
+			) AS member_count
+			FROM groups g WHERE ${clauses.join(' AND ')}
+			ORDER BY g.created_at DESC, g.id DESC LIMIT $${values.length - 1} OFFSET $${values.length}`,
+			values,
+		);
+		return rows.map(normalizeGroupRow);
+	}
+
+	async getUserGroups(userId, { status = 'active', limit = 100, offset = 0 } = {}) {
+		const safeLimit = Math.max(1, Math.min(Number(limit) || 100, 200));
+		const safeOffset = Math.max(0, Number(offset) || 0);
+		const { rows } = await this.pool.query(
+			`SELECT g.*, gm.role_id AS membership_role_id, gm.status AS membership_status,
+				gm.joined_at AS membership_joined_at, (
+					SELECT COUNT(*)::int FROM group_memberships count_gm
+					WHERE count_gm.group_id = g.id AND count_gm.status = 'active'
+				) AS member_count
+			FROM group_memberships gm
+			JOIN groups g ON g.id = gm.group_id
+			WHERE gm.user_id = $1 AND gm.status = $2 AND g.deleted_at IS NULL
+			ORDER BY gm.joined_at DESC NULLS LAST, g.created_at DESC
+			LIMIT $3 OFFSET $4`,
+			[Number(userId), String(status), safeLimit, safeOffset],
+		);
+		return rows.map((row) => ({
+			...normalizeGroupRow(row),
+			membership: normalizeGroupMembershipRow({
+				group_id: row.id, user_id: userId, role_id: row.membership_role_id,
+				status: row.membership_status, joined_at: row.membership_joined_at,
+			}),
+		}));
+	}
+
+	async getMutualUserGroups(userId1, userId2, { limit = 100, offset = 0 } = {}) {
+		const u1 = Number(userId1);
+		const u2 = Number(userId2);
+		if (!Number.isSafeInteger(u1) || !Number.isSafeInteger(u2) || u1 <= 0 || u2 <= 0) return [];
+		if (u1 === u2) return this.getUserGroups(u1, { status: 'active', limit, offset });
+
+		const safeLimit = Math.max(1, Math.min(Number(limit) || 100, 200));
+		const safeOffset = Math.max(0, Number(offset) || 0);
+		const { rows } = await this.pool.query(
+			`SELECT g.*, (
+				SELECT COUNT(*)::int FROM group_memberships count_gm
+				WHERE count_gm.group_id = g.id AND count_gm.status = 'active'
+			) AS member_count
+			FROM groups g
+			JOIN group_memberships gm1 ON gm1.group_id = g.id AND gm1.user_id = $1 AND gm1.status = 'active'
+			JOIN group_memberships gm2 ON gm2.group_id = g.id AND gm2.user_id = $2 AND gm2.status = 'active'
+			WHERE g.deleted_at IS NULL
+			ORDER BY g.created_at DESC
+			LIMIT $3 OFFSET $4`,
+			[u1, u2, safeLimit, safeOffset],
+		);
+		return rows.map(normalizeGroupRow);
+	}
+
+	_getGroupBadgesCache() {
+		if (!this._groupBadgesCache) {
+			this._groupBadgesCache = new MemoryBoundedCache({
+				maxSize: 2000,
+				ttlMs: 30000,
+			});
+		}
+		return this._groupBadgesCache;
+	}
+
+	async getUsersGroupBadgesBatch(userIds) {
+		const result = new Map();
+		const ids = [...new Set((userIds || []).map(Number).filter(Number.isInteger))];
+		if (ids.length === 0) return result;
+
+		const cache = this._getGroupBadgesCache();
+		const missingIds = [];
+		for (const id of ids) {
+			const cached = cache?.get(id);
+			if (cached !== undefined) {
+				result.set(id, cached);
+			} else {
+				result.set(id, []);
+				missingIds.push(id);
+			}
+		}
+
+		if (missingIds.length === 0) return result;
+
+		const { rows } = await this.pool.query(
+			`WITH ranked_badges AS (
+				SELECT gm.user_id, g.id AS group_id, g.name, g.icon_data,
+				       ROW_NUMBER() OVER (
+				           PARTITION BY gm.user_id
+				           ORDER BY gm.joined_at DESC NULLS LAST, g.created_at DESC
+				       ) AS rn
+				FROM group_memberships gm
+				JOIN groups g ON g.id = gm.group_id
+				WHERE gm.user_id = ANY($1::int[])
+				  AND gm.status = 'active'
+				  AND g.deleted_at IS NULL
+				  AND g.icon_data IS NOT NULL
+				  AND g.icon_data <> ''
+				  AND g.visibility IN ('open', 'open_invite')
+			)
+			SELECT user_id, group_id, name, icon_data
+			FROM ranked_badges
+			WHERE rn <= 5
+			ORDER BY user_id, rn ASC`,
+			[missingIds],
+		);
+
+		for (const id of missingIds) {
+			result.set(id, []);
+		}
+		for (const row of rows) {
+			const userId = Number(row.user_id);
+			const list = result.get(userId) || [];
+			list.push({
+				id: String(row.group_id),
+				name: String(row.name || ''),
+				icon_data: row.icon_data,
+			});
+			result.set(userId, list);
+		}
+		for (const id of missingIds) {
+			cache?.set(id, result.get(id) || []);
+		}
+		return result;
+	}
+
+	async createGroupRole(roleData) {
+		const now = roleData.createdAt ? toIsoString(roleData.createdAt) : new Date().toISOString();
+		const { rows } = await this.pool.query(
+			`INSERT INTO group_roles (id, group_id, name, permissions, is_system, sort_order, created_at, updated_at)
+			 VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $7) RETURNING *`,
+			[
+				String(roleData.id), String(roleData.groupId), String(roleData.name || ''),
+				JSON.stringify(Array.isArray(roleData.permissions) ? roleData.permissions : []),
+				Boolean(roleData.isSystem), Number(roleData.sortOrder) || 0, now,
+			],
+		);
+		return normalizeGroupRoleRow(rows[0] || null);
+	}
+
+	async getGroupRoles(groupId) {
+		const { rows } = await this.pool.query(
+			`SELECT * FROM group_roles WHERE group_id = $1 ORDER BY sort_order ASC, name ASC, id ASC`,
+			[String(groupId)],
+		);
+		return rows.map(normalizeGroupRoleRow);
+	}
+
+	async updateGroupRole(roleId, fields) {
+		const fieldMap = { name: 'name', permissions: 'permissions', sortOrder: 'sort_order', sort_order: 'sort_order' };
+		const sets = [];
+		const values = [];
+		const assigned = new Set();
+		for (const [key, column] of Object.entries(fieldMap)) {
+			if (fields[key] === undefined || assigned.has(column)) continue;
+			assigned.add(column);
+			if (column === 'permissions') values.push(JSON.stringify(Array.isArray(fields[key]) ? fields[key] : []));
+			else if (column === 'sort_order') values.push(Number(fields[key]) || 0);
+			else values.push(String(fields[key] || ''));
+			sets.push(`${column} = $${values.length}${column === 'permissions' ? '::jsonb' : ''}`);
+		}
+		if (sets.length === 0) return null;
+		sets.push('updated_at = NOW()');
+		values.push(String(roleId));
+		const { rows } = await this.pool.query(
+			`UPDATE group_roles SET ${sets.join(', ')} WHERE id = $${values.length} RETURNING *`, values,
+		);
+		return normalizeGroupRoleRow(rows[0] || null);
+	}
+
+	async deleteGroupRole(roleId) {
+		const { rows } = await this.pool.query(`DELETE FROM group_roles WHERE id = $1 RETURNING *`, [String(roleId)]);
+		return normalizeGroupRoleRow(rows[0] || null);
+	}
+
+	async getGroupMembership(groupId, userId) {
+		const { rows } = await this.pool.query(
+			`SELECT * FROM group_memberships WHERE group_id = $1 AND user_id = $2 LIMIT 1`,
+			[String(groupId), Number(userId)],
+		);
+		return normalizeGroupMembershipRow(rows[0] || null);
+	}
+
+	async getGroupMemberships(groupId, { status = null, limit = 100, offset = 0 } = {}) {
+		const safeLimit = Math.max(1, Math.min(Number(limit) || 100, 200));
+		const safeOffset = Math.max(0, Number(offset) || 0);
+		const values = [String(groupId)];
+		let where = 'group_id = $1';
+		if (status) { values.push(String(status)); where += ` AND status = $${values.length}`; }
+		values.push(safeLimit, safeOffset);
+		const { rows } = await this.pool.query(
+			`SELECT * FROM group_memberships WHERE ${where}
+			 ORDER BY joined_at ASC NULLS LAST, user_id ASC LIMIT $${values.length - 1} OFFSET $${values.length}`,
+			values,
+		);
+		return rows.map(normalizeGroupMembershipRow);
+	}
+
+	async createGroupMembership(membershipData) {
+		const now = membershipData.updatedAt ? toIsoString(membershipData.updatedAt) : new Date().toISOString();
+		const joinedAt = membershipData.joinedAt ? toIsoString(membershipData.joinedAt) : null;
+		const { rows } = await this.pool.query(
+			`INSERT INTO group_memberships (group_id, user_id, role_id, status, joined_at, updated_at)
+			 VALUES ($1, $2, $3, $4, $5, $6)
+			 ON CONFLICT (group_id, user_id) DO UPDATE SET role_id = EXCLUDED.role_id, status = EXCLUDED.status,
+			 joined_at = EXCLUDED.joined_at, updated_at = EXCLUDED.updated_at RETURNING *`,
+			[String(membershipData.groupId), Number(membershipData.userId), membershipData.roleId ?? null,
+				String(membershipData.status || 'active'), joinedAt, now],
+		);
+		this._groupBadgesCache?.delete(Number(membershipData.userId));
+		return normalizeGroupMembershipRow(rows[0] || null);
+	}
+
+	async updateGroupMembership(groupId, userId, fields) {
+		const sets = [];
+		const values = [];
+		if (fields.roleId !== undefined || fields.role_id !== undefined) {
+			values.push(fields.roleId ?? fields.role_id ?? null); sets.push(`role_id = $${values.length}`);
+		}
+		if (fields.status !== undefined) { values.push(String(fields.status)); sets.push(`status = $${values.length}`); }
+		if (fields.joinedAt !== undefined || fields.joined_at !== undefined) {
+			values.push(toIsoString(fields.joinedAt ?? fields.joined_at)); sets.push(`joined_at = $${values.length}`);
+		}
+		if (sets.length === 0) return this.getGroupMembership(groupId, userId);
+		sets.push('updated_at = NOW()');
+		values.push(String(groupId), Number(userId));
+		const { rows } = await this.pool.query(
+			`UPDATE group_memberships SET ${sets.join(', ')} WHERE group_id = $${values.length - 1} AND user_id = $${values.length} RETURNING *`, values,
+		);
+		this._groupBadgesCache?.delete(Number(userId));
+		return normalizeGroupMembershipRow(rows[0] || null);
+	}
+
+	async createGroupInvite(inviteData) {
+		const now = inviteData.createdAt ? toIsoString(inviteData.createdAt) : new Date().toISOString();
+		const { rows } = await this.pool.query(
+			`INSERT INTO group_invites (id, group_id, inviter_id, invitee_id, status, created_at)
+			 VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+			[String(inviteData.id), String(inviteData.groupId), Number(inviteData.inviterId), Number(inviteData.inviteeId),
+				String(inviteData.status || 'pending'), now],
+		);
+		return normalizeGroupInviteRow(rows[0] || null);
+	}
+
+	async getGroupInvite(inviteId) {
+		const { rows } = await this.pool.query(`SELECT * FROM group_invites WHERE id = $1 LIMIT 1`, [String(inviteId)]);
+		return normalizeGroupInviteRow(rows[0] || null);
+	}
+
+	async getGroupInvites({ groupId = null, inviteeId = null, status = null, limit = 100, offset = 0 } = {}) {
+		const values = [];
+		const clauses = [];
+		if (groupId != null) { values.push(String(groupId)); clauses.push(`group_id = $${values.length}`); }
+		if (inviteeId != null) { values.push(Number(inviteeId)); clauses.push(`invitee_id = $${values.length}`); }
+		if (status != null) { values.push(String(status)); clauses.push(`status = $${values.length}`); }
+		if (clauses.length === 0) return [];
+		values.push(Math.max(1, Math.min(Number(limit) || 100, 200)), Math.max(0, Number(offset) || 0));
+		const { rows } = await this.pool.query(
+			`SELECT * FROM group_invites WHERE ${clauses.join(' AND ')} ORDER BY created_at DESC
+			 LIMIT $${values.length - 1} OFFSET $${values.length}`,
+			values,
+		);
+		return rows.map(normalizeGroupInviteRow);
+	}
+
+	async updateGroupInvite(inviteId, fields) {
+		const sets = [];
+		const values = [];
+		if (fields.status !== undefined) { values.push(String(fields.status)); sets.push(`status = $${values.length}`); }
+		if (fields.respondedAt !== undefined || fields.responded_at !== undefined) {
+			values.push(toIsoString(fields.respondedAt ?? fields.responded_at)); sets.push(`responded_at = $${values.length}`);
+		} else if (fields.status && fields.status !== 'pending') { sets.push('responded_at = NOW()'); }
+		if (sets.length === 0) return this.getGroupInvite(inviteId);
+		values.push(String(inviteId));
+		const { rows } = await this.pool.query(
+			`UPDATE group_invites SET ${sets.join(', ')} WHERE id = $${values.length} RETURNING *`, values,
+		);
+		return normalizeGroupInviteRow(rows[0] || null);
+	}
+
+	async createGroupJoinRequest(requestData) {
+		const now = requestData.createdAt ? toIsoString(requestData.createdAt) : new Date().toISOString();
+		const { rows } = await this.pool.query(
+			`INSERT INTO group_join_requests (id, group_id, user_id, status, created_at)
+			 VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+			[String(requestData.id), String(requestData.groupId), Number(requestData.userId), String(requestData.status || 'pending'), now],
+		);
+		return normalizeGroupJoinRequestRow(rows[0] || null);
+	}
+
+	async getGroupJoinRequest(requestId) {
+		const { rows } = await this.pool.query(`SELECT * FROM group_join_requests WHERE id = $1 LIMIT 1`, [String(requestId)]);
+		return normalizeGroupJoinRequestRow(rows[0] || null);
+	}
+
+	async getGroupJoinRequests({ groupId = null, userId = null, status = null, limit = 100, offset = 0 } = {}) {
+		const values = [];
+		const clauses = [];
+		if (groupId != null) { values.push(String(groupId)); clauses.push(`group_id = $${values.length}`); }
+		if (userId != null) { values.push(Number(userId)); clauses.push(`user_id = $${values.length}`); }
+		if (status != null) { values.push(String(status)); clauses.push(`status = $${values.length}`); }
+		if (clauses.length === 0) return [];
+		values.push(Math.max(1, Math.min(Number(limit) || 100, 200)), Math.max(0, Number(offset) || 0));
+		const { rows } = await this.pool.query(
+			`SELECT * FROM group_join_requests WHERE ${clauses.join(' AND ')} ORDER BY created_at DESC
+			 LIMIT $${values.length - 1} OFFSET $${values.length}`,
+			values,
+		);
+		return rows.map(normalizeGroupJoinRequestRow);
+	}
+
+	async updateGroupJoinRequest(requestId, fields) {
+		const sets = [];
+		const values = [];
+		if (fields.status !== undefined) { values.push(String(fields.status)); sets.push(`status = $${values.length}`); }
+		if (fields.reviewedBy !== undefined || fields.reviewed_by !== undefined) {
+			values.push(fields.reviewedBy ?? fields.reviewed_by ?? null); sets.push(`reviewed_by = $${values.length}`);
+		}
+		if (fields.reviewedAt !== undefined || fields.reviewed_at !== undefined) {
+			values.push(toIsoString(fields.reviewedAt ?? fields.reviewed_at)); sets.push(`reviewed_at = $${values.length}`);
+		} else if (fields.status && fields.status !== 'pending') { sets.push('reviewed_at = NOW()'); }
+		if (sets.length === 0) return this.getGroupJoinRequest(requestId);
+		values.push(String(requestId));
+		const { rows } = await this.pool.query(
+			`UPDATE group_join_requests SET ${sets.join(', ')} WHERE id = $${values.length} RETURNING *`, values,
+		);
+		return normalizeGroupJoinRequestRow(rows[0] || null);
+	}
+
+	async getGroupPostIds(groupId, { limit = 30, offset = 0, beforeId = null, authorId = null, subType = 'posts_only', order = 'latest', cursor = null, cursorCreatedAt = null, cursorId = null } = {}) {
+		if (order !== 'latest') { beforeId = null; cursor = null; cursorCreatedAt = null; cursorId = null; }
+		const safeLimit = Math.max(1, Math.min(Number(limit) || 30, 100));
+		const orderSql = order === 'oldest'
+			? 'created_at ASC, id ASC'
+			: order === 'recommended'
+				? '(COALESCE(like_count,0)*2 + COALESCE(star_count,0)*3 + COALESCE(repost_count,0)*4 + COALESCE(reply_count,0)) DESC, created_at DESC, id DESC'
+				: 'created_at DESC, id DESC';
+		const values = [String(groupId)];
+		const clauses = ['group_id = $1', subType === 'replies_only' ? 'reply_to IS NOT NULL' : 'reply_to IS NULL'];
+		if (authorId != null && authorId !== '' && Number.isInteger(Number(authorId)) && Number(authorId) >= 0) {
+			values.push(Number(authorId)); clauses.push(`user_id = $${values.length}`);
+		}
+		const decodedCursor = cursorCreatedAt && cursorId
+			? { createdAt: cursorCreatedAt, id: Number(cursorId) }
+			: (typeof cursor === 'string' && cursor.trim() ? decodePostCursor(cursor.trim()) : null);
+
+		if (decodedCursor) {
+			values.push(decodedCursor.createdAt, decodedCursor.id);
+			clauses.push(`(created_at, id) < ($${values.length - 1}, $${values.length})`);
+		} else if (Number.isInteger(Number(beforeId)) && Number(beforeId) > 0) {
+			values.push(Number(beforeId)); clauses.push(`id < $${values.length}`);
+		}
+		values.push(safeLimit + 1);
+		const limitIndex = values.length;
+		let offsetSql = '';
+		if (!decodedCursor && !clauses.some((clause) => clause.startsWith('id <'))) {
+			values.push(Math.max(0, Number(offset) || 0)); offsetSql = ` OFFSET $${values.length}`;
+		}
+		const { rows } = await this.pool.query(
+			`SELECT id, created_at FROM posts WHERE ${clauses.join(' AND ')} ORDER BY ${orderSql} LIMIT $${limitIndex}${offsetSql}`,
+			values,
+		);
+		const selectedRows = rows.slice(0, safeLimit);
+		const ids = selectedRows.map((row) => Number(row.id));
+		const lastRow = selectedRows.length > 0 ? selectedRows[selectedRows.length - 1] : null;
+		const nextCursor = order === 'latest' && rows.length > safeLimit && lastRow
+			? (encodePostCursor(lastRow) || ids[ids.length - 1])
+			: null;
+		return { ids, has_more: rows.length > safeLimit, next_cursor: nextCursor, use_offset_pagination: order !== 'latest' };
+	}
+
+	async getGroupAnnouncementPostIds(groupId, params = {}) {
+		const safeLimit = Math.max(1, Math.min(Number(params.limit) || 30, 100));
+		const values = [String(groupId)];
+		const clauses = ['group_id = $1', 'group_announcement = true'];
+		const decodedCursor = params.cursorCreatedAt && params.cursorId
+			? { createdAt: params.cursorCreatedAt, id: Number(params.cursorId) }
+			: (typeof params.cursor === 'string' && params.cursor.trim() ? decodePostCursor(params.cursor.trim()) : null);
+
+		if (decodedCursor) {
+			values.push(decodedCursor.createdAt, decodedCursor.id);
+			clauses.push(`(created_at, id) < ($${values.length - 1}, $${values.length})`);
+		} else if (Number.isInteger(Number(params.beforeId)) && Number(params.beforeId) > 0) {
+			values.push(Number(params.beforeId)); clauses.push(`id < $${values.length}`);
+		}
+		values.push(safeLimit + 1);
+		const limitIndex = values.length;
+		let offsetSql = '';
+		if (!decodedCursor && !clauses.some((clause) => clause.startsWith('id <'))) {
+			values.push(Math.max(0, Number(params.offset) || 0)); offsetSql = ` OFFSET $${values.length}`;
+		}
+		const { rows } = await this.pool.query(
+			`SELECT id, created_at FROM posts WHERE ${clauses.join(' AND ')} ORDER BY created_at DESC, id DESC LIMIT $${limitIndex}${offsetSql}`,
+			values,
+		);
+		const selectedRows = rows.slice(0, safeLimit);
+		const ids = selectedRows.map((row) => Number(row.id));
+		const lastRow = selectedRows.length > 0 ? selectedRows[selectedRows.length - 1] : null;
+		const nextCursor = rows.length > safeLimit && lastRow
+			? (encodePostCursor(lastRow) || ids[ids.length - 1])
+			: null;
+		return { ids, has_more: rows.length > safeLimit, next_cursor: nextCursor };
+	}
+
+	async searchGroupPostIds(userId, query, { limit = 30, offset = 0, beforeId = null, cursor = null, cursorCreatedAt = null, cursorId = null, searchFilters = null } = {}) {
+		const normalizedQuery = String(query || '').trim().toLowerCase();
+		if (!normalizedQuery && !searchFilters) return { ids: [], has_more: false, next_cursor: null };
+		const safeLimit = Math.max(1, Math.min(Number(limit) || 30, 100));
+		const values = searchFilters ? [Number(userId)] : [Number(userId), `%${normalizedQuery}%`];
+		const clauses = ['gm.user_id = $1', "gm.status = 'active'", 'p.group_id = gm.group_id', ...(searchFilters ? buildPostSearchSql(searchFilters, { values, alias: 'p' }).clauses : ['(LOWER(COALESCE(p.view_content, p.content)) LIKE $2 OR LOWER(p.content) LIKE $2)'])];
+		const decodedCursor = cursorCreatedAt && cursorId
+			? { createdAt: cursorCreatedAt, id: Number(cursorId) }
+			: (typeof cursor === 'string' && cursor.trim() ? decodePostCursor(cursor.trim()) : null);
+
+		if (decodedCursor) {
+			values.push(decodedCursor.createdAt, decodedCursor.id);
+			clauses.push(`(p.created_at < $${values.length - 1} OR (p.created_at = $${values.length - 1} AND p.id < $${values.length}))`);
+		} else if (Number.isInteger(Number(beforeId)) && Number(beforeId) > 0) {
+			values.push(Number(beforeId)); clauses.push(`p.id < $${values.length}`);
+		}
+		values.push(safeLimit + 1);
+		const limitIndex = values.length;
+		let offsetSql = '';
+		if (!decodedCursor && !clauses.some((clause) => clause.startsWith('p.id <'))) {
+			values.push(Math.max(0, Number(offset) || 0)); offsetSql = ` OFFSET $${values.length}`;
+		}
+		const { rows } = await this.pool.query(
+			`SELECT p.id, p.created_at FROM posts p JOIN group_memberships gm ON ${clauses.join(' AND ')}
+			 ORDER BY p.created_at DESC, p.id DESC LIMIT $${limitIndex}${offsetSql}`,
+			values,
+		);
+		const selectedRows = rows.slice(0, safeLimit);
+		const ids = selectedRows.map((row) => Number(row.id));
+		const lastRow = selectedRows.length > 0 ? selectedRows[selectedRows.length - 1] : null;
+		const nextCursor = rows.length > safeLimit && lastRow
+			? (encodePostCursor(lastRow) || ids[ids.length - 1])
+			: null;
+		return { ids, has_more: rows.length > safeLimit, next_cursor: nextCursor };
+	}
+
+	// ==================== Posts ====================
+
+	// ==================== Spaces ====================
+	async createSpace(spaceData) {
+		const now = spaceData.createdAt ? toIsoString(spaceData.createdAt) : new Date().toISOString();
+		const { rows } = await this.pool.query(
+			`INSERT INTO spaces (id, owner_id, name, description, icon_data, header_image, visibility, group_id, stage_settings, created_at, updated_at)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10) RETURNING *`,
+			[
+				String(spaceData.id), Number(spaceData.ownerId ?? spaceData.owner_id), String(spaceData.name || ''),
+				String(spaceData.description || ''), spaceData.iconData ?? spaceData.icon_data ?? null,
+				spaceData.headerImage ?? spaceData.header_image ?? null,
+				String(spaceData.visibility || 'public'), spaceData.groupId ?? spaceData.group_id ?? null,
+				spaceData.stage_settings ?? spaceData.stageSettings ?? null,
+				now,
+			],
+		);
+		return normalizeSpaceRow(rows[0] || null);
+	}
+
+	async getSpaceById(spaceId) {
+		const { rows } = await this.pool.query(
+			`SELECT s.*, (SELECT COUNT(*)::int FROM space_members sm WHERE sm.space_id = s.id) AS member_count
+			 FROM spaces s WHERE s.id = $1 LIMIT 1`,
+			[String(spaceId)],
+		);
+		return normalizeSpaceRow(rows[0] || null);
+	}
+
+	async updateSpace(spaceId, fields) {
+		const fieldMap = {
+			name: 'name', description: 'description',
+			iconData: 'icon_data', icon_data: 'icon_data',
+			headerImage: 'header_image', header_image: 'header_image', visibility: 'visibility',
+			groupId: 'group_id', group_id: 'group_id',
+			stage_settings: 'stage_settings',
+		};
+		const sets = [];
+		const values = [];
+		const assigned = new Set();
+		const nullableColumns = ['icon_data', 'header_image', 'group_id'];
+		for (const [key, column] of Object.entries(fieldMap)) {
+			if (fields[key] === undefined || assigned.has(column)) continue;
+			assigned.add(column);
+			values.push(fields[key] == null && nullableColumns.includes(column) ? null : String(fields[key]));
+			sets.push(`${column} = $${values.length}`);
+		}
+		if (sets.length === 0) return this.getSpaceById(spaceId);
+		sets.push('updated_at = NOW()');
+		values.push(String(spaceId));
+		const { rows } = await this.pool.query(
+			`UPDATE spaces SET ${sets.join(', ')} WHERE id = $${values.length} RETURNING *`,
+			values,
+		);
+		return normalizeSpaceRow(rows[0] || null);
+	}
+
+	async deleteSpace(spaceId) {
+		const { rowCount } = await this.pool.query('DELETE FROM spaces WHERE id = $1', [String(spaceId)]);
+		return Number(rowCount) > 0;
+	}
+
+	async listSpaces({ query = '', includePrivate = false, groupIds = null, limit = 20, offset = 0 } = {}) {
+		const safeLimit = Math.max(1, Math.min(Number(limit) || 20, 100));
+		const safeOffset = Math.max(0, Number(offset) || 0);
+		const groups = Array.isArray(groupIds) ? groupIds.map(String).filter(Boolean) : [];
+		const clauses = groups.length ? [] : includePrivate ? [] : ["s.visibility = 'public'"];
+		const values = [];
+		if (groups.length) {
+			values.push(groups);
+			clauses.push(`s.group_id::text = ANY($${values.length}::text[])`);
+		}
+		const normalizedQuery = String(query || '').trim().toLowerCase();
+		if (normalizedQuery) {
+			values.push(`%${normalizedQuery}%`);
+			clauses.push(`(LOWER(s.name) LIKE $${values.length} OR LOWER(s.description) LIKE $${values.length})`);
+		}
+		values.push(safeLimit, safeOffset);
+		const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+		const { rows } = await this.pool.query(
+			`SELECT s.*, (SELECT COUNT(*)::int FROM space_members sm WHERE sm.space_id = s.id) AS member_count
+			 FROM spaces s ${where}
+			 ORDER BY s.created_at DESC, s.id DESC LIMIT $${values.length - 1} OFFSET $${values.length}`,
+			values,
+		);
+		return rows.map(normalizeSpaceRow);
+	}
+
+	async listUserSpaces(userId, { limit = 50, offset = 0 } = {}) {
+		const safeLimit = Math.max(1, Math.min(Number(limit) || 50, 100));
+		const safeOffset = Math.max(0, Number(offset) || 0);
+		const { rows } = await this.pool.query(
+			`SELECT s.*, sm.role AS membership_role, sm.joined_at AS membership_joined_at,
+				(SELECT COUNT(*)::int FROM space_members count_sm WHERE count_sm.space_id = s.id) AS member_count
+			 FROM space_members sm JOIN spaces s ON s.id = sm.space_id
+			 WHERE sm.user_id = $1
+			 ORDER BY s.created_at DESC, s.id DESC LIMIT $2 OFFSET $3`,
+			[Number(userId), safeLimit, safeOffset],
+		);
+		return rows.map((row) => ({
+			...normalizeSpaceRow(row),
+			membership: normalizeSpaceMemberRow({
+				space_id: row.id, user_id: row.user_id ?? userId, role: row.membership_role, joined_at: row.membership_joined_at,
+			}),
+		}));
+	}
+
+	async countSpacesByOwner(ownerId) {
+		const { rows } = await this.pool.query('SELECT COUNT(*)::int AS count FROM spaces WHERE owner_id = $1', [Number(ownerId)]);
+		return Number(rows[0]?.count || 0);
+	}
+
+	async createSpaceChannel(channelData) {
+		const { rows } = await this.pool.query(
+			`INSERT INTO space_channels (id, space_id, name, kind, sort_order, created_at)
+			 VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+			[
+				String(channelData.id), String(channelData.spaceId ?? channelData.space_id),
+				String(channelData.name || ''), String(channelData.kind || 'text'),
+				Number(channelData.sortOrder ?? channelData.sort_order) || 0,
+				channelData.createdAt ? toIsoString(channelData.createdAt) : new Date().toISOString(),
+			],
+		);
+		return normalizeSpaceChannelRow(rows[0] || null);
+	}
+
+	async getSpaceChannel(channelId) {
+		const { rows } = await this.pool.query('SELECT * FROM space_channels WHERE id = $1 LIMIT 1', [String(channelId)]);
+		return normalizeSpaceChannelRow(rows[0] || null);
+	}
+
+	async listSpaceChannels(spaceId) {
+		const { rows } = await this.pool.query(
+			'SELECT * FROM space_channels WHERE space_id = $1 ORDER BY sort_order ASC, created_at ASC',
+			[String(spaceId)],
+		);
+		return rows.map(normalizeSpaceChannelRow);
+	}
+
+	async updateSpaceChannel(channelId, fields) {
+		const fieldMap = { name: 'name', kind: 'kind', sortOrder: 'sort_order', sort_order: 'sort_order' };
+		const sets = [];
+		const values = [];
+		const assigned = new Set();
+		for (const [key, column] of Object.entries(fieldMap)) {
+			if (fields[key] === undefined || assigned.has(column)) continue;
+			assigned.add(column);
+			values.push(column === 'sort_order' ? Number(fields[key]) || 0 : String(fields[key]));
+			sets.push(`${column} = $${values.length}`);
+		}
+		if (sets.length === 0) return this.getSpaceChannel(channelId);
+		values.push(String(channelId));
+		const { rows } = await this.pool.query(
+			`UPDATE space_channels SET ${sets.join(', ')} WHERE id = $${values.length} RETURNING *`,
+			values,
+		);
+		return normalizeSpaceChannelRow(rows[0] || null);
+	}
+
+	async deleteSpaceChannel(channelId) {
+		const { rowCount } = await this.pool.query('DELETE FROM space_channels WHERE id = $1', [String(channelId)]);
+		return Number(rowCount) > 0;
+	}
+
+	async createSpaceMember(memberData) {
+		const { rows } = await this.pool.query(
+			`INSERT INTO space_members (space_id, user_id, role, joined_at)
+			 VALUES ($1, $2, $3, $4)
+			 ON CONFLICT (space_id, user_id) DO UPDATE SET role = EXCLUDED.role
+			 RETURNING *`,
+			[
+				String(memberData.spaceId ?? memberData.space_id),
+				Number(memberData.userId ?? memberData.user_id),
+				String(memberData.role || 'member'),
+				memberData.joinedAt ? toIsoString(memberData.joinedAt) : new Date().toISOString(),
+			],
+		);
+		return normalizeSpaceMemberRow(rows[0] || null);
+	}
+
+	async getSpaceMember(spaceId, userId) {
+		const { rows } = await this.pool.query(
+			'SELECT * FROM space_members WHERE space_id = $1 AND user_id = $2 LIMIT 1',
+			[String(spaceId), Number(userId)],
+		);
+		return normalizeSpaceMemberRow(rows[0] || null);
+	}
+
+	async listSpaceMembers(spaceId, { limit = 100, offset = 0 } = {}) {
+		const safeLimit = Math.max(1, Math.min(Number(limit) || 100, 200));
+		const safeOffset = Math.max(0, Number(offset) || 0);
+		const { rows } = await this.pool.query(
+			'SELECT * FROM space_members WHERE space_id = $1 ORDER BY joined_at ASC LIMIT $2 OFFSET $3',
+			[String(spaceId), safeLimit, safeOffset],
+		);
+		return rows.map(normalizeSpaceMemberRow);
+	}
+
+	async deleteSpaceMember(spaceId, userId) {
+		const { rowCount } = await this.pool.query(
+			'DELETE FROM space_members WHERE space_id = $1 AND user_id = $2',
+			[String(spaceId), Number(userId)],
+		);
+		return Number(rowCount) > 0;
+	}
+
+	async updateSpaceMemberCount(spaceId) {
+		const { rows } = await this.pool.query(
+			`UPDATE spaces SET updated_at = NOW() WHERE id = $1
+			 RETURNING (SELECT COUNT(*)::int FROM space_members WHERE space_id = $1) AS member_count`,
+			[String(spaceId)],
+		);
+		return Number(rows[0]?.member_count || 0);
+	}
+
+	async createSpaceMessage(messageData) {
+		const { rows } = await this.pool.query(
+			`INSERT INTO space_messages (space_id, channel_id, user_id, content, created_at)
+			 VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+			[
+				String(messageData.spaceId ?? messageData.space_id),
+				String(messageData.channelId ?? messageData.channel_id),
+				Number(messageData.userId ?? messageData.user_id),
+				String(messageData.content || ''),
+				messageData.createdAt ? toIsoString(messageData.createdAt) : new Date().toISOString(),
+			],
+		);
+		return normalizeSpaceMessageRow(rows[0] || null);
+	}
+
+	async listSpaceMessages(channelId, { limit = 50, beforeId = null } = {}) {
+		const safeLimit = Math.max(1, Math.min(Number(limit) || 50, 100));
+		const values = [String(channelId), safeLimit];
+		let beforeClause = '';
+		if (beforeId != null && Number.isFinite(Number(beforeId))) {
+			values.push(Number(beforeId));
+			beforeClause = `AND id < $${values.length}`;
+		}
+		const { rows } = await this.pool.query(
+			`SELECT * FROM space_messages WHERE channel_id = $1 ${beforeClause}
+			 ORDER BY id DESC LIMIT $2`,
+			values,
+		);
+		return rows.map(normalizeSpaceMessageRow);
+	}
+
+	async getSpaceMessageById(messageId) {
+		const { rows } = await this.pool.query('SELECT * FROM space_messages WHERE id = $1 LIMIT 1', [Number(messageId)]);
+		return normalizeSpaceMessageRow(rows[0] || null);
+	}
+
+	async deleteSpaceMessage(messageId) {
+		const { rowCount } = await this.pool.query('DELETE FROM space_messages WHERE id = $1', [Number(messageId)]);
+		return Number(rowCount) > 0;
+	}
+
+	async createPost(postData) {
+		const now = postData.createdAt ? toIsoString(postData.createdAt) : new Date().toISOString();
+		const viewContent = postData.viewContent != null
+			? String(postData.viewContent)
+			: (postData.view_content != null ? String(postData.view_content) : extractViewContent(postData.content || ''));
+		const replyControl = String(postData.replyControl ?? postData.reply_control ?? 'everyone');
+		const hasExplicitId = postData.id != null && Number.isSafeInteger(Number(postData.id)) && Number(postData.id) > 0;
+
+		const values = [
+			Number(postData.userId),
+			String(postData.content || ''),
+			viewContent,
+			postData.attachments ? JSON.stringify(postData.attachments) : null,
+			Boolean(postData.mask),
+			Boolean(postData.lock),
+			Boolean(postData.announcement),
+			(postData.replyTo ?? postData.reply_to ?? postData.reply_id) ? Number(postData.replyTo ?? postData.reply_to ?? postData.reply_id) : null,
+			(postData.repostTo ?? postData.repost_to ?? postData.repost_id) ? Number(postData.repostTo ?? postData.repost_to ?? postData.repost_id) : null,
+			JSON.stringify(normalizePostTags(postData.tags)),
+			postData.tagsGeneratedAt ? toIsoString(postData.tagsGeneratedAt) : null,
+			postData.groupId ?? postData.group_id ?? null,
+			Boolean(postData.groupAnnouncement ?? postData.group_announcement),
+			replyControl,
+			now,
+			postData.scheduledAt ?? null,
+		];
+
+		const insertQuery = hasExplicitId
+			? `INSERT INTO posts (id, user_id, content, view_content, attachments, mask, lock, announcement, reply_to, repost_to, tags, tags_generated_at, group_id, group_announcement, reply_control, created_at, scheduled_at)
+			   VALUES ($17, $1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10::jsonb, $11, $12, $13, $14, $15, $16)
+			   RETURNING *`
+			: `INSERT INTO posts (user_id, content, view_content, attachments, mask, lock, announcement, reply_to, repost_to, tags, tags_generated_at, group_id, group_announcement, reply_control, created_at, scheduled_at)
+			   VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10::jsonb, $11, $12, $13, $14, $15, $16)
+			   RETURNING *`;
+
+		if (hasExplicitId) {
+			values.push(Number(postData.id));
+		}
+
+		const createdPost = await this._withTransaction(async (client) => {
+			const { rows } = await client.query(insertQuery, values);
+			const post = normalizePostRow(rows[0] || null);
+			if (post) {
+				const isScheduled = Boolean(post.scheduledAt ?? post.scheduled_at);
+				if (!isScheduled) {
+					await this.enqueuePostEvent(
+						'post.created',
+						{ postId: Number(post.id), userId: Number(post.userId) },
+						{ postId: Number(post.id), client },
+					);
+					// reply/repost カウント更新は公開時だけ行う。
+					await Promise.all([
+						post.replyTo
+							? client.query('UPDATE posts SET reply_count = reply_count + 1 WHERE id = $1', [Number(post.replyTo)])
+							: null,
+						post.repostTo
+							? client.query('UPDATE posts SET repost_count = repost_count + 1 WHERE id = $1', [Number(post.repostTo)])
+							: null,
+					].filter(Boolean));
+				}
+				if (!isScheduled && post.replyTo) {
+					const parentId = Number(post.replyTo);
+					const cachedParent = this._getPostCache()?.get(parentId);
+					if (cachedParent) {
+						const replyCount = (Number(cachedParent.reply_count ?? cachedParent.replyCount) || 0) + 1;
+						this._getPostCache()?.set(parentId, {
+							...cachedParent,
+							reply_count: replyCount,
+							replyCount,
+						});
+					}
+					const cachedMetrics = this._getPostMetricsCache()?.get(parentId);
+					if (cachedMetrics) {
+						this._updateCachedPostMetrics(parentId, {
+							reply_count: (Number(cachedMetrics.reply_count) || 0) + 1,
+						});
+					}
+				}
+				if (!isScheduled && post.repostTo) {
+					const parentId = Number(post.repostTo);
+					const cachedParent = this._getPostCache()?.get(parentId);
+					if (cachedParent) {
+						const repostCount = (Number(cachedParent.repost_count ?? cachedParent.repostCount) || 0) + 1;
+						this._getPostCache()?.set(parentId, {
+							...cachedParent,
+							repost_count: repostCount,
+							repostCount,
+						});
+					}
+					const cachedMetrics = this._getPostMetricsCache()?.get(parentId);
+					if (cachedMetrics) {
+						this._updateCachedPostMetrics(parentId, {
+							repost_count: (Number(cachedMetrics.repost_count) || 0) + 1,
+						});
+					}
+				}
+				this._getPostCache()?.set(post.id, post);
+			}
+			return post;
+		});
+		if (createdPost?.userId) {
+			this._invalidateProfileStatsCache(createdPost.userId);
+		}
+		return createdPost;
+	}
+
+	async processPostCreatedEvent(event) {
+		const postId = Number(event?.post_id ?? event?.payload?.postId);
+		if (!Number.isSafeInteger(postId) || postId <= 0) return;
+		const post = await this.getPostById(postId);
+		if (!post) return;
+		// 単発の UPDATE なので専用クライアントを確保せずプールに任せる。
+		await this._adjustUserKeywordAffinitiesForTags(this.pool, post.userId, post.tags, 1);
+	}
+
+	async enqueuePostEvent(eventType, payload, { postId = null, availableAt = null, client = null } = {}) {
+		const executor = client || this.pool;
+		const result = await executor.query(
+			`INSERT INTO post_events (event_type, post_id, payload, available_at)
+			 VALUES ($1, $2, $3::jsonb, COALESCE($4, NOW()))
+			 RETURNING *`,
+			[String(eventType), postId == null ? null : Number(postId), JSON.stringify(payload || {}), availableAt],
+		);
+		return result.rows[0] || null;
+	}
+
+	async claimPostEvents(limit = 50, workerId = null) {
+		const safeLimit = Math.max(1, Math.min(Number(limit) || 50, 500));
+		return this._withTransaction(async (client) => {
+			const { rows } = await client.query(
+				`WITH candidates AS (
+					SELECT id FROM post_events
+					WHERE (status = 'pending' AND available_at <= NOW())
+					   OR (status = 'processing' AND locked_at < NOW() - INTERVAL '60 seconds')
+					ORDER BY available_at ASC, id ASC
+					FOR UPDATE SKIP LOCKED
+					LIMIT $1
+				)
+				UPDATE post_events e
+				SET status = 'processing', attempts = e.attempts + 1,
+				    locked_at = NOW(), worker_id = $2
+				FROM candidates c
+				WHERE e.id = c.id
+				RETURNING e.*`,
+				[safeLimit, workerId == null ? null : String(workerId)],
+			);
+			return rows;
+		});
+	}
+
+	async completePostEvent(eventId) {
+		const result = await this.pool.query(
+			`UPDATE post_events
+			 SET status = 'completed', locked_at = NULL, processed_at = NOW(), last_error = NULL
+			 WHERE id = $1 AND status = 'processing'`,
+			[Number(eventId)],
+		);
+		return result.rowCount > 0;
+	}
+
+	async failPostEvent(eventId, error, retryAt = null) {
+		const result = await this.pool.query(
+			`UPDATE post_events
+			 SET status = CASE WHEN $2::timestamptz IS NULL THEN 'failed' ELSE 'pending' END,
+			     available_at = COALESCE($2::timestamptz, available_at), locked_at = NULL,
+			     last_error = LEFT($3, 2000)
+			 WHERE id = $1 AND status = 'processing'`,
+			[Number(eventId), toIsoString(retryAt), String(error?.message || error || 'Unknown error')],
+		);
+		return result.rowCount > 0;
+	}
+
+	_getPostCache() {
+		if (!this._postCache) {
+			const cacheCfg = appConfig.cache || {};
+			if (cacheCfg.postCacheEnabled !== false) {
+				this._postCache = new MemoryBoundedCache({
+					maxSize: cacheCfg.postCacheMaxSize || 1000,
+					ttlMs: cacheCfg.postCacheTtlMs || 1800000,
+					maxHeapMb: cacheCfg.memoryCacheMaxHeapMb || 0,
+				});
+			}
+		}
+		return this._postCache;
+	}
+
+	_getPostMetricsCache() {
+		if (!this._postMetricsCache) {
+			this._postMetricsCache = new MemoryBoundedCache({
+				maxSize: 4000,
+				ttlMs: 3600000,
+				maxHeapMb: appConfig.cache?.memoryCacheMaxHeapMb || 0,
+			});
+		}
+		return this._postMetricsCache;
+	}
+
+	_updateCachedPostMetrics(postId, metrics) {
+		const cache = this._getPostMetricsCache();
+		const normalizedPostId = Number(postId);
+		if (!Number.isSafeInteger(normalizedPostId) || !cache) return;
+		cache.updateWhere(
+			(_value, key) => Number(key) === normalizedPostId,
+			(value) => ({ ...value, ...metrics, post_id: normalizedPostId }),
+		);
+	}
+
+	_updateCachedPostReaction(postId, userId, type, active) {
+		const cache = this._getPostMetricsCache();
+		const normalizedPostId = Number(postId);
+		const normalizedUserId = Number(userId);
+		const cached = cache?.get(normalizedPostId);
+		if (!cached || !cached.reactionStateReady || !Number.isSafeInteger(normalizedUserId)) return;
+		const key = type === 'star' ? 'starredBy' : 'likedBy';
+		const users = new Set(cached[key] || []);
+		if (active) users.add(normalizedUserId);
+		else users.delete(normalizedUserId);
+		cache.set(normalizedPostId, { ...cached, [key]: [...users] });
+	}
+
+	async getPostById(id) {
+		if (id == null) return null;
+		const postId = Number(id);
+		if (!Number.isSafeInteger(postId) || postId <= 0) return null;
+
+		const cache = this._getPostCache();
+		const cached = cache?.get(postId);
+		if (cached) return cached;
+
+		const { rows } = await this.pool.query(
+			`SELECT p.*, u.id AS author_id, u.name AS author_name, u.scid AS author_scid, u.handle AS author_handle, u.icon_data AS author_icon_data, u.bio AS author_bio, u.header_image AS author_header_image, u.verify AS author_verify, u.admin AS author_admin, u.settings AS author_settings, u.block AS author_block, u.created_at AS author_created_at
+			 FROM posts p
+			 LEFT JOIN users u ON u.id = p.user_id
+			 WHERE p.id = $1`,
+			[postId],
+		);
+		const post = normalizePostRow(rows[0] || null);
+		if (post) {
+			if (post.author) this._setCachedUser(post.author);
+			cache?.set(postId, post);
+		}
+		return post;
+	}
+
+	async getPostsByIds(postIds) {
+		const ids = [...new Set((postIds || []).map(Number).filter(Number.isSafeInteger))];
+		if (ids.length === 0) return [];
+
+		const cache = this._getPostCache();
+		const postMap = new Map();
+		const missingIds = [];
+
+		for (const id of ids) {
+			const cached = cache?.get(id);
+			if (cached) {
+				postMap.set(id, cached);
+			} else {
+				missingIds.push(id);
+			}
+		}
+
+		if (missingIds.length > 0) {
+			const { rows } = await this.pool.query(
+				`SELECT p.*, u.id AS author_id, u.name AS author_name, u.scid AS author_scid, u.handle AS author_handle, u.icon_data AS author_icon_data, u.bio AS author_bio, u.header_image AS author_header_image, u.verify AS author_verify, u.admin AS author_admin, u.settings AS author_settings, u.block AS author_block, u.created_at AS author_created_at
+				 FROM posts p
+				 LEFT JOIN users u ON u.id = p.user_id
+				 WHERE p.id = ANY($1::int[])`,
+				[missingIds],
+			);
+			for (const row of rows) {
+				const post = normalizePostRow(row);
+				if (post) {
+					if (post.author) this._setCachedUser(post.author);
+					cache?.set(post.id, post);
+					postMap.set(post.id, post);
+				}
+			}
+		}
+
+		return ids.map((id) => postMap.get(id)).filter(Boolean);
+	}
+
+	/**
+	 * WITH RECURSIVE で 1 クエリで祖先ポストを全取得。
+	 * 返り値は [直接の親, ..., ルートポスト] の配列。
+	 * PostgreSQL・CockroachDB 両方互換。
+	 */
+	async getPostAncestors(postId, maxDepth = 20) {
+		const rootId = Number(postId);
+		if (!Number.isSafeInteger(rootId) || rootId <= 0) return [];
+		const limit = Math.min(50, Math.max(1, Number(maxDepth) || 20));
+
+		// WITH RECURSIVE: 起点を direct parent、JOIN で上方向に再帰
+		// p.* に depth 計算列を含める形ではなく、depth は CTE の独立列として管理し
+		// 外側 SELECT では posts の実カラムのみを取得
+		const { rows } = await this.pool.query(
+			`WITH RECURSIVE ancestors(post_id, anc_depth) AS (
+			   SELECT reply_to, 1
+			   FROM posts
+			   WHERE id = $1 AND reply_to IS NOT NULL
+			 UNION ALL
+			   SELECT p.reply_to, a.anc_depth + 1
+			   FROM posts p
+			   JOIN ancestors a ON p.id = a.post_id
+			   WHERE p.reply_to IS NOT NULL AND a.anc_depth < $2
+			 )
+			 SELECT p.*, u.id AS author_id, u.name AS author_name, u.scid AS author_scid, u.handle AS author_handle, u.icon_data AS author_icon_data, u.bio AS author_bio, u.header_image AS author_header_image, u.verify AS author_verify, u.admin AS author_admin, u.settings AS author_settings, u.block AS author_block, u.created_at AS author_created_at
+			 FROM posts p
+			 JOIN ancestors a ON p.id = a.post_id
+			 LEFT JOIN users u ON u.id = p.user_id
+			 ORDER BY a.anc_depth`,
+			[rootId, limit],
+		);
+		const cache = this._getPostCache();
+		return rows.map((row) => {
+			const post = normalizePostRow(row);
+			if (post) {
+				if (post.author) this._setCachedUser(post.author);
+				cache?.set(post.id, post);
+			}
+			return post;
+		}).filter(Boolean);
+	}
+
+	async getPostReferencesByIds(postIds, maxDepth = 2) {
+		const rootIds = [...new Set((postIds || []).map(Number)
+			.filter((id) => Number.isSafeInteger(id) && id > 0))];
+		const normalizedMaxDepth = Math.min(4, Math.max(0, Number(maxDepth) || 0));
+		if (rootIds.length === 0) return [];
+
+		const cache = this._getPostCache();
+		const resolved = new Map();
+		let currentIds = rootIds;
+		let depth = 0;
+
+		while (currentIds.length > 0 && depth <= normalizedMaxDepth) {
+			const nextIds = new Set();
+			const uncachedIds = [];
+
+			for (const id of currentIds) {
+				if (resolved.has(id)) continue;
+				const cached = cache?.get(id);
+				if (cached) {
+					resolved.set(cached.id, cached);
+					if (depth < normalizedMaxDepth) {
+						if (cached.replyTo && !resolved.has(cached.replyTo)) nextIds.add(cached.replyTo);
+						if (cached.repostTo && !resolved.has(cached.repostTo)) nextIds.add(cached.repostTo);
+					}
+				} else {
+					uncachedIds.push(id);
+				}
+			}
+
+			if (uncachedIds.length > 0) {
+				const { rows } = await this.pool.query(
+					`SELECT p.*, u.id AS author_id, u.name AS author_name, u.scid AS author_scid, u.handle AS author_handle, u.icon_data AS author_icon_data, u.bio AS author_bio, u.header_image AS author_header_image, u.verify AS author_verify, u.admin AS author_admin, u.settings AS author_settings, u.block AS author_block, u.created_at AS author_created_at
+					 FROM posts p
+					 LEFT JOIN users u ON u.id = p.user_id
+					 WHERE p.id = ANY($1::int[])`,
+					[uncachedIds],
+				);
+				for (const row of rows) {
+					const post = normalizePostRow(row);
+					if (post) {
+						if (post.author) this._setCachedUser(post.author);
+						cache?.set(post.id, post);
+						resolved.set(post.id, post);
+						if (depth < normalizedMaxDepth) {
+							if (post.replyTo && !resolved.has(post.replyTo)) nextIds.add(post.replyTo);
+							if (post.repostTo && !resolved.has(post.repostTo)) nextIds.add(post.repostTo);
+						}
+					}
+				}
+			}
+
+			currentIds = [...nextIds];
+			depth += 1;
+		}
+
+		return Array.from(resolved.values());
+	}
+
+	async auditAndHealPostCounters(postId) {
+		const id = Number(postId);
+		if (!Number.isSafeInteger(id) || id <= 0) return null;
+
+		return this._withTransaction(async (client) => {
+			const { rows } = await client.query(
+				`UPDATE posts
+				 SET like_count = (SELECT COUNT(*)::int FROM likes WHERE post_id = $1),
+				     star_count = (SELECT COUNT(*)::int FROM stars WHERE post_id = $1),
+				     repost_count = (SELECT COUNT(*)::int FROM reposts WHERE post_id = $1),
+				     reply_count = (SELECT COUNT(*)::int FROM posts WHERE reply_to = $1)
+				 WHERE id = $1
+				 RETURNING *`,
+				[id],
+			);
+			const post = normalizePostRow(rows[0] || null);
+			if (post) {
+				this._getPostCache()?.set(post.id, post);
+			}
+			return post;
+		});
+	}
+
+	async auditAndHealUserCounters(userId) {
+		const id = Number(userId);
+		if (!Number.isSafeInteger(id) || id <= 0) return null;
+
+		const { rows } = await this.pool.query(
+			`SELECT
+				(SELECT COUNT(*)::bigint FROM follows WHERE following_id = $1) AS follower_count,
+				(SELECT COUNT(*)::bigint FROM follows WHERE follower_id = $1) AS following_count,
+				(SELECT COUNT(*)::bigint FROM posts WHERE user_id = $1 AND repost_to IS NULL) AS post_count`,
+			[id],
+		);
+
+		return {
+			userId: id,
+			followerCount: Number(rows[0]?.follower_count || 0),
+			followingCount: Number(rows[0]?.following_count || 0),
+			postCount: Number(rows[0]?.post_count || 0),
+		};
+	}
+
+	async getPostMetricsBatch(postIds, currentUserId = null) {
+		const ids = [...new Set((postIds || []).map(Number)
+			.filter((id) => Number.isSafeInteger(id) && id > 0))];
+		if (ids.length === 0) return [];
+
+		const parsedViewerId = Number(currentUserId);
+		const viewerId = Number.isSafeInteger(parsedViewerId) && parsedViewerId > 0
+			? parsedViewerId
+			: null;
+
+		const metricsCache = this._getPostMetricsCache();
+		const metricsByPostId = new Map();
+		const missingIds = [];
+		const reactionOnlyIds = [];
+		for (const id of ids) {
+			const cached = metricsCache?.get(id);
+			if (cached && viewerId == null) {
+				metricsByPostId.set(id, {
+					...cached,
+					liked_by_me: false,
+					starred_by_me: false,
+				});
+			} else if (cached?.reactionStateReady) {
+				metricsByPostId.set(id, {
+					...cached,
+					liked_by_me: viewerId != null ? cached.likedBy?.includes(viewerId) : false,
+					starred_by_me: viewerId != null ? cached.starredBy?.includes(viewerId) : false,
+				});
+			} else if (cached?.countersReady && viewerId != null) {
+				metricsByPostId.set(id, {
+					...cached,
+					liked_by_me: false,
+					starred_by_me: false,
+				});
+				reactionOnlyIds.push(id);
+			} else {
+				missingIds.push(id);
+			}
+		}
+
+		if (reactionOnlyIds.length > 0) {
+			const reactionQuery = `SELECT p.id AS post_id,
+				(EXISTS (SELECT 1 FROM likes l_viewer WHERE l_viewer.post_id = p.id AND l_viewer.user_id = $2)) AS liked_by_me,
+				(EXISTS (SELECT 1 FROM stars s_viewer WHERE s_viewer.post_id = p.id AND s_viewer.user_id = $2)) AS starred_by_me
+				FROM posts p
+				WHERE p.id = ANY($1::int[])`;
+			const { rows: reactionRows } = await this.pool.query(reactionQuery, [reactionOnlyIds, viewerId]);
+			for (const row of reactionRows) {
+				const id = Number(row.post_id);
+				const current = metricsByPostId.get(id);
+				if (current) {
+					metricsByPostId.set(id, {
+						...current,
+						liked_by_me: Boolean(row.liked_by_me),
+						starred_by_me: Boolean(row.starred_by_me),
+					});
+				}
+			}
+		}
+		if (missingIds.length === 0) return ids.map((id) => metricsByPostId.get(id));
+
+		const viewerReactionColumns = viewerId == null
+			? `FALSE AS liked_by_me, FALSE AS starred_by_me`
+			: `(EXISTS (SELECT 1 FROM likes l_viewer WHERE l_viewer.post_id = p.id AND l_viewer.user_id = $2)) AS liked_by_me,
+				(EXISTS (SELECT 1 FROM stars s_viewer WHERE s_viewer.post_id = p.id AND s_viewer.user_id = $2)) AS starred_by_me`;
+		const query = `SELECT
+				p.id AS post_id,
+				COALESCE(p.like_count, 0)::int AS like_count,
+				COALESCE(p.star_count, 0)::int AS star_count,
+				COALESCE(p.repost_count, 0)::int AS repost_count,
+				COALESCE(p.reply_count, 0)::int AS reply_count,
+				${viewerReactionColumns}
+			   FROM posts p
+			   WHERE p.id = ANY($1::int[])`;
+
+		const params = viewerId == null ? [missingIds] : [missingIds, viewerId];
+		const { rows } = await this.pool.query(query, params);
+		const rowMap = new Map(rows.map((r) => [Number(r.post_id), r]));
+		for (const id of missingIds) {
+			const row = rowMap.get(id);
+			const value = {
+				post_id: id,
+				like_count: Math.max(0, Number(row?.like_count) || 0),
+				star_count: Math.max(0, Number(row?.star_count) || 0),
+				repost_count: Math.max(0, Number(row?.repost_count) || 0),
+				reply_count: Math.max(0, Number(row?.reply_count) || 0),
+				likedBy: [],
+				starredBy: [],
+				reactionStateReady: false,
+				countersReady: true,
+			};
+			metricsByPostId.set(id, {
+				...value,
+				liked_by_me: viewerId != null ? Boolean(row?.liked_by_me) : false,
+				starred_by_me: viewerId != null ? Boolean(row?.starred_by_me) : false,
+			});
+			metricsCache?.set(id, value);
+		}
+		return ids.map((id) => {
+			return metricsByPostId.get(id);
+		});
+	}
+
+	async getViewerPostReactions(postIds, currentUserId) {
+		const ids = [...new Set((postIds || []).map(Number)
+			.filter((id) => Number.isSafeInteger(id) && id > 0))];
+		const viewerId = Number(currentUserId);
+		if (ids.length === 0 || !Number.isSafeInteger(viewerId) || viewerId <= 0) return [];
+		const { rows } = await this.pool.query(
+			`SELECT requested.post_id,
+				EXISTS (SELECT 1 FROM likes WHERE post_id = requested.post_id AND user_id = $2) AS liked_by_me,
+				EXISTS (SELECT 1 FROM stars WHERE post_id = requested.post_id AND user_id = $2) AS starred_by_me
+			 FROM unnest($1::int[]) AS requested(post_id)`,
+			[ids, viewerId],
+		);
+		return rows;
+	}
+
+	async getDueScheduledPosts(now = new Date().toISOString(), limit = 100) {
+		const { rows } = await this.pool.query('SELECT id FROM posts WHERE scheduled_at IS NOT NULL AND scheduled_at <= $1 ORDER BY scheduled_at ASC LIMIT $2', [now, limit]);
+		return rows;
+	}
+
+	async publishScheduledPost(postId, now = new Date().toISOString()) {
+		return this._withTransaction(async client => {
+			const { rows } = await client.query('UPDATE posts SET scheduled_at = NULL, created_at = $2 WHERE id = $1 AND scheduled_at IS NOT NULL AND scheduled_at <= $2 RETURNING *', [Number(postId), now]);
+			const post = normalizePostRow(rows[0]);
+			if (!post) return null;
+			if (post.replyTo) await client.query('UPDATE posts SET reply_count = reply_count + 1 WHERE id = $1', [post.replyTo]);
+			if (post.repostTo) await client.query('UPDATE posts SET repost_count = repost_count + 1 WHERE id = $1', [post.repostTo]);
+			this._getPostCache()?.delete(Number(postId));
+			await this.enqueuePostEvent('post.created', { postId: Number(postId), userId: post.userId }, { postId: Number(postId), client });
+			return post;
+		});
+	}
+
+	async updatePost(postId, fields) {
+
+		const sets = [];
+		const values = [];
+		if (fields.content !== undefined) {
+			values.push(fields.content);
+			sets.push(`content = $${values.length}`);
+			const viewContent = fields.viewContent != null
+				? String(fields.viewContent)
+				: (fields.view_content != null ? String(fields.view_content) : extractViewContent(fields.content || ''));
+			values.push(viewContent);
+			sets.push(`view_content = $${values.length}`);
+		} else if (fields.viewContent !== undefined || fields.view_content !== undefined) {
+			const viewContent = String(fields.viewContent ?? fields.view_content ?? '');
+			values.push(viewContent);
+			sets.push(`view_content = $${values.length}`);
+		}
+		if (fields.tags !== undefined) {
+			values.push(JSON.stringify(normalizePostTags(fields.tags)));
+			sets.push(`tags = $${values.length}::jsonb`);
+		}
+		if (fields.tagsGeneratedAt !== undefined) {
+			values.push(fields.tagsGeneratedAt ? toIsoString(fields.tagsGeneratedAt) : null);
+			sets.push(`tags_generated_at = $${values.length}`);
+		}
+		if (fields.attachments !== undefined) {
+			values.push(fields.attachments ? JSON.stringify(fields.attachments) : null);
+			sets.push(`attachments = $${values.length}::jsonb`);
+		}
+		if (fields.mask !== undefined) {
+			values.push(Boolean(fields.mask));
+			sets.push(`mask = $${values.length}`);
+		}
+		if (fields.lock !== undefined) {
+			values.push(Boolean(fields.lock));
+			sets.push(`lock = $${values.length}`);
+		}
+		if (fields.age_rating !== undefined || fields.ageRating !== undefined) {
+			values.push(Number(fields.ageRating ?? fields.age_rating ?? 0) || 0);
+			sets.push(`age_rating = $${values.length}`);
+		}
+		if (fields.reply_control !== undefined || fields.replyControl !== undefined) {
+			values.push(String(fields.reply_control ?? fields.replyControl ?? 'everyone'));
+			sets.push(`reply_control = $${values.length}`);
+		}
+		if (sets.length === 0) {
+			return this.getPostById(postId);
+		}
+		return this._withTransaction(async (client) => {
+			const existingResult = await client.query(
+				'SELECT user_id, tags FROM posts WHERE id = $1 FOR UPDATE',
+				[Number(postId)],
+			);
+			const existing = existingResult.rows[0];
+			if (!existing) return null;
+			const updateValues = [...values, Number(postId)];
+			const { rows } = await client.query(
+				`UPDATE posts SET ${sets.join(', ')} WHERE id = $${updateValues.length} RETURNING *`,
+				updateValues,
+			);
+			const updated = normalizePostRow(rows[0] || null);
+			if (updated && fields.tags !== undefined) {
+				await this._adjustUserKeywordAffinitiesForTags(client, existing.user_id, existing.tags, -1);
+				await this._adjustUserKeywordAffinitiesForTags(client, existing.user_id, updated.tags, 1);
+			}
+			if (updated) {
+				this._getPostCache()?.set(updated.id, updated);
+			}
+			return updated;
+		});
+	}
+
+	async deletePost(postId, userId) {
+		const targetId = Number(postId);
+		this._getPostCache()?.delete(targetId);
+		this._getPostMetricsCache()?.delete(targetId);
+		return this._withTransaction(async (client) => {
+			const { rows } = await client.query('SELECT user_id, reply_to, repost_to FROM posts WHERE id = $1 FOR UPDATE', [targetId]);
+			if (!rows[0] || Number(rows[0].user_id) !== Number(userId)) {
+				return false;
+			}
+			const post = rows[0];
+			await client.query('DELETE FROM post_age_estimates WHERE post_id = $1', [targetId]);
+			if (post.reply_to) {
+				const parentId = Number(post.reply_to);
+				await client.query('UPDATE posts SET reply_count = GREATEST(0, reply_count - 1) WHERE id = $1', [parentId]);
+				const cachedParent = this._getPostCache()?.get(parentId);
+				if (cachedParent) {
+					const replyCount = Math.max(0, (Number(cachedParent.reply_count ?? cachedParent.replyCount) || 0) - 1);
+					this._getPostCache()?.set(parentId, { ...cachedParent, reply_count: replyCount, replyCount });
+				}
+				const cachedMetrics = this._getPostMetricsCache()?.get(parentId);
+				if (cachedMetrics) {
+					this._updateCachedPostMetrics(parentId, {
+						reply_count: Math.max(0, (Number(cachedMetrics.reply_count) || 0) - 1),
+					});
+				}
+			}
+			if (post.repost_to) {
+				const parentId = Number(post.repost_to);
+				await client.query('UPDATE posts SET repost_count = GREATEST(0, repost_count - 1) WHERE id = $1', [parentId]);
+				await client.query('DELETE FROM reposts WHERE user_id = $1 AND post_id = $2', [Number(userId), parentId]);
+				const cachedParent = this._getPostCache()?.get(parentId);
+				if (cachedParent) {
+					const repostCount = Math.max(0, (Number(cachedParent.repost_count ?? cachedParent.repostCount) || 0) - 1);
+					this._getPostCache()?.set(parentId, { ...cachedParent, repost_count: repostCount, repostCount });
+				}
+				const cachedMetrics = this._getPostMetricsCache()?.get(parentId);
+				if (cachedMetrics) {
+					this._updateCachedPostMetrics(parentId, {
+						repost_count: Math.max(0, (Number(cachedMetrics.repost_count) || 0) - 1),
+					});
+				}
+			}
+			await client.query('UPDATE posts SET repost_to = NULL WHERE repost_to = $1', [targetId]);
+			await client.query('DELETE FROM likes WHERE post_id = $1', [targetId]);
+			await client.query('DELETE FROM stars WHERE post_id = $1', [targetId]);
+			await client.query('DELETE FROM reposts WHERE post_id = $1', [targetId]);
+			await client.query('DELETE FROM pinned_posts WHERE post_id = $1', [targetId]);
+			const result = await client.query('DELETE FROM posts WHERE id = $1', [targetId]);
+			if (result.rowCount > 0 && userId) {
+				this._invalidateProfileStatsCache(userId);
+			}
+			return result.rowCount > 0;
+		});
+	}
+
+	async adminDeletePost(postId) {
+		const targetId = Number(postId);
+		this._getPostCache()?.delete(targetId);
+		this._getPostMetricsCache()?.delete(targetId);
+		let authorId = null;
+		return this._withTransaction(async (client) => {
+			const { rows } = await client.query('SELECT user_id, reply_to, repost_to FROM posts WHERE id = $1 FOR UPDATE', [targetId]);
+			if (rows[0]) {
+				const post = rows[0];
+				authorId = post.user_id ? Number(post.user_id) : null;
+				if (post.reply_to) {
+					const parentId = Number(post.reply_to);
+					await client.query('UPDATE posts SET reply_count = GREATEST(0, reply_count - 1) WHERE id = $1', [parentId]);
+					const cachedParent = this._getPostCache()?.get(parentId);
+					if (cachedParent) {
+						const replyCount = Math.max(0, (Number(cachedParent.reply_count ?? cachedParent.replyCount) || 0) - 1);
+						this._getPostCache()?.set(parentId, { ...cachedParent, reply_count: replyCount, replyCount });
+					}
+					const cachedMetrics = this._getPostMetricsCache()?.get(parentId);
+					if (cachedMetrics) {
+						this._updateCachedPostMetrics(parentId, {
+							reply_count: Math.max(0, (Number(cachedMetrics.reply_count) || 0) - 1),
+						});
+					}
+				}
+				if (post.repost_to) {
+					const parentId = Number(post.repost_to);
+					await client.query('UPDATE posts SET repost_count = GREATEST(0, repost_count - 1) WHERE id = $1', [parentId]);
+					if (post.user_id) {
+						await client.query('DELETE FROM reposts WHERE user_id = $1 AND post_id = $2', [Number(post.user_id), parentId]);
+					}
+					const cachedParent = this._getPostCache()?.get(parentId);
+					if (cachedParent) {
+						const repostCount = Math.max(0, (Number(cachedParent.repost_count ?? cachedParent.repostCount) || 0) - 1);
+						this._getPostCache()?.set(parentId, { ...cachedParent, repost_count: repostCount, repostCount });
+					}
+					const cachedMetrics = this._getPostMetricsCache()?.get(parentId);
+					if (cachedMetrics) {
+						this._updateCachedPostMetrics(parentId, {
+							repost_count: Math.max(0, (Number(cachedMetrics.repost_count) || 0) - 1),
+						});
+					}
+				}
+			}
+			await client.query('UPDATE posts SET repost_to = NULL WHERE repost_to = $1', [Number(postId)]);
+			await client.query('DELETE FROM likes WHERE post_id = $1', [Number(postId)]);
+			await client.query('DELETE FROM stars WHERE post_id = $1', [Number(postId)]);
+			await client.query('DELETE FROM reposts WHERE post_id = $1', [Number(postId)]);
+			await client.query('DELETE FROM pinned_posts WHERE post_id = $1', [Number(postId)]);
+			const result = await client.query('DELETE FROM posts WHERE id = $1', [Number(postId)]);
+			if (result.rowCount > 0 && authorId) {
+				this._invalidateProfileStatsCache(authorId);
+			}
+			return result.rowCount > 0;
+		});
+	}
+
+	async getRecentPosts(limit = 30) {
+		const safeLimit = Math.min(Math.max(Number(limit) || 30, 1), 100);
+		const { rows } = await this.pool.query(
+			`SELECT * FROM posts WHERE group_id IS NULL AND reply_to IS NULL ORDER BY created_at DESC, id DESC LIMIT $1`,
+			[safeLimit],
+		);
+		return rows.map(normalizePostRow);
+	}
+
+	async getPostsByUserId(userId, limit = 50, _currentUserId = null) {
+		const safeLimit = Math.min(Math.max(Number(limit) || 50, 1), 100);
+		const { rows } = await this.pool.query(
+			`SELECT * FROM posts WHERE user_id = $1 AND group_id IS NULL ORDER BY created_at DESC, id DESC LIMIT $2`,
+			[Number(userId), safeLimit],
+		);
+		return rows.map(normalizePostRow);
+	}
+
+	async getScheduledPostsByUser(userId, now = new Date().toISOString(), { limit = 50, offset = 0 } = {}) {
+		const safeLimit = Math.min(Math.max(Number(limit) || 50, 1), 100);
+		const safeOffset = Math.max(0, Number(offset) || 0);
+		const { rows } = await this.pool.query(
+			`SELECT * FROM posts WHERE user_id = $1 AND group_id IS NULL AND scheduled_at IS NOT NULL AND scheduled_at > $2 ORDER BY scheduled_at ASC LIMIT $3 OFFSET $4`,
+			[Number(userId), now, safeLimit, safeOffset],
+		);
+		return rows.map(normalizePostRow);
+	}
+
+	async getTimelinePosts(params = {}) {
+		const limit = Math.min(Math.max(Number(params.limit) || 30, 1), 100);
+		const posts = await this.getRecentPosts(limit);
+		return { posts, hasMore: posts.length === limit };
+	}
+
+	async getTimelinePostIds({ tab = 'foryou', followIds = [], viewerId = null, limit = 30, offset = 0, beforeId = null, cursor = null, cursorCreatedAt = null, cursorId = null } = {}) {
+		const normalizedLimit = Math.max(1, Math.min(Number(limit) || 30, 100));
+		const decodedCursor = cursorCreatedAt && cursorId
+			? { createdAt: cursorCreatedAt, id: Number(cursorId) }
+			: (typeof cursor === 'string' && cursor.trim() ? decodePostCursor(cursor.trim()) : null);
+		const normalizedOffset = (decodedCursor || (Number.isInteger(Number(beforeId)) && Number(beforeId) > 0))
+			? 0
+			: Math.max(0, Number(offset) || 0);
+		const normalizedBeforeId = Number.isInteger(Number(beforeId)) && Number(beforeId) > 0
+			? Number(beforeId)
+			: null;
+		const parsedViewerId = Number(viewerId);
+		const validViewerId = Number.isSafeInteger(parsedViewerId) && parsedViewerId > 0 ? parsedViewerId : null;
+		const authorSelect = `u.id AS author_id, u.name AS author_name, u.scid AS author_scid, u.handle AS author_handle, u.icon_data AS author_icon_data, u.bio AS author_bio, u.header_image AS author_header_image, u.verify AS author_verify, u.admin AS author_admin, u.settings AS author_settings, u.block AS author_block, u.created_at AS author_created_at`;
+		const outerSelect = validViewerId == null
+			? `p.*, ${authorSelect}`
+			: `p.*, ${authorSelect},
+				(EXISTS (SELECT 1 FROM likes l_viewer WHERE l_viewer.post_id = p.id AND l_viewer.user_id = ${validViewerId})) AS liked_by_me,
+				(EXISTS (SELECT 1 FROM stars s_viewer WHERE s_viewer.post_id = p.id AND s_viewer.user_id = ${validViewerId})) AS starred_by_me`;
+
+		const wrapCte = (innerQuery) => `
+			WITH top_posts AS (
+				${innerQuery}
+			)
+			SELECT ${outerSelect}
+			FROM top_posts p
+			LEFT JOIN users u ON u.id = p.user_id
+			ORDER BY p.created_at DESC, p.id DESC
+		`;
+
+		let query;
+		let values;
+
+		if (tab === 'following') {
+			if (validViewerId != null) {
+				if (decodedCursor) {
+					query = wrapCte(`SELECT p.* FROM posts p
+						WHERE p.group_id IS NULL AND p.reply_to IS NULL
+						  AND p.user_id IN (SELECT following_id FROM follows WHERE follower_id = $1)
+						  AND (p.created_at, p.id) < ($2, $3)
+						ORDER BY p.created_at DESC, p.id DESC LIMIT $4`);
+					values = [validViewerId, decodedCursor.createdAt, decodedCursor.id, normalizedLimit + 1];
+				} else if (normalizedBeforeId != null) {
+					query = wrapCte(`SELECT p.* FROM posts p
+						WHERE p.group_id IS NULL AND p.reply_to IS NULL
+						  AND p.user_id IN (SELECT following_id FROM follows WHERE follower_id = $1)
+						  AND p.id < $2
+						ORDER BY p.created_at DESC, p.id DESC LIMIT $3`);
+					values = [validViewerId, normalizedBeforeId, normalizedLimit + 1];
+				} else {
+					query = wrapCte(`SELECT p.* FROM posts p
+						WHERE p.group_id IS NULL AND p.reply_to IS NULL
+						  AND p.user_id IN (SELECT following_id FROM follows WHERE follower_id = $1)
+						ORDER BY p.created_at DESC, p.id DESC LIMIT $2 OFFSET $3`);
+					values = [validViewerId, normalizedLimit + 1, normalizedOffset];
+				}
+			} else {
+				const ids = [...new Set((followIds || []).map(Number).filter(Number.isSafeInteger))];
+				if (ids.length === 0) return { ids: [], posts: [], has_more: false, next_cursor: null };
+				if (decodedCursor) {
+					query = wrapCte(`SELECT p.* FROM posts p
+						WHERE p.user_id = ANY($1::int[]) AND p.group_id IS NULL AND p.reply_to IS NULL
+						  AND (p.created_at, p.id) < ($2, $3)
+						ORDER BY p.created_at DESC, p.id DESC LIMIT $4`);
+					values = [ids, decodedCursor.createdAt, decodedCursor.id, normalizedLimit + 1];
+				} else if (normalizedBeforeId != null) {
+					query = wrapCte(`SELECT p.* FROM posts p
+						WHERE p.user_id = ANY($1::int[]) AND p.group_id IS NULL AND p.reply_to IS NULL AND p.id < $2
+						ORDER BY p.created_at DESC, p.id DESC LIMIT $3`);
+					values = [ids, normalizedBeforeId, normalizedLimit + 1];
+				} else {
+					query = wrapCte(`SELECT p.* FROM posts p
+						WHERE p.user_id = ANY($1::int[]) AND p.group_id IS NULL AND p.reply_to IS NULL
+						ORDER BY p.created_at DESC, p.id DESC LIMIT $2 OFFSET $3`);
+					values = [ids, normalizedLimit + 1, normalizedOffset];
+				}
+			}
+		} else if (tab === 'announce') {
+			if (decodedCursor) {
+				query = wrapCte(`SELECT p.* FROM posts p
+					WHERE p.group_id IS NULL AND p.announcement = TRUE AND p.reply_to IS NULL
+					AND (p.created_at, p.id) < ($1, $2) ORDER BY p.created_at DESC, p.id DESC LIMIT $3`);
+				values = [decodedCursor.createdAt, decodedCursor.id, normalizedLimit + 1];
+			} else if (normalizedBeforeId != null) {
+				query = wrapCte(`SELECT p.* FROM posts p
+					WHERE p.group_id IS NULL AND p.announcement = TRUE AND p.reply_to IS NULL
+					AND p.id < $1 ORDER BY p.created_at DESC, p.id DESC LIMIT $2`);
+				values = [normalizedBeforeId, normalizedLimit + 1];
+			} else {
+				query = wrapCte(`SELECT p.* FROM posts p
+					WHERE p.group_id IS NULL AND p.announcement = TRUE AND p.reply_to IS NULL
+					ORDER BY p.created_at DESC, p.id DESC LIMIT $1 OFFSET $2`);
+				values = [normalizedLimit + 1, normalizedOffset];
+			}
+		} else if (validViewerId != null && decodedCursor) {
+			query = wrapCte(`SELECT p.* FROM posts p
+				WHERE p.reply_to IS NULL
+				  AND (p.group_id IS NULL OR EXISTS (
+					SELECT 1 FROM group_memberships gm
+					WHERE gm.group_id = p.group_id AND gm.user_id = $1 AND gm.status = 'active'
+				  ))
+				  AND (p.created_at, p.id) < ($2, $3) ORDER BY p.created_at DESC, p.id DESC LIMIT $4`);
+			values = [validViewerId, decodedCursor.createdAt, decodedCursor.id, normalizedLimit + 1];
+		} else if (validViewerId != null && normalizedBeforeId != null) {
+			query = wrapCte(`SELECT p.* FROM posts p
+				WHERE p.reply_to IS NULL
+				  AND (p.group_id IS NULL OR EXISTS (
+					SELECT 1 FROM group_memberships gm
+					WHERE gm.group_id = p.group_id AND gm.user_id = $1 AND gm.status = 'active'
+				  ))
+				  AND p.id < $2 ORDER BY p.created_at DESC, p.id DESC LIMIT $3`);
+			values = [validViewerId, normalizedBeforeId, normalizedLimit + 1];
+		} else if (validViewerId != null) {
+			query = wrapCte(`SELECT p.* FROM posts p
+				WHERE p.reply_to IS NULL
+				  AND (p.group_id IS NULL OR EXISTS (
+					SELECT 1 FROM group_memberships gm
+					WHERE gm.group_id = p.group_id AND gm.user_id = $1 AND gm.status = 'active'
+				  ))
+				ORDER BY p.created_at DESC, p.id DESC LIMIT $2 OFFSET $3`);
+			values = [validViewerId, normalizedLimit + 1, normalizedOffset];
+		} else if (decodedCursor) {
+			query = wrapCte(`SELECT p.* FROM posts p
+				WHERE p.group_id IS NULL AND p.reply_to IS NULL
+				AND (p.created_at, p.id) < ($1, $2) ORDER BY p.created_at DESC, p.id DESC LIMIT $3`);
+			values = [decodedCursor.createdAt, decodedCursor.id, normalizedLimit + 1];
+		} else if (normalizedBeforeId != null) {
+			query = wrapCte(`SELECT p.* FROM posts p
+				WHERE p.group_id IS NULL AND p.reply_to IS NULL AND p.id < $1 ORDER BY p.created_at DESC, p.id DESC LIMIT $2`);
+			values = [normalizedBeforeId, normalizedLimit + 1];
+		} else {
+			query = wrapCte(`SELECT p.* FROM posts p
+				WHERE p.group_id IS NULL AND p.reply_to IS NULL ORDER BY p.created_at DESC, p.id DESC LIMIT $1 OFFSET $2`);
+			values = [normalizedLimit + 1, normalizedOffset];
+		}
+
+		const { rows } = await this.pool.query(query, values);
+		const normalizedRows = rows.map(normalizePostRow);
+		for (const post of normalizedRows) {
+			if (post?.author) {
+				this._setCachedUser(post.author);
+			}
+		}
+		const posts = normalizedRows.slice(0, normalizedLimit);
+		const ids = posts.map((post) => Number(post.id));
+		const lastPost = posts.length > 0 ? posts[posts.length - 1] : null;
+		const nextCursor = rows.length > normalizedLimit && lastPost
+			? (encodePostCursor(lastPost) || ids[ids.length - 1])
+			: null;
+		return {
+			ids,
+			posts,
+			has_more: rows.length > normalizedLimit,
+			next_cursor: nextCursor,
+		};
+	}
+
+	async getRecommendedPostIds({ viewerId = null, limit = 30, offset = 0, beforeId = null, cursor = null, cursorCreatedAt = null, cursorId = null } = {}) {
+		const normalizedLimit = Math.max(1, Math.min(Number(limit) || 30, 100));
+		const decodedCursor = cursorCreatedAt && cursorId
+			? { createdAt: cursorCreatedAt, id: Number(cursorId) }
+			: (typeof cursor === 'string' && cursor.trim() ? decodePostCursor(cursor.trim()) : null);
+		const normalizedOffset = decodedCursor ? 0 : Math.max(0, Number(offset) || 0);
+		const normalizedBeforeId = Number.isInteger(Number(beforeId)) && Number(beforeId) > 0
+			? Number(beforeId)
+			: null;
+		const parsedViewerId = Number(viewerId);
+		const validViewerId = Number.isSafeInteger(parsedViewerId) && parsedViewerId > 0 ? parsedViewerId : null;
+
+		// Score a wider, bounded recent window. This keeps DB work predictable while
+		// giving personalization enough candidates to make a meaningful difference.
+		const candidateLimit = Math.min(800, Math.max(240, normalizedLimit * 8)) + 1;
+
+		if (!this._affinityCache) this._affinityCache = new Map();
+		if (!this._followCache) this._followCache = new Map();
+		if (!this._reactionCache) this._reactionCache = new Map();
+		if (!this._feedbackCache) this._feedbackCache = new Map();
+		if (!this._extendedFollowCache) this._extendedFollowCache = new Map();
+		if (!this._blockCache) this._blockCache = new Map();
+		if (!this._candidatePostsCache) this._candidatePostsCache = { posts: [], hasMore: false, expiresAt: 0 };
+		const now = Date.now();
+
+		let keywordProfile = new Map();
+		let directFollows = new Set();
+		let extendedFollows = new Set();
+		let reactedPostIds = new Set();
+		let dislikedPostIds = new Set();
+		let dislikedAuthors = new Set();
+		let dislikedAuthorCounts = new Map();
+		let negativeTagCounts = new Map();
+		let blockedAuthors = new Set();
+
+		if (validViewerId != null) {
+			const cachedAffinity = this._affinityCache.get(validViewerId);
+			const cachedFollows = this._followCache.get(validViewerId);
+			const cachedReactions = this._reactionCache.get(validViewerId);
+			const cachedFeedback = this._feedbackCache.get(validViewerId);
+			const cachedExtended = this._extendedFollowCache.get(validViewerId);
+			const cachedBlock = this._blockCache.get(validViewerId);
+
+			if (cachedAffinity && cachedAffinity.expiresAt > now) keywordProfile = cachedAffinity.profile;
+			if (cachedFollows && cachedFollows.expiresAt > now) directFollows = cachedFollows.follows;
+			if (cachedReactions && cachedReactions.expiresAt > now) reactedPostIds = cachedReactions.posts;
+			if (cachedFeedback && cachedFeedback.expiresAt > now) {
+				dislikedPostIds = cachedFeedback.postIds;
+				dislikedAuthors = cachedFeedback.authorIds;
+				dislikedAuthorCounts = cachedFeedback.authorCounts || new Map();
+				negativeTagCounts = cachedFeedback.tagCounts || new Map();
+			}
+			if (cachedExtended && cachedExtended.expiresAt > now) extendedFollows = cachedExtended.follows;
+			if (cachedBlock && cachedBlock.expiresAt > now) blockedAuthors = cachedBlock.blocks;
+
+			const needsAffinity = !cachedAffinity || cachedAffinity.expiresAt <= now;
+			const needsFollows = !cachedFollows || cachedFollows.expiresAt <= now;
+			const needsReactions = !cachedReactions || cachedReactions.expiresAt <= now;
+			const needsFeedback = !cachedFeedback || cachedFeedback.expiresAt <= now;
+			const needsExtended = !cachedExtended || cachedExtended.expiresAt <= now;
+			const needsBlock = !cachedBlock || cachedBlock.expiresAt <= now;
+
+			if (needsAffinity || needsFollows || needsReactions || needsFeedback || needsExtended || needsBlock) {
+				const [
+					affinityRows,
+					followRows,
+					reactionRows,
+					feedbackRows,
+					extendedRows,
+					viewer,
+				] = await Promise.all([
+					needsAffinity
+						? this.pool.query(
+							'SELECT keyword, score, updated_at FROM user_keyword_affinities WHERE user_id = $1 ORDER BY score DESC LIMIT 200',
+							[validViewerId],
+						)
+						: Promise.resolve({ rows: [] }),
+					needsFollows
+						? this.pool.query(
+							'SELECT following_id FROM follows WHERE follower_id = $1 ORDER BY created_at DESC LIMIT 500',
+							[validViewerId],
+						)
+						: Promise.resolve({ rows: [] }),
+					needsReactions
+						? this.pool.query(
+							`SELECT post_id FROM (
+								(SELECT post_id, created_at FROM likes WHERE user_id = $1 ORDER BY created_at DESC LIMIT 100)
+								UNION ALL
+								(SELECT post_id, created_at FROM stars WHERE user_id = $1 ORDER BY created_at DESC LIMIT 100)
+								UNION ALL
+								(SELECT post_id, created_at FROM reposts WHERE user_id = $1 ORDER BY created_at DESC LIMIT 100)
+							) _r`,
+							[validViewerId],
+						)
+						: Promise.resolve({ rows: [] }),
+					(needsFeedback && typeof this.getPostFeedbackForUser === 'function')
+						? this.getPostFeedbackForUser(validViewerId).catch(() => ({ postIds: [], authorIds: [] }))
+						: Promise.resolve(null),
+					needsExtended
+						? this.pool.query(
+							`SELECT DISTINCT f2.following_id AS user_id
+							 FROM follows f1
+							 JOIN follows f2 ON f2.follower_id = f1.following_id
+							 WHERE f1.follower_id = $1 AND f2.following_id <> $1
+							 LIMIT 1000`,
+							[validViewerId],
+						)
+						: Promise.resolve({ rows: [] }),
+					needsBlock
+						? this.getUserById(validViewerId).catch(() => null)
+						: Promise.resolve(null),
+				]);
+
+				if (needsAffinity) {
+					// 古い興味を自然に退役させるため updated_at で時間減衰（半減期14日）し、
+					// 減衰後の上位25件だけをプロファイルに残す。
+					keywordProfile = buildAffinityProfile(affinityRows.rows, { now, limit: 25 });
+					if (this._affinityCache.size >= 2000) this._affinityCache.clear();
+					this._affinityCache.set(validViewerId, { profile: keywordProfile, expiresAt: Date.now() + 60000 });
+				}
+				if (needsFollows) {
+					directFollows = new Set((followRows.rows || []).map((r) => Number(r.following_id)));
+					if (this._followCache.size >= 2000) this._followCache.clear();
+					this._followCache.set(validViewerId, { follows: directFollows, expiresAt: Date.now() + 60000 });
+				}
+				if (needsReactions) {
+					reactedPostIds = new Set((reactionRows.rows || []).map((r) => Number(r.post_id)));
+					if (this._reactionCache.size >= 2000) this._reactionCache.clear();
+					this._reactionCache.set(validViewerId, { posts: reactedPostIds, expiresAt: Date.now() + 60000 });
+				}
+				if (needsFeedback && feedbackRows) {
+					dislikedPostIds = new Set((feedbackRows.postIds || []).map(Number).filter(Number.isInteger));
+					dislikedAuthors = new Set((feedbackRows.authorIds || []).map(Number).filter(Number.isInteger));
+					dislikedAuthorCounts = feedbackRows.authorCounts instanceof Map ? feedbackRows.authorCounts : new Map();
+					negativeTagCounts = feedbackRows.tagCounts instanceof Map ? feedbackRows.tagCounts : new Map();
+					if (this._feedbackCache.size >= 2000) this._feedbackCache.clear();
+					this._feedbackCache.set(validViewerId, {
+						postIds: dislikedPostIds,
+						authorIds: dislikedAuthors,
+						authorCounts: dislikedAuthorCounts,
+						tagCounts: negativeTagCounts,
+						expiresAt: Date.now() + 60000,
+					});
+				}
+				if (needsExtended) {
+					extendedFollows = new Set((extendedRows.rows || []).map((r) => Number(r.user_id)));
+					if (this._extendedFollowCache.size >= 2000) this._extendedFollowCache.clear();
+					this._extendedFollowCache.set(validViewerId, { follows: extendedFollows, expiresAt: Date.now() + 60000 });
+				}
+				if (needsBlock) {
+					blockedAuthors = new Set(Array.isArray(viewer?.block) ? viewer.block.map(Number).filter(Number.isInteger) : []);
+					if (this._blockCache.size >= 2000) this._blockCache.clear();
+					this._blockCache.set(validViewerId, { blocks: blockedAuthors, expiresAt: Date.now() + 60000 });
+				}
+			}
+		}
+
+		// ブロック・「興味なし」著者を候補クエリの段階で除外し、候補枠の浪費を防ぐ。
+		// NOT IN はリテラル連結なので、フォロー補完チャネルと同じ300件上限でSQL自体を有界化する。
+		// 削れても採点側でブロック・嫌い著者は完全に除外されるため、これは候補確保の最適化に過ぎない。
+		const hardDislikedAuthors = [...dislikedAuthorCounts.entries()]
+			.filter(([, count]) => count >= 2)
+			.map(([id]) => id);
+		const excludedAuthorIds = [...new Set([...blockedAuthors, ...hardDislikedAuthors])]
+			.filter((id) => Number.isSafeInteger(id) && id > 0)
+			.slice(0, 300);
+		const exclusionSql = excludedAuthorIds.length > 0
+			? ` AND p.user_id NOT IN (${excludedAuthorIds.join(',')})`
+			: '';
+
+		let query;
+		let params;
+
+		if (validViewerId != null) {
+			if (decodedCursor) {
+				query = `SELECT p.id, p.user_id, p.created_at, p.tags,
+				          COALESCE(p.like_count, 0)::int AS like_count,
+				          COALESCE(p.star_count, 0)::int AS star_count,
+				          COALESCE(p.repost_count, 0)::int AS repost_count
+				   FROM posts p
+				   WHERE p.reply_to IS NULL AND p.user_id != $1
+				     AND (p.group_id IS NULL OR EXISTS (
+				       SELECT 1 FROM group_memberships gm
+				       WHERE gm.group_id = p.group_id AND gm.user_id = $1 AND gm.status = 'active'
+				     ))${exclusionSql}
+				     AND (p.created_at < $2 OR (p.created_at = $2 AND p.id < $3))
+				   ORDER BY p.created_at DESC, p.id DESC
+				   LIMIT $4`;
+				params = [validViewerId, decodedCursor.createdAt, decodedCursor.id, candidateLimit];
+			} else if (normalizedBeforeId != null) {
+				query = `SELECT p.id, p.user_id, p.created_at, p.tags,
+				          COALESCE(p.like_count, 0)::int AS like_count,
+				          COALESCE(p.star_count, 0)::int AS star_count,
+				          COALESCE(p.repost_count, 0)::int AS repost_count
+				   FROM posts p
+				   WHERE p.reply_to IS NULL AND p.user_id != $1 AND p.id < $2${exclusionSql}
+				     AND (p.group_id IS NULL OR EXISTS (
+				       SELECT 1 FROM group_memberships gm
+				       WHERE gm.group_id = p.group_id AND gm.user_id = $1 AND gm.status = 'active'
+				     ))
+				   ORDER BY p.created_at DESC, p.id DESC
+				   LIMIT $3`;
+				params = [validViewerId, normalizedBeforeId, candidateLimit];
+			} else {
+				query = `SELECT p.id, p.user_id, p.created_at, p.tags,
+				          COALESCE(p.like_count, 0)::int AS like_count,
+				          COALESCE(p.star_count, 0)::int AS star_count,
+				          COALESCE(p.repost_count, 0)::int AS repost_count
+				   FROM posts p
+				   WHERE p.reply_to IS NULL AND p.user_id != $1${exclusionSql}
+				     AND (p.group_id IS NULL OR EXISTS (
+				       SELECT 1 FROM group_memberships gm
+				       WHERE gm.group_id = p.group_id AND gm.user_id = $1 AND gm.status = 'active'
+				     ))
+				   ORDER BY p.created_at DESC, p.id DESC
+				   LIMIT $2 OFFSET $3`;
+				params = [validViewerId, candidateLimit, normalizedOffset];
+			}
+		} else if (decodedCursor) {
+			query = `SELECT p.id, p.user_id, p.created_at, p.tags,
+			          COALESCE(p.like_count, 0)::int AS like_count,
+			          COALESCE(p.star_count, 0)::int AS star_count,
+			          COALESCE(p.repost_count, 0)::int AS repost_count
+			   FROM posts p
+			   WHERE p.group_id IS NULL AND p.reply_to IS NULL
+			     AND (p.created_at < $1 OR (p.created_at = $1 AND p.id < $2))
+			   ORDER BY p.created_at DESC, p.id DESC
+			   LIMIT $3`;
+			params = [decodedCursor.createdAt, decodedCursor.id, candidateLimit];
+		} else if (normalizedBeforeId != null) {
+			query = `SELECT p.id, p.user_id, p.created_at, p.tags,
+			          COALESCE(p.like_count, 0)::int AS like_count,
+			          COALESCE(p.star_count, 0)::int AS star_count,
+			          COALESCE(p.repost_count, 0)::int AS repost_count
+			   FROM posts p
+			   WHERE p.group_id IS NULL AND p.reply_to IS NULL AND p.id < $1
+			   ORDER BY p.created_at DESC, p.id DESC
+			   LIMIT $2`;
+			params = [normalizedBeforeId, candidateLimit];
+		} else {
+			query = `SELECT p.id, p.user_id, p.created_at, p.tags,
+			          COALESCE(p.like_count, 0)::int AS like_count,
+			          COALESCE(p.star_count, 0)::int AS star_count,
+			          COALESCE(p.repost_count, 0)::int AS repost_count
+			   FROM posts p
+			   WHERE p.group_id IS NULL AND p.reply_to IS NULL
+			   ORDER BY p.created_at DESC, p.id DESC
+			   LIMIT $1 OFFSET $2`;
+			params = [candidateLimit, normalizedOffset];
+		}
+
+		let candidateRows = [];
+		let hasMore = false;
+
+		const candidateTask = (async () => {
+			if (validViewerId == null && !decodedCursor && normalizedBeforeId == null && normalizedOffset === 0 && this._candidatePostsCache.expiresAt > now && this._candidatePostsCache.posts.length > 0) {
+				candidateRows = this._candidatePostsCache.posts;
+				hasMore = this._candidatePostsCache.hasMore === true;
+			} else {
+				const { rows } = await this.pool.query(query, params);
+				hasMore = rows.length >= candidateLimit;
+				candidateRows = rows.slice(0, candidateLimit - 1);
+				if (validViewerId == null && !decodedCursor && normalizedBeforeId == null && normalizedOffset === 0) {
+					this._candidatePostsCache = { posts: candidateRows, hasMore, expiresAt: now + 30000 };
+				}
+			}
+		})();
+
+		const followChannelTask = (async () => {
+			// 直近窓だけでは取りこぼす「フォロー中ユーザーの投稿」を補完チャネルとして合流する。
+			if (validViewerId == null || decodedCursor || normalizedBeforeId != null || normalizedOffset !== 0) return [];
+			const followIds = [...directFollows].filter((id) => Number.isSafeInteger(id) && id > 0).slice(0, 300);
+			if (followIds.length === 0) return [];
+			const followLimit = Math.min(300, Math.max(60, Math.floor(candidateLimit / 2)));
+			try {
+				const { rows } = await this.pool.query(
+					`SELECT p.id, p.user_id, p.created_at, p.tags,
+					        COALESCE(p.like_count, 0)::int AS like_count,
+					        COALESCE(p.star_count, 0)::int AS star_count,
+					        COALESCE(p.repost_count, 0)::int AS repost_count
+					 FROM posts p
+					 WHERE p.group_id IS NULL AND p.reply_to IS NULL
+					   AND p.user_id = ANY($1::int[])
+					   AND p.created_at > NOW() - INTERVAL '30 days'
+					 ORDER BY p.created_at DESC, p.id DESC
+					 LIMIT $2`,
+					[followIds, followLimit],
+				);
+				return rows;
+			} catch (_) {
+				return [];
+			}
+		})();
+
+		const [, followedRows] = await Promise.all([candidateTask, followChannelTask]);
+		// 窓の境界は必ず主候補クエリの最古行で決める。補完チャネル（30日さかのぼり得る）を
+		// マージした後の末尾を使うと、次ページがその古い位置から再開して中間の投稿を巻き飛ばす。
+		const windowBoundaryRow = candidateRows.length > 0 ? candidateRows[candidateRows.length - 1] : null;
+		if (followedRows.length > 0) {
+			const merged = new Map();
+			for (const row of candidateRows) merged.set(Number(row.id), row);
+			for (const row of followedRows) {
+				if (!merged.has(Number(row.id))) merged.set(Number(row.id), row);
+			}
+			candidateRows = [...merged.values()]
+				.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime() || Number(b.id) - Number(a.id))
+				.slice(0, candidateLimit - 1);
+		}
+
+		// 年齢近接ボーナス用に、閲覧者と候補の投稿者の推定年齢をまとめて引く。
+		// 列が無い旧 DB 等で失敗しても、おすすめ自体は止めない。
+		let viewerAgeEstimate = null;
+		let authorAgeEstimates = new Map();
+		if (isAgeFeaturesActive(appConfig.autoMod) && validViewerId != null && candidateRows.length > 0) {
+			try {
+				const authorIds = [...new Set(candidateRows.map((row) => Number(row.user_id)).filter((id) => Number.isSafeInteger(id) && id > 0))];
+				const { rows: ageRows } = await this.pool.query(
+					'SELECT id, age_estimate FROM users WHERE id = ANY($1::int[])',
+					[[validViewerId, ...authorIds]],
+				);
+				authorAgeEstimates = new Map((ageRows || []).filter((row) => row.age_estimate != null).map((row) => [Number(row.id), Number(row.age_estimate)]));
+				viewerAgeEstimate = authorAgeEstimates.get(validViewerId) ?? null;
+				authorAgeEstimates.delete(validViewerId);
+			} catch (err) {
+				console.warn('[recommendations] Postgres age lookup failed:', err?.message || err);
+				viewerAgeEstimate = null;
+				authorAgeEstimates = new Map();
+			}
+		}
+
+		// 共通の採点ユーティリティで Node.js サーバー上で高速にスコアリングする。
+		const scored = scoreRecommendedPosts(candidateRows, {
+			viewerId: validViewerId,
+			keywordProfile,
+			directFollows,
+			extendedFollows,
+			reactedPostIds,
+			dislikedPostIds,
+			dislikedAuthorCounts,
+			negativeTagCounts,
+			blockedAuthors,
+			viewerAgeEstimate,
+			authorAgeEstimates,
+			now,
+			limit: normalizedLimit,
+		});
+
+		const selectedIds = scored.map((s) => s.id);
+		const lastCandidateId = windowBoundaryRow ? Number(windowBoundaryRow.id) : null;
+		return {
+			ids: selectedIds,
+			has_more: hasMore,
+			next_cursor: hasMore && lastCandidateId
+				? (encodePostCursor(windowBoundaryRow) || lastCandidateId)
+				: null,
+			next_offset: normalizedOffset + candidateRows.length,
+			use_offset_pagination: normalizedBeforeId == null && !decodedCursor,
+		};
+	}
+
+	async getProfilePostIds({ userId, subType = 'all', order = 'latest', limit = 30, offset = 0, beforeId = null, cursor = null, cursorCreatedAt = null, cursorId = null } = {}) {
+		if (order !== 'latest') { beforeId = null; cursor = null; cursorCreatedAt = null; cursorId = null; }
+		const normalizedLimit = Math.max(1, Math.min(Number(limit) || 30, 100));
+		const decodedCursor = cursorCreatedAt && cursorId
+			? { createdAt: cursorCreatedAt, id: Number(cursorId) }
+			: (typeof cursor === 'string' && cursor.trim() ? decodePostCursor(cursor.trim()) : null);
+		const normalizedOffset = decodedCursor ? 0 : Math.max(0, Number(offset) || 0);
+		const normalizedBeforeId = Number.isInteger(Number(beforeId)) && Number(beforeId) > 0
+			? Number(beforeId)
+			: null;
+		const values = [Number(userId)];
+		const orderSql = order === 'oldest' ? 'created_at ASC, id ASC' : order === 'recommended' ? '(COALESCE(like_count,0)*2 + COALESCE(star_count,0)*3 + COALESCE(repost_count,0)*4 + COALESCE(reply_count,0)) DESC, created_at DESC, id DESC' : 'created_at DESC, id DESC';
+		const clauses = ['user_id = $1', 'group_id IS NULL'];
+		if (subType === 'posts_only') clauses.push('reply_to IS NULL');
+		if (subType === 'replies_only') clauses.push('reply_to IS NOT NULL');
+		if (decodedCursor) {
+			values.push(decodedCursor.createdAt, decodedCursor.id);
+			clauses.push(`(created_at, id) < ($${values.length - 1}, $${values.length})`);
+		} else if (normalizedBeforeId != null) {
+			values.push(normalizedBeforeId);
+			clauses.push(`id < $${values.length}`);
+		}
+		values.push(normalizedLimit + 1);
+		const limitParam = values.length;
+		let offsetSql = '';
+		if (normalizedBeforeId == null && !decodedCursor) {
+			values.push(normalizedOffset);
+			offsetSql = ` OFFSET $${values.length}`;
+		}
+		const { rows } = await this.pool.query(
+			`SELECT * FROM posts WHERE ${clauses.join(' AND ')}
+			 ORDER BY ${orderSql} LIMIT $${limitParam}${offsetSql}`,
+			values,
+		);
+		const normalizedRows = rows.map(normalizePostRow).filter(Boolean);
+		const ids = normalizedRows.slice(0, normalizedLimit).map((post) => Number(post.id));
+		return {
+			ids,
+			use_offset_pagination: order !== 'latest',
+			posts: normalizedRows.slice(0, normalizedLimit),
+			has_more: rows.length > normalizedLimit,
+			next_cursor: order === 'latest' && rows.length > normalizedLimit && ids.length > 0
+				? (encodePostCursor(normalizedRows[normalizedLimit - 1]) || ids[ids.length - 1])
+				: null,
+		};
+	}
+
+	async searchPostIds(query, limit = 30, offset = 0, beforeId = null, _viewerId = null, options = {}) {
+		const q = String(query || '').trim();
+		if (!q && !options.searchFilters) return { ids: [], has_more: false, next_cursor: null };
+		const normalizedLimit = Math.max(1, Math.min(Number(limit) || 30, 100));
+		const decodedCursor = options?.cursorCreatedAt && options?.cursorId
+			? { createdAt: options.cursorCreatedAt, id: Number(options.cursorId) }
+			: (typeof options?.cursor === 'string' && options.cursor.trim() ? decodePostCursor(options.cursor.trim()) : null);
+		const normalizedOffset = decodedCursor ? 0 : Math.max(0, Number(offset) || 0);
+		const normalizedBeforeId = Number.isInteger(Number(beforeId)) && Number(beforeId) > 0
+			? Number(beforeId)
+			: null;
+
+		const pattern = `%${q}%`;
+		const values = options.searchFilters ? [] : [pattern];
+		const clauses = ['group_id IS NULL', ...(options.searchFilters
+			? buildPostSearchSql(options.searchFilters, { values }).clauses
+			: ['(view_content ILIKE $1 OR content ILIKE $1 OR tags::text ILIKE $1)'])];
+
+		if (decodedCursor) {
+			values.push(decodedCursor.createdAt, decodedCursor.id);
+			clauses.push(`(created_at, id) < ($${values.length - 1}, $${values.length})`);
+		} else if (normalizedBeforeId != null) {
+			values.push(normalizedBeforeId);
+			clauses.push(`id < $${values.length}`);
+		}
+
+		values.push(normalizedLimit + 1);
+		const limitIdx = values.length;
+
+		let offsetSql = '';
+		if (normalizedBeforeId == null && !decodedCursor && normalizedOffset > 0) {
+			values.push(normalizedOffset);
+			offsetSql = ` OFFSET $${values.length}`;
+		}
+
+		const sql = `SELECT id, created_at FROM posts WHERE ${clauses.join(' AND ')} ORDER BY created_at DESC, id DESC LIMIT $${limitIdx}${offsetSql}`;
+		const { rows } = await this.pool.query(sql, values);
+
+		const hasMore = rows.length > normalizedLimit;
+		const slice = rows.slice(0, normalizedLimit);
+		const ids = slice.map((r) => Number(r.id));
+		const lastRow = slice.length > 0 ? slice[slice.length - 1] : null;
+
+		return {
+			ids,
+			has_more: hasMore,
+			next_cursor: hasMore && lastRow
+				? (encodePostCursor({ id: Number(lastRow.id), created_at: lastRow.created_at }) || ids[ids.length - 1])
+				: null,
+		};
+	}
+
+	async searchPosts(query, limit = 20) {
+		const result = await this.searchPostIds(query, limit, 0);
+		if (!result.ids.length) return [];
+		const { rows } = await this.pool.query(
+			'SELECT * FROM posts WHERE id = ANY($1::int[])',
+			[result.ids],
+		);
+		const map = new Map(rows.map((r) => [Number(r.id), normalizePostRow(r)]));
+		return result.ids.map((id) => map.get(id)).filter(Boolean);
+	}
+
+	async getReplyPostIds(parentPostId, limit = 50, offset = 0, options = {}) {
+		const normalizedLimit = Math.max(1, Math.min(Number(limit) || 50, 100));
+		const cursor = options?.cursor || null;
+		const cursorCreatedAt = options?.cursorCreatedAt || null;
+		const cursorId = options?.cursorId || null;
+		const decodedCursor = cursorCreatedAt && cursorId
+			? { createdAt: cursorCreatedAt, id: Number(cursorId) }
+			: (typeof cursor === 'string' && cursor.trim() ? decodePostCursor(cursor.trim()) : null);
+
+		if (decodedCursor) {
+			const { rows } = await this.pool.query(
+				`SELECT id, created_at FROM posts
+				 WHERE reply_to = $1 AND (created_at, id) < ($2, $3)
+				 ORDER BY created_at DESC, id DESC LIMIT $4`,
+				[Number(parentPostId), decodedCursor.createdAt, decodedCursor.id, normalizedLimit + 1],
+			);
+			const selectedRows = rows.slice(0, normalizedLimit);
+			const ids = selectedRows.map((row) => Number(row.id));
+			const lastRow = selectedRows.length > 0 ? selectedRows[selectedRows.length - 1] : null;
+			const nextCursor = rows.length > normalizedLimit && lastRow
+				? (encodePostCursor(lastRow) || ids[ids.length - 1])
+				: null;
+			return {
+				ids,
+				has_more: rows.length > normalizedLimit,
+				next_cursor: nextCursor,
+			};
+		}
+
+		const normalizedOffset = Math.max(0, Number(offset) || 0);
+		const { rows } = await this.pool.query(
+			`SELECT id, created_at FROM posts WHERE reply_to = $1
+			 ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3`,
+			[Number(parentPostId), normalizedLimit + 1, normalizedOffset],
+		);
+		const selectedRows = rows.slice(0, normalizedLimit);
+		const ids = selectedRows.map((row) => Number(row.id));
+		const lastRow = selectedRows.length > 0 ? selectedRows[selectedRows.length - 1] : null;
+		const nextCursor = rows.length > normalizedLimit && lastRow
+			? (encodePostCursor(lastRow) || ids[ids.length - 1])
+			: null;
+		return {
+			ids,
+			has_more: rows.length > normalizedLimit,
+			next_cursor: nextCursor,
+		};
+	}
+
+	async getReplyCount(postId) {
+		const { rows } = await this.pool.query(
+			'SELECT COUNT(*)::int AS count FROM posts WHERE reply_to = $1',
+			[Number(postId)],
+		);
+		return Number(rows[0]?.count || 0);
+	}
+
+	async getThreadReplyPostIds(parentPostId, limit = 50, offset = 0) {
+		const normalizedLimit = Math.max(1, Math.min(Number(limit) || 50, 100));
+		const normalizedOffset = Math.max(0, Number(offset) || 0);
+		const { rows } = await this.pool.query(
+			`WITH RECURSIVE reply_tree AS (
+				SELECT id, reply_to, 0 AS depth, ARRAY[id] AS path
+				FROM posts
+				WHERE reply_to = $1
+				UNION ALL
+				SELECT child.id, child.reply_to, tree.depth + 1, tree.path || child.id
+				FROM posts child
+				JOIN reply_tree tree ON child.reply_to = tree.id
+				WHERE tree.depth < 10 AND NOT child.id = ANY(tree.path)
+			)
+			SELECT id FROM reply_tree
+			ORDER BY path
+			LIMIT $2 OFFSET $3`,
+			[Number(parentPostId), normalizedLimit + 1, normalizedOffset],
+		);
+		return {
+			ids: rows.slice(0, normalizedLimit).map((row) => Number(row.id)),
+			has_more: rows.length > normalizedLimit,
+		};
+	}
+
+	async getPostDetail(id, currentUserId = null) {
+		const { rows } = await this.pool.query(
+			`SELECT p.*,
+				author.id AS author_id,
+				author.name AS author_name,
+				author.scid AS author_scid,
+				author.handle AS author_handle,
+				author.icon_data AS author_icon_data,
+				author.bio AS author_bio,
+				author.header_image AS author_header_image,
+				author.verify AS author_verify,
+				author.admin AS author_admin,
+				author.settings AS author_settings,
+				author.block AS author_block,
+				author.created_at AS author_created_at,
+				parent.id AS parent_id,
+				parent.content AS parent_content,
+				parent_author.id AS parent_author_id,
+				parent_author.name AS parent_author_name
+			 FROM posts p
+			 LEFT JOIN users author ON author.id = p.user_id
+			 LEFT JOIN posts parent ON parent.id = p.reply_to
+			 LEFT JOIN users parent_author ON parent_author.id = parent.user_id
+			 WHERE p.id = $1`,
+			[Number(id)],
+		);
+		const detail = rows[0];
+		if (!detail) return null;
+		const [metric] = await this.getPostMetricsBatch([Number(id)], currentUserId);
+
+		const normalized = normalizePostRow(detail);
+		return {
+			...normalized,
+			author: normalized.author,
+			like_count: Number(metric?.like_count || 0),
+			star_count: Number(metric?.star_count || 0),
+			liked_by_me: Boolean(metric?.liked_by_me),
+			starred_by_me: Boolean(metric?.starred_by_me),
+			parent_post: detail.parent_id == null
+				? null
+				: {
+					id: Number(detail.parent_id),
+					content: detail.parent_content ? String(detail.parent_content).substring(0, 100) : '',
+					author: detail.parent_author_id == null
+						? null
+						: { id: Number(detail.parent_author_id), name: detail.parent_author_name || '' },
+				},
+		};
+	}
+
+	async getTrendingPosts(limit = 20) {
+		const safeLimit = Math.min(Math.max(Number(limit) || 20, 1), 100);
+		const { rows } = await this.pool.query(
+			`WITH recent_posts AS (
+				SELECT id, user_id, content, attachments, mask, lock, announcement, group_id, group_announcement, reply_to, repost_to, tags, tags_generated_at, created_at
+				FROM posts
+				WHERE group_id IS NULL
+				  AND reply_to IS NULL
+				  AND created_at >= NOW() - INTERVAL '3 days'
+				ORDER BY created_at DESC, id DESC
+				LIMIT 500
+			), like_agg AS (
+				SELECT l.post_id, COUNT(*)::int AS cnt
+				FROM likes l
+				JOIN recent_posts rp ON rp.id = l.post_id
+				WHERE l.created_at >= NOW() - INTERVAL '3 days'
+				GROUP BY l.post_id
+			), star_agg AS (
+				SELECT s.post_id, COUNT(*)::int AS cnt
+				FROM stars s
+				JOIN recent_posts rp ON rp.id = s.post_id
+				WHERE s.created_at >= NOW() - INTERVAL '3 days'
+				GROUP BY s.post_id
+			), repost_agg AS (
+				SELECT r.post_id, COUNT(*)::int AS cnt
+				FROM reposts r
+				JOIN recent_posts rp ON rp.id = r.post_id
+				WHERE r.created_at >= NOW() - INTERVAL '3 days'
+				GROUP BY r.post_id
+			)
+			SELECT rp.*,
+				(COALESCE(la.cnt, 0) + COALESCE(sa.cnt, 0) * 2 + COALESCE(ra.cnt, 0) * 3) AS score
+			FROM recent_posts rp
+			LEFT JOIN like_agg la ON la.post_id = rp.id
+			LEFT JOIN star_agg sa ON sa.post_id = rp.id
+			LEFT JOIN repost_agg ra ON ra.post_id = rp.id
+			ORDER BY score DESC, rp.created_at DESC, rp.id DESC
+			LIMIT $1`,
+			[safeLimit],
+		);
+		return rows.map(normalizePostRow);
+	}
+
+	async getTrendingHashtags(limit = 10, options = {}) {
+		const normalizedLimit = Math.max(1, Math.min(Number(limit) || 10, 50));
+		const { rows } = await this.pool.query(
+			`SELECT user_id, content, view_content, tags
+			 FROM posts
+			 WHERE group_id IS NULL
+			   AND created_at >= NOW() - INTERVAL '3 days'
+			 ORDER BY created_at DESC
+			 LIMIT 500`,
+		);
+		const hashtagUsers = new Map(); // tag -> Set<userId>
+		const tagUsers = new Map();     // tag -> Set<userId>
+		const wordUsers = new Map();    // word -> Set<userId>
+
+		for (const row of rows) {
+			const userId = row.user_id || 'anonymous';
+			const content = row.view_content || extractViewContent(row.content || '');
+			const hashtagMatches = content.match(/(?:#|＃)([\p{L}\p{N}_-]{1,48})/gu) || [];
+			const postHashtags = new Set(
+				hashtagMatches
+					.map((m) => m.replace(/^[#＃]/, '').toLowerCase())
+					.filter((tag) => tag.length > 2)
+			);
+
+			for (const tag of postHashtags) {
+				const fullTag = `#${tag}`;
+				if (!hashtagUsers.has(fullTag)) hashtagUsers.set(fullTag, new Set());
+				hashtagUsers.get(fullTag).add(userId);
+			}
+
+			const rawTags = Array.isArray(row.tags)
+				? row.tags
+				: (typeof row.tags === 'string' ? parseJsonSafe(row.tags, []) : []);
+			const postWords = new Set(
+				rawTags
+					.map((rawTag) => String(rawTag || '').trim().toLowerCase().replace(/^[#＃]/, ''))
+					.filter((tag) => tag.length > 2 && !postHashtags.has(tag))
+			);
+
+			for (const word of postWords) {
+				if (!wordUsers.has(word)) wordUsers.set(word, new Set());
+				wordUsers.get(word).add(userId);
+			}
+
+			// tags: 「単語より1段階広い範囲」
+			const sanitizedContent = content
+				.replace(/https?:\/\/[^\s]+/giu, ' ')
+				.replace(/@[\p{L}\p{N}_-]+/giu, ' ')
+				.replace(/[#＃][\p{L}\p{N}_-]+/gu, ' ');
+			const phraseMatches = sanitizedContent.match(/([\p{Script=Han}\p{Script=Katakana}a-zA-Z0-9_-]{2,10}(?:の[\p{Script=Han}\p{Script=Katakana}a-zA-Z0-9_-]{2,10}|[\p{Script=Han}\p{Script=Katakana}a-zA-Z0-9_-]{2,10}))/gu) || [];
+			const postCompoundTags = new Set(
+				phraseMatches
+					.map((p) => p.trim().toLowerCase().replace(/^[#＃]/, ''))
+					.filter((tag) => tag.length >= 3 && tag.length <= 30 && !postHashtags.has(tag) && !postWords.has(tag))
+			);
+
+			for (const tag of postCompoundTags) {
+				if (!tagUsers.has(tag)) tagUsers.set(tag, new Set());
+				tagUsers.get(tag).add(userId);
+			}
+		}
+
+		const calculateTagSimilarity = (str1, str2) => {
+			const s1 = String(str1 || '').trim().toLowerCase().replace(/^[#＃]/, '');
+			const s2 = String(str2 || '').trim().toLowerCase().replace(/^[#＃]/, '');
+			if (s1 === s2) return 1.0;
+			if (!s1 || !s2) return 0.0;
+
+			const len1 = s1.length;
+			const len2 = s2.length;
+			const maxLen = Math.max(len1, len2);
+			const minLen = Math.min(len1, len2);
+
+			const isSubstring = s1.includes(s2) || s2.includes(s1);
+			const substringSim = isSubstring ? minLen / maxLen : 0;
+
+			const d = Array.from({ length: len1 + 1 }, () => new Array(len2 + 1).fill(0));
+			for (let i = 0; i <= len1; i++) d[i][0] = i;
+			for (let j = 0; j <= len2; j++) d[0][j] = j;
+			for (let i = 1; i <= len1; i++) {
+				for (let j = 1; j <= len2; j++) {
+					const cost = s1[i - 1] === s2[j - 1] ? 0 : 1;
+					d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + cost);
+				}
+			}
+			const levSim = 1 - d[len1][len2] / maxLen;
+
+			let diceSim = 0;
+			if (len1 >= 2 && len2 >= 2) {
+				const bg1 = new Map();
+				for (let i = 0; i < len1 - 1; i++) {
+					const bg = s1.slice(i, i + 2);
+					bg1.set(bg, (bg1.get(bg) || 0) + 1);
+				}
+				const bg2 = new Map();
+				for (let i = 0; i < len2 - 1; i++) {
+					const bg = s2.slice(i, i + 2);
+					bg2.set(bg, (bg2.get(bg) || 0) + 1);
+				}
+				let intersection = 0;
+				for (const [bg, count1] of bg1.entries()) {
+					if (bg2.has(bg)) intersection += Math.min(count1, bg2.get(bg));
+				}
+				diceSim = (2 * intersection) / ((len1 - 1) + (len2 - 1));
+			}
+
+			return Math.max(substringSim, levSim, diceSim);
+		};
+
+		const mapToMergedSortedList = (userMap, threshold = 0.75) => {
+			const sorted = Array.from(userMap.entries())
+				.sort((a, b) => b[1].size - a[1].size || a[0].localeCompare(b[0], 'ja'));
+
+			const clusters = [];
+			for (const [tag, users] of sorted) {
+				let merged = false;
+				for (const cluster of clusters) {
+					const isBothHashtags = cluster.representative.startsWith('#') && tag.startsWith('#');
+					const isBothNonHashtags = !cluster.representative.startsWith('#') && !tag.startsWith('#');
+					if (isBothHashtags || isBothNonHashtags) {
+						const sim = calculateTagSimilarity(cluster.representative, tag);
+						if (sim > threshold) {
+							for (const u of users) cluster.users.add(u);
+							merged = true;
+							break;
+						}
+					}
+				}
+				if (!merged) {
+					clusters.push({ representative: tag, users: new Set(users) });
+				}
+			}
+
+			return clusters
+				.sort((a, b) => b.users.size - a.users.size || a.representative.localeCompare(b.representative, 'ja'))
+				.slice(0, normalizedLimit)
+				.map((c) => ({
+					tag_name: c.representative,
+					occurrence_count: c.users.size,
+				}));
+		};
+
+		const hashtagsList = mapToMergedSortedList(hashtagUsers);
+		const wordsList = mapToMergedSortedList(wordUsers);
+		const tagsList = mapToMergedSortedList(tagUsers);
+
+		const type = typeof options === 'string' ? options : options?.type;
+		if (type === 'hashtags') return hashtagsList;
+		if (type === 'words') return wordsList;
+		if (type === 'tags') return tagsList.length > 0 ? tagsList : wordsList;
+
+		const mergedUsers = new Map();
+		for (const [k, set] of hashtagUsers) {
+			if (!mergedUsers.has(k)) mergedUsers.set(k, new Set());
+			for (const u of set) mergedUsers.get(k).add(u);
+		}
+		for (const [k, set] of wordUsers) {
+			if (!mergedUsers.has(k)) mergedUsers.set(k, new Set());
+			for (const u of set) mergedUsers.get(k).add(u);
+		}
+		for (const [k, set] of tagUsers) {
+			if (!mergedUsers.has(k)) mergedUsers.set(k, new Set());
+			for (const u of set) mergedUsers.get(k).add(u);
+		}
+		const trendsList = mapToMergedSortedList(mergedUsers);
+
+		if (options?.summary || options?.detailed) {
+			return {
+				trends: trendsList,
+				hashtags: hashtagsList,
+				tags: tagsList.length > 0 ? tagsList : wordsList,
+				words: wordsList,
+			};
+		}
+
+		return trendsList;
+	}
+
+	async getPostCount(userId) {
+		const { rows } = await this.pool.query(
+			'SELECT COUNT(*)::int AS count FROM posts WHERE user_id = $1',
+			[Number(userId)],
+		);
+		return Number(rows[0]?.count || 0);
+	}
+
+	async getMediaCount(userId) {
+		const { rows } = await this.pool.query(
+			`SELECT COUNT(*)::int AS count FROM posts
+			 WHERE user_id = $1
+			   AND attachments IS NOT NULL
+			   AND jsonb_typeof(attachments) = 'array'
+			   AND jsonb_array_length(attachments) > 0`,
+			[Number(userId)],
+		);
+		return Number(rows[0]?.count || 0);
+	}
+
+	async getMediaPosts(userId, limit = 15, offset = 0, type = null, options = {}) {
+		const normalizedLimit = Math.max(1, Math.min(Number(limit) || 15, 100));
+		const cursor = options?.cursor || null;
+		const cursorCreatedAt = options?.cursorCreatedAt || null;
+		const cursorId = options?.cursorId || null;
+		const decodedCursor = cursorCreatedAt && cursorId
+			? { createdAt: cursorCreatedAt, id: Number(cursorId), position: options?.cursorPosition != null ? Number(options.cursorPosition) : null }
+			: (typeof cursor === 'string' && cursor.trim() ? decodePostCursor(cursor.trim()) : null);
+
+		let query = `SELECT p.id AS post_id,
+				p.created_at,
+				attachment.position,
+				attachment.file->>'id' AS file_id,
+				COALESCE(attachment.file->>'type', 'file') AS file_type
+		 FROM posts p
+		 CROSS JOIN LATERAL jsonb_array_elements(p.attachments) WITH ORDINALITY AS attachment(file, position)
+		 WHERE p.user_id = $1
+		   AND p.attachments IS NOT NULL
+		   AND jsonb_typeof(p.attachments) = 'array'
+		   AND jsonb_array_length(p.attachments) > 0`;
+		const params = [Number(userId)];
+		if (type && (type === 'image' || type === 'video')) {
+			query += ` AND COALESCE(attachment.file->>'type', 'file') = $${params.length + 1}`;
+			params.push(type);
+		}
+		if (decodedCursor) {
+			if (decodedCursor.position != null) {
+				query += ` AND (p.created_at < $${params.length + 1} OR (p.created_at = $${params.length + 1} AND p.id < $${params.length + 2}) OR (p.created_at = $${params.length + 1} AND p.id = $${params.length + 2} AND attachment.position > $${params.length + 3}))`;
+				params.push(decodedCursor.createdAt, decodedCursor.id, decodedCursor.position);
+			} else {
+				query += ` AND (p.created_at < $${params.length + 1} OR (p.created_at = $${params.length + 1} AND p.id < $${params.length + 2}))`;
+				params.push(decodedCursor.createdAt, decodedCursor.id);
+			}
+			query += ` ORDER BY p.created_at DESC, p.id DESC, attachment.position ASC LIMIT $${params.length + 1}`;
+			params.push(normalizedLimit + 1);
+		} else {
+			const normalizedOffset = Math.max(0, Number(offset) || 0);
+			query += ` ORDER BY p.created_at DESC, p.id DESC, attachment.position ASC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+			params.push(normalizedLimit + 1, normalizedOffset);
+		}
+
+		const { rows } = await this.pool.query(query, params);
+		const selectedRows = rows.slice(0, normalizedLimit);
+		const lastRow = selectedRows.length > 0 ? selectedRows[selectedRows.length - 1] : null;
+		const nextCursor = rows.length > normalizedLimit && lastRow
+			? encodePostCursor({ createdAt: lastRow.created_at, id: lastRow.post_id, position: lastRow.position })
+			: null;
+
+		const items = selectedRows.map((row) => ({
+			post_id: Number(row.post_id),
+			file_id: row.file_id,
+			file_type: row.file_type || 'file',
+			type: row.file_type || 'file',
+		}));
+
+		if (options?.withNextCursor || decodedCursor) {
+			return {
+				media_items: items,
+				has_more: rows.length > normalizedLimit,
+				next_cursor: nextCursor,
+			};
+		}
+		items.next_cursor = nextCursor;
+		items.has_more = rows.length > normalizedLimit;
+		return items;
+	}
+
+	// ==================== Reactions ====================
+
+	async _adjustUserKeywordAffinitiesForTags(client, userId, tags, delta) {
+		const normalizedDelta = Number(delta);
+		const normalizedTags = normalizePostTags(tags);
+		if (!Number.isFinite(normalizedDelta) || normalizedDelta === 0 || normalizedTags.length === 0) return;
+		if (normalizedDelta > 0) {
+			await client.query(
+				`INSERT INTO user_keyword_affinities (user_id, keyword, score, updated_at)
+				 SELECT $1, keyword, $3::numeric, NOW() FROM unnest($2::text[]) AS keyword
+				 ON CONFLICT (user_id, keyword) DO UPDATE
+				 SET score = user_keyword_affinities.score + EXCLUDED.score,
+					 updated_at = NOW()`,
+				[Number(userId), normalizedTags, normalizedDelta],
+			);
+		} else {
+			await client.query(
+				`UPDATE user_keyword_affinities
+				 SET score = GREATEST(0, score + $3::numeric),
+					 updated_at = NOW()
+				 WHERE user_id = $1 AND keyword = ANY($2::text[])`,
+				[Number(userId), normalizedTags, normalizedDelta],
+			);
+			await client.query(
+				'DELETE FROM user_keyword_affinities WHERE user_id = $1 AND score <= 0',
+				[Number(userId)],
+			);
+		}
+	}
+
+	async _adjustUserKeywordAffinities(client, userId, postId, delta) {
+		const { rows } = await client.query(
+			'SELECT tags FROM posts WHERE id = $1 LIMIT 1',
+			[Number(postId)],
+		);
+		await this._adjustUserKeywordAffinitiesForTags(client, userId, rows[0]?.tags, delta);
+	}
+
+	async dislikePost(userId, postId) {
+		const uId = Number(userId);
+		const pId = Number(postId);
+		this._affinityCache?.delete(uId);
+		this._feedbackCache?.delete(uId);
+		return this._withTransaction(async (client) => {
+			const { rows } = await client.query(
+				'SELECT tags, content, view_content FROM posts WHERE id = $1 LIMIT 1',
+				[pId],
+			);
+			const post = rows[0];
+			if (!post) return false;
+			let tags = normalizePostTags(post.tags);
+			if (tags.length === 0) {
+				const keywords = await extractPostKeywords(post.view_content || post.content || '');
+				tags = normalizePostTags(keywords);
+			}
+			if (tags.length > 0) {
+				await this._adjustUserKeywordAffinitiesForTags(client, uId, tags, -15);
+			}
+			// 「関連性が低いと評価」を推薦の負のシグナルとして永続化する。
+			await client.query(
+				`INSERT INTO post_feedback (user_id, post_id, kind, created_at)
+				 VALUES ($1, $2, 'not_interested', NOW())
+				 ON CONFLICT (user_id, post_id, kind) DO NOTHING`,
+				[uId, pId],
+			);
+			return true;
+		});
+	}
+
+	async recordPostFeedback(userId, postId, kind = 'not_interested') {
+		const uId = Number(userId);
+		const pId = Number(postId);
+		if (!Number.isInteger(uId) || !Number.isInteger(pId)) return false;
+		this._feedbackCache?.delete(uId);
+		await this.pool.query(
+			`INSERT INTO post_feedback (user_id, post_id, kind, created_at)
+			 VALUES ($1, $2, $3, NOW())
+			 ON CONFLICT (user_id, post_id, kind) DO NOTHING`,
+			[uId, pId, String(kind || 'not_interested')],
+		);
+		return true;
+	}
+
+	async getPostFeedbackForUser(userId) {
+		const uId = Number(userId);
+		if (!Number.isInteger(uId)) return { postIds: [], authorIds: [], authorCounts: new Map(), tagCounts: new Map() };
+		// 古い「興味なし」は自然退役させる。フォローと同じ500件、新着順に絞る。
+		const { rows } = await this.pool.query(
+			`SELECT pf.post_id, p.user_id AS author_id, p.tags
+			 FROM post_feedback pf
+			 JOIN posts p ON p.id = pf.post_id
+			 WHERE pf.user_id = $1 AND pf.kind = 'not_interested'
+			 ORDER BY pf.created_at DESC LIMIT 500`,
+			[uId],
+		);
+		const postIds = [];
+		const authorIds = new Set();
+		const authorCounts = new Map();
+		const tagCounts = new Map();
+		for (const row of rows || []) {
+			postIds.push(Number(row.post_id));
+			const authorId = Number(row.author_id);
+			if (Number.isInteger(authorId)) {
+				authorIds.add(authorId);
+				authorCounts.set(authorId, (authorCounts.get(authorId) || 0) + 1);
+			}
+			for (const tag of normalizePostTags(row.tags)) {
+				tagCounts.set(tag, (tagCounts.get(tag) || 0) + 1);
+			}
+		}
+		return { postIds, authorIds: [...authorIds], authorCounts, tagCounts };
+	}
+
+	async toggleLike(userId, postId) {
+		const uId = Number(userId);
+		const pId = Number(postId);
+		const now = new Date().toISOString();
+
+		const { liked, unliked, count, tags } = await this._withTransaction(async (client) => {
+			const removed = await client.query(
+				'DELETE FROM likes WHERE user_id = $1 AND post_id = $2 RETURNING 1',
+				[uId, pId],
+			);
+			let added = false;
+			if (removed.rowCount === 0) {
+				const inserted = await client.query(
+					'INSERT INTO likes (user_id, post_id, created_at) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING RETURNING 1',
+					[uId, pId, now],
+				);
+				added = inserted.rowCount > 0;
+			}
+			const delta = removed.rowCount > 0 ? -1 : (added ? 1 : 0);
+			const updated = await client.query(
+				`UPDATE posts
+				 SET like_count = GREATEST(0, like_count + $1)
+				 WHERE id = $2
+				 RETURNING like_count, tags`,
+				[delta, pId],
+			);
+			return {
+				liked: added,
+				unliked: removed.rowCount > 0,
+				count: Math.max(0, Number(updated.rows[0]?.like_count) || 0),
+				tags: updated.rows[0]?.tags,
+			};
+		});
+
+		if (tags && (liked || unliked)) {
+			const delta = liked ? 1 : -1;
+			this._adjustUserKeywordAffinitiesForTags(this.pool, uId, tags, delta)
+				.then(() => this._affinityCache?.delete(uId))
+				.catch(() => {});
+		}
+		this._reactionCache?.delete(uId);
+
+		const result = { liked, count };
+		const cachedPost = this._getPostCache()?.get(pId);
+		if (cachedPost) {
+			this._getPostCache()?.set(pId, {
+				...cachedPost,
+				like_count: result.count,
+				likeCount: result.count,
+			});
+		}
+		this._updateCachedPostMetrics(pId, { like_count: result.count });
+		this._updateCachedPostReaction(pId, uId, 'like', result.liked);
+		return result;
+	}
+
+	async getLikeCount(postId) {
+		const { rows } = await this.pool.query(
+			'SELECT like_count FROM posts WHERE id = $1',
+			[Number(postId)],
+		);
+		return Number(rows[0]?.like_count || 0);
+	}
+
+	async hasUserLikedPost(userId, postId) {
+		const { rows } = await this.pool.query(
+			'SELECT 1 FROM likes WHERE user_id = $1 AND post_id = $2 LIMIT 1',
+			[Number(userId), Number(postId)],
+		);
+		return rows.length > 0;
+	}
+
+	async getLikeIds(userId) {
+		const { rows } = await this.pool.query(
+			'SELECT post_id FROM likes WHERE user_id = $1 ORDER BY created_at DESC',
+			[Number(userId)],
+		);
+		return rows.map((row) => Number(row.post_id));
+	}
+
+	async toggleStar(userId, postId) {
+		const uId = Number(userId);
+		const pId = Number(postId);
+		const now = new Date().toISOString();
+
+		const { starred, unstarred, count, tags } = await this._withTransaction(async (client) => {
+			const removed = await client.query(
+				'DELETE FROM stars WHERE user_id = $1 AND post_id = $2 RETURNING 1',
+				[uId, pId],
+			);
+			let added = false;
+			if (removed.rowCount === 0) {
+				const inserted = await client.query(
+					'INSERT INTO stars (user_id, post_id, created_at) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING RETURNING 1',
+					[uId, pId, now],
+				);
+				added = inserted.rowCount > 0;
+			}
+			const delta = removed.rowCount > 0 ? -1 : (added ? 1 : 0);
+			const updated = await client.query(
+				`UPDATE posts
+				 SET star_count = GREATEST(0, star_count + $1)
+				 WHERE id = $2
+				 RETURNING star_count, tags`,
+				[delta, pId],
+			);
+			return {
+				starred: added,
+				unstarred: removed.rowCount > 0,
+				count: Math.max(0, Number(updated.rows[0]?.star_count) || 0),
+				tags: updated.rows[0]?.tags,
+			};
+		});
+
+		if (tags && (starred || unstarred)) {
+			const delta = starred ? 3 : -3;
+			this._adjustUserKeywordAffinitiesForTags(this.pool, uId, tags, delta)
+				.then(() => this._affinityCache?.delete(uId))
+				.catch(() => {});
+		}
+		this._reactionCache?.delete(uId);
+
+		const result = { starred, count };
+		const cachedPost = this._getPostCache()?.get(pId);
+		if (cachedPost) {
+			this._getPostCache()?.set(pId, {
+				...cachedPost,
+				star_count: result.count,
+				starCount: result.count,
+			});
+		}
+		this._updateCachedPostMetrics(pId, { star_count: result.count });
+		this._updateCachedPostReaction(pId, uId, 'star', result.starred);
+		return result;
+	}
+
+	async getStarCount(postId) {
+		const { rows } = await this.pool.query(
+			'SELECT star_count FROM posts WHERE id = $1',
+			[Number(postId)],
+		);
+		return Number(rows[0]?.star_count || 0);
+	}
+
+	async hasUserStarredPost(userId, postId) {
+		const { rows } = await this.pool.query(
+			'SELECT 1 FROM stars WHERE user_id = $1 AND post_id = $2 LIMIT 1',
+			[Number(userId), Number(postId)],
+		);
+		return rows.length > 0;
+	}
+
+	async getStarIds(userId) {
+		const { rows } = await this.pool.query(
+			'SELECT post_id FROM stars WHERE user_id = $1 ORDER BY created_at DESC',
+			[Number(userId)],
+		);
+		return rows.map((row) => Number(row.post_id));
+	}
+
+	async togglePin(userId, postId) {
+		const uId = Number(userId);
+		const pId = Number(postId);
+		const now = new Date().toISOString();
+
+		const sql = `
+			WITH post_check AS (
+				SELECT id FROM posts WHERE id = $1 AND user_id = $2
+			),
+			del AS (
+				DELETE FROM pinned_posts
+				WHERE user_id = $2 AND post_id = $1 AND EXISTS (SELECT 1 FROM post_check)
+				RETURNING 1
+			),
+			ins AS (
+				INSERT INTO pinned_posts (user_id, post_id, created_at)
+				SELECT $2, $1, $3
+				WHERE EXISTS (SELECT 1 FROM post_check) AND NOT EXISTS (SELECT 1 FROM del)
+				ON CONFLICT DO NOTHING
+				RETURNING 1
+			)
+			SELECT
+				EXISTS (SELECT 1 FROM post_check) AS post_exists,
+				EXISTS (SELECT 1 FROM ins) AS pinned;
+		`;
+		const { rows } = await this.pool.query(sql, [pId, uId, now]);
+		if (!rows[0]?.post_exists) {
+			throw new Error('Cannot pin a post you do not own');
+		}
+		this._invalidateProfileStatsCache(uId);
+		return { pinned: Boolean(rows[0]?.pinned) };
+	}
+
+	async getPinnedPosts(userId) {
+		const { rows } = await this.pool.query(
+			`SELECT p.* FROM posts p
+			 JOIN pinned_posts pp ON pp.post_id = p.id
+			 WHERE pp.user_id = $1
+			 ORDER BY pp.created_at DESC`,
+			[Number(userId)],
+		);
+		return rows.map(normalizePostRow);
+	}
+
+	async getPinnedPostId(userId) {
+		const { rows } = await this.pool.query(
+			`SELECT post_id FROM pinned_posts
+			 WHERE user_id = $1
+			 ORDER BY created_at DESC
+			 LIMIT 1`,
+			[Number(userId)],
+		);
+		return rows.length > 0 ? Number(rows[0].post_id) : null;
+	}
+
+	async repostPost(userId, postId) {
+		const normalizedUserId = Number(userId);
+		const repost = await this._withTransaction(async (client) => {
+			const original = await client.query('SELECT * FROM posts WHERE id = $1', [Number(postId)]);
+			if (!original.rows[0]) throw new Error('Post not found');
+
+			const existing = await client.query(
+				'SELECT 1 FROM reposts WHERE user_id = $1 AND post_id = $2',
+				[Number(userId), Number(postId)],
+			);
+			if (existing.rows.length > 0) throw new Error('Already reposted');
+
+			const now = new Date().toISOString();
+			await client.query(
+				'INSERT INTO reposts (user_id, post_id, created_at) VALUES ($1, $2, $3)',
+				[Number(userId), Number(postId), now],
+			);
+			await client.query(
+				'UPDATE posts SET repost_count = repost_count + 1 WHERE id = $1',
+				[Number(postId)],
+			);
+
+			const origRow = original.rows[0];
+			// 純粋なリポスト行は content を空・attachments を NULL のままにする。
+			// 元投稿の本文/添付をコピーすると、クライアントが content の有無で
+			// リポストを引用ポストと誤判定してしまうため。
+			const { rows: created } = await client.query(
+				`INSERT INTO posts (user_id, content, attachments, mask, lock, repost_to, created_at)
+				 VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7)
+				 RETURNING *`,
+				[
+					Number(userId),
+					'',
+					null,
+					origRow.mask,
+					origRow.lock,
+					Number(postId),
+					now,
+				],
+			);
+			const post = normalizePostRow(created[0]);
+			if (post) {
+				this._getPostCache()?.set(post.id, post);
+			}
+			const parentId = Number(postId);
+			const cachedParent = this._getPostCache()?.get(parentId);
+			if (cachedParent) {
+				const repostCount = (Number(cachedParent.repost_count ?? cachedParent.repostCount) || 0) + 1;
+				this._getPostCache()?.set(parentId, { ...cachedParent, repost_count: repostCount, repostCount });
+			}
+			const cachedMetrics = this._getPostMetricsCache()?.get(parentId);
+			if (cachedMetrics) {
+				this._updateCachedPostMetrics(parentId, {
+					repost_count: (Number(cachedMetrics.repost_count) || 0) + 1,
+				});
+			}
+			return post;
+		});
+		this._reactionCache?.delete(normalizedUserId);
+		return repost;
+	}
+
+	async getReposts(userId) {
+		const { rows } = await this.pool.query(
+			`SELECT p.* FROM posts p
+			 JOIN reposts r ON r.post_id = p.repost_to
+			 WHERE r.user_id = $1
+			 ORDER BY r.created_at DESC`,
+			[Number(userId)],
+		);
+		return rows.map(normalizePostRow);
+	}
+
+	async getRepostsOfPost(postId, limit = 50) {
+		const safeLimit = Math.min(Math.max(Number(limit) || 50, 1), 100);
+		const { rows } = await this.pool.query(
+			`SELECT u.id as user_id, u.name, u.handle, u.icon_data, u.verify, u.admin, u.bio, r.created_at as reposted_at
+			 FROM reposts r
+			 JOIN users u ON u.id = r.user_id
+			 WHERE r.post_id = $1
+			 ORDER BY r.created_at DESC
+			 LIMIT $2`,
+			[Number(postId), safeLimit],
+		);
+		return rows.map((r) => ({
+			user_id: Number(r.user_id),
+			id: Number(r.user_id),
+			name: r.name,
+			handle: r.handle,
+			icon_data: r.icon_data,
+			verify: Boolean(r.verify),
+			admin: Boolean(r.admin),
+			bio: r.bio,
+			reposted_at: toIsoString(r.reposted_at),
+		}));
+	}
+
+	async getLikesOfPost(postId, limit = 50) {
+		const safeLimit = Math.min(Math.max(Number(limit) || 50, 1), 100);
+		const { rows } = await this.pool.query(
+			`SELECT u.id as user_id, u.name, u.handle, u.icon_data, u.verify, u.admin, u.bio, l.created_at as liked_at
+			 FROM likes l
+			 JOIN users u ON u.id = l.user_id
+			 WHERE l.post_id = $1
+			 ORDER BY l.created_at DESC
+			 LIMIT $2`,
+			[Number(postId), safeLimit],
+		);
+		return rows.map((r) => ({
+			user_id: Number(r.user_id),
+			id: Number(r.user_id),
+			name: r.name,
+			handle: r.handle,
+			icon_data: r.icon_data,
+			verify: Boolean(r.verify),
+			admin: Boolean(r.admin),
+			bio: r.bio,
+			liked_at: toIsoString(r.liked_at),
+		}));
+	}
+
+	async getStarsOfPost(postId, limit = 50) {
+		const safeLimit = Math.min(Math.max(Number(limit) || 50, 1), 100);
+		const { rows } = await this.pool.query(
+			`SELECT u.id as user_id, u.name, u.handle, u.icon_data, u.verify, u.admin, u.bio, s.created_at as starred_at
+			 FROM stars s
+			 JOIN users u ON u.id = s.user_id
+			 WHERE s.post_id = $1
+			 ORDER BY s.created_at DESC
+			 LIMIT $2`,
+			[Number(postId), safeLimit],
+		);
+		return rows.map((r) => ({
+			user_id: Number(r.user_id),
+			id: Number(r.user_id),
+			name: r.name,
+			handle: r.handle,
+			icon_data: r.icon_data,
+			verify: Boolean(r.verify),
+			admin: Boolean(r.admin),
+			bio: r.bio,
+			starred_at: toIsoString(r.starred_at),
+		}));
+	}
+
+	async getQuotesOfPost(postId, limit = 50) {
+		const safeLimit = Math.min(Math.max(Number(limit) || 50, 1), 100);
+		const { rows } = await this.pool.query(
+			`SELECT * FROM posts
+			 WHERE repost_to = $1 AND content IS NOT NULL AND content != ''
+			 ORDER BY created_at DESC
+			 LIMIT $2`,
+			[Number(postId), safeLimit],
+		);
+		return rows.map(normalizePostRow);
+	}
+
+	async getRepostCount(postId) {
+		const { rows } = await this.pool.query(
+			'SELECT COUNT(*)::int as count FROM reposts WHERE post_id = $1',
+			[Number(postId)],
+		);
+		return Number(rows[0]?.count || 0);
+	}
+
+	// ==================== Direct Messages ====================
+
+	async getDmList(userId) {
+		const { rows } = await this.pool.query(
+			'SELECT * FROM dm_channels WHERE participants @> ARRAY[$1]::int[]',
+			[Number(userId)],
+		);
+		return rows.map((r) => ({
+			id: r.id,
+			participants: (r.participants || []).map(Number),
+			created_at: toIsoString(r.created_at),
+		}));
+	}
+
+	async getOrCreateDmChannel(userId1, userId2) {
+		const u1 = Math.min(Number(userId1), Number(userId2));
+		const u2 = Math.max(Number(userId1), Number(userId2));
+		const channelId = `${u1}:${u2}`;
+		const now = new Date().toISOString();
+
+		const { rows } = await this.pool.query(
+			`INSERT INTO dm_channels (id, participants, created_at)
+			 VALUES ($1, $2, $3)
+			 ON CONFLICT (id) DO NOTHING
+			 RETURNING *`,
+			[channelId, [u1, u2], now],
+		);
+
+		if (rows.length > 0) {
+			return {
+				id: rows[0].id,
+				participants: (rows[0].participants || []).map(Number),
+				created_at: toIsoString(rows[0].created_at),
+			};
+		}
+
+		const existing = await this.pool.query('SELECT * FROM dm_channels WHERE id = $1', [channelId]);
+		return existing.rows[0] ? {
+			id: existing.rows[0].id,
+			participants: (existing.rows[0].participants || []).map(Number),
+			created_at: toIsoString(existing.rows[0].created_at),
+		} : null;
+	}
+
+	async getDmMessages(channelId, limit = 50, offset = 0) {
+		const safeLimit = Math.min(Math.max(Number(limit) || 50, 1), 100);
+		const safeOffset = Math.max(Number(offset) || 0, 0);
+		const { rows } = await this.pool.query(
+			`SELECT * FROM dm_messages
+			 WHERE channel_id = $1
+			 ORDER BY sent_at DESC
+			 LIMIT $2 OFFSET $3`,
+			[String(channelId), safeLimit, safeOffset],
+		);
+		return rows.map((r) => ({
+			id: Number(r.id),
+			channelId: r.channel_id,
+			channel_id: r.channel_id,
+			senderId: Number(r.sender_id),
+			sender_id: Number(r.sender_id),
+			content: r.content,
+			sentAt: toIsoString(r.sent_at),
+			sent_at: toIsoString(r.sent_at),
+			readAt: toIsoString(r.read_at),
+			read_at: toIsoString(r.read_at),
+		}));
+	}
+
+	async sendDmMessage(channelId, senderId, content, meta = {}) {
+		const now = meta?.sentAt ? toIsoString(meta.sentAt) : new Date().toISOString();
+		const hasExplicitId = meta?.id != null && Number.isSafeInteger(Number(meta.id)) && Number(meta.id) > 0;
+
+		const values = [String(channelId), Number(senderId), String(content || ''), now];
+		const insertQuery = hasExplicitId
+			? `INSERT INTO dm_messages (id, channel_id, sender_id, content, sent_at)
+			   VALUES ($5, $1, $2, $3, $4)
+			   RETURNING *`
+			: `INSERT INTO dm_messages (channel_id, sender_id, content, sent_at)
+			   VALUES ($1, $2, $3, $4)
+			   RETURNING *`;
+
+		if (hasExplicitId) {
+			values.push(Number(meta.id));
+		}
+
+		const { rows } = await this.pool.query(insertQuery, values);
+		const row = rows[0];
+		return row ? {
+			id: Number(row.id),
+			channelId: row.channel_id,
+			channel_id: row.channel_id,
+			senderId: Number(row.sender_id),
+			sender_id: Number(row.sender_id),
+			content: row.content,
+			sentAt: toIsoString(row.sent_at),
+			sent_at: toIsoString(row.sent_at),
+			readAt: toIsoString(row.read_at),
+			read_at: toIsoString(row.read_at),
+		} : null;
+	}
+
+	async markDmMessagesAsRead(channelId, userId) {
+		const now = new Date().toISOString();
+		await this.pool.query(
+			`UPDATE dm_messages SET read_at = $3
+			 WHERE channel_id = $1 AND sender_id != $2 AND read_at IS NULL`,
+			[String(channelId), Number(userId), now],
+		);
+	}
+
+	async getUnreadDmCount(userId) {
+		const { rows } = await this.pool.query(
+			// participants @> ARRAY[$1] は整数配列の GIN 索引 (gin(participants)) を利用できる形。
+			`SELECT COUNT(*)::int as count FROM dm_messages m
+			 JOIN dm_channels c ON c.id = m.channel_id
+			 WHERE c.participants @> ARRAY[$1]::int[]
+			   AND m.sender_id != $1
+			   AND m.read_at IS NULL`,
+			[Number(userId)],
+		);
+		return Number(rows[0]?.count || 0);
+	}
+
+	_clearGroupDmReadCache() {
+		this.groupDmReadCacheGeneration += 1;
+		this.groupDmReadCache.clear();
+	}
+
+	_cachedGroupDmRead(key, loader) {
+		const now = Date.now();
+		const cached = this.groupDmReadCache.get(key);
+		if (cached && cached.expiresAt > now) return cached.value;
+		if (cached) this.groupDmReadCache.delete(key);
+
+		if (this.groupDmReadCache.size >= GROUP_DM_READ_CACHE_MAX_ENTRIES) {
+			for (const [cachedKey, entry] of this.groupDmReadCache) {
+				if (entry.expiresAt <= now) this.groupDmReadCache.delete(cachedKey);
+			}
+			if (this.groupDmReadCache.size >= GROUP_DM_READ_CACHE_MAX_ENTRIES) {
+				const oldestKey = this.groupDmReadCache.keys().next().value;
+				if (oldestKey !== undefined) this.groupDmReadCache.delete(oldestKey);
+			}
+		}
+
+		const generation = this.groupDmReadCacheGeneration;
+		const promise = Promise.resolve()
+			.then(loader)
+			.then((value) => {
+				if (
+					this.groupDmReadCacheGeneration === generation
+					&& this.groupDmReadCache.get(key)?.value === promise
+				) {
+					this.groupDmReadCache.set(key, {
+						value,
+						expiresAt: Date.now() + GROUP_DM_READ_CACHE_TTL_MS,
+					});
+				}
+				return value;
+			})
+			.catch((error) => {
+				if (this.groupDmReadCache.get(key)?.value === promise) this.groupDmReadCache.delete(key);
+				throw error;
+			});
+		this.groupDmReadCache.set(key, {
+			value: promise,
+			expiresAt: Date.now() + GROUP_DM_READ_CACHE_TTL_MS,
+		});
+		return promise;
+	}
+
+	async getGroupDmsForUser(userId, { limit = 50, offset = 0 } = {}) {
+		const safeLimit = Math.min(Math.max(Number(limit) || 50, 1), 100);
+		const safeOffset = Math.max(Number(offset) || 0, 0);
+		return this._cachedGroupDmRead(`list:${Number(userId)}:${safeLimit}:${safeOffset}`, async () => {
+			// 会話の全メッセージ(post)は一覧では不要。末尾メッセージと件数のみ取得する。
+			// member @> ARRAY[$1] は整数配列の GIN 索引 (gin(member)) を利用できる形。
+			let rows;
+			try {
+				({ rows } = await this.pool.query(
+					`SELECT id, host_id, title, member, unread, time, created_at,
+					        message_count,
+					        latest_message
+					   FROM group_dms
+					  WHERE member @> ARRAY[$1]::int[]
+					  ORDER BY time DESC LIMIT $2 OFFSET $3`,
+					[Number(userId), safeLimit, safeOffset],
+				));
+			} catch (error) {
+				if (!isMissingGroupDmSummaryColumn(error)) throw error;
+				// migration 032 未適用の DB: 集約カラムを使わず従来どおり post 全件から組み立てる。
+				if (!this._groupDmSummaryFallbackWarned) {
+					this._groupDmSummaryFallbackWarned = true;
+					console.warn('[PostgresAdapter] group_dms の message_count/latest_message が未作成です。migration 032 を適用してください。DM 一覧は post 取得にフォールバックします。');
+				}
+				({ rows } = await this.pool.query(
+					`SELECT * FROM group_dms
+					  WHERE member @> ARRAY[$1]::int[]
+					  ORDER BY time DESC LIMIT $2 OFFSET $3`,
+					[Number(userId), safeLimit, safeOffset],
+				));
+			}
+			return rows.map((row) => normalizeGroupDmRow(row, Number(userId)));
+		});
+	}
+
+	async getGroupDmVisibilityDataForUser(userId) {
+		return this._cachedGroupDmRead(`visibility:${Number(userId)}`, async () => {
+			const { rows } = await this.pool.query(
+				`SELECT id, member, unread FROM group_dms WHERE member @> ARRAY[$1]::int[]`,
+				[Number(userId)],
+			);
+			return rows.map((row) => ({
+				id: String(row.id),
+				member: (row.member || []).map(Number),
+				accepted: (() => {
+					const unread = typeof row.unread === 'object' && row.unread !== null
+						? row.unread
+						: parseJsonSafe(row.unread, {});
+					return Array.isArray(unread._accepted) ? unread._accepted.map(Number) : (row.member || []).map(Number);
+				})(),
+				unread: typeof row.unread === 'object' && row.unread !== null ? row.unread : parseJsonSafe(row.unread, {}),
+			}));
+		});
+	}
+
+	async getGroupDm(dmId) {
+		if (!dmId) return null;
+		const { rows } = await this.pool.query(
+			'SELECT * FROM group_dms WHERE id = $1 LIMIT 1',
+			[String(dmId)],
+		);
+		return normalizeGroupDmRow(rows[0] || null);
+	}
+
+	async createGroupDm(dmData) {
+		const hostId = Number(dmData.hostId);
+		const member = Array.from(new Set((dmData.member || [hostId]).map(Number).filter(Number.isInteger)));
+		const id = crypto.randomUUID();
+		const now = new Date().toISOString();
+		const title = String(dmData.title || '');
+		const unreadObj = dmData.unread && typeof dmData.unread === 'object' ? { ...dmData.unread } : {};
+		if (Array.isArray(dmData.accepted)) {
+			unreadObj._accepted = dmData.accepted.map(Number).filter(Number.isInteger);
+		}
+
+		const { rows } = await this.pool.query(
+			`INSERT INTO group_dms (id, host_id, title, member, post, unread, time, created_at)
+			 VALUES ($1, $2, $3, $4::int[], '[]'::jsonb, $5::jsonb, $6, $6)
+			 RETURNING *`,
+			[id, hostId, title, member, JSON.stringify(unreadObj), now],
+		);
+		this._clearGroupDmReadCache();
+		return normalizeGroupDmRow(rows[0], hostId);
+	}
+
+	async updateGroupDm(dmId, updates, expectedPost = undefined, expectedState = undefined) {
+		const sets = [];
+		const values = [];
+		let i = 1;
+
+		if (updates.title !== undefined) {
+			sets.push(`title = $${i++}`);
+			values.push(String(updates.title));
+		}
+		if (updates.member !== undefined) {
+			const memberSet = Array.from(new Set(updates.member.map(Number).filter(Number.isInteger)));
+			sets.push(`member = $${i++}::int[]`);
+			values.push(memberSet);
+		}
+		if (updates.host_id !== undefined || updates.hostId !== undefined) {
+			sets.push(`host_id = $${i++}`);
+			values.push(Number(updates.host_id ?? updates.hostId));
+		}
+		if (updates.post !== undefined) {
+			const postPlaceholder = `$${i++}`;
+			sets.push(`post = ${postPlaceholder}::jsonb`);
+			// 一覧用の集約カラムも同時に更新する。
+			sets.push(`message_count = jsonb_array_length(${postPlaceholder}::jsonb)`);
+			sets.push(`latest_message = CASE WHEN jsonb_array_length(${postPlaceholder}::jsonb) > 0 THEN (${postPlaceholder}::jsonb) -> -1 ELSE NULL END`);
+			values.push(JSON.stringify(updates.post));
+		}
+		if (updates.unread !== undefined) {
+			sets.push(`unread = $${i++}::jsonb`);
+			values.push(JSON.stringify(updates.unread));
+		} else if (updates.accepted !== undefined) {
+			sets.push(`unread = jsonb_set(COALESCE(unread, '{}'::jsonb), '{_accepted}', $${i++}::jsonb)`);
+			values.push(JSON.stringify(Array.from(new Set(updates.accepted.map(Number).filter(Number.isInteger)))));
+		}
+		if (updates.time !== undefined) {
+			sets.push(`time = $${i++}`);
+			values.push(toIsoString(updates.time));
+		}
+
+		if (sets.length === 0) {
+			this._clearGroupDmReadCache();
+			return this.getGroupDm(dmId);
+		}
+
+		values.push(String(dmId));
+		let condition = '';
+		if (expectedPost !== undefined) { values.push(JSON.stringify(expectedPost)); condition += ` AND post = $${values.length}::jsonb`; }
+		if (expectedState) {
+			values.push(Number(expectedState.host_id), expectedState.member, JSON.stringify(expectedState.accepted));
+			condition += ` AND host_id = $${values.length - 2} AND member = $${values.length - 1}::int[] AND COALESCE(unread->'_accepted', to_jsonb(member)) = $${values.length}::jsonb`;
+			values.push(String(expectedState.state_version));
+			condition += ` AND state_version = $${values.length}::bigint`;
+		}
+		const { rows } = await this.pool.query(
+			`UPDATE group_dms SET ${sets.join(', ')} WHERE id = $${i}${condition} RETURNING *`,
+			values,
+		);
+		this._clearGroupDmReadCache();
+		if (!rows[0]) return null;
+		return normalizeGroupDmRow(rows[0]);
+	}
+
+	async editGroupDmMessage(dmId, messageId, userId, content) {
+		const result = await this._withTransaction(async (client) => {
+			const { rows } = await client.query('SELECT * FROM group_dms WHERE id = $1 FOR UPDATE', [String(dmId)]);
+			const row = rows[0];
+			if (!row) return { error: 'not_found' };
+			if (!(row.member || []).map(Number).includes(Number(userId))) return { error: 'forbidden' };
+			const unread = typeof row.unread === 'object' && row.unread !== null ? row.unread : parseJsonSafe(row.unread, {});
+			const accepted = Array.isArray(unread._accepted) ? unread._accepted : row.member;
+			if (!accepted.map(Number).includes(Number(userId))) return { error: 'forbidden' };
+			const posts = Array.isArray(row.post) ? row.post : parseJsonSafe(row.post, []);
+			const index = posts.findIndex((item) => String(item.id) === String(messageId));
+			if (index < 0) return { error: 'not_found' };
+			const message = posts[index];
+			if (Number(message.userid) !== Number(userId) || message.type !== 'user' || message.e2e || message.deleted || message.deleted_at) return { error: 'forbidden' };
+			posts[index] = { ...message, content, edited_at: new Date().toISOString() };
+			await client.query('UPDATE group_dms SET post = $2::jsonb, latest_message = $2::jsonb -> -1 WHERE id = $1', [String(dmId), JSON.stringify(posts)]);
+			return { message: posts[index], member: row.member.filter((id) => accepted.map(Number).includes(Number(id))) };
+		});
+		this._clearGroupDmReadCache();
+		return result;
+	}
+
+	async appendToGroupDm(dmId, message, senderId = null, options = undefined) {
+		const result = await this._withTransaction(async (client) => {
+			const { rows: existingRows } = await client.query(
+				'SELECT * FROM group_dms WHERE id = $1 FOR UPDATE',
+				[String(dmId)],
+			);
+			const row = existingRows[0];
+			if (!row) return null;
+
+			const unread = { ...(typeof row.unread === 'object' && row.unread !== null ? row.unread : parseJsonSafe(row.unread, {})) };
+			const members = (row.member || []).map(Number);
+			const accepted = Array.isArray(unread._accepted) ? unread._accepted.map(Number) : members;
+			if (options?.requestId != null && members.includes(Number(senderId))) {
+				const { rows } = await client.query('SELECT request_hash, response_message FROM group_dm_send_requests WHERE dm_id = $1 AND sender_id = $2 AND request_id = $3', [String(dmId), Number(senderId), options.requestId]);
+				if (rows[0]) {
+					if (rows[0].request_hash !== options.requestHash) return { idempotencyConflict: true };
+					return { ...normalizeGroupDmRow(row, senderId), idempotencyReplay: rows[0].response_message };
+				}
+			}
+			if (options) {
+				const expected = options.expectedState;
+				if (!expected || !members.includes(Number(senderId)) || String(row.state_version) !== String(expected.state_version) || Number(row.host_id) !== Number(expected.host_id) || JSON.stringify(members) !== JSON.stringify(expected.member) || JSON.stringify(accepted) !== JSON.stringify(expected.accepted)) return null;
+				if (!accepted.includes(Number(senderId))) {
+					if (!options.joinEvent) return null;
+					unread._accepted = [...accepted, Number(senderId)];
+				} else if (options.joinEvent) return null;
+			}
+			const time = message.time ? toIsoString(message.time) : new Date().toISOString();
+			const posts = Array.isArray(row.post) ? row.post : parseJsonSafe(row.post, []);
+			if (options?.joinEvent) posts.push(options.joinEvent);
+			posts.push(message);
+
+		if (senderId !== null) {
+			unread[String(senderId)] = 0;
+			for (const memberId of row.member || []) {
+					const normalizedMemberId = Number(memberId);
+					if (normalizedMemberId === Number(senderId)) continue;
+					const key = String(normalizedMemberId);
+					unread[key] = Number(unread[key] || 0) + (options?.joinEvent ? 2 : 1);
+				}
+			}
+
+			const { rows } = await client.query(
+				`UPDATE group_dms
+				 SET post = $1::jsonb,
+				     message_count = message_count + $5,
+				     latest_message = $1::jsonb -> -1,
+				     time = $2,
+				     unread = $3::jsonb
+				 WHERE id = $4
+				 RETURNING *`,
+				[JSON.stringify(posts), time, JSON.stringify(unread), String(dmId), options?.joinEvent ? 2 : 1],
+			);
+			if (options?.requestId != null) {
+				await client.query('INSERT INTO group_dm_send_requests (dm_id, sender_id, request_id, request_hash, response_message) VALUES ($1, $2, $3, $4, $5::jsonb)', [String(dmId), Number(senderId), options.requestId, options.requestHash, JSON.stringify(message)]);
+			}
+			return normalizeGroupDmRow(rows[0], senderId);
+		});
+		this._clearGroupDmReadCache();
+		return result;
+	}
+
+	async markGroupDmRead(dmId, userId) {
+		const result = await this._withTransaction(async (client) => {
+			const { rows } = await client.query('SELECT unread FROM group_dms WHERE id = $1 FOR UPDATE', [String(dmId)]);
+			if (!rows[0]) return;
+			const unread = { ...(typeof rows[0].unread === 'object' && rows[0].unread !== null ? rows[0].unread : parseJsonSafe(rows[0].unread, {})) };
+			unread[String(userId)] = 0;
+			await client.query('UPDATE group_dms SET unread = $2::jsonb WHERE id = $1', [String(dmId), JSON.stringify(unread)]);
+		});
+		this._clearGroupDmReadCache();
+		return result;
+	}
+
+	async getGroupDmUnreadCounts(userId) {
+		return this._cachedGroupDmRead(`unread-counts:${Number(userId)}`, async () => {
+			const { rows } = await this.pool.query(
+				'SELECT id, member, unread FROM group_dms WHERE member @> ARRAY[$1]::int[]',
+				[Number(userId)],
+			);
+			const counts = [];
+			for (const r of rows) {
+				const unread = typeof r.unread === 'object' && r.unread !== null ? r.unread : parseJsonSafe(r.unread, {});
+				counts.push({ dm_id: r.id, unread_count: Number(unread[String(userId)] || 0) });
+			}
+			return counts;
+		});
+	}
+
+	async getGroupDmUnreadTotal(userId) {
+		return this._cachedGroupDmRead(`unread-total:${Number(userId)}`, async () => {
+			const { rows } = await this.pool.query(
+				`SELECT COALESCE(SUM(COALESCE((unread ->> $2)::int, 0)), 0)::int AS total
+				 FROM group_dms WHERE member @> ARRAY[$1]::int[]`,
+				[Number(userId), String(userId)],
+			);
+			return Number(rows[0]?.total || 0);
+		});
+	}
+
+	async deleteGroupDm(dmId, expectedState = undefined) {
+		const values = [String(dmId)];
+		let condition = '';
+		if (expectedState) {
+			values.push(Number(expectedState.host_id), expectedState.member, JSON.stringify(expectedState.accepted), String(expectedState.state_version));
+			condition = " AND host_id = $2 AND member = $3::int[] AND COALESCE(unread->'_accepted', to_jsonb(member)) = $4::jsonb AND state_version = $5::bigint";
+		}
+		const { rowCount } = await this.pool.query(`DELETE FROM group_dms WHERE id = $1${condition}`, values);
+		this._clearGroupDmReadCache();
+		return rowCount > 0;
+	}
+
+	async leaveGroupDm(dmId, userId, expectedState = undefined) {
+		const result = await this._withTransaction(async (client) => {
+			const { rows } = await client.query('SELECT host_id, member, unread, state_version FROM group_dms WHERE id = $1 FOR UPDATE', [String(dmId)]);
+			if (!rows[0]) return false;
+
+			const unread = { ...(typeof rows[0].unread === 'object' && rows[0].unread !== null ? rows[0].unread : parseJsonSafe(rows[0].unread, {})) };
+			const currentMembers = (rows[0].member || []).map(Number);
+			const accepted = Array.isArray(unread._accepted) ? unread._accepted.map(Number) : currentMembers;
+			if (!currentMembers.includes(Number(userId))) return false;
+			if (expectedState && (String(rows[0].state_version) !== String(expectedState.state_version) || Number(rows[0].host_id) !== Number(expectedState.host_id) || JSON.stringify(currentMembers) !== JSON.stringify(expectedState.member) || JSON.stringify(accepted) !== JSON.stringify(expectedState.accepted))) return false;
+			const members = currentMembers.filter((id) => id !== Number(userId));
+			unread._accepted = accepted.filter((id) => id !== Number(userId));
+			delete unread[String(userId)];
+
+			await client.query(
+				'UPDATE group_dms SET member = $2::int[], unread = $3::jsonb WHERE id = $1',
+				[String(dmId), members, JSON.stringify(unread)],
+			);
+			return true;
+		});
+		this._clearGroupDmReadCache();
+		return result;
+	}
+
+	async findGroupDmByMembers(memberIds) {
+		const target = Array.from(new Set(memberIds.map(Number).filter(Number.isInteger))).sort((a, b) => a - b);
+		if (target.length === 0) return null;
+		const { rows } = await this.pool.query(
+			`SELECT * FROM group_dms
+			 WHERE cardinality(member) = $1
+			   AND member @> $2::int[] AND member <@ $2::int[]`,
+			[target.length, target],
+		);
+		if (!rows[0]) return null;
+		return normalizeGroupDmRow(rows[0]);
+	}
+
+	async getDmPublicKeys(userIds) {
+		const ids = Array.from(
+			new Set((userIds || []).map(Number).filter((id) => Number.isInteger(id) && id >= 0)),
+		);
+		if (ids.length === 0) return [];
+		const { rows } = await this.pool.query(
+			'SELECT user_id, public_key FROM dm_e2e_keys WHERE user_id = ANY($1::int[])',
+			[ids],
+		);
+		return rows.map((row) => ({ user_id: Number(row.user_id), public_key: String(row.public_key) }));
+	}
+
+	async setDmPublicKey(userId, publicKey) {
+		const now = new Date().toISOString();
+		await this.pool.query(
+			`INSERT INTO dm_e2e_keys (user_id, public_key, created_at, updated_at)
+			 VALUES ($1, $2, $3, $3)
+			 ON CONFLICT (user_id)
+			 DO UPDATE SET public_key = EXCLUDED.public_key, updated_at = EXCLUDED.updated_at`,
+			[Number(userId), String(publicKey), now],
+		);
+	}
+
+	// ==================== Follows ====================
+
+	async toggleFollow(followerId, followingId) {
+		const u1 = Number(followerId);
+		const u2 = Number(followingId);
+		if (u1 === u2) {
+			throw new Error('Cannot follow yourself');
+		}
+
+		const now = new Date().toISOString();
+		const result = await this._withTransaction(async (client) => {
+			const delResult = await client.query(
+				'DELETE FROM follows WHERE follower_id = $1 AND following_id = $2 RETURNING 1',
+				[u1, u2],
+			);
+			if (delResult.rowCount > 0) {
+				return { following: false };
+			}
+			await client.query(
+				'INSERT INTO follows (follower_id, following_id, created_at) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
+				[u1, u2, now],
+			);
+			return { following: true };
+		});
+		const followCache = this._followCache?.get(u1);
+		if (followCache?.follows instanceof Set) {
+			if (result.following) followCache.follows.add(u2);
+			else followCache.follows.delete(u2);
+			this._followCache.set(u1, followCache);
+		}
+		this._invalidateProfileStatsCache(u1);
+		this._invalidateProfileStatsCache(u2);
+		return result;
+	}
+
+	async toggleBlock(userId, targetUserId) {
+		const u1 = Number(userId);
+		const u2 = Number(targetUserId);
+		if (!Number.isInteger(u1) || !Number.isInteger(u2) || u1 <= 0 || u2 <= 0) {
+			throw new Error('Invalid user ID');
+		}
+		if (u1 === u2) {
+			throw new Error('Cannot block yourself');
+		}
+
+		return this._withTransaction(async (client) => {
+			const userRes = await client.query('SELECT id, "block" FROM users WHERE id = $1 FOR UPDATE', [u1]);
+			if (userRes.rows.length === 0) {
+				throw new Error('User not found');
+			}
+			const rawBlock = parseJsonSafe(userRes.rows[0].block, []);
+			const currentBlock = normalizeBlockList(rawBlock, u1);
+			const isBlocked = currentBlock.includes(u2);
+			const newBlock = isBlocked
+				? currentBlock.filter((id) => id !== u2)
+				: [...currentBlock, u2];
+			const normalized = normalizeBlockList(newBlock, u1);
+			await client.query('UPDATE users SET "block" = $2::jsonb WHERE id = $1', [u1, JSON.stringify(normalized)]);
+
+			if (!isBlocked) {
+				await client.query(
+					'DELETE FROM follows WHERE (follower_id = $1 AND following_id = $2) OR (follower_id = $2 AND following_id = $1)',
+					[u1, u2],
+				);
+				this._followCache?.delete(u1);
+				this._followCache?.delete(u2);
+			}
+
+			this._updateCachedUser(u1, { block: normalized });
+			this._invalidateProfileStatsCache(u1);
+			this._invalidateProfileStatsCache(u2);
+
+			return {
+				blocked: !isBlocked,
+				block: normalized,
+			};
+		});
+	}
+
+	async isFollowing(followerId, followingId) {
+		const { rows } = await this.pool.query(
+			'SELECT 1 FROM follows WHERE follower_id = $1 AND following_id = $2 LIMIT 1',
+			[Number(followerId), Number(followingId)],
+		);
+		return rows.length > 0;
+	}
+
+	async getPublicProfileStats(userId) {
+		const targetUserId = Number(userId);
+		if (!Number.isSafeInteger(targetUserId) || targetUserId <= 0) {
+			return {
+				followingCount: 0, followerCount: 0, postCount: 0, mediaCount: 0, pinnedPostId: null,
+				following_count: 0, follower_count: 0, post_count: 0, media_count: 0, pinned_post_id: null,
+			};
+		}
+
+		const cache = this._getProfileStatsCache();
+		const cached = cache?.get(targetUserId);
+		if (cached) return cached;
+
+		const { rows } = await this.pool.query(
+			`SELECT
+				(SELECT COUNT(*)::int FROM follows WHERE follower_id = $1) AS following_count,
+				(SELECT COUNT(*)::int FROM follows WHERE following_id = $1) AS follower_count,
+				(SELECT COUNT(*)::int FROM posts WHERE user_id = $1 AND group_id IS NULL) AS post_count,
+				(SELECT COUNT(*)::int FROM posts
+					WHERE user_id = $1 AND group_id IS NULL
+						AND attachments IS NOT NULL
+						AND jsonb_typeof(attachments) = 'array'
+						AND jsonb_array_length(attachments) > 0) AS media_count,
+				(SELECT post_id FROM pinned_posts WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1) AS pinned_post_id,
+				COALESCE((
+					SELECT jsonb_agg(jsonb_build_object('id', g.id, 'name', g.name, 'icon_data', g.icon_data))
+					FROM (
+						SELECT g.id, g.name, g.icon_data
+						FROM group_memberships gm
+						JOIN groups g ON g.id = gm.group_id
+						WHERE gm.user_id = $1 AND gm.status = 'active'
+						  AND g.deleted_at IS NULL AND g.icon_data IS NOT NULL AND g.icon_data <> ''
+						  AND g.visibility IN ('open', 'open_invite')
+						ORDER BY gm.joined_at DESC NULLS LAST, g.created_at DESC
+						LIMIT 5
+					) g
+				), '[]'::jsonb) AS group_badges`,
+			[targetUserId],
+		);
+		const row = rows[0] || {};
+		const groupBadges = Array.isArray(row.group_badges)
+			? row.group_badges
+			: (typeof row.group_badges === 'string' ? JSON.parse(row.group_badges || '[]') : []);
+		const stats = {
+			followingCount: Math.max(0, Number(row.following_count) || 0),
+			followerCount: Math.max(0, Number(row.follower_count) || 0),
+			postCount: Math.max(0, Number(row.post_count) || 0),
+			mediaCount: Math.max(0, Number(row.media_count) || 0),
+			pinnedPostId: row.pinned_post_id != null ? Number(row.pinned_post_id) : null,
+			following_count: Math.max(0, Number(row.following_count) || 0),
+			follower_count: Math.max(0, Number(row.follower_count) || 0),
+			post_count: Math.max(0, Number(row.post_count) || 0),
+			media_count: Math.max(0, Number(row.media_count) || 0),
+			pinned_post_id: row.pinned_post_id != null ? Number(row.pinned_post_id) : null,
+			groupBadges,
+			group_badges: groupBadges,
+		};
+		cache?.set(targetUserId, stats);
+		return stats;
+	}
+
+	async getFollowing(userId, limit = 100, offset = 0, { cursor = null, withNextCursor = false } = {}) {
+		const safeLimit = Math.min(Math.max(Number(limit) || 100, 1), 500);
+		const decodedCursor = typeof cursor === 'string' && cursor.trim() ? decodePostCursor(cursor.trim()) : null;
+		const fetchLimit = safeLimit + 1;
+		let query;
+		let params;
+
+		if (decodedCursor) {
+			query = `SELECT u.*, f.created_at AS follow_created_at FROM follows f
+			 JOIN users u ON u.id = f.following_id
+			 WHERE f.follower_id = $1 AND (f.created_at < $2 OR (f.created_at = $2 AND f.following_id < $3))
+			 ORDER BY f.created_at DESC, f.following_id DESC
+			 LIMIT $4`;
+			params = [Number(userId), decodedCursor.createdAt, decodedCursor.id, fetchLimit];
+		} else {
+			const safeOffset = Math.max(Number(offset) || 0, 0);
+			query = `SELECT u.*, f.created_at AS follow_created_at FROM follows f
+			 JOIN users u ON u.id = f.following_id
+			 WHERE f.follower_id = $1
+			 ORDER BY f.created_at DESC, f.following_id DESC
+			 LIMIT $2 OFFSET $3`;
+			params = [Number(userId), fetchLimit, safeOffset];
+		}
+
+		const { rows } = await this.pool.query(query, params);
+		const hasMore = rows.length > safeLimit;
+		const slice = rows.slice(0, safeLimit);
+		const lastRow = slice.length > 0 ? slice[slice.length - 1] : null;
+		const nextCursor = hasMore && lastRow
+			? encodePostCursor({ id: lastRow.id, created_at: lastRow.follow_created_at })
+			: null;
+		const users = slice.map(normalizeUserRow);
+
+		if (withNextCursor) {
+			return { users, has_more: hasMore, next_cursor: nextCursor };
+		}
+		return users;
+	}
+
+	async getFollowers(userId, limit = 100, offset = 0, { cursor = null, withNextCursor = false } = {}) {
+		const safeLimit = Math.min(Math.max(Number(limit) || 100, 1), 500);
+		const decodedCursor = typeof cursor === 'string' && cursor.trim() ? decodePostCursor(cursor.trim()) : null;
+		const fetchLimit = safeLimit + 1;
+		let query;
+		let params;
+
+		if (decodedCursor) {
+			query = `SELECT u.*, f.created_at AS follow_created_at FROM follows f
+			 JOIN users u ON u.id = f.follower_id
+			 WHERE f.following_id = $1 AND (f.created_at < $2 OR (f.created_at = $2 AND f.follower_id < $3))
+			 ORDER BY f.created_at DESC, f.follower_id DESC
+			 LIMIT $4`;
+			params = [Number(userId), decodedCursor.createdAt, decodedCursor.id, fetchLimit];
+		} else {
+			const safeOffset = Math.max(Number(offset) || 0, 0);
+			query = `SELECT u.*, f.created_at AS follow_created_at FROM follows f
+			 JOIN users u ON u.id = f.follower_id
+			 WHERE f.following_id = $1
+			 ORDER BY f.created_at DESC, f.follower_id DESC
+			 LIMIT $2 OFFSET $3`;
+			params = [Number(userId), fetchLimit, safeOffset];
+		}
+
+		const { rows } = await this.pool.query(query, params);
+		const hasMore = rows.length > safeLimit;
+		const slice = rows.slice(0, safeLimit);
+		const lastRow = slice.length > 0 ? slice[slice.length - 1] : null;
+		const nextCursor = hasMore && lastRow
+			? encodePostCursor({ id: lastRow.id, created_at: lastRow.follow_created_at })
+			: null;
+		const users = slice.map(normalizeUserRow);
+
+		if (withNextCursor) {
+			return { users, has_more: hasMore, next_cursor: nextCursor };
+		}
+		return users;
+	}
+
+	async getFollowIds(userId) {
+		const { rows } = await this.pool.query(
+			`SELECT following_id FROM follows
+			 WHERE follower_id = $1
+			 ORDER BY created_at DESC, following_id ASC`,
+			[Number(userId)],
+		);
+		return rows.map((row) => Number(row.following_id));
+	}
+
+	async getFollowRelationshipSnapshot(userId, candidateUserIds) {
+		const normalizedUserId = Number(userId);
+		const ids = [...new Set((candidateUserIds || [])
+			.map(Number)
+			.filter((id) => Number.isInteger(id) && id !== normalizedUserId))].slice(0, 500);
+		if (!Number.isSafeInteger(normalizedUserId) || ids.length === 0) {
+			return { followingIds: [], followerIds: [] };
+		}
+		const { rows } = await this.pool.query(
+			`SELECT following_id AS user_id, 'following' AS direction
+			 FROM follows
+			 WHERE follower_id = $1 AND following_id = ANY($2::int[])
+			 UNION ALL
+			 SELECT follower_id AS user_id, 'follower' AS direction
+			 FROM follows
+			 WHERE following_id = $1 AND follower_id = ANY($2::int[])`,
+			[normalizedUserId, ids],
+		);
+		const followingIds = [];
+		const followerIds = [];
+		for (const row of rows) {
+			if (row.direction === 'following') followingIds.push(Number(row.user_id));
+			if (row.direction === 'follower') followerIds.push(Number(row.user_id));
+		}
+		return { followingIds, followerIds };
+	}
+
+	async getFollowingCount(userId) {
+		const { rows } = await this.pool.query(
+			'SELECT COUNT(*)::int AS count FROM follows WHERE follower_id = $1',
+			[Number(userId)],
+		);
+		return Number(rows[0]?.count || 0);
+	}
+
+	async getFollowerCount(userId) {
+		const { rows } = await this.pool.query(
+			'SELECT COUNT(*)::int AS count FROM follows WHERE following_id = $1',
+			[Number(userId)],
+		);
+		return Number(rows[0]?.count || 0);
+	}
+
+	// ==================== Notifications ====================
+
+	async createNotification(notificationData) {
+		const target = normalizeTarget(notificationData.target, {
+			postId: notificationData.postId,
+			open: notificationData.open,
+		});
+		const now = notificationData.createdAt ? toIsoString(notificationData.createdAt) : new Date().toISOString();
+		const hasExplicitId = notificationData.id != null && Number.isSafeInteger(Number(notificationData.id)) && Number(notificationData.id) > 0;
+
+		const values = [
+			Number(notificationData.userId),
+			String(notificationData.type),
+			notificationData.fromUserId != null ? Number(notificationData.fromUserId) : null,
+			target?.kind === 'post' ? Number(target.id) : (notificationData.postId != null ? Number(notificationData.postId) : null),
+			target ? JSON.stringify(target) : null,
+			typeof notificationData.message === 'string' ? notificationData.message : null,
+			now,
+		];
+
+		const insertQuery = hasExplicitId
+			? `INSERT INTO notifications
+				 (id, user_id, type, from_user_id, post_id, target, message, read, clicked, created_at)
+				 VALUES ($8, $1, $2, $3, $4, $5::jsonb, $6, false, false, $7)
+			   RETURNING *`
+			: `INSERT INTO notifications
+				 (user_id, type, from_user_id, post_id, target, message, read, clicked, created_at)
+				 VALUES ($1, $2, $3, $4, $5::jsonb, $6, false, false, $7)
+			   RETURNING *`;
+
+		if (hasExplicitId) {
+			values.push(Number(notificationData.id));
+		}
+
+		const { rows } = await this.pool.query(insertQuery, values);
+		const row = rows[0];
+		if (!row) return null;
+		return {
+			id: Number(row.id),
+			userId: Number(row.user_id),
+			user_id: Number(row.user_id),
+			type: row.type,
+			fromUserId: row.from_user_id != null ? Number(row.from_user_id) : null,
+			from_user_id: row.from_user_id != null ? Number(row.from_user_id) : null,
+			postId: row.post_id != null ? Number(row.post_id) : null,
+			post_id: row.post_id != null ? Number(row.post_id) : null,
+			target: parseJsonSafe(row.target, null),
+			message: row.message || null,
+			read: Boolean(row.read),
+			clicked: Boolean(row.clicked),
+			createdAt: toIsoString(row.created_at),
+			created_at: toIsoString(row.created_at),
+		};
+	}
+
+	async getNotifications(userId, limit = 50, offset = 0) {
+		const safeLimit = Math.min(Math.max(Number(limit) || 50, 1), 200);
+		const safeOffset = Math.max(Number(offset) || 0, 0);
+		const { rows } = await this.pool.query(
+			`SELECT n.*,
+			        u.id AS from_user_id, u.name AS from_user_name, u.scid AS from_user_scid, u.handle AS from_user_handle, u.icon_data AS from_user_icon_data, u.settings AS from_user_settings, u.block AS from_user_block, u.created_at AS from_user_created_at,
+			        p.id AS target_post_id, p.content AS target_post_content, p.view_content AS target_post_view_content, p.created_at AS target_post_created_at
+			 FROM notifications n
+			 LEFT JOIN users u ON u.id = n.from_user_id
+			 LEFT JOIN posts p ON p.id = n.post_id
+			 WHERE n.user_id = $1
+			 ORDER BY n.created_at DESC, n.id DESC
+			 LIMIT $2 OFFSET $3`,
+			[Number(userId), safeLimit, safeOffset],
+		);
+		return rows.map((r) => {
+			const fromUser = r.from_user_id != null ? {
+				id: Number(r.from_user_id),
+				name: r.from_user_name,
+				scid: r.from_user_scid,
+				handle: r.from_user_handle,
+				icon_data: r.from_user_icon_data,
+				settings: r.from_user_settings,
+				block: r.from_user_block,
+				created_at: toIsoString(r.from_user_created_at),
+			} : null;
+			const targetPost = r.target_post_id != null ? {
+				id: Number(r.target_post_id),
+				content: r.target_post_content,
+				view_content: r.target_post_view_content,
+				created_at: toIsoString(r.target_post_created_at),
+			} : null;
+			return {
+				id: Number(r.id),
+				userId: Number(r.user_id),
+				user_id: Number(r.user_id),
+				type: r.type,
+				fromUserId: r.from_user_id != null ? Number(r.from_user_id) : null,
+				from_user_id: r.from_user_id != null ? Number(r.from_user_id) : null,
+				fromUser,
+				postId: r.post_id != null ? Number(r.post_id) : null,
+				post_id: r.post_id != null ? Number(r.post_id) : null,
+				targetPost,
+				target: parseJsonSafe(r.target, null),
+				message: r.message || null,
+				read: Boolean(r.read),
+				clicked: Boolean(r.clicked),
+				createdAt: toIsoString(r.created_at),
+				created_at: toIsoString(r.created_at),
+			};
+		});
+	}
+
+	async markNotificationAsRead(notificationId) {
+		await this.pool.query(
+			'UPDATE notifications SET read = true WHERE id = $1',
+			[Number(notificationId)],
+		);
+		return { success: true };
+	}
+
+	async markNotificationAsClicked(notificationId) {
+		await this.pool.query(
+			'UPDATE notifications SET clicked = true WHERE id = $1',
+			[Number(notificationId)],
+		);
+		return { success: true };
+	}
+
+	async getNotificationById(notificationId) {
+		const { rows } = await this.pool.query(
+			'SELECT * FROM notifications WHERE id = $1',
+			[Number(notificationId)],
+		);
+		const r = rows[0];
+		if (!r) return null;
+		return {
+			id: Number(r.id),
+			userId: Number(r.user_id),
+			user_id: Number(r.user_id),
+			type: r.type,
+			fromUserId: r.from_user_id != null ? Number(r.from_user_id) : null,
+			from_user_id: r.from_user_id != null ? Number(r.from_user_id) : null,
+			postId: r.post_id != null ? Number(r.post_id) : null,
+			post_id: r.post_id != null ? Number(r.post_id) : null,
+			target: parseJsonSafe(r.target, null),
+			message: r.message || null,
+			read: Boolean(r.read),
+			clicked: Boolean(r.clicked),
+			createdAt: toIsoString(r.created_at),
+			created_at: toIsoString(r.created_at),
+		};
+	}
+
+	async markAllNotificationsAsRead(userId) {
+		await this.pool.query(
+			'UPDATE notifications SET read = true WHERE user_id = $1 AND read = false',
+			[Number(userId)],
+		);
+		return { success: true };
+	}
+
+	async markAllNotificationsAsClicked(userId) {
+		await this.pool.query(
+			'UPDATE notifications SET read = true, clicked = true WHERE user_id = $1 AND (read = false OR clicked = false)',
+			[Number(userId)],
+		);
+		return { success: true };
+	}
+
+	async deleteNotification(notificationId) {
+		const { rowCount } = await this.pool.query(
+			'DELETE FROM notifications WHERE id = $1',
+			[Number(notificationId)],
+		);
+		return rowCount > 0;
+	}
+
+	async getUnreadNotificationCount(userId) {
+		const { rows } = await this.pool.query(
+			'SELECT COUNT(*)::int as count FROM notifications WHERE user_id = $1 AND read = false',
+			[Number(userId)],
+		);
+		return Number(rows[0]?.count || 0);
+	}
+
+	// ==================== Moderation Reports ====================
+
+	async createModerationReport(reportData) {
+		const now = reportData.createdAt ? toIsoString(reportData.createdAt) : new Date().toISOString();
+		const assignmentType = ['freeze_appeal', 'verification_application'].includes(reportData.assignmentType)
+			? reportData.assignmentType
+			: 'report';
+		const hasExplicitId = reportData.id != null && Number.isSafeInteger(Number(reportData.id)) && Number(reportData.id) > 0;
+
+		const values = [
+			Number(reportData.reporterUserId),
+			String(reportData.targetKind),
+			String(reportData.targetId),
+			String(reportData.description || ''),
+			JSON.stringify(reportData.targetSnapshot || {}),
+			assignmentType,
+			now,
+		];
+
+		const insertQuery = hasExplicitId
+			? `INSERT INTO moderation_reports
+				(id, reporter_user_id, target_kind, target_id, description, target_snapshot, assignment_type, status, excluded_admin_ids, created_at)
+			   VALUES ($8, $1, $2, $3, $4, $5::jsonb, $6, 'pending', '[]'::jsonb, $7)
+			   RETURNING *`
+			: `INSERT INTO moderation_reports
+				(reporter_user_id, target_kind, target_id, description, target_snapshot, assignment_type, status, excluded_admin_ids, created_at)
+			   VALUES ($1, $2, $3, $4, $5::jsonb, $6, 'pending', '[]'::jsonb, $7)
+			   RETURNING *`;
+
+		if (hasExplicitId) {
+			values.push(Number(reportData.id));
+		}
+
+		const { rows } = await this.pool.query(insertQuery, values);
+		return normalizeModerationReportRow(rows[0]);
+	}
+
+	async getOpenModerationAppealByUserId(userId) {
+		const { rows } = await this.pool.query(
+			`SELECT * FROM moderation_reports
+			 WHERE reporter_user_id = $1 AND assignment_type = 'freeze_appeal' AND status <> 'resolved'
+			 ORDER BY created_at DESC LIMIT 1`,
+			[Number(userId)],
+		);
+		return normalizeModerationReportRow(rows[0]);
+	}
+
+	async getOpenModerationVerificationByUserId(userId) {
+		const { rows } = await this.pool.query(
+			`SELECT * FROM moderation_reports
+			 WHERE reporter_user_id = $1 AND assignment_type = 'verification_application' AND status <> 'resolved'
+			 ORDER BY created_at DESC LIMIT 1`,
+			[Number(userId)],
+		);
+		return normalizeModerationReportRow(rows[0]);
+	}
+
+	async getModerationReportById(reportId) {
+		const { rows } = await this.pool.query(
+			'SELECT * FROM moderation_reports WHERE id = $1 LIMIT 1',
+			[Number(reportId)],
+		);
+		return normalizeModerationReportRow(rows[0]);
+	}
+
+	async listModerationReportsForAdmin(adminId, options = {}) {
+		const status = options.status || 'assigned';
+		const limit = Math.max(1, Math.min(Number(options.limit) || 50, 100));
+		const offset = Math.max(0, Number(options.offset) || 0);
+		const { rows } = await this.pool.query(
+			`SELECT * FROM moderation_reports
+			 WHERE assigned_admin_id = $1
+			   AND ($2::text IS NULL OR status = $2)
+			 ORDER BY COALESCE(assigned_at, created_at) DESC, id DESC
+			 LIMIT $3 OFFSET $4`,
+			[Number(adminId), status || null, limit, offset],
+		);
+		return rows.map(normalizeModerationReportRow);
+	}
+
+	async getModerationAdminWorkloads(excludedAdminIds = []) {
+		const excluded = [...new Set((excludedAdminIds || []).map(Number).filter(Number.isInteger))];
+		const { rows } = await this.pool.query(
+			`SELECT u.id AS admin_id, COUNT(r.id)::int AS active_count
+			 FROM users u
+			 LEFT JOIN moderation_reports r
+			   ON r.assigned_admin_id = u.id AND r.status = 'assigned'
+			 WHERE u.admin = TRUE
+			   AND u.admin_request_excluded = FALSE
+			   AND COALESCE(u."freeze", '') = ''
+			   AND NOT (u.id = ANY($1::int[]))
+			 GROUP BY u.id`,
+			[excluded],
+		);
+		return rows.map((row) => ({
+			adminId: Number(row.admin_id),
+			activeCount: Number(row.active_count || 0),
+		}));
+	}
+
+	async setAdminRequestExcluded(userId, excluded) {
+		const { rows } = await this.pool.query(
+			'UPDATE users SET admin_request_excluded = $2 WHERE id = $1 AND admin = TRUE RETURNING *',
+			[Number(userId), excluded],
+		);
+		return normalizeUserRow(rows[0]);
+	}
+
+	async assignModerationReport(reportId, assignment = {}) {
+		return this._withTransaction(async (client) => {
+			const eligible = await client.query(
+				`SELECT id FROM users WHERE id = $1 AND admin = TRUE AND admin_request_excluded = FALSE AND COALESCE("freeze", '') = '' FOR UPDATE`,
+				[Number(assignment.adminId)],
+			);
+			if (!eligible.rows.length) return null;
+			const existingRes = await client.query('SELECT * FROM moderation_reports WHERE id = $1 FOR UPDATE', [Number(reportId)]);
+			const existing = existingRes.rows[0];
+			if (!existing || existing.status === 'resolved') return null;
+
+			if (Object.prototype.hasOwnProperty.call(assignment, 'expectedAdminId') &&
+				existing.assigned_admin_id !== null &&
+				Number(existing.assigned_admin_id) !== Number(assignment.expectedAdminId)) {
+				return null;
+			}
+
+			const rawExistingExcluded = Array.isArray(existing.excluded_admin_ids) ? existing.excluded_admin_ids : parseJsonSafe(existing.excluded_admin_ids, []);
+			const excluded = [...new Set((Array.isArray(assignment.excludedAdminIds) ? assignment.excludedAdminIds : rawExistingExcluded)
+				.map(Number)
+				.filter(Number.isInteger))];
+			const assignedAt = assignment.assignedAt ? toIsoString(assignment.assignedAt) : new Date().toISOString();
+
+			// スイープの SELECT を信用しない: read→write の窓で旧担当者が再claimすると無条件 UPDATE が lease を潰して二重対応になるため、assign 側で lease を CAS する。
+			const claimStaleBefore = assignment.claimStaleBefore == null || assignment.claimStaleBefore === ''
+				? null
+				: toIsoString(assignment.claimStaleBefore);
+			const claimClause = claimStaleBefore === null
+				? ''
+				: ' AND (claimed_at IS NULL OR claimed_at <= $5::timestamptz)';
+			const values = [Number(reportId), Number(assignment.adminId), assignedAt, JSON.stringify(excluded)];
+			if (claimStaleBefore !== null) values.push(claimStaleBefore);
+
+			const { rows } = await client.query(
+				`UPDATE moderation_reports
+				 SET status = 'assigned', assigned_admin_id = $2,
+					 assigned_at = $3,
+					 excluded_admin_ids = $4::jsonb,
+					 claimed_at = NULL
+				 WHERE id = $1${claimClause}
+				 RETURNING *`,
+				values,
+			);
+			return normalizeModerationReportRow(rows[0]);
+		});
+	}
+
+	async getOverdueModerationReports(cutoff, claimStaleBeforeIso = null) {
+		const cutoffIso = toIsoString(cutoff);
+		// lease は SQL 側で除外する。JS フィルタだと read→assign の窓で再割り当てが走り二重対応が残る。
+		const claimClause = claimStaleBeforeIso == null || claimStaleBeforeIso === ''
+			? ''
+			: 'AND (claimed_at IS NULL OR claimed_at <= $2::timestamptz)';
+		const values = claimClause
+			? [cutoffIso, toIsoString(claimStaleBeforeIso)]
+			: [cutoffIso];
+		const { rows } = await this.pool.query(
+			`SELECT * FROM moderation_reports
+			 WHERE status = 'assigned' AND assigned_at IS NOT NULL AND assigned_at <= $1::timestamptz
+			 ${claimClause}
+			 ORDER BY assigned_at ASC`,
+			values,
+		);
+		return rows.map(normalizeModerationReportRow);
+	}
+
+	async getUnassignedModerationReports(limit = 100) {
+		const safeLimit = Math.max(1, Math.min(Number(limit) || 100, 100));
+		const { rows } = await this.pool.query(
+			`SELECT * FROM moderation_reports
+			 WHERE status = 'pending'
+			 ORDER BY created_at ASC, id ASC LIMIT $1`,
+			[safeLimit],
+		);
+		return rows.map(normalizeModerationReportRow);
+	}
+
+	async claimModerationReport(reportId, adminId, claimedAtIso) {
+		// 排他ロックではなく lease の更新なので freshness 条件は置かない:
+		// 今の担当者が何度でも claim できないと、処理途中で失敗した管理者が期限まで再試行できない。
+		const claimedAt = toIsoString(claimedAtIso) || new Date().toISOString();
+		const { rows } = await this.pool.query(
+			`UPDATE moderation_reports
+			 SET claimed_at = $3
+			 WHERE id = $1 AND status = 'assigned' AND assigned_admin_id = $2
+			 RETURNING *`,
+			[Number(reportId), Number(adminId), claimedAt],
+		);
+		return rows.length ? normalizeModerationReportRow(rows[0]) : null;
+	}
+
+	async resolveModerationReport(reportId, adminId, resolution) {
+		const now = new Date().toISOString();
+		const { rows } = await this.pool.query(
+			`UPDATE moderation_reports
+			 SET status = 'resolved', resolution = $3::jsonb, resolved_at = $4, claimed_at = NULL
+			 WHERE id = $1 AND assigned_admin_id = $2 AND status = 'assigned'
+			 RETURNING *`,
+			[Number(reportId), Number(adminId), JSON.stringify(resolution || {}), now],
+		);
+		return normalizeModerationReportRow(rows[0]);
+	}
+
+	async deleteModerationReport(reportId) {
+		const result = await this.pool.query(
+			'DELETE FROM moderation_reports WHERE id = $1',
+			[Number(reportId)],
+		);
+		return result.rowCount > 0;
+	}
+
+	// ==================== Push Subscriptions ====================
+
+	async upsertPushSubscription(userId, subscription) {
+		const now = new Date().toISOString();
+		const expTime = subscription.expirationTime ? new Date(Number(subscription.expirationTime)).toISOString() : null;
+		const { rows } = await this.pool.query(
+			`INSERT INTO push_subscriptions
+				(user_id, endpoint, expiration_time, p256dh, auth, session_token, created_at, updated_at)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
+			 ON CONFLICT (user_id, endpoint)
+			 DO UPDATE SET
+				expiration_time = EXCLUDED.expiration_time,
+				p256dh = EXCLUDED.p256dh,
+				auth = EXCLUDED.auth,
+				session_token = COALESCE(EXCLUDED.session_token, push_subscriptions.session_token),
+				updated_at = EXCLUDED.updated_at
+			 RETURNING *`,
+			[
+				Number(userId),
+				String(subscription.endpoint),
+				expTime,
+				String(subscription.keys?.p256dh || ''),
+				String(subscription.keys?.auth || ''),
+				subscription.sessionToken ? String(subscription.sessionToken) : null,
+				now,
+			],
+		);
+		const r = rows[0];
+		if (!r) return null;
+		return {
+			userId: Number(r.user_id),
+			endpoint: r.endpoint,
+			expirationTime: r.expiration_time ? new Date(r.expiration_time).getTime() : null,
+			keys: { p256dh: r.p256dh, auth: r.auth },
+			sessionToken: r.session_token || null,
+		};
+	}
+
+	async getPushSubscriptions(userId) {
+		const { rows } = await this.pool.query(
+			`SELECT endpoint, expiration_time, p256dh, auth, session_token
+			 FROM push_subscriptions
+			 WHERE user_id = $1`,
+			[Number(userId)],
+		);
+		return rows.map((row) => ({
+			endpoint: row.endpoint,
+			expirationTime: row.expiration_time ? new Date(row.expiration_time).getTime() : null,
+			keys: { p256dh: row.p256dh, auth: row.auth },
+			sessionToken: row.session_token || null,
+		}));
+	}
+
+	async deletePushSubscription(userId, endpoint) {
+		const result = await this.pool.query(
+			'DELETE FROM push_subscriptions WHERE user_id = $1 AND endpoint = $2',
+			[Number(userId), String(endpoint)],
+		);
+		return result.rowCount > 0;
+	}
+
+	// ==================== User Account State & Batch Profile Data ====================
+
+	async getUserAccountState(userId) {
+		const { rows } = await this.pool.query(
+			`SELECT
+				COALESCE((
+					SELECT array_agg(following_id ORDER BY created_at DESC, following_id ASC)
+					FROM (
+						SELECT following_id, created_at
+						FROM follows
+						WHERE follower_id = $1
+						ORDER BY created_at DESC, following_id ASC
+						LIMIT 1000
+					) recent_follows
+				), ARRAY[]::INTEGER[]) AS follow_ids,
+				COALESCE((
+					SELECT array_agg(post_id ORDER BY created_at DESC)
+					FROM (
+						SELECT post_id, created_at
+						FROM likes
+						WHERE user_id = $1
+						ORDER BY created_at DESC
+						LIMIT 1000
+					) recent_likes
+				), ARRAY[]::INTEGER[]) AS like_ids,
+				COALESCE((
+					SELECT array_agg(post_id ORDER BY created_at DESC)
+					FROM (
+						SELECT post_id, created_at
+						FROM stars
+						WHERE user_id = $1
+						ORDER BY created_at DESC
+						LIMIT 1000
+					) recent_stars
+				), ARRAY[]::INTEGER[]) AS star_ids,
+				(
+					SELECT post_id FROM pinned_posts WHERE user_id = $1
+					ORDER BY created_at DESC LIMIT 1
+				) AS pinned_post_id`,
+			[Number(userId)],
+		);
+		const normalizeIds = (values) => (Array.isArray(values) ? values : [])
+			.map(Number)
+			.filter((id) => Number.isSafeInteger(id) && id > 0);
+		const state = rows[0] || {};
+		const result = {
+			follow: normalizeIds(state.follow_ids),
+			like: normalizeIds(state.like_ids),
+			star: normalizeIds(state.star_ids),
+			pin: state.pinned_post_id != null && Number.isSafeInteger(Number(state.pinned_post_id))
+				? Number(state.pinned_post_id)
+				: null,
+		};
+		return result;
+	}
+
+	async getUserBootstrapData(userId, notificationLimit = 200) {
+		const normalizedLimit = Math.min(Math.max(Number(notificationLimit) || 200, 1), 200);
+		const { rows } = await this.pool.query(
+			`WITH notification_rows AS (
+				SELECT * FROM notifications
+				WHERE user_id = $1
+				ORDER BY created_at DESC, id DESC
+				LIMIT $2
+			), notification_users AS (
+				SELECT DISTINCT u.*
+				FROM users u
+				JOIN notification_rows n ON n.from_user_id = u.id
+			), notification_posts AS (
+				SELECT DISTINCT p.id, p.content
+				FROM posts p
+				JOIN notification_rows n ON n.post_id = p.id
+			)
+			SELECT
+				COALESCE((
+					SELECT array_agg(following_id ORDER BY created_at DESC, following_id ASC)
+					FROM (
+						SELECT following_id, created_at
+						FROM follows
+						WHERE follower_id = $1
+						ORDER BY created_at DESC, following_id ASC
+						LIMIT 1000
+					) recent_follows
+				), ARRAY[]::INTEGER[]) AS follow_ids,
+				COALESCE((
+					SELECT array_agg(post_id ORDER BY created_at DESC)
+					FROM (
+						SELECT post_id, created_at
+						FROM likes
+						WHERE user_id = $1
+						ORDER BY created_at DESC
+						LIMIT 1000
+					) recent_likes
+				), ARRAY[]::INTEGER[]) AS like_ids,
+				COALESCE((
+					SELECT array_agg(post_id ORDER BY created_at DESC)
+					FROM (
+						SELECT post_id, created_at
+						FROM stars
+						WHERE user_id = $1
+						ORDER BY created_at DESC
+						LIMIT 1000
+					) recent_stars
+				), ARRAY[]::INTEGER[]) AS star_ids,
+				(
+					SELECT post_id FROM pinned_posts WHERE user_id = $1
+					ORDER BY created_at DESC LIMIT 1
+				) AS pinned_post_id,
+				(SELECT COUNT(*)::int FROM notifications WHERE user_id = $1 AND read = false)
+					AS unread_notification_count,
+				COALESCE((
+					SELECT jsonb_agg(jsonb_build_object('id', g.id, 'name', g.name, 'icon_data', g.icon_data))
+					FROM (
+						SELECT g.id, g.name, g.icon_data
+						FROM group_memberships gm
+						JOIN groups g ON g.id = gm.group_id
+						WHERE gm.user_id = $1 AND gm.status = 'active'
+						  AND g.deleted_at IS NULL AND g.icon_data IS NOT NULL AND g.icon_data <> ''
+						  AND g.visibility IN ('open', 'open_invite')
+						ORDER BY gm.joined_at DESC NULLS LAST, g.created_at DESC
+						LIMIT 5
+					) g
+				), '[]'::jsonb) AS group_badges,
+				COALESCE((SELECT jsonb_agg(to_jsonb(n) ORDER BY n.created_at DESC, n.id DESC) FROM notification_rows n), '[]'::jsonb)
+					AS notifications,
+				COALESCE((SELECT jsonb_agg(to_jsonb(u)) FROM notification_users u), '[]'::jsonb)
+					AS notification_users,
+				COALESCE((SELECT jsonb_agg(to_jsonb(p)) FROM notification_posts p), '[]'::jsonb)
+					AS notification_posts`,
+			[Number(userId), normalizedLimit],
+		);
+		const normalizeIds = (values) => (Array.isArray(values) ? values : [])
+			.map(Number)
+			.filter((id) => Number.isSafeInteger(id) && id > 0);
+		const result = rows[0] || {};
+		const rawNotifs = Array.isArray(result.notifications) ? result.notifications : parseJsonSafe(result.notifications, []);
+		const rawUsers = Array.isArray(result.notification_users) ? result.notification_users : parseJsonSafe(result.notification_users, []);
+		const rawPosts = Array.isArray(result.notification_posts) ? result.notification_posts : parseJsonSafe(result.notification_posts, []);
+		const rawBadges = Array.isArray(result.group_badges) ? result.group_badges : parseJsonSafe(result.group_badges, []);
+
+		return {
+			follow: normalizeIds(result.follow_ids),
+			like: normalizeIds(result.like_ids),
+			star: normalizeIds(result.star_ids),
+			pin: result.pinned_post_id != null && Number.isSafeInteger(Number(result.pinned_post_id))
+				? Number(result.pinned_post_id)
+				: null,
+			unreadCount: Math.max(0, Number(result.unread_notification_count) || 0),
+			group_badges: rawBadges.map((gb) => ({
+				id: String(gb.id),
+				name: String(gb.name || ''),
+				icon_data: gb.icon_data,
+			})),
+			notifications: rawNotifs.map((r) => ({
+				id: Number(r.id),
+				userId: Number(r.user_id),
+				user_id: Number(r.user_id),
+				type: r.type,
+				fromUserId: r.from_user_id != null ? Number(r.from_user_id) : null,
+				from_user_id: r.from_user_id != null ? Number(r.from_user_id) : null,
+				postId: r.post_id != null ? Number(r.post_id) : null,
+				post_id: r.post_id != null ? Number(r.post_id) : null,
+				target: parseJsonSafe(r.target, null),
+				message: r.message || null,
+				read: Boolean(r.read),
+				clicked: Boolean(r.clicked),
+				createdAt: toIsoString(r.created_at),
+				created_at: toIsoString(r.created_at),
+			})),
+			notificationUsers: rawUsers.map(normalizeUserRow).filter(Boolean),
+			notificationPosts: rawPosts.filter(Boolean),
+		};
+	}
+
+	// ==================== Rankings ====================
+
+	async getRanking(type, limit = 50) {
+		const safeLimit = Math.min(Math.max(Number(limit) || 50, 1), 100);
+		let query;
+		if (type === 'followers') {
+			query = `WITH top_users AS (
+				SELECT following_id AS user_id, COUNT(*)::int AS follower_count
+				FROM follows
+				GROUP BY following_id
+				ORDER BY follower_count DESC, following_id ASC
+				LIMIT $1
+			)
+			SELECT u.id AS user_id, u.name, u.scid, u.icon_data, tu.follower_count
+			FROM top_users tu
+			JOIN users u ON u.id = tu.user_id
+			ORDER BY tu.follower_count DESC, tu.user_id ASC`;
+		} else if (type === 'posts') {
+			query = `WITH top_users AS (
+				SELECT user_id, COUNT(*)::int AS post_count
+				FROM posts
+				WHERE group_id IS NULL
+				GROUP BY user_id
+				ORDER BY post_count DESC, user_id ASC
+				LIMIT $1
+			)
+			SELECT u.id AS user_id, u.name, u.scid, u.icon_data, tu.post_count
+			FROM top_users tu
+			JOIN users u ON u.id = tu.user_id
+			ORDER BY tu.post_count DESC, tu.user_id ASC`;
+		} else if (type === 'likes') {
+			query = `WITH top_users AS (
+				SELECT p.user_id, COUNT(*)::int AS like_count
+				FROM likes l
+				JOIN posts p ON p.id = l.post_id
+				GROUP BY p.user_id
+				ORDER BY like_count DESC, p.user_id ASC
+				LIMIT $1
+			)
+			SELECT u.id AS user_id, u.name, u.scid, u.icon_data, tu.like_count
+			FROM top_users tu
+			JOIN users u ON u.id = tu.user_id
+			ORDER BY tu.like_count DESC, tu.user_id ASC`;
+		} else if (type === 'stars') {
+			query = `WITH top_users AS (
+				SELECT p.user_id, COUNT(*)::int AS star_count
+				FROM stars s
+				JOIN posts p ON p.id = s.post_id
+				GROUP BY p.user_id
+				ORDER BY star_count DESC, p.user_id ASC
+				LIMIT $1
+			)
+			SELECT u.id AS user_id, u.name, u.scid, u.icon_data, tu.star_count
+			FROM top_users tu
+			JOIN users u ON u.id = tu.user_id
+			ORDER BY tu.star_count DESC, tu.user_id ASC`;
+		} else {
+			throw new Error('Invalid ranking type');
+		}
+		const { rows } = await this.pool.query(query, [safeLimit]);
+		return rows.map((r) => ({
+			user_id: Number(r.user_id),
+			name: r.name,
+			scid: r.scid || null,
+			icon_data: r.icon_data || null,
+			...(r.follower_count !== undefined ? { follower_count: Number(r.follower_count) } : {}),
+			...(r.post_count !== undefined ? { post_count: Number(r.post_count) } : {}),
+			...(r.like_count !== undefined ? { like_count: Number(r.like_count) } : {}),
+			...(r.star_count !== undefined ? { star_count: Number(r.star_count) } : {}),
+		}));
+	}
+
+	async getUserRanking(type, userId) {
+		const targetId = Number(userId);
+		let query;
+		if (type === 'followers') {
+			query = `WITH my_count AS (
+				SELECT COUNT(*)::int AS cnt FROM follows WHERE following_id = $1
+			), higher AS (
+				SELECT COUNT(*)::int AS rank_offset
+				FROM (
+					SELECT following_id, COUNT(*)::int AS c
+					FROM follows
+					GROUP BY following_id
+					HAVING COUNT(*)::int > (SELECT cnt FROM my_count)
+				) h
+			)
+			SELECT (SELECT cnt FROM my_count) AS follower_count,
+			       (SELECT rank_offset + 1 FROM higher) AS rank`;
+		} else if (type === 'posts') {
+			query = `WITH my_count AS (
+				SELECT COUNT(*)::int AS cnt FROM posts WHERE user_id = $1 AND group_id IS NULL
+			), higher AS (
+				SELECT COUNT(*)::int AS rank_offset
+				FROM (
+					SELECT user_id, COUNT(*)::int AS c
+					FROM posts
+					WHERE group_id IS NULL
+					GROUP BY user_id
+					HAVING COUNT(*)::int > (SELECT cnt FROM my_count)
+				) h
+			)
+			SELECT (SELECT cnt FROM my_count) AS post_count,
+			       (SELECT rank_offset + 1 FROM higher) AS rank`;
+		} else if (type === 'likes') {
+			query = `WITH my_count AS (
+				SELECT COUNT(*)::int AS cnt
+				FROM likes l JOIN posts p ON p.id = l.post_id
+				WHERE p.user_id = $1
+			), higher AS (
+				SELECT COUNT(*)::int AS rank_offset
+				FROM (
+					SELECT p.user_id, COUNT(*)::int AS c
+					FROM likes l JOIN posts p ON p.id = l.post_id
+					GROUP BY p.user_id
+					HAVING COUNT(*)::int > (SELECT cnt FROM my_count)
+				) h
+			)
+			SELECT (SELECT cnt FROM my_count) AS like_count,
+			       (SELECT rank_offset + 1 FROM higher) AS rank`;
+		} else if (type === 'stars') {
+			query = `WITH my_count AS (
+				SELECT COUNT(*)::int AS cnt
+				FROM stars s JOIN posts p ON p.id = s.post_id
+				WHERE p.user_id = $1
+			), higher AS (
+				SELECT COUNT(*)::int AS rank_offset
+				FROM (
+					SELECT p.user_id, COUNT(*)::int AS c
+					FROM stars s JOIN posts p ON p.id = s.post_id
+					GROUP BY p.user_id
+					HAVING COUNT(*)::int > (SELECT cnt FROM my_count)
+				) h
+			)
+			SELECT (SELECT cnt FROM my_count) AS star_count,
+			       (SELECT rank_offset + 1 FROM higher) AS rank`;
+		} else {
+			throw new Error('Invalid ranking type');
+		}
+		const { rows } = await this.pool.query(query, [targetId]);
+		const metricField = type === 'followers' ? 'follower_count' : (type === 'posts' ? 'post_count' : (type === 'likes' ? 'like_count' : 'star_count'));
+		return rows[0] ? {
+			rank: Number(rows[0].rank || 1),
+			[metricField]: Number(rows[0][metricField] || 0),
+		} : { rank: null, [metricField]: 0 };
+	}
+
+	// ==================== Logs ====================
+
+	async addLog(entry) {
+		const now = new Date().toISOString();
+		const { rows } = await this.pool.query(
+			`INSERT INTO logs (scratch_id, nyaitter_id, masked_ip_uuid, log_time)
+			 VALUES ($1, $2, $3, $4)
+			 RETURNING id`,
+			[entry.scratch_id || '', entry.nyaitter_id != null ? Number(entry.nyaitter_id) : null, entry.masked_ip_uuid || '', now],
+		);
+		return rows[0] ? { id: Number(rows[0].id) } : { success: true };
+	}
+
+	async getLogs(limit = 20, offset = 0) {
+		const normalizedLimit = Math.max(1, Math.min(Number(limit) || 20, 100));
+		const normalizedOffset = Math.max(0, Number(offset) || 0);
+		const { rows } = await this.pool.query(
+			`SELECT * FROM logs
+			 ORDER BY log_time DESC, id DESC
+			 LIMIT $1 OFFSET $2`,
+			[normalizedLimit, normalizedOffset],
+		);
+		return rows.map((r) => ({
+			id: Number(r.id),
+			scratch_id: r.scratch_id,
+			nyaitter_id: r.nyaitter_id != null ? Number(r.nyaitter_id) : null,
+			masked_ip_uuid: r.masked_ip_uuid,
+			log_time: toIsoString(r.log_time),
+		}));
+	}
+
+	async getUserPostSubscribers(authorUserId) {
+		const { rows } = await this.pool.query(
+			`SELECT id, settings->'user_notifications'->>$1 AS mode
+			 FROM users
+			 WHERE settings->'user_notifications'->>$1 IN ('important', 'media', 'all')`,
+			[String(authorUserId)],
+		);
+		return rows.map((r) => ({
+			userId: Number(r.id),
+			mode: r.mode,
+		}));
+	}
+
+	// ==================== Polls ====================
+
+	_formatPoll(pollRow, voteRows = [], currentUserId = null) {
+		if (!pollRow) return null;
+		const parsedUserId = currentUserId != null ? String(currentUserId).trim() : null;
+		const validUserId = parsedUserId && /^[A-Za-z0-9_-]+$/.test(parsedUserId) ? parsedUserId : null;
+		let rawOptions = [];
+		if (Array.isArray(pollRow.options)) {
+			rawOptions = pollRow.options;
+		} else if (typeof pollRow.options === 'string') {
+			try {
+				rawOptions = JSON.parse(pollRow.options);
+			} catch (_) {
+				rawOptions = [];
+			}
+		}
+		
+		// 票の集計
+		const voteCounts = new Map();
+		const otherVotes = [];
+		const myVotes = [];
+		let myOtherText = null;
+		const uniqueVoters = new Set();
+
+		for (const vote of voteRows) {
+			const vUserId = String(vote.user_id);
+			uniqueVoters.add(vUserId);
+			const optId = Number(vote.option_id);
+			voteCounts.set(optId, (voteCounts.get(optId) || 0) + 1);
+
+			if (optId === -1 && vote.other_text) {
+				otherVotes.push({
+					text: String(vote.other_text),
+					userId: vUserId,
+				});
+			}
+
+			if (validUserId && vUserId === validUserId) {
+				myVotes.push(optId);
+				if (optId === -1 && vote.other_text) {
+					myOtherText = String(vote.other_text);
+				}
+			}
+		}
+
+		const totalVotesCount = voteRows.length;
+		const totalVotersCount = uniqueVoters.size;
+
+		const options = rawOptions.map((opt) => {
+			const id = Number(opt.id);
+			const count = voteCounts.get(id) || 0;
+			return {
+				id,
+				text: String(opt.text || ''),
+				votes_count: count,
+				percentage: totalVotesCount > 0 ? Math.round((count / totalVotesCount) * 100) : 0,
+			};
+		});
+
+		const otherCount = voteCounts.get(-1) || 0;
+		const isExpired = Boolean(pollRow.expires_at && new Date(pollRow.expires_at) <= new Date()) || Boolean(pollRow.closed);
+		const hasVoted = myVotes.length > 0;
+		const showResultsBeforeVoting = Boolean(pollRow.show_results_before_voting);
+
+		return {
+			id: String(pollRow.id),
+			post_id: String(pollRow.post_id),
+			user_id: String(pollRow.user_id),
+			title: String(pollRow.title || ''),
+			options,
+			allow_multiple: Boolean(pollRow.allow_multiple),
+			allow_other: Boolean(pollRow.allow_other),
+			show_results_before_voting: showResultsBeforeVoting,
+			other_count: otherCount,
+			other_percentage: totalVotesCount > 0 ? Math.round((otherCount / totalVotesCount) * 100) : 0,
+			other_votes: isExpired || hasVoted || showResultsBeforeVoting ? otherVotes : [],
+			total_votes: totalVotesCount,
+			total_voters: totalVotersCount,
+			my_votes: myVotes,
+			my_other_text: myOtherText,
+			has_voted: hasVoted,
+			expires_at: pollRow.expires_at ? toIsoString(pollRow.expires_at) : null,
+			is_expired: isExpired,
+			closed: Boolean(pollRow.closed),
+			created_at: toIsoString(pollRow.created_at),
+		};
+	}
+
+	async createPoll({
+		id = null,
+		postId,
+		userId,
+		title,
+		options,
+		allowMultiple = false,
+		allowOther = false,
+		showResultsBeforeVoting = true,
+		expiresAt = null,
+	}) {
+		const normOptions = Array.isArray(options) ? options.map((opt, idx) => ({
+			id: Number(opt.id ?? idx + 1),
+			text: String(opt.text ?? opt).trim(),
+		})).filter((opt) => opt.text.length > 0) : [];
+
+		if (normOptions.length < 2) {
+			throw new Error('投票には最低2つの選択肢が必要です');
+		}
+
+		const pollId = id != null
+			? (Number(id) || String(id).trim())
+			: Number(`${Date.now() % 1000000000}${crypto.randomInt(0, 1000).toString().padStart(3, '0')}`);
+		const pId = Number(postId) || String(postId).trim();
+		const uId = Number(userId) || String(userId).trim();
+
+		const { rows } = await this.pool.query(
+			`INSERT INTO polls (id, post_id, user_id, title, options, allow_multiple, allow_other, show_results_before_voting, expires_at)
+			 VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9)
+			 RETURNING *`,
+			[
+				pollId,
+				pId,
+				uId,
+				String(title || '').trim() || '投票',
+				JSON.stringify(normOptions),
+				Boolean(allowMultiple),
+				Boolean(allowOther),
+				Boolean(showResultsBeforeVoting),
+				expiresAt ? toIsoString(expiresAt) : null,
+			],
+		);
+		return this._formatPoll(rows[0], [], uId);
+	}
+
+	async getPollByPostId(postId, currentUserId = null) {
+		const pId = postId != null ? String(postId).trim() : '';
+		if (!/^[A-Za-z0-9_-]+$/.test(pId)) return null;
+
+		const { rows: pollRows } = await this.pool.query(
+			'SELECT * FROM polls WHERE post_id::text = $1',
+			[pId],
+		);
+		if (!pollRows[0]) return null;
+
+		const { rows: voteRows } = await this.pool.query(
+			'SELECT * FROM poll_votes WHERE poll_id::text = $1',
+			[String(pollRows[0].id)],
+		);
+
+		return this._formatPoll(pollRows[0], voteRows, currentUserId);
+	}
+
+	async getPollById(pollId, currentUserId = null) {
+		const pId = pollId != null ? String(pollId).trim() : '';
+		if (!/^[A-Za-z0-9_-]+$/.test(pId)) return null;
+
+		const { rows: pollRows } = await this.pool.query(
+			'SELECT * FROM polls WHERE id::text = $1',
+			[pId],
+		);
+		if (!pollRows[0]) return null;
+
+		const { rows: voteRows } = await this.pool.query(
+			'SELECT * FROM poll_votes WHERE poll_id::text = $1',
+			[String(pollRows[0].id)],
+		);
+
+		return this._formatPoll(pollRows[0], voteRows, currentUserId);
+	}
+
+	async getPollsByPostIds(postIds, currentUserId = null) {
+		const ids = [...new Set((postIds || []).map((id) => String(id).trim()).filter((id) => /^[A-Za-z0-9_-]+$/.test(id)))];
+		if (ids.length === 0) return new Map();
+
+		const { rows: pollRows } = await this.pool.query(
+			'SELECT * FROM polls WHERE post_id::text = ANY($1::text[])',
+			[ids],
+		);
+		if (pollRows.length === 0) return new Map();
+
+		const pollIds = pollRows.map((r) => String(r.id));
+		const { rows: voteRows } = await this.pool.query(
+			'SELECT * FROM poll_votes WHERE poll_id::text = ANY($1::text[])',
+			[pollIds],
+		);
+
+		const votesByPollId = new Map();
+		for (const v of voteRows) {
+			const pId = String(v.poll_id);
+			if (!votesByPollId.has(pId)) votesByPollId.set(pId, []);
+			votesByPollId.get(pId).push(v);
+		}
+
+		const map = new Map();
+		for (const pollRow of pollRows) {
+			const formatted = this._formatPoll(pollRow, votesByPollId.get(String(pollRow.id)) || [], currentUserId);
+			if (formatted) map.set(Number(pollRow.post_id) || pollRow.post_id, formatted);
+		}
+		return map;
+	}
+
+	async votePoll({ pollId, userId, optionIds = [], otherText = null }) {
+		const pId = pollId != null ? String(pollId).trim() : '';
+		const uId = userId != null ? String(userId).trim() : '';
+		if (!/^[A-Za-z0-9_-]+$/.test(pId) || !/^[A-Za-z0-9_-]+$/.test(uId)) {
+			throw new Error('無効なパラメータです');
+		}
+
+		return this._withTransaction(async (client) => {
+			const { rows: pollRows } = await client.query(
+				'SELECT * FROM polls WHERE id::text = $1 FOR UPDATE',
+				[pId],
+			);
+			const poll = pollRows[0];
+			if (!poll) throw new Error('投票が見つかりません');
+
+			const isExpired = Boolean(poll.expires_at && new Date(poll.expires_at) <= new Date()) || Boolean(poll.closed);
+			if (isExpired) throw new Error('この投票は既に終了しています');
+
+			let rawOptions = [];
+			if (Array.isArray(poll.options)) {
+				rawOptions = poll.options;
+			} else if (typeof poll.options === 'string') {
+				try {
+					rawOptions = JSON.parse(poll.options);
+				} catch (_) {
+					rawOptions = [];
+				}
+			}
+
+			const validOptionIds = new Set(rawOptions.map((o) => Number(o.id)));
+			if (poll.allow_other) {
+				validOptionIds.add(-1); // その他用のID
+			}
+
+			let targetOptionIds = [...new Set((optionIds || []).map(Number).filter((id) => validOptionIds.has(id)))];
+			const isOtherSelected = targetOptionIds.includes(-1);
+			const sanitizedOtherText = isOtherSelected && typeof otherText === 'string' ? otherText.trim().slice(0, 200) : null;
+
+			if (targetOptionIds.length === 0) {
+				throw new Error('選択肢を1つ以上選択してください');
+			}
+
+			if (!poll.allow_multiple && targetOptionIds.length > 1) {
+				targetOptionIds = [targetOptionIds[0]];
+			}
+
+			// 既存の投票を削除
+			await client.query(
+				'DELETE FROM poll_votes WHERE poll_id::text = $1 AND user_id::text = $2',
+				[String(poll.id), uId],
+			);
+
+			// 新規投票を挿入
+			const now = new Date().toISOString();
+			for (const optId of targetOptionIds) {
+				const voteId = Number(`${Date.now() % 1000000000}${crypto.randomInt(0, 1000).toString().padStart(3, '0')}`);
+				await client.query(
+					`INSERT INTO poll_votes (id, poll_id, user_id, option_id, other_text, created_at)
+					 VALUES ($1, $2, $3, $4, $5, $6)`,
+					[voteId, poll.id, Number(uId) || uId, optId, optId === -1 ? sanitizedOtherText : null, now],
+				);
+			}
+
+			// 更新後の全票を取得
+			const { rows: voteRows } = await client.query(
+				'SELECT * FROM poll_votes WHERE poll_id::text = $1',
+				[String(poll.id)],
+			);
+
+			return this._formatPoll(poll, voteRows, uId);
+		});
+	}
+
+	async getExpiredUnnotifiedPolls() {
+		const { rows } = await this.pool.query(
+			`SELECT * FROM polls
+			 WHERE expires_at IS NOT NULL AND expires_at <= NOW() AND closed_notified = FALSE
+			 LIMIT 50`,
+		);
+		return rows;
+	}
+
+	async markPollClosedNotified(pollId) {
+		const pId = Number(pollId);
+		if (!Number.isFinite(pId) || pId <= 0) return;
+
+		await this.pool.query(
+			'UPDATE polls SET closed = TRUE, closed_notified = TRUE WHERE id = $1',
+			[pId],
+		);
+	}
+
+	async getPollVoters(pollId) {
+		const pId = pollId != null ? String(pollId).trim() : '';
+		if (!/^[A-Za-z0-9_-]+$/.test(pId)) return [];
+
+		const { rows } = await this.pool.query(
+			'SELECT DISTINCT user_id FROM poll_votes WHERE poll_id::text = $1',
+			[pId],
+		);
+		return rows.map((r) => String(r.user_id)).filter((id) => /^[A-Za-z0-9_-]+$/.test(id));
+	}
+	// ==================== Community Notes ====================
+
+	_normalizeCommunityNoteSources(sources) {
+		if (!Array.isArray(sources)) throw new Error('sources must be an array');
+		const out = [];
+		const seen = new Set();
+		for (const src of sources) {
+			const url = String(src?.url || src || '').trim();
+			const title = src?.title != null ? String(src.title).trim() : '';
+			if (!url) continue;
+			let parsed;
+			try { parsed = new URL(url); } catch (_) { continue; }
+			if (parsed.protocol !== 'https:') throw new Error('source URL must use https');
+			if (seen.has(url)) continue;
+			seen.add(url);
+			out.push({ url, title });
+		}
+		return out;
+	}
+
+	async _getNoteRatingSummary(noteId, currentUserId = null) {
+		const { rows } = await this.pool.query(
+			'SELECT helpful, COUNT(*)::int AS cnt FROM note_ratings WHERE note_id = $1 GROUP BY helpful',
+			[Number(noteId)],
+		);
+		let helpfulCount = 0;
+		let total = 0;
+		for (const r of rows) {
+			const c = Number(r.cnt) || 0;
+			total += c;
+			if (r.helpful === true) helpfulCount += c;
+		}
+		let myRating = null;
+		if (currentUserId != null) {
+			const r2 = await this.pool.query('SELECT helpful FROM note_ratings WHERE note_id=$1 AND user_id=$2', [Number(noteId), Number(currentUserId)]);
+			if (r2.rows[0]) myRating = Boolean(r2.rows[0].helpful);
+		}
+		return { helpfulCount, totalRatingCount: total, myRating };
+	}
+
+	async _reasonTagsForNotes(noteIds) {
+		if (!noteIds || noteIds.length === 0) return [];
+		const { rows } = await this.pool.query(
+			'SELECT * FROM note_reason_tags WHERE note_id = ANY($1::int[])',
+			[noteIds.map(Number)],
+		);
+		return rows;
+	}
+
+	async _formatNote(noteRow, ratings, reasonTagRows, currentUserId = null) {
+		if (!noteRow) return null;
+		let summary = ratings;
+		if (!summary || typeof summary.helpfulCount === 'undefined') {
+			summary = await this._getNoteRatingSummary(noteRow.id, currentUserId);
+		}
+		const sources = parseJsonSafe(noteRow.sources, []);
+		const tags = (reasonTagRows || []).filter((t) => Number(t.note_id) === Number(noteRow.id)).map((t) => ({ side: t.side, code: t.code }));
+		return {
+			id: Number(noteRow.id),
+			postId: Number(noteRow.post_id),
+			distributionKey: noteRow.distribution_key || `${noteRow.post_id}:${noteRow.user_id}`,
+			userId: Number(noteRow.user_id),
+			content: String(noteRow.content || ''),
+			sources: Array.isArray(sources) ? sources : [],
+			status: String(noteRow.status || 'limited'),
+			stage: Number(noteRow.stage ?? 1) || 1,
+			publishedAt: toIsoString(noteRow.published_at),
+			createdAt: toIsoString(noteRow.created_at),
+			updatedAt: toIsoString(noteRow.updated_at),
+			helpfulCount: Number(summary.helpfulCount || 0),
+			totalRatingCount: Number(summary.totalRatingCount || 0),
+			myRating: summary.myRating ?? null,
+			reasons: tags,
+		};
+	}
+
+	async _ensureReasonDef(code, side, label) {
+		try {
+			await this.pool.query(
+				`INSERT INTO note_reason_tag_defs (code, side, label_ja) VALUES ($1,$2,$3) ON CONFLICT (code) DO NOTHING`,
+				[String(code), String(side), String(label || code)],
+			);
+		} catch (_) {}
+	}
+
+	async createNote({ postId, userId, content, sources = [], reasons = [], status = 'limited', dailyLimit = null, postLimit = 20 } = {}) {
+		if (dailyLimit !== null && (!Number.isInteger(dailyLimit) || dailyLimit < 1)) throw new Error('Invalid note daily limit');
+		const normSources = this._normalizeCommunityNoteSources(sources);
+		const pId = Number(postId);
+		const uId = Number(userId);
+		const now = new Date();
+		let rows;
+		try {
+			({ rows } = await this._withTransaction(async client => {
+				await client.query('SELECT id FROM users WHERE id=$1 FOR UPDATE',[uId]);
+				await client.query('SELECT id FROM posts WHERE id=$1 FOR UPDATE',[pId]);
+				const counts=await client.query(`SELECT (SELECT COUNT(*) FROM note_creation_claims WHERE user_id=$1 AND created_at >= $3) AS daily,(SELECT COUNT(*) FROM community_notes WHERE post_id=$2) AS total`,[uId,pId,new Date(`${now.toISOString().slice(0,10)}T00:00:00Z`)]);
+				if (dailyLimit !== null && Number(counts.rows[0].daily)>=dailyLimit) throw Object.assign(new Error('本日のノート作成上限に達しました'),{code:'NOTE_DAILY_LIMIT',statusCode:429});
+				if (Number(counts.rows[0].total)>=postLimit) throw Object.assign(new Error('この投稿のノート上限に達しました'),{code:'NOTE_POST_LIMIT',statusCode:429});
+				await client.query('INSERT INTO note_creation_claims(post_id,user_id) VALUES($1,$2)',[pId,uId]);
+				return client.query(`INSERT INTO community_notes (post_id,user_id,content,sources,status,created_at,updated_at,distribution_key) VALUES($1,$2,$3,$4::jsonb,$5,$6,$6,$7) RETURNING *`,[pId,uId,String(content||''),JSON.stringify(normSources),String(status||'limited'),now,`${pId}:${uId}`]);
+			}));
+		} catch (error) {
+			// 一意制約違反は重複作成。制約名を含む生メッセージを外へ出さない。
+			if (error && error.code === '23505') {
+				throw Object.assign(new Error('同じ投稿には一度だけノートを作成できます'), { code: 'NOTE_ALREADY_EXISTS', statusCode: 409 });
+			}
+			throw error;
+		}
+		const row = rows[0];
+		if (Array.isArray(reasons)) {
+			for (const r of reasons) {
+				const side = String(r?.side || '').trim();
+				const code = String(r?.code || r || '').trim();
+				if (!side || !code) continue;
+				await this._ensureReasonDef(code, side, r?.label_ja || r?.label);
+				try {
+					await this.pool.query(
+						`INSERT INTO note_reason_tags (note_id, side, code) VALUES ($1,$2,$3) ON CONFLICT (note_id, side, code) DO NOTHING`,
+						[Number(row.id), side, code],
+					);
+				} catch (_) {}
+			}
+		}
+		const summary = await this._getNoteRatingSummary(row.id, uId);
+		const tags = await this._reasonTagsForNotes([Number(row.id)]);
+		return this._formatNote(row, summary, tags, uId);
+	}
+
+	async getNote(noteId, currentUserId = null) {
+		const nId = Number(noteId);
+		if (!Number.isSafeInteger(nId) || nId <= 0) return null;
+		const { rows } = await this.pool.query('SELECT * FROM community_notes WHERE id = $1', [nId]);
+		if (!rows[0]) return null;
+		const tags = await this._reasonTagsForNotes([nId]);
+		const summary = await this._getNoteRatingSummary(nId, currentUserId);
+		return this._formatNote(rows[0], summary, tags, currentUserId);
+	}
+
+	async listNotesByPost(postId, currentUserId = null) {
+		const pId = Number(postId);
+		const { rows: noteRows } = await this.pool.query(
+			'SELECT * FROM community_notes WHERE post_id = $1 ORDER BY created_at DESC',
+			[pId],
+		);
+		if (noteRows.length === 0) return [];
+		const noteIds = noteRows.map((r) => Number(r.id));
+		const tags = await this._reasonTagsForNotes(noteIds);
+		const { rows: ratingRows } = await this.pool.query(
+			'SELECT note_id, helpful, user_id FROM note_ratings WHERE note_id = ANY($1::int[])',
+			[noteIds],
+		);
+		const byNote = new Map();
+		for (const id of noteIds) byNote.set(id, { helpfulCount: 0, totalRatingCount: 0, myRating: null });
+		for (const rr of ratingRows) {
+			const nid = Number(rr.note_id);
+			const entry = byNote.get(nid);
+			if (!entry) continue;
+			entry.totalRatingCount += 1;
+			if (rr.helpful === true) entry.helpfulCount += 1;
+			if (currentUserId != null && Number(rr.user_id) === Number(currentUserId)) entry.myRating = Boolean(rr.helpful);
+		}
+		return Promise.all(noteRows.map((r) => this._formatNote(r, byNote.get(Number(r.id)), tags, currentUserId)));
+	}
+
+	async listNotesByPostIds(postIds, currentUserId = null) {
+		const ids = [...new Set((postIds || []).map((id) => Number(id)).filter((id) => Number.isSafeInteger(id) && id > 0))];
+		const byPost = new Map();
+		if (ids.length === 0) return byPost;
+		const { rows: noteRows } = await this.pool.query(
+			'SELECT * FROM community_notes WHERE post_id = ANY($1::int[]) ORDER BY created_at DESC',
+			[ids],
+		);
+		if (noteRows.length === 0) return byPost;
+		const noteIds = noteRows.map((r) => Number(r.id));
+		const tags = await this._reasonTagsForNotes(noteIds);
+		const { rows: ratingRows } = await this.pool.query(
+			'SELECT note_id, helpful, user_id FROM note_ratings WHERE note_id = ANY($1::int[])',
+			[noteIds],
+		);
+		const byNote = new Map();
+		for (const id of noteIds) byNote.set(id, { helpfulCount: 0, totalRatingCount: 0, myRating: null });
+		for (const rr of ratingRows) {
+			const nid = Number(rr.note_id);
+			const entry = byNote.get(nid);
+			if (!entry) continue;
+			entry.totalRatingCount += 1;
+			if (rr.helpful === true) entry.helpfulCount += 1;
+			if (currentUserId != null && Number(rr.user_id) === Number(currentUserId)) entry.myRating = Boolean(rr.helpful);
+		}
+		const formatted = await Promise.all(noteRows.map((r) => this._formatNote(r, byNote.get(Number(r.id)), tags, currentUserId)));
+		for (let i = 0; i < noteRows.length; i += 1) {
+			const pid = Number(noteRows[i].post_id);
+			if (!byPost.has(pid)) byPost.set(pid, []);
+			byPost.get(pid).push(formatted[i]);
+		}
+		return byPost;
+	}
+
+	async countNotesByUserSince(userId, since) {
+		const uId = Number(userId);
+		const { rows } = await this.pool.query(
+			'SELECT COUNT(*)::int AS cnt FROM community_notes WHERE user_id = $1 AND created_at >= $2',
+			[uId, since instanceof Date ? since : new Date(since)],
+		);
+		return Number(rows[0]?.cnt || 0);
+	}
+
+	async rateNote({ noteId, userId, helpful, weight = 1, maxRatings = 200, relationManifest = null, expectedRatingVersion = null } = {}) {
+		const nId = Number(noteId);
+		const uId = Number(userId);
+		const help = Boolean(helpful);
+		await this._withTransaction(async client => {
+			const noteRow=await client.query('SELECT n.id,n.user_id,p.user_id AS post_author_id,n.rating_version FROM community_notes n JOIN posts p ON p.id=n.post_id WHERE n.id=$1 FOR UPDATE OF n',[nId]);
+			if (expectedRatingVersion!==null && Number(noteRow.rows[0]?.rating_version)!==expectedRatingVersion) { const error=new Error('投票状態が同時に変更されました');error.code='NOTE_VOTE_CONFLICT';throw error; }
+			if (expectedRatingVersion!==null) {
+				const covered=new Set(relationManifest?.coveredUserIds || []);
+				if (relationManifest?.basis!=='admission-evidence'||relationManifest.complete!==true||!relationManifest.version||!relationManifest.evidenceRef||![uId,Number(noteRow.rows[0]?.user_id),Number(noteRow.rows[0]?.post_author_id)].every(id=>covered.has(id))) throw new Error('関係証跡が不完全です');
+			}
+			const prior=await client.query('SELECT revision,authorized,legacy FROM note_vote_admissions WHERE note_id=$1 AND user_id=$2 ORDER BY revision DESC LIMIT 1',[nId,uId]);
+			const reacceptLegacy=expectedRatingVersion!==null&&prior.rows.length>0&&(prior.rows[0].legacy===true||prior.rows[0].authorized!==true);
+			const now = new Date();
+			const savedWeight = Math.min(1.5,Math.max(1,weight));
+			const changed = await client.query(`INSERT INTO note_ratings(note_id,user_id,helpful,created_at,updated_at,weight)
+				 SELECT $1,$2,$3,$6,$6,$4 WHERE EXISTS(SELECT 1 FROM note_ratings WHERE note_id=$1 AND user_id=$2) OR (SELECT COUNT(*) FROM note_ratings WHERE note_id=$1)<$5
+				 ON CONFLICT(note_id,user_id) DO UPDATE SET helpful=EXCLUDED.helpful,updated_at=EXCLUDED.updated_at WHERE note_ratings.helpful IS DISTINCT FROM EXCLUDED.helpful OR $7 RETURNING note_id`,[nId,uId,help,savedWeight,maxRatings,now,reacceptLegacy]);
+			if (changed.rowCount) {
+				const current = await client.query('SELECT weight FROM note_ratings WHERE note_id=$1 AND user_id=$2',[nId,uId]);
+				const revision = Number(prior.rows[0]?.revision || 0) + 1;
+				await client.query('INSERT INTO note_vote_admissions(note_id,user_id,revision,admitted_at,authorized,weight,evidence_ref,relation_manifest,legacy) VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,FALSE)',[nId,uId,revision,now,Boolean(relationManifest&&expectedRatingVersion!==null),Number(current.rows[0].weight),relationManifest&&expectedRatingVersion!==null?`note:${nId}:vote:${uId}:revision:${revision}`:null,relationManifest == null ? null : JSON.stringify(relationManifest)]);
+			}
+		});
+		return this.getRatingsSummary(nId, uId);
+	}
+
+	async getNoteVoteEvidence(noteId) {
+		const nId = Number(noteId);
+		return this._withTransaction(async client=>{
+			await client.query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY');
+			const note=await client.query('SELECT rating_version FROM community_notes WHERE id=$1',[nId]);
+			if (!note.rows[0]) return null;
+			const ratings=await client.query(`SELECT r.user_id,r.helpful,r.created_at,r.updated_at,r.weight,a.revision,a.admitted_at AS cast_at,a.legacy
+				FROM note_ratings r LEFT JOIN LATERAL (SELECT revision,admitted_at,legacy FROM note_vote_admissions WHERE note_id=r.note_id AND user_id=r.user_id ORDER BY revision DESC LIMIT 1) a ON TRUE
+				WHERE r.note_id=$1 ORDER BY r.user_id`,[nId]);
+			const admissions=await client.query('SELECT user_id,revision,admitted_at,authorized,weight,evidence_ref,relation_manifest,legacy FROM note_vote_admissions WHERE note_id=$1 ORDER BY user_id,revision',[nId]);
+			return {version:Number(note.rows[0].rating_version),
+				ratings:ratings.rows.map(row=>({userId:Number(row.user_id),helpful:row.helpful,weight:Number(row.weight),revision:row.legacy||row.revision==null?null:Number(row.revision),castAt:row.legacy?null:toIsoString(row.cast_at),createdAt:toIsoString(row.created_at),updatedAt:toIsoString(row.updated_at)})),
+				admissions:admissions.rows.map(row=>({noteId:nId,userId:Number(row.user_id),revision:Number(row.revision),admittedAt:toIsoString(row.admitted_at),authorized:Boolean(row.authorized),weight:Number(row.weight),evidenceRef:row.evidence_ref,relationManifest:typeof row.relation_manifest==='string'?JSON.parse(row.relation_manifest):row.relation_manifest,legacy:Boolean(row.legacy)})),
+			};
+		});
+	}
+
+	async getRatingsSummary(noteIdOrObj, userId = null) {
+		let noteId = noteIdOrObj;
+		let uid = userId;
+		if (noteIdOrObj && typeof noteIdOrObj === 'object') {
+			noteId = noteIdOrObj.noteId ?? noteIdOrObj.id;
+			uid = noteIdOrObj.userId ?? noteIdOrObj.user_id ?? uid;
+		}
+		const nId = Number(noteId);
+		const { rows } = await this.pool.query('SELECT helpful, COUNT(*)::int cnt FROM note_ratings WHERE note_id=$1 GROUP BY helpful', [nId]);
+		let helpfulCount = 0;
+		let total = 0;
+		for (const r of rows) {
+			const c = Number(r.cnt) || 0;
+			total += c;
+			if (r.helpful === true) helpfulCount += c;
+		}
+		let myRating = null;
+		if (uid != null) {
+			const r = await this.pool.query('SELECT helpful FROM note_ratings WHERE note_id=$1 AND user_id=$2', [nId, Number(uid)]);
+			if (r.rows[0]) myRating = Boolean(r.rows[0].helpful);
+		}
+		return { helpfulCount, totalRatingCount: total, myRating };
+	}
+
+
+	async deleteNote(noteId) {
+		const { rowCount } = await this.pool.query('DELETE FROM community_notes WHERE id = $1', [Number(noteId)]);
+		return (rowCount || 0) > 0;
+	}
+
+	// ===== Phase 2 helpers =====
+	async listEngagedUsersByPost(postId) {
+		const { rows } = await this.pool.query(
+			`SELECT user_id FROM likes WHERE post_id = $1
+			 UNION SELECT user_id FROM stars WHERE post_id = $1
+			 UNION SELECT user_id FROM reposts WHERE post_id = $1
+			 UNION SELECT user_id FROM posts WHERE reply_to = $1`,
+			[Number(postId)],
+		);
+		return rows.map((r) => Number(r.user_id)).filter(Number.isSafeInteger);
+	}
+
+	async listEngagedUsersByPostPage(postId,{afterUserId=0,limit=500}={}) {
+		const {rows}=await this.pool.query(`SELECT user_id FROM (
+			SELECT user_id FROM likes WHERE post_id=$1
+			UNION SELECT user_id FROM stars WHERE post_id=$1
+			UNION SELECT user_id FROM reposts WHERE post_id=$1
+			UNION SELECT user_id FROM posts WHERE reply_to=$1
+		) engaged WHERE user_id>$2 ORDER BY user_id LIMIT $3`,[Number(postId),Number(afterUserId),Math.min(500,Math.max(1,Number(limit)||500))]);
+		return rows.map(row=>Number(row.user_id)).filter(Number.isSafeInteger);
+	}
+
+	async getUserFollows(userId) {
+		const { rows } = await this.pool.query('SELECT following_id FROM follows WHERE follower_id = $1', [Number(userId)]);
+		return rows.map((r) => Number(r.following_id)).filter(Number.isSafeInteger);
+	}
+
+	async getNoteRelevanceContext(userIds,authorId) {
+		const ids=[...new Set([...userIds.map(Number),Number(authorId)])];if(!ids.length)return {users:[],followingByUser:new Map(),sharedUserIds:new Set()};
+		const [users,relations]=await Promise.all([
+			this.getUsersByIds(ids),
+			this.pool.query(`WITH candidates AS (SELECT unnest($1::int[]) AS user_id), counts AS (
+				SELECT follower_id,COUNT(*)::int AS total FROM follows WHERE follower_id=ANY($3::int[]) GROUP BY follower_id
+			), intersection_counts AS (
+				SELECT f.follower_id AS user_id,COUNT(*)::int AS total FROM follows f JOIN follows a ON a.following_id=f.following_id AND a.follower_id=$2 WHERE f.follower_id=ANY($1::int[]) GROUP BY f.follower_id
+			), shared AS (
+				SELECT candidate.user_id FROM candidates candidate WHERE
+				EXISTS(SELECT 1 FROM group_memberships a JOIN group_memberships b ON a.group_id=b.group_id WHERE a.user_id=candidate.user_id AND b.user_id=$2 AND a.status='active' AND b.status='active') OR
+				EXISTS(SELECT 1 FROM dm_channels d WHERE d.participants @> ARRAY[candidate.user_id,$2]::int[]) OR
+				EXISTS(SELECT 1 FROM group_dms d WHERE d.member @> ARRAY[candidate.user_id,$2]::int[])
+			)
+			SELECT candidates.user_id,COALESCE(counts.total,0) AS user_total,COALESCE(author.total,0) AS author_total,COALESCE(intersection_counts.total,0) AS overlap,shared.user_id IS NOT NULL AS shared
+			FROM candidates LEFT JOIN counts ON counts.follower_id=candidates.user_id LEFT JOIN counts author ON author.follower_id=$2
+			LEFT JOIN intersection_counts ON intersection_counts.user_id=candidates.user_id LEFT JOIN shared ON shared.user_id=candidates.user_id`,[userIds.map(Number),Number(authorId),ids]),
+		]);
+		const sharedUserIds=new Set(),relevanceByUser=new Map();for(const row of relations.rows){const id=Number(row.user_id),union=Number(row.user_total)+Number(row.author_total)-Number(row.overlap);const shared=Boolean(row.shared);if(shared)sharedUserIds.add(id);relevanceByUser.set(id,(union?Number(row.overlap)/union:0)+(shared?0.2:0));}
+		return {users,relevanceByUser,sharedUserIds};
+	}
+
+	async listGroupDmsForUser(userId) {
+		const { rows } = await this.pool.query('SELECT id FROM group_dms WHERE member @> ARRAY[$1]::int[]', [Number(userId)]);
+		return rows.map((r) => String(r.id));
+	}
+
+	async createNoteDistribution(data = {}) {
+		const noteId = Number(data.noteId ?? data.note_id);
+		const userId = Number(data.userId ?? data.user_id);
+		const tier = Number(data.tier ?? 1);
+		const notified = Boolean(data.notified ?? false);
+		await this.pool.query(
+			`INSERT INTO note_distribution (note_id, user_id, tier, notified, created_at)
+			 VALUES ($1,$2,$3,$4,NOW()) ON CONFLICT (note_id, user_id) DO UPDATE SET tier=$3, notified=$4`,
+			[noteId, userId, tier, notified],
+		);
+		const { rows } = await this.pool.query('SELECT * FROM note_distribution WHERE note_id=$1 AND user_id=$2', [noteId, userId]);
+		return rows[0] ? {
+				noteId: Number(rows[0].note_id),
+				userId: Number(rows[0].user_id),
+				tier: Number(rows[0].tier),
+				notified: Boolean(rows[0].notified),
+				createdAt: toIsoString(rows[0].created_at),
+			} : null;
+	}
+
+	async getNoteDistribution(noteId, userId) {
+		const { rows } = await this.pool.query('SELECT * FROM note_distribution WHERE note_id=$1 AND user_id=$2', [Number(noteId), Number(userId)]);
+		return rows[0] ? {noteId:Number(rows[0].note_id),userId:Number(rows[0].user_id),tier:Number(rows[0].tier),notified:Boolean(rows[0].notified),createdAt:toIsoString(rows[0].created_at)} : null;
+	}
+
+	async getNoteDistributionStates(noteId,userIds) {
+		if(!userIds.length)return [];
+		const {rows}=await this.pool.query('SELECT note_id,user_id,tier,notified,created_at FROM note_distribution WHERE note_id=$1 AND user_id=ANY($2::int[])',[Number(noteId),userIds.map(Number)]);
+		return rows.map(r=>({noteId:Number(r.note_id),userId:Number(r.user_id),tier:Number(r.tier),notified:Boolean(r.notified),createdAt:toIsoString(r.created_at)}));
+	}
+
+	async listNoteDistributionsByNote(noteId) {
+		const { rows } = await this.pool.query('SELECT * FROM note_distribution WHERE note_id=$1', [Number(noteId)]);
+		return rows.map((r) => ({
+				noteId: Number(r.note_id),
+				userId: Number(r.user_id),
+				tier: Number(r.tier),
+				notified: Boolean(r.notified),
+				createdAt: toIsoString(r.created_at),
+			}));
+	}
+
+	async listNoteDistributionsByUser(userId) {
+		const { rows } = await this.pool.query('SELECT * FROM note_distribution WHERE user_id=$1', [Number(userId)]);
+		return rows.map((r) => ({
+				noteId: Number(r.note_id),
+				userId: Number(r.user_id),
+				tier: Number(r.tier),
+				notified: Boolean(r.notified),
+				createdAt: toIsoString(r.created_at),
+			}));
+	}
+
+	async updateNoteDistribution(noteId, userId, fields = {}) {
+		const sets = [];
+		const params = [];
+		let idx = 1;
+		if (fields.tier != null) { sets.push(`tier=$${idx++}`); params.push(Number(fields.tier)); }
+		if (fields.notified != null) { sets.push(`notified=$${idx++}`); params.push(Boolean(fields.notified)); }
+		if (sets.length === 0) return this.getNoteDistribution(noteId, userId);
+		params.push(Number(noteId), Number(userId));
+		await this.pool.query(`UPDATE note_distribution SET ${sets.join(',')} WHERE note_id=$${idx++} AND user_id=$${idx}`, params);
+		return this.getNoteDistribution(noteId, userId);
+	}
+
+	async upsertNoteDistribution(data = {}) {
+		return this.createNoteDistribution(data);
+	}
+
+	async upsertNoteDistributions(rows=[]) {
+		for(let offset=0;offset<rows.length;offset+=500){const batch=rows.slice(offset,offset+500);if(!batch.length)continue;
+			await this.pool.query(`INSERT INTO note_distribution(note_id,user_id,tier,notified,created_at)
+				SELECT * FROM UNNEST($1::int[],$2::int[],$3::int[],$4::boolean[],$5::timestamptz[])
+				ON CONFLICT(note_id,user_id) DO UPDATE SET tier=EXCLUDED.tier,notified=EXCLUDED.notified`,[
+				batch.map(r=>Number(r.noteId)),batch.map(r=>Number(r.userId)),batch.map(r=>Number(r.tier??1)),batch.map(r=>Boolean(r.notified)),batch.map(()=>new Date()),
+			]);
+		}return rows;
+	}
+
+	async deleteNoteDistribution(noteId, userId = null) {
+		if (userId == null) {
+			await this.pool.query('DELETE FROM note_distribution WHERE note_id=$1', [Number(noteId)]);
+		} else {
+			await this.pool.query('DELETE FROM note_distribution WHERE note_id=$1 AND user_id=$2', [Number(noteId), Number(userId)]);
+		}
+		return true;
+	}
+
+	async updateNote(noteId, fields = {}) {
+		const sets = [];
+		const params = [];
+		let idx = 1;
+		if (fields.status != null) { sets.push(`status=$${idx++}`); params.push(String(fields.status)); }
+		if (fields.stage != null) { sets.push(`stage=$${idx++}`); params.push(Number(fields.stage)); }
+		if (fields.publishedAt != null || fields.published_at != null) {
+			const v = fields.publishedAt ?? fields.published_at;
+			sets.push(`published_at=$${idx++}`); params.push(v ? new Date(v) : null);
+		}
+		if (sets.length === 0) return this.getNote(noteId);
+		sets.push('updated_at=NOW()');
+		params.push(Number(noteId));
+		const { rows } = await this.pool.query(`UPDATE community_notes SET ${sets.join(',')} WHERE id=$${idx} RETURNING *`, params);
+		if (!rows[0]) return null;
+		const tags = await this._reasonTagsForNotes([Number(noteId)]);
+		const summary = await this._getNoteRatingSummary(noteId);
+		return this._formatNote(rows[0], summary, tags);
+	}
+
+	async listNoteReasonTagDefs({ side } = {}) {
+		const params = [];
+		let sql = 'SELECT code, side, label_ja, description, sort_order FROM note_reason_tag_defs WHERE enabled = TRUE';
+		if (side) {
+			params.push(String(side));
+			sql += ` AND side = $${params.length}`;
+		}
+		sql += ' ORDER BY sort_order ASC, code ASC';
+		const { rows } = await this.pool.query(sql, params);
+		return rows.map((r) => ({
+			code: r.code,
+			side: r.side,
+			label: r.label_ja,
+			description: r.description ?? null,
+			sortOrder: Number(r.sort_order) || 0,
+		}));
+	}
+
+	async saveNoteRatingReasons({ noteId, userId, codes = [] } = {}) {
+		const nId = Number(noteId);
+		const uId = Number(userId);
+		const unique = [...new Set((Array.isArray(codes) ? codes : []).map((c) => String(c || '').trim()).filter(Boolean))];
+		await this._withTransaction(async (client) => {
+			await client.query('DELETE FROM note_rating_reasons WHERE note_id = $1 AND user_id = $2', [nId, uId]);
+			for (const code of unique) {
+				await client.query(
+					`INSERT INTO note_rating_reasons (note_id, user_id, code, created_at)
+					 VALUES ($1,$2,$3,NOW())
+					 ON CONFLICT (note_id, user_id, code) DO NOTHING`,
+					[nId, uId, code],
+				);
+			}
+		});
+		return unique;
+	}
+
+	// Shared group / DM membership helpers (Phase 2)
+	async getSharedGroupCount(userId1, userId2) {
+		const { rows } = await this.pool.query(
+			`SELECT COUNT(*)::int AS cnt
+			 FROM group_memberships a
+			 JOIN group_memberships b ON a.group_id = b.group_id
+			 WHERE a.user_id = $1 AND b.user_id = $2
+			   AND a.status = 'active' AND b.status = 'active'`,
+			[Number(userId1), Number(userId2)],
+		);
+		return Number(rows?.[0]?.cnt || 0);
+	}
+
+	async getSharedDmCount(userId1, userId2) {
+		const { rows } = await this.pool.query(
+			`SELECT
+			 (SELECT COUNT(*)::int FROM dm_channels WHERE participants @> ARRAY[$1::int, $2::int]) +
+			 (SELECT COUNT(*)::int FROM group_dms WHERE member @> ARRAY[$1::int, $2::int]) AS cnt`,
+			[Number(userId1), Number(userId2)],
+		);
+		return Number(rows?.[0]?.cnt || 0);
+	}
+
+	async getSharedGroupMembership(userId1, userId2) {
+		const groups = await this.getSharedGroupCount(userId1, userId2);
+		const dms = await this.getSharedDmCount(userId1, userId2);
+		const bonus = (groups > 0 || dms > 0) ? 0.2 : 0;
+		return { groups, dms, total: groups + dms, bonus };
+	}
+
+	async sharedGroupCount(...args) { return this.getSharedGroupCount(...args); }
+	async sharedGroupMembership(...args) { return this.getSharedGroupMembership(...args); }
+	async hasSharedGroupMembership(userId1, userId2) {
+		return (await this.getSharedGroupCount(userId1, userId2)) > 0;
+	}
+
+	async updatePostRecommendationPenalty(postId, delta = 0.1, max = 1) {
+		const result = await this.pool.query(
+			`UPDATE posts
+			 SET recommendation_penalty = LEAST($2::real, GREATEST(0::real, COALESCE(recommendation_penalty,0) + $3::real))
+			 WHERE id = $1`,
+			[Number(postId), Number(max) || 1, Number(delta) || 0],
+		);
+		return (result.rowCount || 0) > 0;
+	}
+	async incrementPostRecommendationPenalty(...args) { return this.updatePostRecommendationPenalty(...args); }
+	async addPostRecommendationPenalty(...args) { return this.updatePostRecommendationPenalty(...args); }
+
+}
+
+require('../reputation').installPostgres(PostgresAdapter);
+module.exports = PostgresAdapter;
+
+
+module.exports = PostgresAdapter;

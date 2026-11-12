@@ -1,0 +1,17 @@
+node_modules
+.env
+
+# Local server environment settings
+/server/.env
+
+# NyaitterClient is synced independently into page/
+/page/
+
+# Runtime-uploaded user files
+/uploads/
+
+# Local development server logs
+/.nyaitter-dev-server.log
+
+/data/
+/server/data/

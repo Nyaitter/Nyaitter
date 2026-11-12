@@ -1,0 +1,2867 @@
+const DatabaseAdapter = require('../DatabaseAdapter');
+
+const { normalizeBlockList } = require('../../../utils/blockList');
+const { extractViewContent } = require('../../../utils/viewContent');
+const { encodePostCursor, decodePostCursor } = require('../../../utils/postCursor');
+const { scoreRecommendedPosts, buildAffinityProfile } = require('../../../utils/recommendation');
+const { isAgeFeaturesActive } = require('../../../services/AgeEstimateService');
+const appConfig = require('../../../config');
+
+const RETRYABLE_STATUS_CODES = new Set([408, 425, 429, 500, 502, 503, 504]);
+
+function boundedInteger(value, fallback, minimum, maximum) {
+	const parsed = Number(value);
+	if (!Number.isFinite(parsed)) return fallback;
+	return Math.min(maximum, Math.max(minimum, Math.floor(parsed)));
+}
+
+function requireId(value, fieldName = 'id', minimum = 0) {
+	const parsed = Number(value);
+	if (!Number.isSafeInteger(parsed) || parsed < minimum) {
+		throw new TypeError(`${fieldName} must be an integer greater than or equal to ${minimum}`);
+	}
+	return parsed;
+}
+
+function mapSession(session) {
+	if (!session) return null;
+	return {
+		id: session.id || session.session_id,
+		token: session.token,
+		userId: session.userId ?? session.user_id,
+		expiresAt: session.expiresAt || session.expires_at,
+		createdAt: session.createdAt || session.created_at,
+		ipHash: session.ipHash ?? session.ip_hash ?? null,
+		ipMasked: session.ipMasked ?? session.ip_masked ?? '旧セッション',
+		userAgent: session.userAgent ?? session.user_agent ?? '不明な端末',
+	};
+}
+
+function mapLoginApproval(approval) {
+	if (!approval) return null;
+	return {
+		id: approval.id,
+		userId: approval.userId ?? approval.user_id,
+		ipHash: approval.ipHash ?? approval.ip_hash,
+		ipMasked: approval.ipMasked ?? approval.ip_masked,
+		userAgent: approval.userAgent ?? approval.user_agent,
+		authProvider: approval.authProvider ?? approval.auth_provider ?? null,
+		pollTokenHash: approval.pollTokenHash ?? approval.poll_token_hash,
+		status: approval.status,
+		createdAt: approval.createdAt ?? approval.created_at,
+		expiresAt: approval.expiresAt ?? approval.expires_at,
+		decidedAt: approval.decidedAt ?? approval.decided_at,
+		consumedAt: approval.consumedAt ?? approval.consumed_at,
+	};
+}
+
+function mapAccountRecovery(request) {
+	if (!request) return null;
+	return {
+		id: request.id,
+		userId: request.userId ?? request.user_id,
+		ipHash: request.ipHash ?? request.ip_hash,
+		ipMasked: request.ipMasked ?? request.ip_masked ?? '不明なIPアドレス',
+		userAgent: request.userAgent ?? request.user_agent ?? '不明な端末',
+		authProvider: request.authProvider ?? request.auth_provider ?? null,
+		requestTokenHash: request.requestTokenHash ?? request.request_token_hash,
+		status: request.status,
+		trustScore: Number(request.trustScore ?? request.trust_score ?? 0),
+		waitUntil: request.waitUntil ?? request.wait_until,
+		startedAt: request.startedAt ?? request.started_at,
+		lastNotifiedAt: request.lastNotifiedAt ?? request.last_notified_at,
+		notifiedCount: Number(request.notifiedCount ?? request.notified_count ?? 0),
+		decidedAt: request.decidedAt ?? request.decided_at,
+		decidedBy: request.decidedBy ?? request.decided_by ?? null,
+		consumedAt: request.consumedAt ?? request.consumed_at,
+	};
+}
+
+function normalizeUser(user) {
+	if (!user) return null;
+	return {
+		...user,
+		age_estimate: user.age_estimate != null ? Number(user.age_estimate) : null,
+		age_source: user.age_source || null,
+		age_samples: Math.max(0, Number(user.age_samples) || 0),
+		block: normalizeBlockList(user.block, user.id),
+	};
+}
+
+function normalizePost(post) {
+	if (!post) return post;
+	post.userId = post.userId ?? post.user_id;
+	post.replyTo = post.replyTo ?? post.reply_to ?? null;
+	post.repostTo = post.repostTo ?? post.repost_to ?? null;
+	post.createdAt = post.createdAt ?? post.created_at ?? null;
+	post.viewContent = post.viewContent ?? post.view_content ?? extractViewContent(post.content || '');
+	post.view_content = post.viewContent;
+	post.tagsGeneratedAt = post.tagsGeneratedAt ?? post.tags_generated_at ?? null;
+	post.tags_generated_at = post.tagsGeneratedAt;
+	post.mask = !!post.mask;
+	post.lock = !!post.lock;
+	post.ageRating = Number(post.ageRating ?? post.age_rating ?? 0) || 0;
+	post.age_rating = post.ageRating;
+	post.announcement = !!post.announcement;
+	post.groupId = post.groupId ?? post.group_id ?? null;
+	post.group_id = post.groupId;
+	post.scheduledAt = post.scheduledAt ?? post.scheduled_at ?? null;
+	post.groupAnnouncement = !!(post.groupAnnouncement ?? post.group_announcement);
+	post.group_announcement = post.groupAnnouncement;
+	post.replyControl = post.replyControl ?? post.reply_control ?? 'everyone';
+	post.reply_control = post.replyControl;
+	post.recommendation_penalty = Number((post.recommendation_penalty ?? post.recommendationPenalty) ?? 0) || 0;
+	post.recommendationPenalty = post.recommendation_penalty;
+	if (post.tags && typeof post.tags === 'string') {
+		try {
+			post.tags = JSON.parse(post.tags);
+		} catch (_) {
+			// 壊れた JSON は続く配列正規化で空として扱う。
+		}
+	}
+	if (!Array.isArray(post.tags)) post.tags = [];
+	if (post.attachments && typeof post.attachments === 'string') {
+		try {
+			post.attachments = JSON.parse(post.attachments);
+		} catch (_) {
+			// 壊れた JSON は続く配列正規化で空として扱う。
+		}
+	}
+	if (!Array.isArray(post.attachments)) {
+		post.attachments = post.attachments ? [post.attachments] : [];
+	}
+	return post;
+}
+
+function normalizeGroup(group) {
+	if (!group) return null;
+	const ownerId = Number(group.ownerId ?? group.owner_id);
+	const iconData = group.iconData ?? group.icon_data ?? null;
+	const headerImage = group.headerImage ?? group.header_image ?? null;
+	const createdAt = group.createdAt ?? group.created_at ?? null;
+	const updatedAt = group.updatedAt ?? group.updated_at ?? null;
+	const deletedAt = group.deletedAt ?? group.deleted_at ?? null;
+	return {
+		...group, id: String(group.id), ownerId, owner_id: ownerId, iconData, icon_data: iconData,
+		headerImage, header_image: headerImage, memberCount: Number(group.memberCount ?? group.member_count) || 0,
+		member_count: Number(group.memberCount ?? group.member_count) || 0, createdAt, created_at: createdAt,
+		updatedAt, updated_at: updatedAt, deletedAt, deleted_at: deletedAt,
+	};
+}
+
+function normalizeGroupRole(role) {
+	if (!role) return null;
+	let permissions = role.permissions;
+	if (typeof permissions === 'string') { try { permissions = JSON.parse(permissions); } catch (_) { permissions = []; } }
+	const groupId = String(role.groupId ?? role.group_id);
+	const createdAt = role.createdAt ?? role.created_at ?? null;
+	const updatedAt = role.updatedAt ?? role.updated_at ?? null;
+	return { ...role, id: String(role.id), groupId, group_id: groupId, permissions: Array.isArray(permissions) ? permissions.map(String) : [],
+		isSystem: Boolean(role.isSystem ?? role.is_system), is_system: Boolean(role.isSystem ?? role.is_system),
+		sortOrder: Number(role.sortOrder ?? role.sort_order) || 0, sort_order: Number(role.sortOrder ?? role.sort_order) || 0,
+		createdAt, created_at: createdAt, updatedAt, updated_at: updatedAt };
+}
+
+function normalizeSpace(space) {
+	if (!space) return null;
+	const ownerId = Number(space.ownerId ?? space.owner_id);
+	const iconData = space.iconData ?? space.icon_data ?? null;
+	const headerImage = space.headerImage ?? space.header_image ?? null;
+	const createdAt = space.createdAt ?? space.created_at ?? null;
+	const updatedAt = space.updatedAt ?? space.updated_at ?? null;
+	const memberCount = Number(space.memberCount ?? space.member_count) || 0;
+	const groupId = space.groupId ?? space.group_id ?? null;
+	return {
+		...space, id: String(space.id), ownerId, owner_id: ownerId, iconData, icon_data: iconData,
+		headerImage, header_image: headerImage, groupId, group_id: groupId, memberCount, member_count: memberCount,
+		createdAt, created_at: createdAt, updatedAt, updated_at: updatedAt,
+	};
+}
+
+function normalizeSpaceChannel(channel) {
+	if (!channel) return null;
+	const spaceId = String(channel.spaceId ?? channel.space_id);
+	const sortOrder = Number(channel.sortOrder ?? channel.sort_order) || 0;
+	const createdAt = channel.createdAt ?? channel.created_at ?? null;
+	return { ...channel, id: String(channel.id), spaceId, space_id: spaceId, kind: channel.kind || 'text',
+		sortOrder, sort_order: sortOrder, createdAt, created_at: createdAt };
+}
+
+function normalizeSpaceMember(member) {
+	if (!member) return null;
+	const spaceId = String(member.spaceId ?? member.space_id);
+	const userId = Number(member.userId ?? member.user_id);
+	const joinedAt = member.joinedAt ?? member.joined_at ?? null;
+	return { ...member, spaceId, space_id: spaceId, userId, user_id: userId,
+		role: member.role || 'member', joinedAt, joined_at: joinedAt };
+}
+
+function normalizeSpaceMessage(message) {
+	if (!message) return null;
+	const spaceId = String(message.spaceId ?? message.space_id);
+	const channelId = String(message.channelId ?? message.channel_id);
+	const userId = Number(message.userId ?? message.user_id);
+	const createdAt = message.createdAt ?? message.created_at ?? null;
+	return { ...message, id: Number(message.id), spaceId, space_id: spaceId, channelId, channel_id: channelId,
+		userId, user_id: userId, content: message.content || '', createdAt, created_at: createdAt };
+}
+
+function normalizeGroupMembership(membership) {
+	if (!membership) return null;
+	const groupId = String(membership.groupId ?? membership.group_id);
+	const userId = Number(membership.userId ?? membership.user_id);
+	const roleId = membership.roleId ?? membership.role_id ?? null;
+	const joinedAt = membership.joinedAt ?? membership.joined_at ?? null;
+	const updatedAt = membership.updatedAt ?? membership.updated_at ?? null;
+	return { ...membership, groupId, group_id: groupId, userId, user_id: userId, roleId, role_id: roleId,
+		joinedAt, joined_at: joinedAt, updatedAt, updated_at: updatedAt };
+}
+
+function normalizeGroupInvite(invite) {
+	if (!invite) return null;
+	const groupId = String(invite.groupId ?? invite.group_id);
+	const inviterId = Number(invite.inviterId ?? invite.inviter_id);
+	const inviteeId = Number(invite.inviteeId ?? invite.invitee_id);
+	const createdAt = invite.createdAt ?? invite.created_at ?? null;
+	const respondedAt = invite.respondedAt ?? invite.responded_at ?? null;
+	return { ...invite, id: String(invite.id), groupId, group_id: groupId, inviterId, inviter_id: inviterId, inviteeId, invitee_id: inviteeId,
+		createdAt, created_at: createdAt, respondedAt, responded_at: respondedAt };
+}
+
+function normalizeGroupJoinRequest(request) {
+	if (!request) return null;
+	const groupId = String(request.groupId ?? request.group_id);
+	const userId = Number(request.userId ?? request.user_id);
+	const reviewedBy = request.reviewedBy ?? request.reviewed_by ?? null;
+	const createdAt = request.createdAt ?? request.created_at ?? null;
+	const reviewedAt = request.reviewedAt ?? request.reviewed_at ?? null;
+	return { ...request, id: String(request.id), groupId, group_id: groupId, userId, user_id: userId,
+		reviewedBy, reviewed_by: reviewedBy, createdAt, created_at: createdAt, reviewedAt, reviewed_at: reviewedAt };
+}
+
+function serializeGroupDm(row, userId = null) {
+	if (!row) return null;
+	const unread = row.unread || {};
+	const memberList = Array.isArray(row.member) ? row.member.map(Number) : [];
+	const accepted = Array.isArray(row.accepted)
+		? row.accepted.map(Number)
+		: (Array.isArray(unread?._accepted) ? unread._accepted.map(Number) : memberList);
+	const res = {
+		id: row.id,
+		title: row.title || '',
+		member: memberList,
+		accepted,
+		host_id: row.host_id ?? row.hostId,
+		state_version: row.state_version,
+		time: row.time instanceof Date ? row.time.toISOString() : (row.time || null),
+		post: Array.isArray(row.post) ? row.post : [],
+	};
+	if (row.unread !== undefined) {
+		res.unread = row.unread;
+	}
+	if (userId !== null && userId !== undefined) {
+		res.unread_count = Number(unread[userId] ?? unread[String(userId)] ?? row.unread_count ?? 0);
+	}
+	return res;
+}
+
+function mapModerationReport(row) {
+	if (!row) return null;
+	const parseObject = (value, fallback) => {
+		if (value && typeof value === 'object') return value;
+		try { return JSON.parse(value || ''); } catch (_) { return fallback; }
+	};
+	const excluded = parseObject(row.excludedAdminIds ?? row.excluded_admin_ids, []);
+	return {
+		id: Number(row.id),
+		reporterUserId: Number(row.reporterUserId ?? row.reporter_user_id),
+		targetKind: row.targetKind ?? row.target_kind,
+		targetId: String(row.targetId ?? row.target_id),
+		description: row.description || '',
+		targetSnapshot: parseObject(row.targetSnapshot ?? row.target_snapshot, {}),
+		assignmentType: row.assignmentType ?? row.assignment_type ?? 'report',
+		status: row.status,
+		assignedAdminId: row.assignedAdminId ?? row.assigned_admin_id ?? null,
+		assignedAt: row.assignedAt ?? row.assigned_at ?? null,
+		excludedAdminIds: Array.isArray(excluded) ? excluded.map(Number).filter(Number.isInteger) : [],
+		resolution: parseObject(row.resolution, null),
+		createdAt: row.createdAt ?? row.created_at ?? null,
+		resolvedAt: row.resolvedAt ?? row.resolved_at ?? null,
+		claimedAt: row.claimedAt ?? row.claimed_at ?? null,
+	};
+}
+
+class D1Adapter extends DatabaseAdapter {
+	async createModLog(input) {
+		const m = require('../modLogs');
+		// Keep the same primary key across a retried request: D1 may have committed
+		// the first request even when the response was lost.
+		const row = m.normalizeRecord(input, require('crypto').randomUUID());
+		return this._request('/mod-logs', { method: 'POST', body: row, retry: true });
+	}
+	async searchModLogs(input = {}) {
+		const filters = require('../modLogs').normalizeFilters(input);
+		return this._request('/mod-logs/search', { method: 'POST', body: filters, retry: true });
+	}
+	constructor(options = {}) {
+		super();
+		this.workerUrl = options.workerUrl || options.endpoint || process.env.D1_WORKER_URL || '';
+		this.authToken = options.authToken || options.token || process.env.D1_WORKER_TOKEN || '';
+		this.fetchImpl = options.fetch || globalThis.fetch;
+		this.requestTimeoutMs = boundedInteger(options.requestTimeoutMs ?? process.env.D1_REQUEST_TIMEOUT_MS, 10000, 100, 60000);
+		this.retryAttempts = boundedInteger(options.retryAttempts ?? process.env.D1_RETRY_ATTEMPTS, 1, 0, 4);
+		this.retryBaseDelayMs = boundedInteger(options.retryBaseDelayMs ?? process.env.D1_RETRY_BASE_DELAY_MS, 120, 0, 5000);
+		this.readCacheSeconds = boundedInteger(options.readCacheSeconds ?? process.env.D1_READ_CACHE_SECONDS, 0, 0, 60);
+		this.maxReadCacheEntries = boundedInteger(options.maxReadCacheEntries ?? process.env.D1_READ_CACHE_MAX_ENTRIES, 500, 1, 5000);
+		this.batchMaxItems = boundedInteger(options.batchMaxItems ?? process.env.D1_BATCH_MAX_ITEMS, 100, 1, 500);
+		this.readCache = new Map();
+		this.inFlightReads = new Map();
+		this.supportsGroupDmSendIdempotency = true;
+	}
+
+	async connect() {
+		if (!this.workerUrl) {
+			throw new Error('D1Adapter requires workerUrl (or D1_WORKER_URL env var)');
+		}
+		if (typeof this.fetchImpl !== 'function') {
+			throw new Error('D1Adapter requires a Fetch-compatible implementation');
+		}
+
+		let endpoint;
+		try {
+			endpoint = new URL(this.workerUrl);
+		} catch (_) {
+			throw new Error('D1Adapter workerUrl must be an absolute URL');
+		}
+		if (!['https:', 'http:'].includes(endpoint.protocol)) {
+			throw new Error('D1Adapter workerUrl must use HTTP(S)');
+		}
+		if (endpoint.protocol !== 'https:' && process.env.NODE_ENV === 'production') {
+			throw new Error('D1Adapter requires an HTTPS workerUrl in production');
+		}
+		endpoint.pathname = endpoint.pathname.replace(/\/+$/, '');
+		this.workerUrl = endpoint.toString().replace(/\/+$/, '');
+		console.log('[D1Adapter] Using D1 via Worker proxy:', endpoint.origin);
+	}
+
+	async disconnect() {
+		this.readCache.clear();
+		this.inFlightReads.clear();
+	}
+
+	async exportDataSnapshot() {
+		const { normalizeSnapshot, signSnapshot } = require('../../../services/DataMigrationService');
+		const snapshot = await this._read('/migration/snapshot', { cacheSeconds: 0 });
+		if (snapshot?.version == null) throw new Error('D1 worker returned an unsupported migration snapshot');
+		// ワーカーが返した tables_present / skipped_columns を保持したまま正規化する。
+		// 旧ワーカーが返さないテーブルは「省略」として扱われ、宛先で保持される。
+		return signSnapshot(normalizeSnapshot({ ...snapshot, source_adapter: 'd1' }));
+	}
+
+	async importDataSnapshot(snapshot, { replace = false } = {}) {
+		if (replace !== true) throw new Error('Destination replacement requires replace=true');
+		const { normalizeSnapshot } = require('../../../services/DataMigrationService');
+		const normalized = normalizeSnapshot(snapshot);
+		if (normalized.tables.group_dms.length && !normalized.tables_present.includes('group_dm_send_requests')) throw new Error('DM snapshot is missing send request history');
+		if (normalized.tables.group_dm_send_requests.length) {
+			const capability = await this._read('/migration/dm-send-requests-v1', { cacheSeconds: 0 });
+			if (capability?.supported !== true) throw new Error('D1 worker cannot import DM send requests');
+		}
+		const result = await this._write('/migration/snapshot/import', {
+			replace: true,
+			// tables_present を含めて送る。ワーカーはこれを見て「含まれるテーブルだけ」を置換する。
+			snapshot: normalized,
+		});
+		return {
+			counts: result?.counts || {},
+			imported_tables: result?.imported_tables || normalized.tables_present,
+			preserved_tables: result?.preserved_tables || [],
+			cascaded_tables: result?.cascaded_tables || [],
+			cleared_tables: result?.cleared_tables || [],
+			skipped_columns: result?.skipped_columns || {},
+			excluded_tables: result?.excluded_tables || [],
+		};
+	}
+
+	_clearReadCache() {
+		this.readCache.clear();
+	}
+
+	_pruneReadCache(now = Date.now()) {
+		for (const [key, entry] of this.readCache) {
+			if (!entry || entry.expiresAt <= now) this.readCache.delete(key);
+		}
+		while (this.readCache.size >= this.maxReadCacheEntries) {
+			const oldestKey = this.readCache.keys().next().value;
+			if (oldestKey === undefined) break;
+			this.readCache.delete(oldestKey);
+		}
+	}
+
+	_readCached(cacheKey) {
+		const cached = this.readCache.get(cacheKey);
+		if (!cached) return undefined;
+		if (cached.expiresAt <= Date.now()) {
+			this.readCache.delete(cacheKey);
+			return undefined;
+		}
+		return cached.value;
+	}
+
+	_isRetryable(error) {
+		if (error && RETRYABLE_STATUS_CODES.has(Number(error.status))) return true;
+		return error?.name === 'AbortError' || error?.name === 'TimeoutError' || error instanceof TypeError;
+	}
+
+	async _sleep(milliseconds) {
+		if (milliseconds <= 0) return;
+		await new Promise((resolve) => setTimeout(resolve, milliseconds));
+	}
+
+	async _executeRequest(path, { method = 'GET', body = null, retry = false } = {}) {
+		if (!this.workerUrl) throw new Error('D1Adapter is not connected');
+		const bodyText = body == null ? undefined : JSON.stringify(body);
+		const maximumAttempts = retry ? this.retryAttempts : 0;
+
+		for (let attempt = 0; ; attempt += 1) {
+			const controller = new AbortController();
+			const timeout = setTimeout(() => controller.abort(), this.requestTimeoutMs);
+			try {
+				const response = await this.fetchImpl(`${this.workerUrl}${path}`, {
+					method,
+					headers: {
+						...(bodyText ? { 'Content-Type': 'application/json' } : {}),
+						...(this.authToken ? { Authorization: `Bearer ${this.authToken}` } : {}),
+					},
+					body: bodyText,
+					signal: controller.signal,
+				});
+				if (!response || !response.ok) {
+					const text = response ? (await response.text()).slice(0, 500) : '';
+					const error = new Error(`D1 Worker error: ${response?.status || 0}${text ? ` ${text}` : ''}`);
+					error.status = response?.status;
+					throw error;
+				}
+				return await response.json();
+			} catch (error) {
+				if (!retry || attempt >= maximumAttempts || !this._isRetryable(error)) throw error;
+				await this._sleep(this.retryBaseDelayMs * (2 ** attempt));
+			} finally {
+				clearTimeout(timeout);
+			}
+		}
+	}
+
+	async _request(path, {
+		method = 'GET', body = null, cacheKey = null, cacheSeconds = 0, retry = false,
+	} = {}) {
+		const normalizedCacheKey = cacheKey || null;
+		if (!normalizedCacheKey) {
+			return this._executeRequest(path, { method, body, retry });
+		}
+
+		const cached = this._readCached(normalizedCacheKey);
+		if (cached !== undefined) return cached;
+		const existing = this.inFlightReads.get(normalizedCacheKey);
+		if (existing) return existing;
+
+		const request = this._executeRequest(path, { method, body, retry })
+				.then((value) => {
+					if (cacheSeconds > 0) {
+						this._pruneReadCache();
+						this.readCache.set(normalizedCacheKey, {
+							value,
+							expiresAt: Date.now() + cacheSeconds * 1000,
+						});
+					}
+					return value;
+				})
+			.finally(() => this.inFlightReads.delete(normalizedCacheKey));
+		this.inFlightReads.set(normalizedCacheKey, request);
+		return request;
+	}
+
+	async _read(path, { body = null, cacheKey = null, cacheSeconds = this.readCacheSeconds } = {}) {
+		return this._request(path, {
+			method: body == null ? 'GET' : 'POST',
+			body,
+			cacheKey: cacheKey || `${path}:${body == null ? '' : JSON.stringify(body)}`,
+			cacheSeconds,
+			retry: true,
+		});
+	}
+
+	async _write(path, body = null, method = 'POST') {
+		const result = await this._request(path, {
+			method,
+			body,
+			retry: false,
+		});
+		this._clearReadCache();
+		return result;
+	}
+
+	_query(path, values = {}) {
+		const query = new URLSearchParams();
+		for (const [key, value] of Object.entries(values)) {
+			if (value != null && value !== '') query.set(key, String(value));
+		}
+		const encoded = query.toString();
+		return encoded ? `${path}?${encoded}` : path;
+	}
+
+	_normalizeIds(ids, { fieldName = 'id', minimum = 0 } = {}) {
+		if (!Array.isArray(ids)) throw new TypeError('ids must be an array');
+		return [...new Set(ids.map((id) => requireId(id, fieldName, minimum)))].slice(0, this.batchMaxItems);
+	}
+
+	_limit(value, fallback = 20, maximum = 100) {
+		return boundedInteger(value, fallback, 1, maximum);
+	}
+
+	_offset(value) {
+		return boundedInteger(value, 0, 0, 1000000);
+	}
+
+	async createSession(userId, meta = {}) {
+		const session = await this._write('/sessions', {
+			userId: requireId(userId, 'userId'),
+			...meta,
+		});
+		return mapSession(session);
+	}
+
+	async getSessionByToken(token) {
+		if (!token) return null;
+		const session = await this._read(`/sessions/token/${encodeURIComponent(String(token))}`, { cacheSeconds: 0 });
+		return mapSession(session);
+	}
+
+	async getUserBySessionToken(token) {
+		if (!token) return null;
+		const result = await this._read(`/sessions/token-user/${encodeURIComponent(String(token))}`, { cacheSeconds: 0 });
+		return normalizeUser(result?.user || result);
+	}
+
+	async invalidateSession(token) {
+		if (!token) return false;
+		const result = await this._write('/sessions/invalidate', { token: String(token) });
+		return typeof result === 'boolean' ? result : !!result?.success;
+	}
+
+	async getUserSessions(userId) {
+		const sessions = await this._read(`/users/${requireId(userId, 'userId')}/sessions`, { cacheSeconds: 0 });
+		return Array.isArray(sessions) ? sessions.map(mapSession) : [];
+	}
+
+	async invalidateAllSessions(userId) {
+		const result = await this._write(`/users/${requireId(userId, 'userId')}/sessions/invalidate-all`);
+		return Number(result?.count ?? result ?? 0);
+	}
+
+	async invalidateSessionsByIp(userId, ipHash) {
+		const result = await this._write(`/users/${requireId(userId, 'userId')}/sessions/invalidate-ip`, {
+			ipHash: String(ipHash),
+		});
+		return Number(result?.count ?? result ?? 0);
+	}
+
+	async trustLoginIp(userId, { ipHash, ipMasked }) {
+		return this._write(`/users/${requireId(userId, 'userId')}/trusted-ips`, {
+			ipHash: String(ipHash),
+			ipMasked: ipMasked || '不明なIPアドレス',
+		});
+	}
+
+	async getTrustedLoginIp(userId, ipHash) {
+		return this._read(`/users/${requireId(userId, 'userId')}/trusted-ips/${encodeURIComponent(String(ipHash))}`, { cacheSeconds: 0 });
+	}
+
+	async countTrustedLoginIps(userId) {
+		const result = await this._read(`/users/${requireId(userId, 'userId')}/trusted-ips/count`, { cacheSeconds: 0 });
+		return Number(result?.count ?? result ?? 0);
+	}
+
+	async revokeTrustedLoginIp(userId, ipHash) {
+		const result = await this._write(`/users/${requireId(userId, 'userId')}/trusted-ips/${encodeURIComponent(String(ipHash))}/revoke`);
+		return typeof result === 'boolean' ? result : !!result?.success;
+	}
+
+	async createLoginApproval(approvalData) {
+		const approval = await this._write('/login-approvals', approvalData);
+		return mapLoginApproval(approval);
+	}
+
+	async getLoginApproval(id) {
+		if (!id) return null;
+		const approval = await this._read(`/login-approvals/${encodeURIComponent(String(id))}`, { cacheSeconds: 0 });
+		return mapLoginApproval(approval);
+	}
+
+	async getLoginApprovalByPollToken(id, pollTokenHash) {
+		if (!id || !pollTokenHash) return null;
+		// 承認画面が約2秒ごとポーリングするため、`_write`（全 read キャッシュを消す）は使わない。
+		const approval = await this._read(`/login-approvals/${encodeURIComponent(String(id))}/poll`, {
+			body: { pollTokenHash: String(pollTokenHash) },
+			cacheSeconds: 0,
+		});
+		return mapLoginApproval(approval);
+	}
+
+	async decideLoginApproval(userId, id, decision) {
+		const approval = await this._write(`/login-approvals/${encodeURIComponent(String(id))}/decision`, {
+			userId: requireId(userId, 'userId'),
+			decision: String(decision),
+		});
+		return mapLoginApproval(approval);
+	}
+
+	async consumeLoginApproval(id, pollTokenHash) {
+		const approval = await this._write(`/login-approvals/${encodeURIComponent(String(id))}/consume`, {
+			pollTokenHash: String(pollTokenHash),
+		});
+		return mapLoginApproval(approval);
+	}
+
+	// ==================== Account Recovery ====================
+
+	async createAccountRecoveryRequest(data) {
+		return mapAccountRecovery(await this._write('/account-recovery', {
+			id: data.id || null,
+			userId: requireId(data.userId, 'userId'),
+			ipHash: String(data.ipHash),
+			ipMasked: data.ipMasked || '不明なIPアドレス',
+			userAgent: data.userAgent || '不明な端末',
+			authProvider: String(data.authProvider || '').toLowerCase(),
+			requestTokenHash: String(data.requestTokenHash),
+			trustScore: Number(data.trustScore || 0),
+			waitUntil: data.waitUntil,
+		}));
+	}
+
+	async getAccountRecoveryRequest(id) {
+		if (!id) return null;
+		return mapAccountRecovery(await this._read(`/account-recovery/${encodeURIComponent(String(id))}`, { cacheSeconds: 0 }));
+	}
+
+	async getAccountRecoveryRequestByToken(id, tokenHash) {
+		if (!id || !tokenHash) return null;
+		// 復旧画面が長時間ポーリングするため、`_write`（全 read キャッシュを消す）は使わない。
+		return mapAccountRecovery(await this._read(`/account-recovery/${encodeURIComponent(String(id))}/token-check`, {
+			body: { requestTokenHash: String(tokenHash) },
+			cacheSeconds: 0,
+		}));
+	}
+
+	async getActiveAccountRecoveryRequest(userId, ipHash) {
+		if (!ipHash) return null;
+		return mapAccountRecovery(await this._read('/account-recovery/active', {
+			body: {
+				userId: requireId(userId, 'userId'),
+				ipHash: String(ipHash),
+			},
+			cacheSeconds: 0,
+		}));
+	}
+
+	async getOpenAccountRecoveryRequest(userId) {
+		return mapAccountRecovery(await this._read(this._query('/account-recovery/open', {
+			userId: requireId(userId, 'userId'),
+		}), { cacheSeconds: 0 }));
+	}
+
+	async rotateAccountRecoveryToken(id, tokenHash) {
+		return mapAccountRecovery(await this._write(`/account-recovery/${encodeURIComponent(String(id))}/token`, {
+			requestTokenHash: String(tokenHash),
+		}));
+	}
+
+	async listAccountRecoveryRequestsToNotify(cutoff) {
+		const requests = await this._read(this._query('/account-recovery/waiting', {
+			mode: 'notify',
+			cutoff: new Date(cutoff).toISOString(),
+		}), { cacheSeconds: 0 });
+		return (Array.isArray(requests) ? requests : []).map(mapAccountRecovery);
+	}
+
+	async markAccountRecoveryNotified(id, notifiedAt) {
+		await this._write(`/account-recovery/${encodeURIComponent(String(id))}/notified`, {
+			notifiedAt: new Date(notifiedAt || Date.now()).toISOString(),
+		});
+	}
+
+	async listDueAccountRecoveryRequests(now) {
+		const requests = await this._read(this._query('/account-recovery/waiting', {
+			mode: 'due',
+			cutoff: new Date(now).toISOString(),
+		}), { cacheSeconds: 0 });
+		return (Array.isArray(requests) ? requests : []).map(mapAccountRecovery);
+	}
+
+	async decideAccountRecoveryRequest(userId, id, decision) {
+		return mapAccountRecovery(await this._write(`/account-recovery/${encodeURIComponent(String(id))}/decision`, {
+			userId: requireId(userId, 'userId'),
+			decision: String(decision),
+		}));
+	}
+
+	async expireAccountRecoveryRequest(id) {
+		return mapAccountRecovery(await this._write(`/account-recovery/${encodeURIComponent(String(id))}/expire`, {}));
+	}
+
+	async approveDueAccountRecoveryRequest(id, decidedBy = 'timeout') {
+		return mapAccountRecovery(await this._write(`/account-recovery/${encodeURIComponent(String(id))}/approve-due`, {
+			decidedBy: String(decidedBy),
+		}));
+	}
+
+	async consumeAccountRecoveryRequest(id, tokenHash) {
+		return mapAccountRecovery(await this._write(`/account-recovery/${encodeURIComponent(String(id))}/consume`, {
+			requestTokenHash: String(tokenHash),
+		}));
+	}
+
+	async blockLoginIp(userId, { ipHash, ipMasked, reason = null, sourceRecoveryId = null } = {}) {
+		return this._write('/blocked-login-ips', {
+			userId: requireId(userId, 'userId'),
+			ipHash: String(ipHash),
+			ipMasked: ipMasked || '不明なIPアドレス',
+			reason,
+			sourceRecoveryId,
+		});
+	}
+
+	async getBlockedLoginIp(userId, ipHash) {
+		if (!ipHash) return null;
+		// ログイン試行ごとに呼ばれる。POST `_write` にすると `_clearReadCache()` で
+		// 全読み取りキャッシュを捨て続けるので、必ず読み取り専用の GET にする。
+		return this._read(`/users/${requireId(userId, 'userId')}/blocked-login-ips/${encodeURIComponent(String(ipHash))}`, { cacheSeconds: 0 });
+	}
+
+	async listBlockedLoginIps(userId) {
+		const records = await this._read(`/users/${requireId(userId, 'userId')}/blocked-login-ips`, { cacheSeconds: 0 });
+		return Array.isArray(records) ? records : [];
+	}
+
+	async unblockLoginIp(userId, ipHash) {
+		if (!ipHash) return false;
+		const result = await this._write(`/users/${requireId(userId, 'userId')}/blocked-login-ips/${encodeURIComponent(String(ipHash))}/unblock`);
+		return typeof result === 'boolean' ? result : !!result?.success;
+	}
+
+	// D1 は複数の連携プロバイダーを保持しないため、プロバイダーの無効化は行わない。
+	async revokeAuthProvider(userId, provider) {
+		const targetId = requireId(userId, 'userId');
+		const normProvider = String(provider || '').toLowerCase();
+		if (!normProvider) return { revoked: false, reason: 'invalid_provider' };
+
+		const linkedProviders = await this.getUserAuthProviders(targetId);
+		const remaining = linkedProviders.filter((p) => String(p.provider).toLowerCase() !== normProvider);
+		if (linkedProviders.length <= 1 || remaining.length < 1) {
+			return { revoked: false, reason: 'last_provider' };
+		}
+
+		await this._write(this._query(`/users/${targetId}/auth-providers`, { provider: normProvider }), null, 'DELETE');
+
+		const user = await this.getUserById(targetId);
+		const fallback = remaining[0];
+		const updates = {};
+		if (normProvider === 'scratch' && user?.scid) updates.scid = null;
+		// primaryの外部IDが残ると、連携解除後も同じプロバイダーで再ログインできてしまうため無効化する。
+		if (user && String(user.auth_provider || '').toLowerCase() === normProvider) {
+			updates.auth_provider = String(fallback.provider).toLowerCase();
+			updates.external_id = null;
+			updates.provider_domain = null;
+			updates.external_profile = fallback.providerProfile || {};
+		}
+		if (Object.keys(updates).length > 0) {
+			await this._write(`/users/${targetId}/auth-identity`, updates);
+		}
+
+		return {
+			revoked: true,
+			provider: normProvider,
+			remainingProviders: remaining.map((p) => p.provider),
+		};
+	}
+
+	async createBotToken(userId, tokenId, tokenHash, name) {
+		return this._write(`/users/${requireId(userId, 'userId')}/bot-tokens`, {
+			tokenId: String(tokenId),
+			tokenHash: String(tokenHash),
+			name: String(name || ''),
+		});
+	}
+
+	async getBotTokenById(tokenId) {
+		if (!tokenId) return null;
+		return this._read(`/bot-tokens/${encodeURIComponent(String(tokenId))}`, { cacheSeconds: 0 });
+	}
+
+	async getUserBotTokens(userId) {
+		const tokens = await this._read(`/users/${requireId(userId, 'userId')}/bot-tokens`, { cacheSeconds: 0 });
+		return Array.isArray(tokens) ? tokens : [];
+	}
+
+	async revokeBotToken(userId, tokenId) {
+		const result = await this._write(`/users/${requireId(userId, 'userId')}/bot-tokens/${encodeURIComponent(String(tokenId))}/revoke`);
+		return typeof result === 'boolean' ? result : !!result?.success;
+	}
+
+	async updateBotTokenLastUsed(tokenId) {
+		await this._write(`/bot-tokens/${encodeURIComponent(String(tokenId))}/last-used`);
+	}
+
+	// ==================== Authorized Apps (NyaitterAuth) ====================
+
+	async createAuthorizedApp(userId, appId, appTokenHash, appName, appIconUrl, scopes, accessTokenId = null, accessTokenHash = null) {
+		return this._write(`/users/${requireId(userId, 'userId')}/authorized-apps`, {
+			appId: String(appId),
+			appTokenHash: String(appTokenHash),
+			appName: String(appName),
+			appIconUrl: appIconUrl ? String(appIconUrl) : null,
+			scopes: Array.isArray(scopes) ? scopes : [],
+			accessTokenId: accessTokenId ? String(accessTokenId) : null,
+			accessTokenHash: accessTokenHash ? String(accessTokenHash) : null,
+		});
+	}
+
+	async getAuthorizedAppByUserAndAppToken(userId, appId, appTokenHash) {
+		return this._read(`/users/${requireId(userId, 'userId')}/authorized-apps/lookup?appId=${encodeURIComponent(String(appId))}&appTokenHash=${encodeURIComponent(String(appTokenHash))}`, { cacheSeconds: 0 });
+	}
+
+	async getAuthorizedAppByAccessTokenId(accessTokenId) {
+		if (!accessTokenId) return null;
+		return this._read(`/authorized-apps/by-token/${encodeURIComponent(String(accessTokenId))}`, { cacheSeconds: 0 });
+	}
+
+	async getUserAuthorizedApps(userId) {
+		const apps = await this._read(`/users/${requireId(userId, 'userId')}/authorized-apps`, { cacheSeconds: 0 });
+		return Array.isArray(apps) ? apps : [];
+	}
+
+	async getAuthorizedAppById(id, userId = null) {
+		const query = userId !== null ? `?userId=${encodeURIComponent(String(userId))}` : '';
+		return this._read(`/authorized-apps/${encodeURIComponent(String(id))}${query}`, { cacheSeconds: 0 });
+	}
+
+	async updateAuthorizedAppScopes(id, userId, scopes, accessTokenId = null, accessTokenHash = null) {
+		return this._write(`/authorized-apps/${encodeURIComponent(String(id))}/scopes`, {
+			userId: userId !== null ? Number(userId) : undefined,
+			scopes: Array.isArray(scopes) ? scopes : [],
+			accessTokenId: accessTokenId ? String(accessTokenId) : null,
+			accessTokenHash: accessTokenHash ? String(accessTokenHash) : null,
+		});
+	}
+
+	async updateAuthorizedAppLastUsed(id) {
+		await this._write(`/authorized-apps/${encodeURIComponent(String(id))}/last-used`);
+		return true;
+	}
+
+	async deleteAuthorizedApp(id, userId = null) {
+		const query = userId !== null ? `?userId=${encodeURIComponent(String(userId))}` : '';
+		const result = await this._write(`/authorized-apps/${encodeURIComponent(String(id))}/delete${query}`);
+		return typeof result === 'boolean' ? result : !!result?.success;
+	}
+
+	async getUserByScid(scid) {
+		return normalizeUser(await this._read(`/users/scid/${encodeURIComponent(String(scid))}`));
+	}
+
+	async getUserById(id, { fresh = false } = {}) {
+		const userId = requireId(id, 'id');
+		if (fresh) return normalizeUser(await this._request(`/users/${userId}`, { retry: true }));
+		return normalizeUser(await this._read(`/users/${userId}`));
+	}
+
+	async getUserByExternalId(authProvider, externalId) {
+		return normalizeUser(await this._read(`/users/external/${encodeURIComponent(String(authProvider))}/${encodeURIComponent(String(externalId))}`));
+	}
+
+	// user_auth_providers を正とし、users 行にしか無い scid/primary 相当も
+	// 紐づけ情報として合成して返す。
+	async getUserAuthProviders(userId) {
+		const targetId = requireId(userId, 'userId');
+		const user = await this.getUserById(targetId);
+		if (!user) return [];
+
+		const raw = await this._read(`/users/${targetId}/auth-providers`, { cacheSeconds: 0 });
+		const records = (Array.isArray(raw) ? raw : []).map((r) => ({
+			id: r.id,
+			userId: Number(r.userId ?? r.user_id ?? targetId),
+			provider: r.provider,
+			providerUserId: r.providerUserId ?? r.provider_user_id,
+			providerProfile: typeof r.providerProfile === 'string'
+				? JSON.parse(r.providerProfile)
+				: (r.providerProfile || {}),
+			createdAt: r.createdAt || r.created_at || null,
+		}));
+
+		const hasScratch = records.some((r) => String(r.provider).toLowerCase() === 'scratch');
+		if (!hasScratch && user.scid) {
+			records.unshift({
+				id: 0,
+				userId: targetId,
+				provider: 'scratch',
+				providerUserId: user.scid,
+				providerProfile: { username: user.scid },
+				isPrimary: records.length === 0,
+				createdAt: user.created_at || user.createdAt || new Date(),
+			});
+		}
+		// users の auth_provider/external_id も、紐づけ行が無い場合の有効なログイン方法として一覧に含める。
+		// 一覧から消すと、解除ガードや設定画面の表示が実態とズレる。
+		const hasExternal = records.some((r) => String(r.provider).toLowerCase() === String(user.auth_provider || '').toLowerCase()
+			&& String(r.providerUserId) === String(user.external_id));
+		if (!hasExternal && user.auth_provider && user.external_id) {
+			records.push({
+				id: 0,
+				userId: targetId,
+				provider: user.auth_provider,
+				providerUserId: user.external_id,
+				providerProfile: user.external_profile || {},
+				isPrimary: records.length === 0,
+				createdAt: user.created_at || user.createdAt || new Date(),
+			});
+		}
+
+		return records;
+	}
+
+	async findUserByAuthProvider(provider, providerUserId) {
+		if (!provider || providerUserId == null) return null;
+		const normProvider = String(provider).toLowerCase();
+		const normUserId = String(providerUserId).trim();
+		if (!normProvider || !normUserId) return null;
+		return normalizeUser(await this._read(
+			`/users/auth-provider/${encodeURIComponent(normProvider)}/${encodeURIComponent(normUserId)}`,
+			{ cacheSeconds: 0 },
+		));
+	}
+
+	async linkAuthProvider(userId, provider, providerUserId, providerProfile = {}) {
+		const targetId = requireId(userId, 'userId');
+		const user = await this.getUserById(targetId);
+		if (!user) throw new Error('ユーザーが見つかりません。');
+
+		const normProvider = String(provider).toLowerCase();
+		const normUserId = String(providerUserId).trim();
+		const alreadyLinked = () => {
+			const error = new Error('この認証情報は既に他のアカウントに紐付けられています。');
+			error.status = 409;
+			error.code = 'auth_provider_already_linked';
+			return error;
+		};
+		if (!normProvider || !normUserId) throw alreadyLinked();
+
+		const existingUser = await this.findUserByAuthProvider(normProvider, normUserId);
+		if (existingUser && Number(existingUser.id) !== targetId) throw alreadyLinked();
+
+		const record = await this._write(`/users/${targetId}/auth-providers`, {
+			provider: normProvider,
+			providerUserId: normUserId,
+			providerProfile: providerProfile || {},
+		});
+		return {
+			id: record?.id ?? 0,
+			userId: Number(record?.userId ?? record?.user_id ?? targetId),
+			provider: record?.provider || normProvider,
+			providerUserId: record?.providerUserId ?? record?.provider_user_id ?? normUserId,
+			providerProfile: record?.providerProfile || record?.provider_profile || providerProfile || {},
+			createdAt: record?.createdAt || record?.created_at || user.created_at || user.createdAt || new Date(),
+		};
+	}
+
+	async unlinkAuthProvider(userId, provider, providerUserId = null) {
+		const targetId = requireId(userId, 'userId');
+		const user = await this.getUserById(targetId);
+		if (!user) throw new Error('ユーザーが見つかりません。');
+
+		const normProvider = String(provider).toLowerCase();
+		const linkedProviders = await this.getUserAuthProviders(targetId);
+		if (linkedProviders.length <= 1) {
+			const err = new Error('最後のログイン方法を解除することはできません。アカウントには最低1つのログイン方法が必要です。');
+			err.status = 400;
+			err.code = 'cannot_unlink_last_provider';
+			throw err;
+		}
+
+		const wantedId = providerUserId == null ? null : String(providerUserId).toLowerCase();
+		const match = linkedProviders.find((record) => String(record.provider).toLowerCase() === normProvider
+			&& (wantedId == null || String(record.providerUserId).toLowerCase() === wantedId));
+		if (!match) return { success: true, deleted: false };
+
+		await this._write(
+			this._query(`/users/${targetId}/auth-providers`, { provider: normProvider, providerUserId }),
+			null,
+			'DELETE',
+		);
+		return { success: true, deleted: true };
+	}
+
+	async createUser(userData) {
+		return normalizeUser(await this._write('/users', userData));
+	}
+
+	async searchUsers(query, limit = 20, offset = 0, { cursor = null, withNextCursor = false } = {}) {
+		const raw = await this._read(this._query('/users/search', {
+			q: String(query || ''),
+			limit: this._limit(limit),
+			offset: Math.max(Number(offset) || 0, 0),
+			cursor: cursor || undefined,
+			withNextCursor: withNextCursor ? 'true' : undefined,
+		}));
+		if (withNextCursor && raw && typeof raw === 'object' && !Array.isArray(raw)) {
+			return {
+				users: Array.isArray(raw.users) ? raw.users : [],
+				has_more: !!raw.has_more,
+				next_cursor: raw.next_cursor || null,
+			};
+		}
+		return Array.isArray(raw) ? raw : (raw?.users || []);
+	}
+
+	async getUsersByIds(userIds) {
+		const ids = this._normalizeIds(userIds);
+		if (ids.length === 0) return [];
+		const users = await this._read('/users/batch', { body: { ids } });
+		return Array.isArray(users) ? users.map(normalizeUser).filter(Boolean) : [];
+	}
+
+	// おすすめの年齢近接専用に、id と推定年齢だけを軽量に引く。
+	async getUserAgeEstimatesByIds(userIds) {
+		const ids = this._normalizeIds(userIds);
+		if (ids.length === 0) return new Map();
+		try {
+			const raw = await this._read('/users/age-estimates', { body: { ids }, cacheSeconds: 0 });
+			if (!raw || typeof raw !== 'object') throw new Error('Malformed age estimates response');
+			const users = Array.isArray(raw) ? raw : (raw?.users || []);
+			return new Map(users
+				.filter((user) => user?.age_estimate != null)
+				.map((user) => [Number(user.id), Number(user.age_estimate)]));
+		} catch (_) {
+			// 旧ワーカーには専用エンドポイントが無いため、全行取得へ後退する。
+			const users = await this.getUsersByIds(ids);
+			return new Map(users
+				.filter((user) => user?.age_estimate != null)
+				.map((user) => [Number(user.id), Number(user.age_estimate)]));
+		}
+	}
+
+	async getPostAuthorsByIds(userIds) {
+		const ids = this._normalizeIds(userIds);
+		if (ids.length === 0) return [];
+		const users = await this._read('/users/batch', {
+			body: { ids, projection: 'post_author' },
+		});
+		return Array.isArray(users) ? users.map(normalizeUser).filter(Boolean) : [];
+	}
+
+	async getAllUsers() {
+		const users = await this._read('/users', { cacheSeconds: 0 });
+		return Array.isArray(users) ? users.map(normalizeUser).filter(Boolean) : [];
+	}
+
+	async setAdminRequestExcluded(userId, excluded) {
+		return normalizeUser(await this._write(`/users/${requireId(userId, 'userId')}/admin-request-exclusion`, { excluded }));
+	}
+
+	async getImposterUsers() {
+		const users = await this._read('/users/imposters', { cacheSeconds: 0 });
+		return Array.isArray(users) ? users.map(normalizeUser).filter(Boolean) : [];
+	}
+
+	async getUsersAndSessionsByTokens(tokens) {
+		const safeTokens = [...new Set((tokens || []).map(String).filter(Boolean))];
+		if (safeTokens.length === 0) return [];
+		const result = await this._read('/sessions/users-by-tokens', {
+			body: { tokens: safeTokens },
+			cacheSeconds: 0,
+		});
+		return Array.isArray(result) ? result.map((item) => ({
+			session: item.session,
+			user: normalizeUser(item.user),
+		})).filter((item) => item.session && item.user) : [];
+	}
+
+	async getUserStatus(userId) {
+		return this._read(`/users/${requireId(userId, 'userId')}/status`, { cacheSeconds: 0 });
+	}
+
+	async setUserStatus(userId, status) {
+		return this._write(`/users/${requireId(userId, 'userId')}/status`, status);
+	}
+
+	async beginAccountOperation(userId, operation) {
+		return normalizeUser(await this._write(
+			`/users/${requireId(userId, 'userId')}/account-operation/begin`,
+			{ operation },
+		));
+	}
+
+	async finishAccountOperation(userId, operation) {
+		return normalizeUser(await this._write(
+			`/users/${requireId(userId, 'userId')}/account-operation/finish`,
+			{ operation },
+		));
+	}
+
+	async getAccountAttachmentKeys(userId) {
+		const keys = await this._read(`/users/${requireId(userId, 'userId')}/account/attachments`, { cacheSeconds: 0 });
+		return Array.isArray(keys) ? keys.filter((key) => typeof key === 'string') : [];
+	}
+
+	async deleteAccount(userId) {
+		const result = await this._write(`/users/${requireId(userId, 'userId')}/account/delete`);
+		return result === true || Boolean(result?.success);
+	}
+
+	async updateUserProfile(userId, profileData) {
+		return normalizeUser(await this._write(
+			`/users/${requireId(userId, 'userId')}/profile`,
+			profileData,
+		));
+	}
+
+	async recordPostAgeEstimate(postId, userId, band) {
+		if (!['under13', '13-15', '16-17', '18-24', '25-34', '35over'].includes(band)) return null;
+		return this._write(`/posts/${requireId(postId, 'postId', 1)}/age-estimate`, {
+			userId: requireId(userId, 'userId'),
+			band,
+		});
+	}
+
+	async getPostAgeBands(userId, limit = 50) {
+		const result = await this._read(this._query(
+			`/users/${requireId(userId, 'userId')}/age-estimates`,
+			{ limit: Math.max(1, Math.min(Number(limit) || 50, 500)) },
+		), { cacheSeconds: 0 });
+		return Array.isArray(result?.bands) ? result.bands : [];
+	}
+
+	async updateUserAgeEstimate(userId, fields = {}) {
+		const sanitized = { ...fields };
+		if (sanitized.ageEstimate != null) {
+			const estimate = Number(sanitized.ageEstimate);
+			if (!Number.isFinite(estimate) || estimate < 0 || estimate > 120) delete sanitized.ageEstimate;
+			else sanitized.ageEstimate = estimate;
+		}
+		if (sanitized.ageSource !== undefined && !['post', 'ondevice', 'api'].includes(sanitized.ageSource)) {
+			sanitized.ageSource = null;
+		}
+		return normalizeUser(await this._write(
+			`/users/${requireId(userId, 'userId')}/age-estimate`,
+			sanitized,
+		));
+	}
+
+	async toggleFollow(followerId, followingId) {
+		return this._write(`/users/${requireId(followingId, 'followingId')}/follow`, {
+			followerId: requireId(followerId, 'followerId'),
+		});
+	}
+
+	async toggleBlock(userId, targetUserId) {
+		const uid = requireId(userId, 'userId');
+		const tid = requireId(targetUserId, 'targetUserId');
+		try {
+			const res = await this._write(`/users/${tid}/block`, {
+				userId: uid,
+			});
+			if (res && typeof res.blocked === 'boolean') {
+				return res;
+			}
+		} catch (_) {
+			// Fallback to manual update below
+		}
+
+		const user = await this.getUser(uid);
+		if (!user) throw new Error('User not found');
+		const currentBlock = normalizeBlockList(user.block, uid);
+		const isBlocked = currentBlock.includes(tid);
+		const newBlock = isBlocked
+			? currentBlock.filter((id) => id !== tid)
+			: [...currentBlock, tid];
+		const normalized = normalizeBlockList(newBlock, uid);
+		await this.updateUserProfile(uid, { block: normalized });
+		return {
+			blocked: !isBlocked,
+			block: normalized,
+		};
+	}
+
+	async isFollowing(followerId, followingId) {
+		const result = await this._read(this._query(`/users/${requireId(followingId, 'followingId')}/is-following`, {
+			followerId: requireId(followerId, 'followerId'),
+		}), { cacheSeconds: 0 });
+		return typeof result === 'boolean' ? result : !!result?.following;
+	}
+
+	async dislikePost(userId, postId) {
+		const result = await this._write(`/posts/${requireId(postId, 'postId')}/dislike`, {
+			userId: requireId(userId, 'userId'),
+		});
+		return typeof result === 'boolean' ? result : !!result?.success;
+	}
+
+	async getFollowing(userId, limit = 100, offset = 0, { cursor = null, withNextCursor = false } = {}) {
+		const raw = await this._read(this._query(`/users/${requireId(userId, 'userId')}/following`, {
+			limit: this._limit(limit, 100, 500),
+			offset: this._offset(offset),
+			cursor: cursor || undefined,
+			withNextCursor: withNextCursor ? 'true' : undefined,
+		}), { cacheSeconds: 0 });
+		if (withNextCursor && raw && typeof raw === 'object' && !Array.isArray(raw)) {
+			return {
+				users: Array.isArray(raw.users) ? raw.users : [],
+				has_more: !!raw.has_more,
+				next_cursor: raw.next_cursor || null,
+			};
+		}
+		return Array.isArray(raw) ? raw : (raw?.users || []);
+	}
+
+	async getFollowers(userId, limit = 100, offset = 0, { cursor = null, withNextCursor = false } = {}) {
+		const raw = await this._read(this._query(`/users/${requireId(userId, 'userId')}/followers`, {
+			limit: this._limit(limit, 100, 500),
+			offset: this._offset(offset),
+			cursor: cursor || undefined,
+			withNextCursor: withNextCursor ? 'true' : undefined,
+		}), { cacheSeconds: 0 });
+		if (withNextCursor && raw && typeof raw === 'object' && !Array.isArray(raw)) {
+			return {
+				users: Array.isArray(raw.users) ? raw.users : [],
+				has_more: !!raw.has_more,
+				next_cursor: raw.next_cursor || null,
+			};
+		}
+		return Array.isArray(raw) ? raw : (raw?.users || []);
+	}
+
+	async getFollowingCount(userId) {
+		const res = await this._read(`/users/${requireId(userId, 'userId')}/following/count`, { cacheSeconds: 0 });
+		return Number(res?.count ?? res ?? 0);
+	}
+
+	async getFollowerCount(userId) {
+		const res = await this._read(`/users/${requireId(userId, 'userId')}/followers/count`, { cacheSeconds: 0 });
+		return Number(res?.count ?? res ?? 0);
+	}
+
+	async getPublicProfileStats(userId) {
+		const stats = await this._read(`/users/${requireId(userId, 'userId')}/profile-stats`, { cacheSeconds: 0 });
+		return {
+			followingCount: Number(stats?.following_count ?? stats?.followingCount ?? 0),
+			followerCount: Number(stats?.follower_count ?? stats?.followerCount ?? 0),
+			postCount: Number(stats?.post_count ?? stats?.postCount ?? 0),
+			mediaCount: Number(stats?.media_count ?? stats?.mediaCount ?? 0),
+			pinnedPostId: stats?.pinned_post_id ?? stats?.pinnedPostId ?? null,
+		};
+	}
+
+	async getFollowIds(userId) {
+		const ids = await this._read(`/users/${requireId(userId, 'userId')}/following/ids`, { cacheSeconds: 0 });
+		return Array.isArray(ids) ? ids.map(Number) : [];
+	}
+
+	async getFollowRelationshipSnapshot(userId, candidateUserIds) {
+		const normalizedUserId = requireId(userId, 'userId');
+		const candidateIds = this._normalizeIds(candidateUserIds, { fieldName: 'candidateUserId' })
+			.filter((id) => id !== normalizedUserId);
+		if (candidateIds.length === 0) return { followingIds: [], followerIds: [] };
+		const result = await this._read('/users/follow-relationships', {
+			body: { userId: normalizedUserId, candidateIds },
+			cacheSeconds: 0,
+		});
+		return {
+			followingIds: Array.isArray(result?.following_ids ?? result?.followingIds)
+				? (result.following_ids ?? result.followingIds).map(Number).filter(Number.isInteger)
+				: [],
+			followerIds: Array.isArray(result?.follower_ids ?? result?.followerIds)
+				? (result.follower_ids ?? result.followerIds).map(Number).filter(Number.isInteger)
+				: [],
+		};
+	}
+
+	// ==================== Groups ====================
+
+	_groupPath(groupId) {
+		const id = String(groupId || '').trim();
+		if (!id) throw new TypeError('groupId is required');
+		return encodeURIComponent(id);
+	}
+
+	async createGroup(groupData) {
+		return normalizeGroup(await this._write('/groups', groupData));
+	}
+
+	async getGroupById(groupId) {
+		return normalizeGroup(await this._read(`/groups/${this._groupPath(groupId)}`, { cacheSeconds: 0 }));
+	}
+
+	async updateGroup(groupId, fields) {
+		return normalizeGroup(await this._write(`/groups/${this._groupPath(groupId)}`, fields, 'PATCH'));
+	}
+
+	async deleteGroup(groupId) {
+		return normalizeGroup(await this._write(`/groups/${this._groupPath(groupId)}`, undefined, 'DELETE'));
+	}
+
+	async transferGroupOwnership(groupId, newOwnerId) {
+		return normalizeGroup(await this._write(
+			`/groups/${this._groupPath(groupId)}/owner`,
+			{ newOwnerId: requireId(newOwnerId, 'newOwnerId') },
+			'PATCH',
+		));
+	}
+
+	async getGroupsByVisibility({ query = '', visibility = ['open', 'open_invite'], limit = 20, offset = 0 } = {}) {
+		const groups = await this._read(this._query('/groups', { query, visibility: Array.isArray(visibility) ? visibility.join(',') : visibility,
+			limit: this._limit(limit, 20, 100), offset: Math.max(0, Number(offset) || 0) }), { cacheSeconds: 0 });
+		return Array.isArray(groups) ? groups.map(normalizeGroup) : [];
+	}
+
+	async getUserGroups(userId, { status = 'active', limit = 100, offset = 0 } = {}) {
+		const groups = await this._read(this._query(`/users/${requireId(userId, 'userId')}/groups`, {
+			status, limit: this._limit(limit, 100, 200), offset: Math.max(0, Number(offset) || 0),
+		}), { cacheSeconds: 0 });
+		return Array.isArray(groups) ? groups.map((group) => ({ ...normalizeGroup(group), membership: normalizeGroupMembership(group.membership) })) : [];
+	}
+
+	async getMutualUserGroups(userId1, userId2, { limit = 100, offset = 0 } = {}) {
+		const u1 = requireId(userId1, 'userId1');
+		const u2 = requireId(userId2, 'userId2');
+		if (u1 === u2) return this.getUserGroups(u1, { status: 'active', limit, offset });
+		const groups = await this._read(this._query(`/users/${u1}/mutual-groups`, {
+			targetUserId: u2,
+			limit: this._limit(limit, 100, 200),
+			offset: Math.max(0, Number(offset) || 0),
+		}), { cacheSeconds: 0 });
+		return Array.isArray(groups) ? groups.map(normalizeGroup) : [];
+	}
+
+	async getUserBootstrapData(userId, notificationLimit = 200) {
+		const targetId = requireId(userId, 'userId');
+		const limit = this._limit(notificationLimit, 200, 200);
+		try {
+			const data = await this._read(this._query(`/users/${targetId}/bootstrap`, { limit }), { cacheSeconds: 0 });
+			if (data && typeof data === 'object') {
+				return {
+					follow: Array.isArray(data.follow) ? data.follow.map(Number).filter(Number.isInteger) : [],
+					like: Array.isArray(data.like) ? data.like.map(Number).filter(Number.isInteger) : [],
+					star: Array.isArray(data.star) ? data.star.map(Number).filter(Number.isInteger) : [],
+					pin: data.pin != null ? Number(data.pin) : null,
+					unreadCount: Number(data.unreadCount || data.unread_count || 0),
+					group_badges: Array.isArray(data.group_badges) ? data.group_badges : [],
+					notifications: Array.isArray(data.notifications) ? data.notifications : [],
+					notificationUsers: Array.isArray(data.notificationUsers) ? data.notificationUsers.map(normalizeUser).filter(Boolean) : [],
+					notificationPosts: Array.isArray(data.notificationPosts) ? data.notificationPosts.map(normalizePost).filter(Boolean) : [],
+				};
+			}
+		} catch (_) {
+			// bootstrap 取得に失敗したら、以下の個別取得へ後退する。
+		}
+
+		const [follow, like, star, pin, notifs, unreadCount, groupBadgesMap] = await Promise.all([
+			this.getFollowIds(targetId),
+			this.getLikeIds(targetId),
+			this.getStarIds(targetId),
+			this.getPinnedPostId(targetId),
+			this.getNotifications(targetId, limit),
+			this.getUnreadNotificationCount(targetId),
+			this.getUsersGroupBadgesBatch([targetId]),
+		]);
+		return {
+			follow, like, star, pin, unreadCount,
+			group_badges: groupBadgesMap.get(targetId) || [],
+			notifications: notifs,
+			notificationUsers: [],
+			notificationPosts: [],
+		};
+	}
+
+	async getUsersGroupBadgesBatch(userIds) {
+		const result = new Map();
+		const ids = [...new Set((userIds || []).map(Number).filter(Number.isInteger))];
+		if (ids.length === 0) return result;
+		ids.forEach((id) => result.set(id, []));
+
+		try {
+			const res = await this._read('/groups/user-badges-batch', { body: { user_ids: ids }, cacheSeconds: 0 });
+			if (res && res.badges) {
+				for (const [uid, badges] of Object.entries(res.badges)) {
+					result.set(Number(uid), Array.isArray(badges) ? badges.slice(0, 5) : []);
+				}
+				return result;
+			}
+		} catch (_) {
+			// Fallback to per-user retrieval below
+		}
+
+		await Promise.all(ids.map(async (userId) => {
+			try {
+				const groups = await this.getUserGroups(userId, { status: 'active', limit: 20 });
+				const badges = (groups || [])
+					.filter((g) => Boolean(g.icon_data || g.iconData) && (g.visibility === 'open' || g.visibility === 'open_invite'))
+					.slice(0, 5)
+					.map((g) => ({
+						id: String(g.id),
+						name: String(g.name || ''),
+						icon_data: g.icon_data || g.iconData,
+					}));
+				result.set(userId, badges);
+			} catch (_) {
+				// 1ユーザー分の取得失敗はバッジ無しとして扱う。
+			}
+		}));
+
+		return result;
+	}
+
+	async createGroupRole(roleData) {
+		return normalizeGroupRole(await this._write(`/groups/${this._groupPath(roleData.groupId)}/roles`, roleData));
+	}
+
+	async getGroupRoles(groupId) {
+		const roles = await this._read(`/groups/${this._groupPath(groupId)}/roles`, { cacheSeconds: 0 });
+		return Array.isArray(roles) ? roles.map(normalizeGroupRole) : [];
+	}
+
+	async updateGroupRole(roleId, fields) {
+		return normalizeGroupRole(await this._write(`/group-roles/${this._groupPath(roleId)}`, fields, 'PATCH'));
+	}
+
+	async deleteGroupRole(roleId) {
+		return normalizeGroupRole(await this._write(`/group-roles/${this._groupPath(roleId)}`, undefined, 'DELETE'));
+	}
+
+	async getGroupMembership(groupId, userId) {
+		return normalizeGroupMembership(await this._read(`/groups/${this._groupPath(groupId)}/members/${requireId(userId, 'userId')}`, { cacheSeconds: 0 }));
+	}
+
+	async getGroupMemberships(groupId, { status = null, limit = 100, offset = 0 } = {}) {
+		const memberships = await this._read(this._query(`/groups/${this._groupPath(groupId)}/members`, {
+			status: status || undefined, limit: this._limit(limit, 100, 200), offset: Math.max(0, Number(offset) || 0),
+		}), { cacheSeconds: 0 });
+		return Array.isArray(memberships) ? memberships.map(normalizeGroupMembership) : [];
+	}
+
+	async createGroupMembership(membershipData) {
+		return normalizeGroupMembership(await this._write(`/groups/${this._groupPath(membershipData.groupId)}/members`, membershipData));
+	}
+
+	async updateGroupMembership(groupId, userId, fields) {
+		return normalizeGroupMembership(await this._write(
+			`/groups/${this._groupPath(groupId)}/members/${requireId(userId, 'userId')}`, fields, 'PATCH',
+		));
+	}
+
+	async createGroupInvite(inviteData) {
+		return normalizeGroupInvite(await this._write(`/groups/${this._groupPath(inviteData.groupId)}/invites`, inviteData));
+	}
+
+	async getGroupInvite(inviteId) {
+		return normalizeGroupInvite(await this._read(`/group-invites/${this._groupPath(inviteId)}`, { cacheSeconds: 0 }));
+	}
+
+	async getGroupInvites({ groupId = null, inviteeId = null, status = null, limit = 100, offset = 0 } = {}) {
+		const invites = await this._read(this._query('/group-invites', { groupId: groupId || undefined, inviteeId: inviteeId ?? undefined,
+			status: status || undefined, limit: this._limit(limit, 100, 200), offset: Math.max(0, Number(offset) || 0) }), { cacheSeconds: 0 });
+		return Array.isArray(invites) ? invites.map(normalizeGroupInvite) : [];
+	}
+
+	async updateGroupInvite(inviteId, fields) {
+		return normalizeGroupInvite(await this._write(`/group-invites/${this._groupPath(inviteId)}`, fields, 'PATCH'));
+	}
+
+	async createGroupJoinRequest(requestData) {
+		return normalizeGroupJoinRequest(await this._write(`/groups/${this._groupPath(requestData.groupId)}/join-requests`, requestData));
+	}
+
+	async getGroupJoinRequest(requestId) {
+		return normalizeGroupJoinRequest(await this._read(`/group-join-requests/${this._groupPath(requestId)}`, { cacheSeconds: 0 }));
+	}
+
+	async getGroupJoinRequests({ groupId = null, userId = null, status = null, limit = 100, offset = 0 } = {}) {
+		const requests = await this._read(this._query('/group-join-requests', { groupId: groupId || undefined, userId: userId ?? undefined,
+			status: status || undefined, limit: this._limit(limit, 100, 200), offset: Math.max(0, Number(offset) || 0) }), { cacheSeconds: 0 });
+		return Array.isArray(requests) ? requests.map(normalizeGroupJoinRequest) : [];
+	}
+
+	async updateGroupJoinRequest(requestId, fields) {
+		return normalizeGroupJoinRequest(await this._write(`/group-join-requests/${this._groupPath(requestId)}`, fields, 'PATCH'));
+	}
+
+	async getGroupPostIds(groupId, { limit = 30, offset = 0, beforeId = null, authorId = null, subType = 'posts_only', order = 'latest', cursor = null, cursorCreatedAt = null, cursorId = null } = {}) {
+		if (order !== 'latest') { beforeId = null; cursor = null; cursorCreatedAt = null; cursorId = null; }
+		const decodedCursor = cursorCreatedAt && cursorId
+			? { createdAt: cursorCreatedAt, id: Number(cursorId) }
+			: (typeof cursor === 'string' && cursor.trim() ? decodePostCursor(cursor.trim()) : null);
+		return this._read(this._query(`/groups/${this._groupPath(groupId)}/posts`, {
+			order,
+			limit: this._limit(limit, 30, 100),
+			offset: (decodedCursor || (beforeId != null && Number(beforeId) > 0)) ? 0 : Math.max(0, Number(offset) || 0),
+			beforeId: beforeId ?? undefined,
+			cursor: decodedCursor ? encodePostCursor(decodedCursor) : (cursor || undefined),
+			authorId: authorId != null && authorId !== '' && Number.isInteger(Number(authorId)) && Number(authorId) >= 0
+				? Number(authorId)
+				: undefined,
+			subType: subType === 'replies_only' ? 'replies_only' : 'posts_only',
+		}), { cacheSeconds: 0 });
+	}
+
+	async getGroupAnnouncementPostIds(groupId, { limit = 30, offset = 0, beforeId = null, cursor = null, cursorCreatedAt = null, cursorId = null } = {}) {
+		const decodedCursor = cursorCreatedAt && cursorId
+			? { createdAt: cursorCreatedAt, id: Number(cursorId) }
+			: (typeof cursor === 'string' && cursor.trim() ? decodePostCursor(cursor.trim()) : null);
+		return this._read(this._query(`/groups/${this._groupPath(groupId)}/announcements`, {
+			limit: this._limit(limit, 30, 100),
+			offset: (decodedCursor || (beforeId != null && Number(beforeId) > 0)) ? 0 : Math.max(0, Number(offset) || 0),
+			beforeId: beforeId ?? undefined,
+			cursor: decodedCursor ? encodePostCursor(decodedCursor) : (cursor || undefined),
+		}), { cacheSeconds: 0 });
+	}
+
+	async searchGroupPostIds(userId, query, { limit = 30, offset = 0, beforeId = null, cursor = null, cursorCreatedAt = null, cursorId = null, searchFilters = null } = {}) {
+		const decodedCursor = cursorCreatedAt && cursorId
+			? { createdAt: cursorCreatedAt, id: Number(cursorId) }
+			: (typeof cursor === 'string' && cursor.trim() ? decodePostCursor(cursor.trim()) : null);
+		return this._read(this._query('/group-posts/search', {
+			userId: requireId(userId, 'userId'),
+			query: String(query || ''),
+			searchFilters: searchFilters ? JSON.stringify(searchFilters) : null,
+			limit: this._limit(limit, 30, 100),
+			offset: (decodedCursor || (beforeId != null && Number(beforeId) > 0)) ? 0 : Math.max(0, Number(offset) || 0),
+			beforeId: beforeId ?? undefined,
+			cursor: decodedCursor ? encodePostCursor(decodedCursor) : (cursor || undefined),
+		}), { cacheSeconds: 0 });
+	}
+
+	// ==================== Spaces ====================
+	async createSpace(spaceData) {
+		return normalizeSpace(await this._write('/spaces', spaceData));
+	}
+
+	async getSpaceById(spaceId) {
+		return normalizeSpace(await this._read(`/spaces/${encodeURIComponent(String(spaceId))}`, { cacheSeconds: 0 }));
+	}
+
+	async updateSpace(spaceId, fields) {
+		return normalizeSpace(await this._write(`/spaces/${encodeURIComponent(String(spaceId))}`, fields, 'PATCH'));
+	}
+
+	async deleteSpace(spaceId) {
+		const result = await this._write(`/spaces/${encodeURIComponent(String(spaceId))}`, undefined, 'DELETE');
+		return typeof result === 'boolean' ? result : !!result?.deleted;
+	}
+
+	async listSpaces({ query = '', includePrivate = false, groupIds = null, limit = 20, offset = 0 } = {}) {
+		const groups = Array.isArray(groupIds) ? groupIds.map(String).filter(Boolean) : [];
+		const spaces = await this._read(this._query('/spaces', {
+			query,
+			include_private: includePrivate ? 'true' : undefined,
+			group_ids: groups.length ? groups.join(',') : undefined,
+			limit: this._limit(limit, 20, 100),
+			offset: Math.max(0, Number(offset) || 0),
+		}), { cacheSeconds: 0 });
+		return Array.isArray(spaces) ? spaces.map(normalizeSpace) : [];
+	}
+
+	async listUserSpaces(userId, { limit = 50, offset = 0 } = {}) {
+		const spaces = await this._read(this._query(`/users/${requireId(userId, 'userId')}/spaces`, {
+			limit: this._limit(limit, 50, 100), offset: Math.max(0, Number(offset) || 0),
+		}), { cacheSeconds: 0 });
+		return Array.isArray(spaces)
+			? spaces.map((space) => ({ ...normalizeSpace(space), membership: normalizeSpaceMember(space.membership) }))
+			: [];
+	}
+
+	async countSpacesByOwner(ownerId) {
+		const result = await this._read(this._query('/spaces/count', { ownerId: requireId(ownerId, 'ownerId') }), { cacheSeconds: 0 });
+		return Number(result?.count) || 0;
+	}
+
+	async createSpaceChannel(channelData) {
+		return normalizeSpaceChannel(await this._write('/spaces/channels', channelData));
+	}
+
+	async getSpaceChannel(channelId) {
+		return normalizeSpaceChannel(await this._read(`/spaces/channels/${encodeURIComponent(String(channelId))}`, { cacheSeconds: 0 }));
+	}
+
+	async listSpaceChannels(spaceId) {
+		const channels = await this._read(`/spaces/${encodeURIComponent(String(spaceId))}/channels`, { cacheSeconds: 0 });
+		return Array.isArray(channels) ? channels.map(normalizeSpaceChannel) : [];
+	}
+
+	async updateSpaceChannel(channelId, fields) {
+		return normalizeSpaceChannel(await this._write(`/spaces/channels/${encodeURIComponent(String(channelId))}`, fields, 'PATCH'));
+	}
+
+	async deleteSpaceChannel(channelId) {
+		const result = await this._write(`/spaces/channels/${encodeURIComponent(String(channelId))}`, undefined, 'DELETE');
+		return typeof result === 'boolean' ? result : !!result?.deleted;
+	}
+
+	async createSpaceMember(memberData) {
+		return normalizeSpaceMember(await this._write(`/spaces/${encodeURIComponent(String(memberData.spaceId ?? memberData.space_id))}/members`, memberData));
+	}
+
+	async getSpaceMember(spaceId, userId) {
+		return normalizeSpaceMember(await this._read(`/spaces/${encodeURIComponent(String(spaceId))}/members/${requireId(userId, 'userId')}`, { cacheSeconds: 0 }));
+	}
+
+	async listSpaceMembers(spaceId, { limit = 100, offset = 0 } = {}) {
+		const members = await this._read(this._query(`/spaces/${encodeURIComponent(String(spaceId))}/members`, {
+			limit: this._limit(limit, 100, 200), offset: Math.max(0, Number(offset) || 0),
+		}), { cacheSeconds: 0 });
+		return Array.isArray(members) ? members.map(normalizeSpaceMember) : [];
+	}
+
+	async deleteSpaceMember(spaceId, userId) {
+		const result = await this._write(`/spaces/${encodeURIComponent(String(spaceId))}/members/${requireId(userId, 'userId')}`, undefined, 'DELETE');
+		return typeof result === 'boolean' ? result : !!result?.removed;
+	}
+
+	async updateSpaceMemberCount(spaceId) {
+		const result = await this._write(`/spaces/${encodeURIComponent(String(spaceId))}/member-count`, {});
+		return Number(result?.memberCount ?? result?.member_count) || 0;
+	}
+
+	async createSpaceMessage(messageData) {
+		return normalizeSpaceMessage(await this._write(`/spaces/channels/${encodeURIComponent(String(messageData.channelId ?? messageData.channel_id))}/messages`, messageData));
+	}
+
+	async listSpaceMessages(channelId, { limit = 50, beforeId = null } = {}) {
+		const messages = await this._read(this._query(`/spaces/channels/${encodeURIComponent(String(channelId))}/messages`, {
+			limit: this._limit(limit, 50, 100), before_id: beforeId != null ? Number(beforeId) : undefined,
+		}), { cacheSeconds: 0 });
+		return Array.isArray(messages) ? messages.map(normalizeSpaceMessage) : [];
+	}
+
+	async getSpaceMessageById(messageId) {
+		return normalizeSpaceMessage(await this._read(`/spaces/messages/${requireId(messageId, 'messageId', 1)}`, { cacheSeconds: 0 }));
+	}
+
+	async deleteSpaceMessage(messageId) {
+		const result = await this._write(`/spaces/messages/${encodeURIComponent(String(messageId))}`, undefined, 'DELETE');
+		return typeof result === 'boolean' ? result : !!result?.deleted;
+	}
+
+	async createPost(postData) {
+		const post = await this._write('/posts', postData);
+		return normalizePost(post);
+	}
+
+	async getPostById(id) {
+		const postId = requireId(id, 'postId', 1);
+		const post = await this._read(`/posts/${postId}`);
+		return normalizePost(post);
+	}
+
+	async getPostsByIds(postIds) {
+		const ids = this._normalizeIds(postIds, { fieldName: 'postId', minimum: 1 });
+		if (ids.length === 0) return [];
+		const posts = await this._read('/posts/batch', { body: { ids } });
+		return Array.isArray(posts) ? posts.map(normalizePost) : [];
+	}
+
+	async getPostReferencesByIds(postIds, maxDepth = 2) {
+		const ids = this._normalizeIds(postIds, { fieldName: 'postId', minimum: 1 });
+		const normalizedMaxDepth = Math.min(4, Math.max(0, Number(maxDepth) || 0));
+		if (ids.length === 0) return [];
+
+		try {
+			const res = await this._read('/posts/references/batch', {
+				body: { ids, maxDepth: normalizedMaxDepth },
+			});
+			if (Array.isArray(res)) return res.map(normalizePost);
+		} catch (_) {
+			// Fallback: breadth-first resolution using getPostsByIds in bounded iterations
+		}
+
+		const postsById = new Map();
+		let currentIds = ids;
+		for (let depth = 0; depth <= normalizedMaxDepth && currentIds.length > 0; depth += 1) {
+			const missingIds = currentIds.filter((id) => !postsById.has(id));
+			if (missingIds.length === 0) break;
+			const fetched = await this.getPostsByIds(missingIds);
+			const nextIds = [];
+			for (const post of fetched) {
+				if (post && post.id) {
+					const pid = Number(post.id);
+					postsById.set(pid, post);
+					if (post.replyTo != null && !postsById.has(Number(post.replyTo))) {
+						nextIds.push(Number(post.replyTo));
+					}
+					if (post.repostTo != null && !postsById.has(Number(post.repostTo))) {
+						nextIds.push(Number(post.repostTo));
+					}
+				}
+			}
+			currentIds = [...new Set(nextIds)];
+		}
+		return Array.from(postsById.values());
+	}
+
+	async getPostMetricsBatch(postIds, currentUserId = null) {
+		const ids = this._normalizeIds(postIds, { fieldName: 'postId', minimum: 1 });
+		if (ids.length === 0) return [];
+		const body = {
+			ids,
+			currentUserId: currentUserId == null ? null : requireId(currentUserId, 'currentUserId'),
+		};
+		return this._read('/posts/metrics/batch', { body });
+	}
+
+	async getViewerPostReactions(postIds, currentUserId) {
+		const ids = this._normalizeIds(postIds, { fieldName: 'postId', minimum: 1 });
+		if (ids.length === 0) return [];
+		return this._read('/posts/reactions/batch', {
+			body: {
+				ids,
+				currentUserId: currentUserId == null ? null : requireId(currentUserId, 'currentUserId'),
+			},
+		});
+	}
+
+	async getDueScheduledPosts(now = new Date().toISOString(), limit = 100) {
+		const posts = await this._read(this._query('/posts/scheduled/due', { now, limit }), { cacheSeconds: 0 });
+		return (posts || []).map(normalizePost);
+	}
+
+	async publishScheduledPost(postId, now = new Date().toISOString()) {
+		return normalizePost(await this._write(`/posts/${requireId(postId, 'postId')}/publish-scheduled`, { now }));
+	}
+
+	async updatePost(postId, fields) {
+
+		const post = await this._write(`/posts/${requireId(postId, 'postId', 1)}`, fields);
+		return normalizePost(post);
+	}
+
+	async auditAndHealPostCounters(postId) {
+		const id = Number(postId);
+		if (!Number.isSafeInteger(id) || id <= 0) return null;
+		const post = await this._write(`/posts/${id}/audit-counters`, {});
+		return normalizePost(post);
+	}
+
+	async auditAndHealUserCounters(userId) {
+		const id = Number(userId);
+		if (!Number.isSafeInteger(id) || id <= 0) return null;
+		const counts = await this._read(`/users/${id}/audit-counters`, { cacheSeconds: 0 });
+		return {
+			userId: id,
+			followerCount: Number(counts?.followerCount || 0),
+			followingCount: Number(counts?.followingCount || 0),
+			postCount: Number(counts?.postCount || 0),
+		};
+	}
+
+	async deletePost(postId, userId) {
+		const result = await this._write(`/posts/${requireId(postId, 'postId', 1)}/delete`, {
+			userId: requireId(userId, 'userId'),
+		});
+		return typeof result === 'boolean' ? result : !!result?.success;
+	}
+
+	async adminDeletePost(postId) {
+		const result = await this._write(`/posts/${requireId(postId, 'postId', 1)}/admin-delete`);
+		return typeof result === 'boolean' ? result : !!result?.success;
+	}
+
+	async getRecentPosts(limit = 30) {
+		const posts = await this._read(this._query('/posts/recent', { limit: this._limit(limit, 30) }));
+		return Array.isArray(posts) ? posts.map(normalizePost) : [];
+	}
+
+	async getPostsByUserId(userId, limit = 50, currentUserId = null) {
+		const posts = await this._read(this._query(`/users/${requireId(userId, 'userId')}/posts`, {
+			limit: this._limit(limit, 50),
+			currentUserId: currentUserId == null ? null : requireId(currentUserId, 'currentUserId'),
+		}));
+		return Array.isArray(posts) ? posts.map(normalizePost) : [];
+	}
+
+	async getScheduledPostsByUser(userId, now = new Date().toISOString(), { limit = 50, offset = 0 } = {}) {
+		const posts = await this._read(this._query(`/users/${requireId(userId, 'userId')}/scheduled`, {
+			now,
+			limit: this._limit(limit, 50),
+			offset: this._offset(offset),
+		}), { cacheSeconds: 0 });
+		return Array.isArray(posts) ? posts.map(normalizePost) : [];
+	}
+
+	async getTimelinePosts(params = {}) {
+		const limit = this._limit(params.limit, 30);
+		const posts = await this.getRecentPosts(limit);
+		return { posts, hasMore: posts.length === limit };
+	}
+
+	async getTimelinePostIds({ tab = 'foryou', followIds = [], viewerId = null, limit = 30, offset = 0, beforeId = null, cursor = null, cursorCreatedAt = null, cursorId = null } = {}) {
+		const resolvedFollowIds = this._normalizeIds(followIds);
+		const decodedCursor = cursorCreatedAt && cursorId
+			? { createdAt: cursorCreatedAt, id: Number(cursorId) }
+			: (typeof cursor === 'string' && cursor.trim() ? decodePostCursor(cursor.trim()) : null);
+		const body = {
+			tab: String(tab),
+			followIds: resolvedFollowIds,
+			viewerId: viewerId == null ? null : requireId(viewerId, 'viewerId'),
+			includePosts: true,
+			limit: this._limit(limit, 30),
+			offset: (decodedCursor || (beforeId != null && Number(beforeId) > 0)) ? 0 : this._offset(offset),
+			beforeId: beforeId == null ? null : requireId(beforeId, 'beforeId', 1),
+			cursor: decodedCursor ? encodePostCursor(decodedCursor) : (cursor || null),
+		};
+		return this._read('/posts/timeline/ids', { body, cacheSeconds: 0 });
+	}
+
+	async getRecommendedPostIds({ viewerId = null, limit = 30, offset = 0, beforeId = null, cursor = null, cursorCreatedAt = null, cursorId = null } = {}) {
+		const normalizedLimit = this._limit(limit, 30);
+		const decodedCursor = cursorCreatedAt && cursorId
+			? { createdAt: cursorCreatedAt, id: Number(cursorId) }
+			: (typeof cursor === 'string' && cursor.trim() ? decodePostCursor(cursor.trim()) : null);
+		// 直近窓を広めに取得し、採点は Node.js 側の共通ユーティリティへ一本化する。
+		const windowSize = Math.min(800, Math.max(240, normalizedLimit * 8));
+		const candidatePage = await this._read(this._query('/posts/recommended/candidates', {
+			viewerId: viewerId == null ? null : requireId(viewerId, 'viewerId'),
+			limit: windowSize,
+			offset: (decodedCursor || (beforeId != null && Number(beforeId) > 0)) ? 0 : this._offset(offset),
+			beforeId: beforeId == null ? null : requireId(beforeId, 'beforeId', 1),
+			cursor: decodedCursor ? encodePostCursor(decodedCursor) : (cursor || null),
+		}), { cacheSeconds: 0 });
+
+		const candidates = Array.isArray(candidatePage?.posts) ? candidatePage.posts : [];
+		let keywordProfile = new Map();
+		let directFollows = new Set();
+		let extendedFollows = new Set();
+		let reactedPostIds = new Set();
+		let dislikedPostIds = new Set();
+		let dislikedAuthorCounts = new Map();
+		let negativeTagCounts = new Map();
+		let blockedAuthors = new Set();
+		let viewerAgeEstimate = null;
+		let authorAgeEstimates = new Map();
+
+		if (viewerId != null) {
+			const profile = await this._read(
+				`/users/${requireId(viewerId, 'viewerId')}/recommendation-profile`,
+				{ cacheSeconds: 30 },
+			).catch(() => null);
+			if (profile) {
+				keywordProfile = buildAffinityProfile(profile.affinities, { limit: 25 });
+				directFollows = new Set((profile.follows || []).map(Number).filter(Number.isSafeInteger));
+				extendedFollows = new Set((profile.extendedFollows || []).map(Number).filter(Number.isSafeInteger));
+				reactedPostIds = new Set((profile.reacted || []).map(Number).filter(Number.isSafeInteger));
+				dislikedPostIds = new Set((profile.dislikedPostIds || []).map(Number).filter(Number.isSafeInteger));
+				dislikedAuthorCounts = new Map(Object.entries(profile.dislikedAuthorCounts || {}).map(([id, count]) => [Number(id), Number(count) || 0]).filter(([id]) => Number.isSafeInteger(id)));
+				if (dislikedAuthorCounts.size === 0 && Array.isArray(profile.dislikedAuthors)) {
+					// 回数情報が無い旧ワーカーでは、従来どおり著者リストを除外として扱う。
+					for (const id of profile.dislikedAuthors) {
+						const authorId = Number(id);
+						if (Number.isSafeInteger(authorId) && authorId > 0) dislikedAuthorCounts.set(authorId, 2);
+					}
+				}
+				negativeTagCounts = new Map(Object.entries(profile.negativeTagCounts || {}).map(([tag, count]) => [tag, Number(count) || 0]));
+				blockedAuthors = new Set((profile.blockedAuthors || []).map(Number).filter(Number.isSafeInteger));
+			}
+		}
+
+		if (isAgeFeaturesActive(appConfig.autoMod) && viewerId != null && candidates.length > 0) {
+			try {
+				const authorIds = [...new Set(candidates.map((post) => Number(post.user_id ?? post.userId)).filter((id) => Number.isSafeInteger(id) && id > 0))];
+				authorAgeEstimates = await this.getUserAgeEstimatesByIds([Number(viewerId), ...authorIds]);
+				viewerAgeEstimate = authorAgeEstimates.get(Number(viewerId)) ?? null;
+				authorAgeEstimates.delete(Number(viewerId));
+			} catch (err) {
+				console.warn('[recommendations] D1 age lookup failed:', err?.message || err);
+				viewerAgeEstimate = null;
+				authorAgeEstimates = new Map();
+			}
+		}
+
+		const scored = scoreRecommendedPosts(candidates, {
+			viewerId: viewerId == null ? null : Number(viewerId),
+			keywordProfile,
+			directFollows,
+			extendedFollows,
+			reactedPostIds,
+			dislikedPostIds,
+			dislikedAuthorCounts,
+			negativeTagCounts,
+			blockedAuthors,
+			viewerAgeEstimate,
+			authorAgeEstimates,
+			limit: normalizedLimit,
+		});
+
+		return {
+			ids: scored.map((item) => item.id),
+			has_more: candidatePage?.has_more === true,
+			next_cursor: candidatePage?.next_cursor || null,
+			next_offset: candidatePage?.next_offset,
+			use_offset_pagination: candidatePage?.use_offset_pagination === true,
+		};
+	}
+
+	async recordPostFeedback(userId, postId, kind = 'not_interested') {
+		const uId = Number(userId);
+		const pId = Number(postId);
+		if (!Number.isInteger(uId) || !Number.isInteger(pId)) return false;
+		await this._write(`/users/${uId}/post-feedback`, {
+			postId: pId,
+			kind: String(kind || 'not_interested'),
+		});
+		return true;
+	}
+
+	async getPostFeedbackForUser(userId) {
+		const profile = await this._read(
+			`/users/${requireId(userId, 'userId')}/recommendation-profile`,
+			{ cacheSeconds: 30 },
+		).catch(() => null);
+		return {
+			postIds: Array.isArray(profile?.dislikedPostIds)
+				? profile.dislikedPostIds.map(Number).filter(Number.isInteger)
+				: [],
+			authorIds: Array.isArray(profile?.dislikedAuthors)
+				? profile.dislikedAuthors.map(Number).filter(Number.isInteger)
+				: [],
+			authorCounts: profile?.dislikedAuthorCounts && typeof profile.dislikedAuthorCounts === 'object' ? profile.dislikedAuthorCounts : {},
+			tagCounts: profile?.negativeTagCounts && typeof profile.negativeTagCounts === 'object' ? profile.negativeTagCounts : {},
+		};
+	}
+
+	async getUserRecommendationProfile(userId) {
+		const profile = await this._read(
+			`/users/${requireId(userId, 'userId')}/recommendation-profile`,
+			{ cacheSeconds: 30 },
+		).catch(() => null);
+		return {
+			affinities: Array.isArray(profile?.affinities) ? profile.affinities : [],
+			follows: Array.isArray(profile?.follows) ? profile.follows.map(Number).filter(Number.isInteger) : [],
+			extendedFollows: Array.isArray(profile?.extendedFollows) ? profile.extendedFollows.map(Number).filter(Number.isInteger) : [],
+			reacted: Array.isArray(profile?.reacted) ? profile.reacted.map(Number).filter(Number.isInteger) : [],
+			dislikedPostIds: Array.isArray(profile?.dislikedPostIds) ? profile.dislikedPostIds.map(Number).filter(Number.isInteger) : [],
+			dislikedAuthors: Array.isArray(profile?.dislikedAuthors) ? profile.dislikedAuthors.map(Number).filter(Number.isInteger) : [],
+			dislikedAuthorCounts: profile?.dislikedAuthorCounts && typeof profile.dislikedAuthorCounts === 'object' ? profile.dislikedAuthorCounts : {},
+			negativeTagCounts: profile?.negativeTagCounts && typeof profile.negativeTagCounts === 'object' ? profile.negativeTagCounts : {},
+			blockedAuthors: Array.isArray(profile?.blockedAuthors) ? profile.blockedAuthors.map(Number).filter(Number.isInteger) : [],
+		};
+	}
+
+	async getProfilePostIds({ userId, subType = 'all', order = 'latest', limit = 30, offset = 0, beforeId = null, cursor = null, cursorCreatedAt = null, cursorId = null } = {}) {
+		if (order !== 'latest') { beforeId = null; cursor = null; cursorCreatedAt = null; cursorId = null; }
+		const decodedCursor = cursorCreatedAt && cursorId
+			? { createdAt: cursorCreatedAt, id: Number(cursorId) }
+			: (typeof cursor === 'string' && cursor.trim() ? decodePostCursor(cursor.trim()) : null);
+		return this._read(this._query(`/users/${requireId(userId, 'userId')}/post-ids`, {
+			order,
+			subType: String(subType || 'all'),
+			limit: this._limit(limit, 30),
+			offset: (decodedCursor || (beforeId != null && Number(beforeId) > 0)) ? 0 : this._offset(offset),
+			beforeId: beforeId == null ? null : requireId(beforeId, 'beforeId', 1),
+			cursor: decodedCursor ? encodePostCursor(decodedCursor) : (cursor || null),
+			includePosts: 'true',
+		}), { cacheSeconds: 0 });
+	}
+
+	async searchPostIds(query, limit = 30, offset = 0, beforeId = null, viewerId = null, options = {}) {
+		const cursor = options?.cursor || null;
+		const cursorCreatedAt = options?.cursorCreatedAt || null;
+		const cursorId = options?.cursorId || null;
+		const decodedCursor = cursorCreatedAt && cursorId
+			? { createdAt: cursorCreatedAt, id: Number(cursorId) }
+			: (typeof cursor === 'string' && cursor.trim() ? decodePostCursor(cursor.trim()) : null);
+		return this._read(this._query('/posts/search/ids', {
+			q: String(query || ''),
+			searchFilters: options.searchFilters ? JSON.stringify(options.searchFilters) : null,
+			viewerId: viewerId == null ? null : requireId(viewerId, 'viewerId'),
+			limit: this._limit(limit, 30),
+			offset: (decodedCursor || (beforeId != null && Number(beforeId) > 0)) ? 0 : this._offset(offset),
+			beforeId: beforeId == null ? null : requireId(beforeId, 'beforeId', 1),
+			cursor: decodedCursor ? encodePostCursor(decodedCursor) : (cursor || null),
+			includePosts: 'true',
+		}), { cacheSeconds: 0 });
+	}
+
+	async searchPosts(query, limit = 20) {
+		const posts = await this._read(this._query('/posts/search', { q: String(query || ''), limit: this._limit(limit) }), { cacheSeconds: 0 });
+		return Array.isArray(posts) ? posts.map(normalizePost) : [];
+	}
+
+	async getReplyPostIds(parentPostId, limit = 50, offset = 0, options = {}) {
+		const cursor = options?.cursor || null;
+		const cursorCreatedAt = options?.cursorCreatedAt || null;
+		const cursorId = options?.cursorId || null;
+		const decodedCursor = cursorCreatedAt && cursorId
+			? { createdAt: cursorCreatedAt, id: Number(cursorId) }
+			: (typeof cursor === 'string' && cursor.trim() ? decodePostCursor(cursor.trim()) : null);
+		return this._read(this._query(`/posts/${requireId(parentPostId, 'parentPostId', 1)}/reply-ids`, {
+			limit: this._limit(limit, 50),
+			offset: decodedCursor ? 0 : this._offset(offset),
+			cursor: decodedCursor ? encodePostCursor(decodedCursor) : (cursor || null),
+		}), { cacheSeconds: 0 });
+	}
+
+	async getThreadReplyPostIds(parentPostId, limit = 50, offset = 0) {
+		return this._read(this._query(`/posts/${requireId(parentPostId, 'parentPostId', 1)}/thread-reply-ids`, {
+			limit: this._limit(limit, 50), offset: this._offset(offset),
+		}), { cacheSeconds: 0 });
+	}
+
+	async getPostDetail(id, currentUserId = null) {
+		return this._read(this._query(`/posts/${requireId(id, 'postId', 1)}/detail`, {
+			currentUserId: currentUserId == null ? null : requireId(currentUserId, 'currentUserId'),
+		}));
+	}
+
+	async getTrendingPosts(limit = 20) {
+		const posts = await this._read(this._query('/posts/trending', { limit: this._limit(limit) }), { cacheSeconds: 30 });
+		return Array.isArray(posts) ? posts.map(normalizePost) : [];
+	}
+
+	async getTrendingHashtags(limit = 10, options = {}) {
+		const type = typeof options === 'string' ? options : options?.type;
+		const queryParams = { limit: this._limit(limit, 10, 50) };
+		if (type) queryParams.type = type;
+		if (options?.summary) queryParams.summary = 'true';
+		const res = await this._read(this._query('/posts/trending-hashtags', queryParams), { cacheSeconds: 30 });
+		if (res && typeof res === 'object' && !Array.isArray(res)) {
+			return {
+				trends: Array.isArray(res.trends) ? res.trends : [],
+				hashtags: Array.isArray(res.hashtags) ? res.hashtags : [],
+				tags: Array.isArray(res.tags) ? res.tags : [],
+				words: Array.isArray(res.words) ? res.words : (Array.isArray(res.tags) ? res.tags : []),
+			};
+		}
+		return Array.isArray(res) ? res : [];
+	}
+
+	async getPostCount(userId) {
+		const res = await this._read(`/users/${requireId(userId, 'userId')}/posts/count`, { cacheSeconds: 0 });
+		return Number(res?.count ?? res ?? 0);
+	}
+
+	async getMediaCount(userId) {
+		const res = await this._read(`/users/${requireId(userId, 'userId')}/media/count`, { cacheSeconds: 0 });
+		return Number(res?.count ?? res ?? 0);
+	}
+
+	async getMediaPosts(userId, limit = 15, offset = 0, type = null, options = {}) {
+		const cursor = options?.cursor || null;
+		const decodedCursor = typeof cursor === 'string' && cursor.trim() ? decodePostCursor(cursor.trim()) : null;
+		const query = {
+			limit: this._limit(limit, 15, 100),
+			offset: decodedCursor ? 0 : this._offset(offset),
+			cursor: decodedCursor ? encodePostCursor(decodedCursor) : (cursor || undefined),
+		};
+		if (type && (type === 'image' || type === 'video')) {
+			query.type = type;
+		}
+		const list = await this._read(this._query(`/users/${requireId(userId, 'userId')}/media`, query), { cacheSeconds: 0 });
+		return Array.isArray(list) ? list : (list?.media_items || []);
+	}
+
+	async getReplyCount(postId) {
+		const res = await this._read(`/posts/${requireId(postId, 'postId', 1)}/replies/count`, { cacheSeconds: 0 });
+		return Number(res?.count ?? res ?? 0);
+	}
+
+	async toggleLike(userId, postId) {
+		const result = await this._write(`/posts/${requireId(postId, 'postId', 1)}/like`, { userId: requireId(userId, 'userId') });
+		return result;
+	}
+
+	async getLikeCount(postId) {
+		const res = await this._read(`/posts/${requireId(postId, 'postId', 1)}/likes/count`, { cacheSeconds: 0 });
+		return Number(res?.count ?? res ?? 0);
+	}
+
+	async hasUserLikedPost(userId, postId) {
+		const res = await this._read(this._query(`/posts/${requireId(postId, 'postId', 1)}/likes/check`, {
+			userId: requireId(userId, 'userId'),
+		}), { cacheSeconds: 0 });
+		return typeof res === 'boolean' ? res : !!res?.liked;
+	}
+
+	async getLikeIds(userId) {
+		const list = await this._read(`/users/${requireId(userId, 'userId')}/likes/ids`, { cacheSeconds: 0 });
+		return Array.isArray(list) ? list.map(Number) : [];
+	}
+
+	async toggleStar(userId, postId) {
+		const result = await this._write(`/posts/${requireId(postId, 'postId', 1)}/star`, { userId: requireId(userId, 'userId') });
+		return result;
+	}
+
+	async getStarCount(postId) {
+		const res = await this._read(`/posts/${requireId(postId, 'postId', 1)}/stars/count`, { cacheSeconds: 0 });
+		return Number(res?.count ?? res ?? 0);
+	}
+
+	async hasUserStarredPost(userId, postId) {
+		const res = await this._read(this._query(`/posts/${requireId(postId, 'postId', 1)}/stars/check`, {
+			userId: requireId(userId, 'userId'),
+		}), { cacheSeconds: 0 });
+		return typeof res === 'boolean' ? res : !!res?.starred;
+	}
+
+	async getStarIds(userId) {
+		const list = await this._read(`/users/${requireId(userId, 'userId')}/stars/ids`, { cacheSeconds: 0 });
+		return Array.isArray(list) ? list.map(Number) : [];
+	}
+
+	async togglePin(userId, postId) {
+		return this._write(`/posts/${requireId(postId, 'postId', 1)}/pin`, { userId: requireId(userId, 'userId') });
+	}
+
+	async getPinnedPosts(userId) {
+		const posts = await this._read(`/users/${requireId(userId, 'userId')}/pinned`, { cacheSeconds: 0 });
+		return Array.isArray(posts) ? posts.map(normalizePost) : [];
+	}
+
+	async getPinnedPostId(userId) {
+		const res = await this._read(`/users/${requireId(userId, 'userId')}/pinned/id`, { cacheSeconds: 0 });
+		if (res == null) return null;
+		if (typeof res === 'number') return res;
+		return res.postId != null ? Number(res.postId) : (res.id != null ? Number(res.id) : null);
+	}
+
+	async repostPost(userId, postId) {
+		const post = await this._write(`/posts/${requireId(postId, 'postId', 1)}/repost`, { userId: requireId(userId, 'userId') });
+		return normalizePost(post);
+	}
+
+	async getReposts(userId) {
+		const posts = await this._read(`/users/${requireId(userId, 'userId')}/reposts`, { cacheSeconds: 0 });
+		return Array.isArray(posts) ? posts.map(normalizePost) : [];
+	}
+
+	async getRepostCount(postId) {
+		const res = await this._read(`/posts/${requireId(postId, 'postId', 1)}/reposts/count`, { cacheSeconds: 0 });
+		return Number(res?.count ?? res ?? 0);
+	}
+
+	async getDmList(userId) {
+		return this._read(this._query('/dm/list', { userId: requireId(userId, 'userId') }), { cacheSeconds: 0 });
+	}
+
+	async getOrCreateDmChannel(userId1, userId2) {
+		return this._write('/dm/channel', {
+			userId1: requireId(userId1, 'userId1'),
+			userId2: requireId(userId2, 'userId2'),
+		});
+	}
+
+	async getDmMessages(channelId, limit = 50, offset = 0) {
+		return this._read(this._query(`/dm/messages/${encodeURIComponent(String(channelId))}`, {
+			limit: this._limit(limit, 50), offset: this._offset(offset),
+		}), { cacheSeconds: 0 });
+	}
+
+	async sendDmMessage(channelId, senderId, content, meta = {}) {
+		return this._write('/dm/messages', {
+			channelId: String(channelId),
+			senderId: requireId(senderId, 'senderId'),
+			content,
+			...(meta || {}),
+		});
+	}
+
+	async markDmMessagesAsRead(channelId, userId) {
+		return this._write('/dm/read', { channelId: String(channelId), userId: requireId(userId, 'userId') });
+	}
+
+	async getUnreadDmCount(userId) {
+		const res = await this._read(this._query('/dm/unread', { userId: requireId(userId, 'userId') }), { cacheSeconds: 0 });
+		return Number(res?.count ?? res ?? 0);
+	}
+
+	async getGroupDmsForUser(userId, { limit = 50, offset = 0 } = {}) {
+		const list = await this._read(this._query(`/users/${requireId(userId, 'userId')}/group-dms`, {
+			limit: this._limit(limit, 50),
+			offset: this._offset(offset),
+		}), { cacheSeconds: 2 });
+		return Array.isArray(list) ? list.map((item) => serializeGroupDm(item, userId)) : [];
+	}
+
+	async getGroupDmVisibilityDataForUser(userId) {
+		const list = await this._read(`/users/${requireId(userId, 'userId')}/group-dms/visibility`, { cacheSeconds: 2 });
+		return Array.isArray(list) ? list : [];
+	}
+
+	async getGroupDm(dmId) {
+		if (dmId == null || dmId === '') return null;
+		const dm = await this._read(`/group-dms/${encodeURIComponent(String(dmId))}`, { cacheSeconds: 2 });
+		return serializeGroupDm(dm);
+	}
+
+	async createGroupDm(dmData) {
+		const dm = await this._write('/group-dms', {
+			hostId: requireId(dmData.hostId, 'hostId'),
+			member: this._normalizeIds(dmData.member || []),
+			accepted: this._normalizeIds(dmData.accepted || dmData.member || []),
+			title: String(dmData.title || ''),
+		});
+		return serializeGroupDm(dm, dmData.hostId);
+	}
+
+	async updateGroupDm(dmId, updates, expectedPost = undefined, expectedState = undefined, guardedHistory = false) {
+		let dm;
+		try {
+			dm = await this._write(`/group-dms/${encodeURIComponent(String(dmId))}/${guardedHistory ? 'update-history-guarded' : 'update'}`, { ...updates, ...(expectedPost === undefined ? {} : { _expectedPost: expectedPost }), ...(expectedState ? { _expectedState: expectedState } : {}) });
+		} catch (error) {
+			if (guardedHistory && error.status === 404) error.code = 'DM_GUARDED_UPDATE_UNAVAILABLE';
+			throw error;
+		}
+		return serializeGroupDm(dm, dm?.host_id ?? dm?.hostId);
+	}
+
+	async editGroupDmMessage(dmId, messageId, userId, content) {
+		return this._write(`/group-dms/${encodeURIComponent(String(dmId))}/edit-message`, {
+			messageId: String(messageId), userId: requireId(userId, 'userId'), content,
+		});
+	}
+
+	async appendToGroupDm(dmId, message, senderId = null, options = undefined) {
+		const action = options?.requestId != null ? 'messages-idempotent' : (options ? 'messages-guarded' : 'messages');
+		const dm = await this._write(`/group-dms/${encodeURIComponent(String(dmId))}/${action}`, {
+			message,
+			senderId: senderId == null ? null : requireId(senderId, 'senderId'),
+			...(options || {}),
+		});
+		if (dm?.idempotencyConflict) return { idempotencyConflict: true };
+		const serialized = serializeGroupDm(dm, senderId);
+		return dm?.idempotencyReplay ? { ...serialized, idempotencyReplay: dm.idempotencyReplay } : serialized;
+	}
+
+	async markGroupDmRead(dmId, userId) {
+		return this._write(`/group-dms/${encodeURIComponent(String(dmId))}/read`, {
+			userId: requireId(userId, 'userId'),
+		});
+	}
+
+	async getGroupDmUnreadCounts(userId) {
+		const list = await this._read(`/users/${requireId(userId, 'userId')}/group-dms/unread-counts`, { cacheSeconds: 2 });
+		return Array.isArray(list) ? list : [];
+	}
+
+	async getGroupDmUnreadTotal(userId) {
+		const res = await this._read(`/users/${requireId(userId, 'userId')}/group-dms/unread-total`, { cacheSeconds: 2 });
+		return Number(res?.total ?? res?.count ?? res ?? 0);
+	}
+
+	async deleteGroupDm(dmId, expectedState = undefined) {
+		const action = expectedState ? 'delete-guarded' : 'delete';
+		const result = await this._write(`/group-dms/${encodeURIComponent(String(dmId))}/${action}`, expectedState ? { expectedState } : {});
+		return typeof result === 'boolean' ? result : !!result?.success;
+	}
+
+	async leaveGroupDm(dmId, userId, expectedState = undefined) {
+		const result = await this._write(`/group-dms/${encodeURIComponent(String(dmId))}/leave`, {
+			userId: requireId(userId, 'userId'),
+			...(expectedState ? { expectedState } : {}),
+		});
+		return typeof result === 'boolean' ? result : !!result?.success;
+	}
+
+	async findGroupDmByMembers(memberIds) {
+		const ids = this._normalizeIds(memberIds);
+		if (ids.length === 0) return null;
+		const dm = await this._read('/group-dms/find-by-members', { body: { memberIds: ids }, cacheSeconds: 0 });
+		return serializeGroupDm(dm);
+	}
+
+	async getDmPublicKeys(userIds) {
+		const ids = this._normalizeIds(userIds);
+		if (ids.length === 0) return [];
+		const list = await this._read(`/dm-e2e-keys?user_ids=${encodeURIComponent(ids.join(','))}`, { cacheSeconds: 0 });
+		return Array.isArray(list) ? list : [];
+	}
+
+	async setDmPublicKey(userId, publicKey) {
+		await this._write('/dm-e2e-keys', {
+			userId: requireId(userId, 'userId'),
+			publicKey: String(publicKey),
+		});
+	}
+
+	async createNotification(notificationData) {
+		return this._write('/notifications', notificationData);
+	}
+
+	async getNotifications(userId, limit = 50, offset = 0) {
+		const list = await this._read(this._query(`/users/${requireId(userId, 'userId')}/notifications`, {
+			limit: this._limit(limit, 50, 200), offset: this._offset(offset),
+		}), { cacheSeconds: 0 });
+		return Array.isArray(list) ? list : [];
+	}
+
+	async markNotificationAsRead(notificationId) {
+		return this._write(`/notifications/${requireId(notificationId, 'notificationId', 1)}/read`);
+	}
+
+	async markNotificationAsClicked(notificationId) {
+		return this._write(`/notifications/${requireId(notificationId, 'notificationId', 1)}/click`);
+	}
+
+	async getNotificationById(notificationId) {
+		return this._read(`/notifications/${requireId(notificationId, 'notificationId', 1)}`, { cacheSeconds: 0 });
+	}
+
+	async deleteNotification(notificationId) {
+		const result = await this._write(`/notifications/${requireId(notificationId, 'notificationId', 1)}/delete`);
+		return typeof result === 'boolean' ? result : !!result?.success;
+	}
+
+	async markAllNotificationsAsRead(userId) {
+		return this._write(`/users/${requireId(userId, 'userId')}/notifications/read-all`);
+	}
+
+	async markAllNotificationsAsClicked(userId) {
+		return this._write(`/users/${requireId(userId, 'userId')}/notifications/click-all`);
+	}
+
+	async getUnreadNotificationCount(userId) {
+		const res = await this._read(`/users/${requireId(userId, 'userId')}/notifications/unread-count`, { cacheSeconds: 0 });
+		return Number(res?.count ?? res ?? 0);
+	}
+
+	async createModerationReport(reportData) {
+		return mapModerationReport(await this._write('/moderation-reports', reportData));
+	}
+
+	async getOpenModerationAppealByUserId(userId) {
+		return mapModerationReport(await this._read(
+			`/users/${requireId(userId, 'userId')}/moderation-appeal/open`,
+			{ cacheSeconds: 0 },
+		));
+	}
+
+	async getOpenModerationVerificationByUserId(userId) {
+		return mapModerationReport(await this._read(
+			`/users/${requireId(userId, 'userId')}/moderation-verification/open`,
+			{ cacheSeconds: 0 },
+		));
+	}
+
+	async getModerationReportById(reportId) {
+		return mapModerationReport(await this._read(
+			`/moderation-reports/${requireId(reportId, 'reportId', 1)}`,
+			{ cacheSeconds: 0 },
+		));
+	}
+
+	async listModerationReportsForAdmin(adminId, options = {}) {
+		const reports = await this._read(this._query(
+			`/moderation-reports/admin/${requireId(adminId, 'adminId')}`,
+			{
+				status: options.status || 'assigned',
+				limit: this._limit(options.limit, 50, 100),
+				offset: this._offset(options.offset),
+			},
+		), { cacheSeconds: 0 });
+		return Array.isArray(reports) ? reports.map(mapModerationReport).filter(Boolean) : [];
+	}
+
+	async getModerationAdminWorkloads(excludedAdminIds = []) {
+		const excluded = this._normalizeIds(excludedAdminIds, { fieldName: 'excludedAdminId' });
+		const result = await this._read('/moderation-reports/admin-workloads', {
+			body: { excludedAdminIds: excluded },
+			cacheSeconds: 0,
+		});
+		return Array.isArray(result)
+			? result.map((row) => ({
+				adminId: Number(row.adminId ?? row.admin_id),
+				activeCount: Number(row.activeCount ?? row.active_count ?? 0),
+			})).filter((row) => Number.isInteger(row.adminId))
+			: [];
+	}
+
+	async assignModerationReport(reportId, assignment = {}) {
+		return mapModerationReport(await this._write(
+			`/moderation-reports/${requireId(reportId, 'reportId', 1)}/assign`,
+			assignment,
+		));
+	}
+
+	async getOverdueModerationReports(cutoff, claimStaleBeforeIso = null) {
+		const reports = await this._read('/moderation-reports/overdue', {
+			body: {
+				cutoff,
+				...(claimStaleBeforeIso == null || claimStaleBeforeIso === '' ? {} : { claimStaleBefore: claimStaleBeforeIso }),
+			},
+			cacheSeconds: 0,
+		});
+		return Array.isArray(reports) ? reports.map(mapModerationReport).filter(Boolean) : [];
+	}
+
+	async getUnassignedModerationReports(limit = 100) {
+		const reports = await this._read('/moderation-reports/unassigned', {
+			body: { limit: this._limit(limit, 100, 100) },
+			cacheSeconds: 0,
+		});
+		return Array.isArray(reports) ? reports.map(mapModerationReport).filter(Boolean) : [];
+	}
+
+	async claimModerationReport(reportId, adminId, claimedAtIso) {
+		return mapModerationReport(await this._write(
+			`/moderation-reports/${requireId(reportId, 'reportId', 1)}/claim`,
+			{ adminId: requireId(adminId, 'adminId'), claimedAt: claimedAtIso },
+		));
+	}
+
+	async resolveModerationReport(reportId, adminId, resolution) {
+		return mapModerationReport(await this._write(
+			`/moderation-reports/${requireId(reportId, 'reportId', 1)}/resolve`,
+			{ adminId: requireId(adminId, 'adminId'), resolution },
+		));
+	}
+
+	async deleteModerationReport(reportId) {
+		const result = await this._write(
+			`/moderation-reports/${requireId(reportId, 'reportId', 1)}/delete`,
+		);
+		return typeof result === 'boolean' ? result : Boolean(result?.success);
+	}
+
+	async upsertPushSubscription(userId, subscription) {
+		return this._write(`/users/${requireId(userId, 'userId')}/push-subscriptions`, subscription);
+	}
+
+	async getPushSubscriptions(userId) {
+		const list = await this._read(`/users/${requireId(userId, 'userId')}/push-subscriptions`, { cacheSeconds: 0 });
+		return Array.isArray(list) ? list : [];
+	}
+
+	async deletePushSubscription(userId, endpoint) {
+		const result = await this._write(`/users/${requireId(userId, 'userId')}/push-subscriptions/delete`, {
+			endpoint: String(endpoint),
+		});
+		return typeof result === 'boolean' ? result : !!result?.success;
+	}
+
+	async getRanking(type, limit = 50) {
+		const list = await this._read(this._query(`/ranking/${encodeURIComponent(String(type))}`, {
+			limit: this._limit(limit, 50, 100),
+		}), { cacheSeconds: 0 });
+		return Array.isArray(list) ? list : (list?.data || []);
+	}
+
+	async getUserRanking(type, userId) {
+		return this._read(`/users/${requireId(userId, 'userId')}/ranking/${encodeURIComponent(String(type))}`, { cacheSeconds: 0 });
+	}
+
+	async addLog(entry) {
+		return this._write('/logs', entry);
+	}
+
+	async getLogs(limit = 20, offset = 0) {
+		const list = await this._read(this._query('/logs', {
+			limit: this._limit(limit, 20, 100), offset: this._offset(offset),
+		}), { cacheSeconds: 0 });
+		return Array.isArray(list) ? list : [];
+	}
+
+	async getUserPostSubscribers(authorUserId) {
+		const id = Number(authorUserId);
+		if (!Number.isSafeInteger(id) || id <= 0) return [];
+		const subscribers = await this._read(`/users/${id}/post-subscribers`, { cacheSeconds: 0 });
+		if (!Array.isArray(subscribers)) return [];
+		return subscribers
+			.map((sub) => ({
+				userId: Number(sub?.userId ?? sub?.user_id ?? sub?.id),
+				mode: sub?.mode,
+			}))
+			.filter((sub) => Number.isInteger(sub.userId) && sub.userId > 0 && typeof sub.mode === 'string');
+	}
+
+	// ==================== Polls ====================
+
+	async createPoll(pollData) {
+		const payload = { ...pollData };
+		if (payload.id == null) {
+			payload.id = Number(`${Date.now() % 1000000000}${Math.floor(Math.random() * 1000).toString().padStart(3, '0')}`);
+		}
+		return this._write('/polls', payload);
+	}
+
+	async getPollByPostId(postId, currentUserId = null) {
+		return this._read(this._query(`/posts/${requireId(postId, 'postId')}/poll`, {
+			currentUserId: currentUserId == null ? null : requireId(currentUserId, 'currentUserId'),
+		}), { cacheSeconds: 0 });
+	}
+
+	async getPollById(pollId, currentUserId = null) {
+		return this._read(this._query(`/polls/${requireId(pollId, 'pollId')}`, {
+			currentUserId: currentUserId == null ? null : requireId(currentUserId, 'currentUserId'),
+		}), { cacheSeconds: 0 });
+	}
+
+	async getPollsByPostIds(postIds, currentUserId = null) {
+		const res = await this._read(this._query('/polls/by-posts', {
+			postIds: (postIds || []).map(Number).join(','),
+			currentUserId: currentUserId == null ? null : requireId(currentUserId, 'currentUserId'),
+		}), { cacheSeconds: 0 });
+		const map = new Map();
+		if (Array.isArray(res)) {
+			for (const p of res) {
+				if (p && p.post_id) map.set(Number(p.post_id), p);
+			}
+		}
+		return map;
+	}
+
+	async votePoll({ pollId, userId, optionIds = [], otherText = null }) {
+		const validOptionIds = (optionIds || []).map(Number);
+		const votes = validOptionIds.map((optId) => ({
+			id: Number(`${Date.now() % 1000000000}${Math.floor(Math.random() * 1000).toString().padStart(3, '0')}`),
+			optionId: optId,
+		}));
+		return this._write(`/polls/${requireId(pollId, 'pollId')}/vote`, {
+			userId: requireId(userId, 'userId'),
+			optionIds: validOptionIds,
+			otherText,
+			votes,
+		});
+	}
+
+	async getExpiredUnnotifiedPolls() {
+		const res = await this._read('/polls/expired-unnotified', { cacheSeconds: 0 });
+		return Array.isArray(res) ? res : [];
+	}
+
+	async markPollClosedNotified(pollId) {
+		return this._write(`/polls/${requireId(pollId, 'pollId')}/mark-notified`, {});
+	}
+
+	async getPollVoters(pollId) {
+		const res = await this._read(`/polls/${requireId(pollId, 'pollId')}/voters`, { cacheSeconds: 0 });
+		return Array.isArray(res) ? res : [];
+	}
+
+	// ==================== Post Activities ====================
+
+	async getRepostsOfPost(postId, limit = 50) {
+		const list = await this._read(this._query(`/posts/${requireId(postId, 'postId')}/reposts`, {
+			limit: this._limit(limit, 50, 100),
+		}), { cacheSeconds: 0 });
+		return Array.isArray(list) ? list : [];
+	}
+
+	async getLikesOfPost(postId, limit = 50) {
+		const list = await this._read(this._query(`/posts/${requireId(postId, 'postId')}/likes`, {
+			limit: this._limit(limit, 50, 100),
+		}), { cacheSeconds: 0 });
+		return Array.isArray(list) ? list : [];
+	}
+
+	async getStarsOfPost(postId, limit = 50) {
+		const list = await this._read(this._query(`/posts/${requireId(postId, 'postId')}/stars`, {
+			limit: this._limit(limit, 50, 100),
+		}), { cacheSeconds: 0 });
+		return Array.isArray(list) ? list : [];
+	}
+
+	async getQuotesOfPost(postId, limit = 50) {
+		const list = await this._read(this._query(`/posts/${requireId(postId, 'postId')}/quotes`, {
+			limit: this._limit(limit, 50, 100),
+		}), { cacheSeconds: 0 });
+		return Array.isArray(list) ? list.map(normalizePost) : [];
+	}
+
+	// ==================== Post Events (Outbox) ====================
+
+	async processPostCreatedEvent(event) {
+		const postId = Number(event?.post_id ?? event?.payload?.postId);
+		if (!Number.isSafeInteger(postId) || postId <= 0) return;
+		const post = await this.getPostById(postId);
+		if (!post) return;
+		const tags = Array.isArray(post.tags) ? post.tags : [];
+		if (tags.length === 0) return;
+		await this._write(`/users/${Number(post.userId)}/keyword-affinity`, { tags, delta: 1 });
+	}
+
+	async enqueuePostEvent(eventType, payload, { postId = null, availableAt = null } = {}) {
+		const body = {
+			eventType: String(eventType),
+			postId: postId == null ? null : requireId(postId, 'postId'),
+			payload: payload || {},
+			availableAt: availableAt ? new Date(availableAt).toISOString() : null,
+		};
+		return this._write('/post-events/enqueue', body);
+	}
+
+	async claimPostEvents(limit = 50, workerId = null) {
+		const body = {
+			limit: this._limit(limit, 50, 500),
+			workerId: workerId == null ? null : String(workerId),
+		};
+		const events = await this._write('/post-events/claim', body);
+		return Array.isArray(events) ? events : [];
+	}
+
+	async completePostEvent(eventId) {
+		const res = await this._write(`/post-events/${requireId(eventId, 'eventId', 1)}/complete`, {});
+		return res?.success === true;
+	}
+
+	async failPostEvent(eventId, error, retryAt = null) {
+		const body = {
+			error: String(error?.message || error || 'Unknown error'),
+			retryAt: retryAt ? new Date(retryAt).toISOString() : null,
+		};
+		const res = await this._write(`/post-events/${requireId(eventId, 'eventId', 1)}/fail`, body);
+		return res?.success === true;
+	}
+	// ==================== Community Notes ====================
+
+	async createNote(noteData = {}) {
+		const payload = { ...noteData };
+		if (payload.id == null) {
+			payload.id = Number(BigInt(`0x${require('crypto').randomUUID().replace(/-/g, '').slice(0, 13)}`) % 9007199254740991n);
+		}
+		if (payload.postId != null && payload.post_id == null) payload.post_id = payload.postId;
+		if (payload.userId != null && payload.user_id == null) payload.user_id = payload.userId;
+		if (payload.sources == null) payload.sources = [];
+		try {
+			return await this._write('/community-notes', payload);
+		} catch (error) {
+			// ワーカーの理由別エラー（重複／日次上限／投稿上限）を他アダプタと同じ形へそろえる。
+			const match = String(error?.message || '').match(/\{.*\}/s);
+			if (match) {
+				try {
+					const parsed = JSON.parse(match[0]);
+					if (parsed && typeof parsed.error === 'string') {
+						error.message = parsed.error;
+						if (parsed.code) error.code = parsed.code;
+						error.statusCode = error.status;
+					}
+				} catch (_) {}
+			}
+			throw error;
+		}
+	}
+
+	async getNote(noteId, currentUserId = null) {
+		const query = { currentUserId: currentUserId == null ? null : requireId(currentUserId, 'currentUserId') };
+		return this._read(this._query(`/community-notes/${requireId(noteId, 'noteId')}`, query), { cacheSeconds: 0 });
+	}
+
+	async listNotesByPost(postId, currentUserId = null) {
+		const res = await this._read(this._query(`/posts/${requireId(postId, 'postId')}/notes`, {
+			currentUserId: currentUserId == null ? null : requireId(currentUserId, 'currentUserId'),
+		}), { cacheSeconds: 0 });
+		return Array.isArray(res) ? res : [];
+	}
+
+	async listNotesByPostIds(postIds, currentUserId = null) {
+		const byPost = new Map();
+		const ids = [...new Set((postIds || []).map((id) => Number(id)).filter((id) => Number.isSafeInteger(id) && id > 0))];
+		for (const postId of ids) {
+			const notes = await this.listNotesByPost(postId, currentUserId);
+			if (notes.length > 0) byPost.set(postId, notes);
+		}
+		return byPost;
+	}
+
+	async countNotesByUserSince(userId, since) {
+		const res = await this._read(this._query('/community-notes/count', {
+			userId: requireId(userId, 'userId'),
+			since: since instanceof Date ? since.toISOString() : String(since),
+		}), { cacheSeconds: 0 });
+		return Number(res?.count ?? res ?? 0);
+	}
+
+	async rateNote({ noteId, userId, helpful, weight = 1, maxRatings = 200, relationManifest = null, expectedRatingVersion = null } = {}) {
+		try { return await this._write(`/community-notes/${requireId(noteId, 'noteId')}/ratings`, {
+			userId: requireId(userId, 'userId'),
+			helpful: Boolean(helpful),
+			weight: Math.min(1.5,Math.max(1,weight)),
+			maxRatings,
+			relationManifest,
+			expectedRatingVersion,
+		}); } catch (error) { if (error.status===409) error.code='NOTE_VOTE_CONFLICT'; throw error; }
+	}
+
+	async getNoteVoteEvidence(noteId) {
+		return this._read(`/community-notes/${requireId(noteId, 'noteId')}/vote-evidence`, { cacheSeconds: 0 });
+	}
+
+	async getRatingsSummary(noteIdOrObj, userId = null) {
+		let noteId = noteIdOrObj;
+		let uid = userId;
+		if (noteIdOrObj && typeof noteIdOrObj === 'object') {
+			noteId = noteIdOrObj.noteId ?? noteIdOrObj.id;
+			uid = noteIdOrObj.userId ?? noteIdOrObj.user_id ?? uid;
+		}
+		const query = { currentUserId: uid == null ? null : requireId(uid, 'currentUserId') };
+		return this._read(this._query(`/community-notes/${requireId(noteId, 'noteId')}/ratings-summary`, query), { cacheSeconds: 0 });
+	}
+
+	async listNoteReasonTagDefs({ side } = {}) {
+		const res = await this._read(this._query('/note-reason-tags', side ? { side } : {}), { cacheSeconds: 0 });
+		const rows = Array.isArray(res) ? res : (Array.isArray(res?.tags) ? res.tags : []);
+		return rows.map((r) => ({
+			code: String(r.code),
+			side: String(r.side),
+			label: String(r.label ?? r.label_ja ?? r.code),
+			description: r.description ?? null,
+			sortOrder: Number(r.sortOrder ?? r.sort_order ?? 0) || 0,
+		}));
+	}
+
+	async saveNoteRatingReasons({ noteId, userId, codes = [] } = {}) {
+		const res = await this._write(`/community-notes/${requireId(noteId, 'noteId')}/rating-reasons`, {
+			userId: requireId(userId, 'userId'),
+			codes: Array.isArray(codes) ? codes.map(String) : [],
+		});
+		return Array.isArray(res?.codes) ? res.codes : [];
+	}
+
+	// delete support
+	async deleteNote(noteId) {
+		const result = await this._write(`/community-notes/${requireId(noteId, 'noteId')}`, {}, 'DELETE');
+		return result?.success === true;
+	}
+
+	// ===== Phase 2 helpers =====
+	async listEngagedUsersByPost(postId) {
+		const res = await this._read(`/posts/${requireId(postId, 'postId')}/engaged-users`, { cacheSeconds: 0 });
+		if (Array.isArray(res)) return res.map(Number).filter(Number.isSafeInteger);
+		if (Array.isArray(res?.userIds)) return res.userIds.map(Number).filter(Number.isSafeInteger);
+		if (Array.isArray(res?.users)) return res.users.map((u) => Number(u?.id ?? u?.user_id ?? u?.userId)).filter(Number.isSafeInteger);
+		return [];
+	}
+
+	async listEngagedUsersByPostPage(postId,{afterUserId=0,limit=500}={}) {
+		const params=new URLSearchParams({afterUserId:String(Number(afterUserId)||0),limit:String(Math.min(500,Math.max(1,Number(limit)||500)))});
+		const res=await this._read(`/posts/${requireId(postId,'postId')}/engaged-users-page?${params}`,{cacheSeconds:0});
+		if(Array.isArray(res))return res.map(Number).filter(Number.isSafeInteger);
+		return Array.isArray(res?.userIds)?res.userIds.map(Number).filter(Number.isSafeInteger):[];
+	}
+
+	async getNoteRelevanceContext(userIds,authorId) {
+		const ids=[...new Set([...userIds.map(Number),Number(authorId)])].filter(id=>Number.isSafeInteger(id)&&id>0);
+		const result=await this._write('/community-notes/relevance-context',{userIds:ids,authorId:Number(authorId)});
+		return {users:result?.users||[],relevanceByUser:new Map(Object.entries(result?.relevanceByUser||{}).map(([id,value])=>[Number(id),Number(value)])),sharedUserIds:new Set((result?.sharedUserIds||[]).map(Number))};
+	}
+
+	async createNoteDistribution(data = {}) {
+		return this._write('/community-note-distributions', {
+			noteId: requireId(data.noteId ?? data.note_id, 'noteId'),
+			userId: requireId(data.userId ?? data.user_id, 'userId'),
+			tier: data.tier != null ? Number(data.tier) : 1,
+			notified: Boolean(data.notified ?? false),
+		});
+	}
+
+	async getNoteDistribution(noteId, userId) {
+		return this._read(this._query('/community-note-distributions', {
+			noteId: requireId(noteId, 'noteId'),
+			userId: requireId(userId, 'userId'),
+		}), { cacheSeconds: 0 });
+	}
+
+	async getNoteDistributionStates(noteId,userIds) {
+		const rows=[];for(let offset=0;offset<userIds.length;offset+=500){const ids=userIds.slice(offset,offset+500).map(id=>requireId(id,'userId'));
+			const result=await this._read(this._query('/community-note-distributions/batch',{noteId:requireId(noteId,'noteId'),userIds:ids.join(',')}),{cacheSeconds:0});
+			if(Array.isArray(result))rows.push(...result);
+		}return rows;
+	}
+
+	async listNoteDistributionsByNote(noteId) {
+		const res = await this._read(this._query('/community-note-distributions', { noteId: requireId(noteId, 'noteId') }), { cacheSeconds: 0 });
+		return Array.isArray(res) ? res : (Array.isArray(res?.distributions) ? res.distributions : []);
+	}
+
+	async listNoteDistributionsByUser(userId) {
+		const res = await this._read(this._query('/community-note-distributions', { userId: requireId(userId, 'userId') }), { cacheSeconds: 0 });
+		return Array.isArray(res) ? res : (Array.isArray(res?.distributions) ? res.distributions : []);
+	}
+
+	async updateNoteDistribution(noteId, userId, fields = {}) {
+		return this._write('/community-note-distributions', {
+			noteId: requireId(noteId, 'noteId'),
+			userId: requireId(userId, 'userId'),
+			...(fields.tier != null ? { tier: Number(fields.tier) } : {}),
+			...(fields.notified != null ? { notified: Boolean(fields.notified) } : {}),
+		});
+	}
+
+	async upsertNoteDistribution(data = {}) {
+		return this.createNoteDistribution(data);
+	}
+
+	async upsertNoteDistributions(rows=[]) {
+		for(let offset=0;offset<rows.length;offset+=500)await this._write('/community-note-distributions/batch',{rows:rows.slice(offset,offset+500).map(row=>({noteId:requireId(row.noteId,'noteId'),userId:requireId(row.userId,'userId'),tier:Number(row.tier??1),notified:Boolean(row.notified??false)}))});
+		return rows;
+	}
+
+	async deleteNoteDistribution(noteId, userId = null) {
+		const path = userId == null ? `/community-note-distributions/${requireId(noteId, 'noteId')}` : `/community-note-distributions/${requireId(noteId, 'noteId')}/${requireId(userId, 'userId')}`;
+		return this._write(path, {}, 'DELETE');
+	}
+
+	async updateNote(noteId, fields = {}) {
+		return this._write(`/community-notes/${requireId(noteId, 'noteId')}`, {
+			...(fields.status != null ? { status: String(fields.status) } : {}),
+			...(fields.stage != null ? { stage: Number(fields.stage) } : {}),
+			...(fields.publishedAt != null || fields.published_at != null ? { publishedAt: fields.publishedAt ?? fields.published_at ?? null } : {}),
+		}, 'PATCH');
+	}
+
+	// Shared group / DM membership helpers (Phase 2)
+	async getSharedGroupCount(userId1, userId2) {
+		const res = await this._read(this._query('/shared-group-membership', {
+			userId1: requireId(userId1, 'userId1'),
+			userId2: requireId(userId2, 'userId2'),
+		}), { cacheSeconds: 0 });
+		return Number(res?.groups ?? res?.groupCount ?? 0);
+	}
+
+	async getSharedDmCount(userId1, userId2) {
+		const res = await this._read(this._query('/shared-group-membership', {
+			userId1: requireId(userId1, 'userId1'),
+			userId2: requireId(userId2, 'userId2'),
+		}), { cacheSeconds: 0 });
+		return Number(res?.dms ?? 0);
+	}
+
+	async getSharedGroupMembership(userId1, userId2) {
+		const res = await this._read(this._query('/shared-group-membership', {
+			userId1: requireId(userId1, 'userId1'),
+			userId2: requireId(userId2, 'userId2'),
+		}), { cacheSeconds: 0 });
+		return {
+			groups: Number(res?.groups ?? 0),
+			dms: Number(res?.dms ?? 0),
+			total: Number(res?.total ?? ((res?.groups || 0) + (res?.dms || 0))),
+			bonus: Number(res?.bonus ?? (((res?.groups || 0) + (res?.dms || 0)) > 0 ? 0.2 : 0)),
+		};
+	}
+	async sharedGroupCount(...args) { return this.getSharedGroupCount(...args); }
+	async sharedGroupMembership(...args) { return this.getSharedGroupMembership(...args); }
+	async hasSharedGroupMembership(userId1, userId2) { return (await this.getSharedGroupCount(userId1, userId2)) > 0; }
+
+	async updatePostRecommendationPenalty(postId, delta = 0.1, max = 1) {
+		await this._write(`/posts/${requireId(postId, 'postId')}/recommendation-penalty`, {
+			delta: Number(delta) || 0,
+			max: Number(max) || 1,
+		});
+		return true;
+	}
+	async incrementPostRecommendationPenalty(...args) { return this.updatePostRecommendationPenalty(...args); }
+	async addPostRecommendationPenalty(...args) { return this.updatePostRecommendationPenalty(...args); }
+
+	// Override base getUserFollows consistency
+	async getUserFollows(userId) {
+		return this.getFollowIds(userId);
+	}
+
+}
+require('../reputation').installD1(D1Adapter);
+module.exports = D1Adapter;

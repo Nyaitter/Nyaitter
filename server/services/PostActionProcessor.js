@@ -1,0 +1,796 @@
+'use strict';
+
+const PostService = require('./PostService');
+const { extractPostKeywords } = require('./PostKeywordService');
+const { extractViewContent } = require('../utils/viewContent');
+const {
+  invalidateImmutablePostCache,
+} = require('../utils/serialize');
+const timelineCacheManager = require('../utils/TimelineCacheManager');
+const {
+  isOwnedAttachmentKey,
+  normalizeContentType,
+} = require('../adapters/storage/safeStoragePath');
+const {
+  createPostVisibilityContext,
+  canViewPostWithContext,
+} = require('../utils/postVisibility');
+const {
+  createNotificationIfAllowed,
+} = require('./NotificationDeliveryService');
+const {
+  resolvePostingUser,
+  assertPostingUserAccess,
+  assertAuthenticatedUserAccess,
+} = require('./auth/PostAsUserService');
+const {
+  normalizeGroupId,
+  requireGroupPermission,
+  listActiveGroupMemberIds,
+  hasPermission,
+} = require('./GroupService');
+const {
+  extractNumericHashtagUserIds,
+  isMentionedInText,
+} = require('../utils/mentionText');
+
+const idempotencyCache = new Map();
+const recentUserPostSignatures = new Map();
+// 同時に投入された完全同一の編集アクションを1回の実行へ集約する (二重送信対策)。
+const inFlightEditActions = new Map();
+
+/**
+ * キーワード抽出は投稿保存を妨げてはならない。抽出器の失敗 (辞書構築失敗・
+ * 予期しないトークナイズエラー) 時はタグ無しで保存を継続する。
+ * 成功時の結果は従来と完全に同一。
+ */
+async function extractPostKeywordsSafely(viewContent) {
+  try {
+    return await extractPostKeywords(viewContent);
+  } catch (error) {
+    console.warn('[post-actions] keyword extraction failed; saving without tags:', error.message);
+    return [];
+  }
+}
+
+function pruneIdempotencyCache(now = Date.now()) {
+  for (const [key, entry] of idempotencyCache) {
+    if (!entry || now - entry.createdAt > 60000) idempotencyCache.delete(key);
+  }
+  for (const [userId, entry] of recentUserPostSignatures) {
+    if (!entry || now - entry.createdAt > 5000) recentUserPostSignatures.delete(userId);
+  }
+}
+
+const idempotencyPruner = setInterval(pruneIdempotencyCache, 30000);
+idempotencyPruner.unref();
+
+function decodeBase64File(value) {
+  if (typeof value !== 'string' || value.length === 0 || value.length % 4 !== 0) {
+    throw new Error('Invalid base64 file data');
+  }
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(value)) {
+    throw new Error('Invalid base64 file data');
+  }
+  return Buffer.from(value, 'base64');
+}
+
+function isValidAttachmentUrl(value) {
+  if (typeof value !== 'string' || value.length === 0) return true;
+  if (value.startsWith('/')) return true;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' && !url.username && !url.password;
+  } catch (_) {
+    return false;
+  }
+}
+
+function validateAttachmentReferences(attachments, userId) {
+  if (!Array.isArray(attachments)) {
+    throw new Error('attachments must be an array');
+  }
+
+  for (const attachment of attachments) {
+    if (!attachment || typeof attachment !== 'object') {
+      throw new Error('Invalid attachment');
+    }
+    if (attachment.type === 'poll') {
+      const options = Array.isArray(attachment.options) ? attachment.options : [];
+      if (options.length < 2) {
+        throw new Error('投票には最低2つの選択肢が必要です');
+      }
+      continue;
+    }
+    if (attachment.data !== undefined) {
+      normalizeContentType(attachment.contentType);
+      decodeBase64File(attachment.data);
+      continue;
+    }
+    if (typeof attachment.id !== 'string' || !isOwnedAttachmentKey(attachment.id, userId)) {
+      throw new Error('Attachment does not belong to the current user');
+    }
+    if (attachment.url !== undefined && !isValidAttachmentUrl(attachment.url)) {
+      throw new Error('Invalid attachment URL');
+    }
+  }
+}
+
+function getAttachmentStorageKeys(attachments) {
+  let parsed = attachments;
+  if (typeof parsed === 'string') {
+    try {
+      parsed = JSON.parse(parsed);
+    } catch (_) {
+      parsed = null;
+    }
+  }
+  if (!Array.isArray(parsed)) return [];
+  return [...new Set(parsed
+    .map((attachment) => attachment && (attachment.id || attachment.key || null))
+    .filter((key) => typeof key === 'string' && key.length > 0))];
+}
+
+async function deleteStoredAttachments(storage, attachments, context) {
+  const keys = getAttachmentStorageKeys(attachments);
+  if (keys.length === 0 || !storage) return;
+  try {
+    if (typeof storage.deleteMany === 'function') {
+      await storage.deleteMany(keys);
+    } else if (typeof storage.delete === 'function') {
+      await Promise.all(keys.map((key) => storage.delete(key)));
+    }
+  } catch (error) {
+    console.warn(
+      `[post-actions] Failed to delete ${keys.length} attachment(s) during ${context}:`,
+      error.message,
+    );
+  }
+}
+
+async function notifyPostAction(context, { userId, type, fromUserId, postId }) {
+  if (Number(userId) === Number(fromUserId)) return;
+  await createNotificationIfAllowed(context.db, {
+    userId: Number(userId),
+    type,
+    fromUserId: Number(fromUserId),
+    target: { kind: 'post', id: Number(postId) },
+  });
+}
+
+async function fetchExistingUserIds(db, ids) {
+  const unique = [...new Set((ids || []).map(Number).filter((id) => Number.isSafeInteger(id) && id > 0))];
+  if (unique.length === 0) return new Set();
+  let users = [];
+  if (typeof db.getUsersByIds === 'function') {
+    try {
+      users = (await db.getUsersByIds(unique)) || [];
+    } catch (_) {
+      users = [];
+    }
+  }
+  const found = new Set((users || [])
+    .map((user) => Number(user?.id))
+    .filter((id) => Number.isSafeInteger(id) && id > 0));
+  const missing = unique.filter((id) => !found.has(id));
+  if (missing.length > 0 && typeof db.getUserById === 'function') {
+    const fetched = await Promise.all(missing.map((id) => db.getUserById(id).catch(() => null)));
+    for (const user of fetched) {
+      if (user && Number.isSafeInteger(Number(user.id))) found.add(Number(user.id));
+    }
+  }
+  return found;
+}
+
+async function publishNewTimelinePost(context, post) {
+  if (!post || post.groupId || post.group_id || post.replyTo != null || post.reply_to != null) return;
+  if (!context.realtime?.publishPostToFollowers) return;
+  try {
+    await context.realtime.publishPostToFollowers(post.userId, context.db, post);
+  } catch (error) {
+    console.warn('[post-actions] timeline realtime delivery failed:', error.message);
+  }
+}
+
+function enqueueGeminiModeration(context, post) {
+  const service = context.autoModerationService;
+  if (!service?.enabled || !post || post.groupId || post.group_id) return;
+  try {
+    service.enqueue(post);
+  } catch (error) {
+    console.warn('[post-actions] Gemini moderation enqueue failed:', error.message);
+  }
+}
+
+function normalizeTargetPostId(value) {
+  const postId = Number(value);
+  return Number.isInteger(postId) && postId > 0 ? postId : null;
+}
+
+async function notifyGroupAnnouncement(context, group, post, knownMemberIds = null) {
+  const memberIds = knownMemberIds || await listActiveGroupMemberIds(context.db, group.id);
+  await Promise.all(memberIds
+    .filter((memberId) => Number(memberId) !== Number(post.userId))
+    .map(async (memberId) => {
+      await createNotificationIfAllowed(context.db, {
+        userId: memberId,
+        type: 'group_announcement',
+        fromUserId: post.userId,
+        target: { kind: 'post', id: Number(post.id) },
+        message: `「${group.name}」のグループアナウンスが投稿されました。`,
+      });
+    }));
+}
+
+async function processCreatePostAction(context, payload) {
+  const attachments = Array.isArray(payload.attachments) ? payload.attachments : [];
+  const pollAttachment = attachments.find((a) => a && a.type === 'poll') || (payload.poll && typeof payload.poll === 'object' ? payload.poll : null);
+  const fileAttachments = attachments.filter((a) => a && a.type !== 'poll');
+  const features = ['write', 'posts'];
+  if (pollAttachment) features.push('polls');
+  if (fileAttachments.length > 0) features.push('uploads');
+  const postingUser = await assertPostingUserAccess(
+    context.authRequest,
+    context.db,
+    await resolvePostingUser(context.authRequest, context.db, payload.postAsUserId),
+    features,
+  );
+  const userId = Number(postingUser.id);
+  const rawSchedule = payload.scheduledAt ?? payload.scheduled_at;
+  const scheduleTime = rawSchedule ? new Date(rawSchedule).getTime() : null;
+  if (rawSchedule && !Number.isFinite(scheduleTime)) {
+    const error = new Error('予約日時が正しくありません');
+    error.statusCode = 400;
+    throw error;
+  }
+  const scheduledAt = rawSchedule ? new Date(scheduleTime).toISOString() : null;
+  if (scheduledAt && scheduleTime <= Date.now()) {
+    const error = new Error('予約日時は現在より後を指定してください');
+    error.statusCode = 400;
+    throw error;
+  }
+  const content = typeof payload.content === 'string' ? payload.content.trim() : '';
+  const replyTo = normalizeTargetPostId(payload.replyTo);
+  const repostTo = normalizeTargetPostId(payload.repostTo);
+  const isAnnouncement = payload.announcement === true;
+  let groupId = normalizeGroupId(payload.groupId ?? payload.group_id);
+  let groupAnnouncement = payload.groupAnnouncement === true || payload.group_announcement === true;
+  let group = null;
+  const isSimpleRepost = content.length === 0 && repostTo != null;
+
+  const clientNonce = typeof payload.clientNonce === 'string' ? payload.clientNonce.trim() : (
+    typeof payload.client_nonce === 'string' ? payload.client_nonce.trim() : null
+  );
+  const idempotencyKey = clientNonce ? `${userId}:${clientNonce}` : null;
+  if (idempotencyKey && idempotencyCache.has(idempotencyKey)) {
+    return idempotencyCache.get(idempotencyKey).post;
+  }
+
+  // 短時間の完全同一ポスト連投検知 (Flood Protection)
+  const now = Date.now();
+  const signature = `${userId}:${replyTo || 0}:${repostTo || 0}:${groupId || 0}:${content}`;
+  const recentSignature = recentUserPostSignatures.get(userId);
+  if (recentSignature && recentSignature.signature === signature && (now - recentSignature.createdAt) < 2500 && attachments.length === 0) {
+    return recentSignature.post;
+  }
+
+  if (!content && attachments.length === 0 && !isSimpleRepost) {
+    throw new Error('content, attachments, or repost_to is required');
+  }
+  if (isAnnouncement && postingUser.admin !== true) {
+    throw new Error('Only administrators can create announcements');
+  }
+  if (isAnnouncement && (replyTo || repostTo)) {
+    throw new Error('Announcements cannot be replies or reposts');
+  }
+  if (isAnnouncement && groupId) throw new Error('Global announcements cannot be group posts');
+  if (groupAnnouncement && !groupId) throw new Error('Group announcements require a group');
+  if (groupAnnouncement && replyTo) throw new Error('Group announcements cannot be replies');
+
+  if (isSimpleRepost) {
+    groupId = null;
+    groupAnnouncement = false;
+  }
+
+  validateAttachmentReferences(attachments, userId);
+  const relatedPosts = new Map();
+  const targetIds = [...new Set([replyTo, repostTo].filter(Boolean))];
+  let targetPosts = [];
+  if (targetIds.length > 0 && typeof context.db.getPostsByIds === 'function') {
+    try {
+      targetPosts = await context.db.getPostsByIds(targetIds);
+    } catch (_) {
+      // 一括取得に失敗したら、続く単件取得へ後退する。
+    }
+  }
+  if (targetPosts.length === 0 && targetIds.length > 0 && typeof context.db.getPostById === 'function') {
+    targetPosts = await Promise.all(targetIds.map((targetId) => context.db.getPostById(targetId)));
+  }
+  const targetPostsById = new Map((targetPosts || []).filter(Boolean).map((post) => [Number(post.id), post]));
+  // 返信先/リポスト先は高々2件。可視性コンテキストを1回だけ構築し、
+  // 各対象の判定に使い回す (従来は対象ごとに個別に構築していた)。
+  const resolvedTargets = targetIds.map((targetId) => targetPostsById.get(Number(targetId)) || null);
+  if (resolvedTargets.some((target) => !target)) {
+    throw new Error('Post not found');
+  }
+  if (resolvedTargets.length > 0) {
+    const targetVisibilityContext = await createPostVisibilityContext(
+      context.db,
+      resolvedTargets,
+      userId,
+      null,
+      postingUser,
+    );
+    for (let index = 0; index < targetIds.length; index += 1) {
+      const target = resolvedTargets[index];
+      if (!canViewPostWithContext(target, targetVisibilityContext)) {
+        throw new Error('Post not found');
+      }
+      relatedPosts.set(targetIds[index], target);
+    }
+  }
+
+  const rawReplyControl = payload.replyControl ?? payload.reply_control ?? 'everyone';
+  let replyControl = ['everyone', 'following', 'mentioned', 'following_or_mentioned', 'mentioned_only'].includes(rawReplyControl)
+    ? (rawReplyControl === 'following_or_mentioned' ? 'following' : (rawReplyControl === 'mentioned_only' ? 'mentioned' : rawReplyControl))
+    : 'everyone';
+
+  // 返信は強制的に返信先と同一グループに統一し、返信権限を検証
+  if (replyTo) {
+    let replyTarget = relatedPosts.get(replyTo);
+    if (!replyTarget && typeof context.db.getPostById === 'function') {
+      replyTarget = await context.db.getPostById(replyTo);
+    }
+    if (replyTarget) {
+      let rootPost = replyTarget;
+
+      // WITH RECURSIVE で祖先を 1 クエリで取得
+      if (typeof context.db.getPostAncestors === 'function') {
+        const ancestors = await context.db.getPostAncestors(replyTo);
+        for (const ancestor of ancestors) {
+          relatedPosts.set(Number(ancestor.id), ancestor);
+          rootPost = ancestor; // 最後が最も深い祖先
+        }
+      } else {
+        // getPostAncestors 非対応時は、返信先を1つずつ辿って祖先を求める。
+        let currentAncestor = replyTarget;
+        const visited = new Set([Number(replyTarget.id)]);
+        while (currentAncestor && (currentAncestor.replyTo || currentAncestor.reply_to)) {
+          const nextParentId = Number(currentAncestor.replyTo || currentAncestor.reply_to);
+          if (!Number.isInteger(nextParentId) || visited.has(nextParentId)) break;
+          visited.add(nextParentId);
+          let nextParent = relatedPosts.get(nextParentId);
+          if (!nextParent && typeof context.db.getPostById === 'function') {
+            nextParent = await context.db.getPostById(nextParentId);
+          }
+          if (nextParent) {
+            rootPost = nextParent;
+            currentAncestor = nextParent;
+          } else {
+            break;
+          }
+        }
+      }
+
+      const rootReplyControl = rootPost.replyControl || rootPost.reply_control || 'everyone';
+      replyControl = rootReplyControl; // 返信には親/ルートポストの返信制限が伝播する
+
+      if (rootReplyControl !== 'everyone') {
+        const isRootAuthor = Number(rootPost.userId) === Number(userId);
+        const isParentAuthor = Number(replyTarget.userId) === Number(userId);
+        if (!isRootAuthor && !isParentAuthor) {
+          const isMentionedInRoot = isMentionedInText(rootPost.content, userId);
+          const isMentionedInParent = isMentionedInText(replyTarget.content, userId);
+          const isMentioned = isMentionedInRoot || isMentionedInParent;
+          let permitted = false;
+          if (rootReplyControl === 'following' || rootReplyControl === 'following_or_mentioned') {
+            const relationshipUserIds = [Number(rootPost.userId), Number(replyTarget.userId)]
+              .filter((id, index, ids) => Number.isInteger(id) && ids.indexOf(id) === index);
+            let followedBy = new Set();
+            let relationshipSnapshotLoaded = false;
+            if (typeof context.db.getFollowRelationshipSnapshot === 'function') {
+              try {
+                const snapshot = await context.db.getFollowRelationshipSnapshot(userId, relationshipUserIds);
+                followedBy = new Set((snapshot?.followerIds || []).map(Number));
+                relationshipSnapshotLoaded = true;
+              } catch (_) {
+                // スナップショット取得に失敗したら、続く個別確認へ後退する。
+              }
+            }
+            const isFollowedByRoot = followedBy.has(Number(rootPost.userId))
+              || (!relationshipSnapshotLoaded && typeof context.db.isFollowing === 'function'
+                && await context.db.isFollowing(Number(rootPost.userId), Number(userId)));
+            const isFollowedByParent = followedBy.has(Number(replyTarget.userId))
+              || (!relationshipSnapshotLoaded && typeof context.db.isFollowing === 'function'
+                && await context.db.isFollowing(Number(replyTarget.userId), Number(userId)));
+            permitted = isMentioned || isFollowedByRoot || isFollowedByParent;
+          } else if (rootReplyControl === 'mentioned' || rootReplyControl === 'mentioned_only') {
+            permitted = isMentioned;
+          }
+          if (!permitted) {
+            throw new Error('このポストに返信できるユーザーが制限されています');
+          }
+        }
+      }
+    }
+    groupId = normalizeGroupId(replyTarget?.groupId ?? replyTarget?.group_id);
+    groupAnnouncement = false;
+  }
+
+  if (groupId) {
+    group = await context.db.getGroupById(groupId);
+    if (!group) throw new Error('Group not found');
+    const membershipState = await requireGroupPermission(context.db, group, userId, 'post');
+    // announce 権限は既に解決済みのメンバーシップで判定でき、DB再取得は不要。
+    if (groupAnnouncement
+      && !hasPermission(group, membershipState.membership, membershipState.role, 'announce')) {
+      const error = new Error('グループ操作の権限がありません。');
+      error.statusCode = 403;
+      throw error;
+    }
+  }
+
+  const processedAttachments = fileAttachments.map((attachment) => {
+    if (attachment.data !== undefined) {
+      return {
+        buffer: decodeBase64File(attachment.data),
+        fileName: attachment.fileName || 'file',
+        contentType: normalizeContentType(attachment.contentType),
+      };
+    }
+    return attachment;
+  });
+
+  const viewContent = isSimpleRepost ? '' : extractViewContent(content);
+  const tags = isSimpleRepost ? [] : await extractPostKeywordsSafely(viewContent);
+  const postService = new PostService({
+    dbAdapter: context.db,
+    storageAdapter: context.storage,
+  });
+  const post = await postService.createPost({
+    userId,
+    content,
+    viewContent,
+    view_content: viewContent,
+    tags,
+    tagsGeneratedAt: new Date().toISOString(),
+    attachments: processedAttachments,
+    mask: Boolean(payload.mask),
+    lock: Boolean(payload.lock),
+    announcement: isAnnouncement,
+    groupId,
+    groupAnnouncement,
+    scheduledAt,
+    replyControl,
+    reply_control: replyControl,
+    replyTo,
+    repostTo,
+  });
+
+  if (pollAttachment && typeof context.db.createPoll === 'function') {
+    try {
+      const createdPoll = await context.db.createPoll({
+        postId: post.id,
+        userId,
+        title: pollAttachment.title || content || '投票',
+        options: pollAttachment.options,
+        allowMultiple: Boolean(pollAttachment.allow_multiple ?? pollAttachment.allowMultiple),
+        allowOther: Boolean(pollAttachment.allow_other ?? pollAttachment.allowOther),
+        showResultsBeforeVoting: Boolean(pollAttachment.show_results_before_voting ?? pollAttachment.showResultsBeforeVoting ?? true),
+        expiresAt: pollAttachment.expires_at ?? pollAttachment.expiresAt ?? null,
+      });
+      post.poll = createdPoll;
+    } catch (pollErr) {
+      console.warn('[post-actions] failed to create poll for post:', pollErr.message);
+    }
+  }
+
+  if (idempotencyKey) {
+    idempotencyCache.set(idempotencyKey, { post, createdAt: now });
+  }
+  recentUserPostSignatures.set(userId, { signature, createdAt: now, post });
+  if (scheduledAt) {
+    timelineCacheManager.clear();
+    invalidateImmutablePostCache(post.id);
+    return post;
+  }
+
+  const replyTarget = replyTo ? relatedPosts.get(replyTo) : null;
+  const repostTarget = repostTo ? relatedPosts.get(repostTo) : null;
+
+  // @メンションと、実在ユーザーに一致する純粋数値ハッシュタグを同一の宛先集合として扱う。
+  const mentionUserIds = new Set();
+  for (const match of content.matchAll(/@(\d+)/g)) {
+    const mentionedUserId = Number(match[1]);
+    if (!Number.isInteger(mentionedUserId) || mentionedUserId <= 0) continue;
+    mentionUserIds.add(mentionedUserId);
+  }
+  const numericHashtagIds = extractNumericHashtagUserIds(content);
+  if (numericHashtagIds.length > 0) {
+    const existingIds = await fetchExistingUserIds(context.db, numericHashtagIds);
+    for (const id of existingIds) mentionUserIds.add(id);
+  }
+
+  const needsGroupRecipientCheck = Boolean(group && (
+    replyTarget || repostTarget || mentionUserIds.size > 0
+  ));
+  // グループメンバー一覧は、宛先チェックとグループアナウンス通知の双方で
+  // 必要になる場合があるため、1回だけ取得して共有する。
+  const groupMemberIds = (group && (needsGroupRecipientCheck || groupAnnouncement))
+    ? await listActiveGroupMemberIds(context.db, group.id)
+    : null;
+  const activeGroupMemberIds = needsGroupRecipientCheck ? new Set(groupMemberIds) : null;
+  const canNotifyPostRecipient = (recipientId) => (
+    !activeGroupMemberIds || activeGroupMemberIds.has(Number(recipientId))
+  );
+
+  // 通知タスクを収集して並列実行
+  const notificationTasks = [];
+  const excludedNotificationIds = new Set([
+    userId,
+    replyTarget ? Number(replyTarget.userId) : null,
+    repostTarget ? Number(repostTarget.userId) : null,
+  ].filter((id) => id != null && Number.isInteger(id)));
+
+  if (replyTarget && canNotifyPostRecipient(replyTarget.userId)) {
+    notificationTasks.push(notifyPostAction(context, {
+      userId: replyTarget.userId,
+      type: 'reply',
+      fromUserId: userId,
+      postId: post.id,
+    }));
+  }
+  if (isSimpleRepost && repostTarget && canNotifyPostRecipient(repostTarget.userId)) {
+    notificationTasks.push(notifyPostAction(context, {
+      userId: repostTarget.userId,
+      type: 'repost',
+      fromUserId: userId,
+      postId: post.id,
+    }));
+  }
+
+  // メンション通知
+  for (const mentionedUserId of mentionUserIds) {
+    if (excludedNotificationIds.has(mentionedUserId)) continue;
+    excludedNotificationIds.add(mentionedUserId);
+    if (!canNotifyPostRecipient(mentionedUserId)) continue;
+    notificationTasks.push(notifyPostAction(context, {
+      userId: mentionedUserId,
+      type: 'mention',
+      fromUserId: userId,
+      postId: post.id,
+    }));
+  }
+
+  if (groupAnnouncement && group) {
+    notificationTasks.push(notifyGroupAnnouncement(context, group, post, groupMemberIds));
+  }
+
+  // 購読者通知
+  if (!replyTo && !isSimpleRepost && typeof context.db.getUserPostSubscribers === 'function') {
+    try {
+      const subscribers = await context.db.getUserPostSubscribers(userId);
+      if (Array.isArray(subscribers) && subscribers.length > 0) {
+        const hasHeading = /(?:^|\n)#{1,6}\s+\S/.test(content);
+        const hasMedia = Array.isArray(processedAttachments) && processedAttachments.length > 0;
+
+        for (const sub of subscribers) {
+          const subId = Number(sub?.userId ?? sub?.user_id ?? sub?.id);
+          const mode = sub?.mode;
+          if (!Number.isInteger(subId) || subId <= 0) continue;
+          if (excludedNotificationIds.has(subId)) continue;
+          if (subId === userId) continue;
+          if (!canNotifyPostRecipient(subId)) continue;
+
+          let shouldNotify = false;
+          if (mode === 'all') {
+            shouldNotify = true;
+          } else if (mode === 'important' && hasHeading) {
+            shouldNotify = true;
+          } else if (mode === 'media' && hasMedia) {
+            shouldNotify = true;
+          }
+
+          if (shouldNotify) {
+            excludedNotificationIds.add(subId);
+            notificationTasks.push(notifyPostAction(context, {
+              userId: subId,
+              type: 'post',
+              fromUserId: userId,
+              postId: post.id,
+            }));
+          }
+        }
+      }
+    } catch (err) {
+      console.warn('[post-actions] failed to notify post subscribers:', err.message);
+    }
+  }
+
+  timelineCacheManager.onPostCreated(post);
+  await publishNewTimelinePost(context, post);
+  void Promise.allSettled(notificationTasks).catch((err) => {
+    console.warn('[post-actions] background notification delivery error:', err.message);
+  });
+  enqueueGeminiModeration(context, post);
+  return post;
+}
+
+async function processDeletePostAction(context, payload) {
+  if (!payload.admin) return runDeletePostAction(context, payload);
+  return require('./ModLogService').operation(context.db, 'admin', payload.userId, 'delete_post_processing', 'post', payload.postId, async () => {
+    await runDeletePostAction(context, payload);
+    return true;
+  }, 'failure');
+}
+
+async function runDeletePostAction(context, { postId, userId, admin = false }) {
+  const user = await assertAuthenticatedUserAccess(context.authRequest, context.db, ['write', 'posts']);
+  if (Number(user.id) !== Number(userId)
+    || (admin && !(user.admin === true && context.authRequest.user.admin === true))) {
+    const error = new Error('この投稿を削除する権限がありません。');
+    error.statusCode = 403;
+    throw error;
+  }
+  const postToDelete = await context.db.getPostById(postId);
+  if (!postToDelete) throw new Error('Post not found');
+  if (!admin && Number(postToDelete.userId) !== Number(userId)) {
+    const error = new Error('自分の投稿だけを削除できます。');
+    error.statusCode = 403;
+    throw error;
+  }
+  const notesToDelete=await context.db.listNotesByPost(postId);
+
+  const success = admin
+    ? await require('./ModLogService').operation(context.db, 'admin', userId, 'delete_post', 'post', postId, () => context.db.adminDeletePost(postId), 'failure')
+    : await context.db.deletePost(postId, userId);
+  if (!success) {
+    throw new Error(admin ? 'Post not found' : 'You do not have permission to delete this post');
+  }
+  await require('./ReputationService').cancelPostEvents(context.db,postId,notesToDelete);
+
+  timelineCacheManager.onPostDeleted(postId);
+  invalidateImmutablePostCache(postId);
+  await deleteStoredAttachments(
+    context.storage,
+    postToDelete.attachments,
+    admin ? 'admin post deletion' : 'post deletion',
+  );
+}
+
+async function runEditPostAction(context, { postId, userId, content, attachments, mask, lock, replyControl }) {
+  const post = await context.db.getPostById(postId);
+  if (!post) throw new Error('Post not found');
+  if (post.userId !== userId) throw new Error('You can only edit your own posts');
+
+  const { extractViewContent } = require('../utils/viewContent');
+
+  const normalizedContent = content.trim();
+  const viewContent = extractViewContent(normalizedContent);
+  const updatePayload = {
+    content: normalizedContent,
+    viewContent,
+    view_content: viewContent,
+    tags: await extractPostKeywordsSafely(viewContent),
+    tagsGeneratedAt: new Date().toISOString(),
+    attachments: Array.isArray(attachments) && attachments.length > 0 ? attachments : null,
+    mask: !!mask,
+    lock: !!lock,
+  };
+
+  const isReply = Boolean(post.replyTo != null || post.reply_to != null);
+  if (replyControl !== undefined && !isReply) {
+    updatePayload.reply_control = replyControl;
+    updatePayload.replyControl = replyControl;
+  }
+
+  const updated = await context.db.updatePost(postId, updatePayload);
+  await require('./ReputationService').syncPostTrust(context.db,postId);
+  invalidateImmutablePostCache(postId);
+
+  // 返信制限変更時スレッド全体に伝播、条件外の返信を削除
+  if (!isReply && replyControl !== undefined) {
+    try {
+      let replyIds = [];
+      if (typeof context.db.getThreadReplyPostIds === 'function') {
+        replyIds = (await context.db.getThreadReplyPostIds(postId, 500, 0))?.ids || [];
+      } else if (typeof context.db.getReplyPostIds === 'function') {
+        replyIds = (await context.db.getReplyPostIds(postId, 500, 0))?.ids || [];
+      }
+      if (replyIds.length > 0) {
+        const existingReplies = await context.db.getPostsByIds(replyIds);
+        for (const reply of existingReplies) {
+          if (!reply) continue;
+          if (replyControl !== 'everyone' && Number(reply.userId) !== Number(userId)) {
+            const isMentioned = isMentionedInText(normalizedContent, reply.userId);
+            let permitted = false;
+            if (replyControl === 'following') {
+              const isFollowed = typeof context.db.isFollowing === 'function'
+                ? await context.db.isFollowing(Number(userId), Number(reply.userId))
+                : false;
+              permitted = isMentioned || isFollowed;
+            } else if (replyControl === 'mentioned') {
+              permitted = isMentioned;
+            }
+            if (!permitted) {
+              if (typeof context.db.adminDeletePost === 'function') await context.db.adminDeletePost(reply.id);
+              else if (typeof context.db.deletePost === 'function') await context.db.deletePost(reply.id, reply.userId);
+              timelineCacheManager.onPostDeleted(reply.id);
+              invalidateImmutablePostCache(reply.id);
+              continue;
+            }
+          }
+          const updatedReply = await context.db.updatePost(reply.id, {
+            reply_control: replyControl,
+            replyControl,
+          }).catch(() => {});
+          if (updatedReply) {
+            timelineCacheManager.updatePost(updatedReply);
+            invalidateImmutablePostCache(reply.id);
+          }
+        }
+      }
+    } catch (cleanupError) {
+      console.warn('[post-actions] Failed to clean up invalid replies on post edit:', cleanupError.message);
+    }
+  }
+
+  const moderatedPost = updated || post;
+  timelineCacheManager.updatePost(moderatedPost);
+  enqueueGeminiModeration(context, moderatedPost);
+  return moderatedPost;
+}
+
+/**
+ * 完全に同一の編集が同時に投入された場合は、1回の実行結果を共有する。
+ * 添付を含む編集はキーが本文だけでは一意にならないため対象外とする。
+ * 先の実行が完了すれば即座にキーは解放され、通常の連続編集には影響しない。
+ */
+function buildEditDedupeKey({ postId, userId, content, mask, lock, replyControl }) {
+  if (postId == null || userId == null || typeof content !== 'string') return null;
+  return [
+    Number(postId),
+    Number(userId),
+    replyControl === undefined ? 'u' : String(replyControl),
+    mask ? 1 : 0,
+    lock ? 1 : 0,
+    content,
+  ].join('\u0000');
+}
+
+async function processEditPostAction(context, payload) {
+  const hasAttachments = Array.isArray(payload.attachments) && payload.attachments.length > 0;
+  const features = ['write', 'posts'];
+  if (hasAttachments) {
+    if (payload.attachments.some(attachment => attachment?.type === 'poll')) features.push('polls');
+    if (payload.attachments.some(attachment => attachment?.type !== 'poll')) features.push('uploads');
+  }
+  const user = await assertAuthenticatedUserAccess(context.authRequest, context.db, features);
+  if (Number(user.id) !== Number(payload.userId)) {
+    const error = new Error('自分の投稿だけを編集できます。');
+    error.statusCode = 403;
+    throw error;
+  }
+  if (payload.attachments !== undefined) validateAttachmentReferences(payload.attachments, Number(user.id));
+  if (hasAttachments) return runEditPostAction(context, payload);
+
+  const dedupeKey = buildEditDedupeKey(payload);
+  if (!dedupeKey) return runEditPostAction(context, payload);
+
+  const existing = inFlightEditActions.get(dedupeKey);
+  if (existing) return existing;
+
+  const task = runEditPostAction(context, payload).finally(() => {
+    if (inFlightEditActions.get(dedupeKey) === task) inFlightEditActions.delete(dedupeKey);
+  });
+  inFlightEditActions.set(dedupeKey, task);
+  return task;
+}
+
+module.exports = {
+  publishNewTimelinePost,
+  notifyPostAction,
+  processCreatePostAction,
+  processDeletePostAction,
+  processEditPostAction,
+};

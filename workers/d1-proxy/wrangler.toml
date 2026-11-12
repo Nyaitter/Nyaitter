@@ -1,0 +1,16 @@
+name = "nyaitter-d1-proxy"
+main = "src/index.js"
+compatibility_date = "2026-08-14"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "nyaitter-d1"
+database_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+migrations_dir = "migrations"
+
+[vars]
+# NODE_ENV = "production"
+
+# REQUIRED: the proxy refuses all requests when AUTH_TOKEN is not set (fail-closed).
+# Set the secret via:
+#   npx wrangler secret put AUTH_TOKEN

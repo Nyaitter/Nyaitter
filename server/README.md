@@ -1,0 +1,206 @@
+# Nyaitter サーバー設定ガイド
+
+サーバーの起動と主要な設定の入口です。各項目の詳しい手順はリンク先のガイドを参照してください。
+
+## 1. 起動する
+
+Node.js 22.23.4 以上が必要です（Node.js 20 は 2026-07 に EOL）。
+
+```bash
+npm install
+cp server/.env.example server/.env
+npm start
+```
+
+ブラウザで <http://localhost:3000/> を開きます。`server/.env` を変更したらサーバーを再起動してください。設定の不備は `npm run check:config` で確認できます。
+
+### サーバーごとの待ち受け設定
+
+Nyaitter サーバーは用途ごとに別の HTTP サーバーを持ちます。ホストとポートをそれぞれ指定できます。
+
+| サーバー | 用途 | ポート | ホスト | 未設定時 |
+|---|---|---|---|---|
+| メイン | API・画面・WebSocket | `PORT`（既定 `3000`） | `NYAITTER_HOST` / `server.host` | 全インターフェース |
+| ユーザーファイル | 画像・添付の配信 | `NYAITTER_USER_FILES_PORT` / `userFiles.port` | `NYAITTER_USER_FILES_HOST` / `userFiles.host` | 専用サーバーなし。メイン配下で配信 |
+| 共有 | クローラー向けOGP・埋め込み | `SHARE_PORT`（旧 `POST_SHARE_PORT`。メインと別のときだけ起動） | `NYAITTER_SHARE_HOST` / `share.host`（旧 `NYAITTER_POST_SHARE_HOST` / `postShare.host`） | 起動せずメインが配信 |
+| 埋め込みメール | メール送信の受け口 | `EMBEDDED_MAIL_SERVER_PORT`（既定 `2525`） | `EMBEDDED_MAIL_SERVER_HOST`（既定 `0.0.0.0`） | 起動しない |
+| 運用コントロール | CLI からの操作 | Unix ソケット | `NYAITTER_OPERATOR_SOCKET`（既定 `/tmp/nyaitter-operator.sock`） | 常に起動 |
+
+- `NYAITTER_BIND=0.0.0.0:3000` を指定すると、メインサーバーのホストとポートをまとめて上書きできます（`NYAITTER_HOST` / `PORT` より優先）。
+- ユーザーファイルと共有のホストは、指定しなければメインサーバーと同じホストで待ち受けます。
+- ホストにはホスト名、IPv4、IPv6（`::` や `::1`）を指定できます。不正な値は起動時に警告され、`npm run check:config` で検出されます。
+
+### 広告配信元を許可する
+
+広告用のスクリプトとフレームの配信元は既定では追加されません。利用する場合は、広告事業者が指定する HTTPS オリジンだけを運営者の信頼済み設定に登録します。manifest 等の画面データから配信元が追加されることはありません。画像と通信には広告設定とは別に任意の HTTPS 配信元が許可されています。
+
+```json
+{
+  "security": {
+    "advertisingOrigins": {
+      "script": ["https://ads.example.test"],
+      "frame": ["https://ads.example.test"],
+      "connect": ["https://ads.example.test"],
+      "img": ["https://ads.example.test"]
+    }
+  }
+}
+```
+
+用途に必要な項目だけを設定してください。環境変数 `NYAITTER_ADVERTISING_CSP_ORIGINS` では同じ内容を JSON オブジェクトで指定でき、config.json より優先されます。各値は `https://host[:port]` の完全一致オリジンです。ワイルドカード、HTTP、パス、資格情報、クエリ、フラグメントは拒否され、起動ログに警告されます。設定後は Server を再起動してください。
+
+Server が `page/` を配信する場合、CSP ヘッダーと画面内 meta の両方に同じポリシーが反映されます。Cloudflare やリバースプロキシが独自の CSP ヘッダーを追加する場合は、そこで設定したポリシーも同じ配信元を許可してください（CSP は複数あると制限が重なります）。Server を通さず静的ファイルを別配信する構成では、`page/index.html` の `<head>` に同じ CSP meta を設定し、配信元の HTTP ヘッダーも一致させてください。変更の反映後、両方を確認するまで広告許可を有効とみなさないでください。
+
+### SDK・UI の配信元とメディア
+
+画面の `nyaitter_js` または `nyaitter_ui` に標準以外の HTTPS URL を指定する場合、信頼できる配信元を Server の `security.clientAssetOrigins` に `["https://cdn.example.test"]` のように登録してください。環境変数 `NYAITTER_CLIENT_ASSET_CSP_ORIGINS` は JSON 配列またはカンマ区切りで指定でき、設定ファイルより優先されます。オリジンは HTTPS のホストと任意のポートのみで、パスやワイルドカードは指定できません。登録先はスクリプトとスタイルを配信でき、画面内でコードを実行できるため、完全に信頼できる先だけを登録してください。manifest や API の URL 設定だけでは許可されません。広告用の許可リストとは別です。
+
+音声・動画は同一オリジン、`data:`、`blob:`、任意の HTTPS 配信元を許可します。HTTP の外部配信元は許可しません。静的な別配信やプロキシを使う場合は、上記と同様に meta とすべての CSP ヘッダーを個別に合わせてください。meta ではフレーム埋め込み制限を設定できないため、静的配信元でも HTTP ヘッダーの `frame-ancestors` を設定してください。
+
+#### リバースプロキシの背後で公開する
+
+直接公開せず、プロキシだけが接続できるようにします。
+
+```dotenv
+NYAITTER_HOST=127.0.0.1
+PORT=3000
+TRUST_PROXY=true
+PUBLIC_URL=https://nyaitter.example.com
+```
+
+`TRUST_PROXY=true` はすべてのプロキシを信頼します。`X-Forwarded-For` の偽装を防ぐには、信頼するホップ数を明示します。
+
+```dotenv
+NYAITTER_TRUST_PROXY_HOPS=1
+```
+
+#### 直接公開する
+
+```dotenv
+NYAITTER_HOST=0.0.0.0
+PORT=3000
+# または
+NYAITTER_BIND=0.0.0.0:3000
+```
+
+#### 画像を別ポート、共有を別オリジンにする
+
+```dotenv
+PORT=3000
+NYAITTER_USER_FILES_PORT=3001
+NYAITTER_USER_FILES_HOST=127.0.0.1
+SHARE_PORT=3002
+NYAITTER_SHARE_HOST=0.0.0.0
+SHARE_URL=https://share.example.com
+```
+
+旧名（`POST_SHARE_PORT` / `NYAITTER_POST_SHARE_HOST` / `POST_SHARE_URL`、
+config.json の `postSharePort` / `postShare.host` / `postShareUrl`）も後方互換で使用できます。
+
+#### 埋め込みメールサーバーを立てる
+
+```dotenv
+EMBEDDED_MAIL_SERVER_ENABLED=true
+EMBEDDED_MAIL_SERVER_HOST=0.0.0.0
+EMBEDDED_MAIL_SERVER_PORT=2525
+EMBEDDED_MAIL_HOSTNAME=mail.example.com
+```
+
+## 2. データを保存する
+
+初期状態ではメモリに保存され、サーバーを止めるとデータが消えます。`DB_ADAPTER` を `postgres` または `d1` に設定してください。
+
+### PostgreSQL
+
+```dotenv
+DB_ADAPTER=postgres
+DATABASE_URL=postgresql://ユーザー名:パスワード@ホスト名:5432/データベース名?sslmode=require
+```
+
+設定後にテーブルを作ります。テーブル定義を更新したときも同じコマンドを実行します。
+
+```bash
+npm run migrate
+```
+
+詳しくは [マイグレーション](./migrations/README.md) を参照してください。
+
+### Cloudflare D1
+
+[Cloudflare D1 設定ガイド](./help/database-d1-worker.md) の手順に従ってください。
+
+## 3. 画像を保存する
+
+```dotenv
+STORAGE_ADAPTER=local
+STORAGE_USER_QUOTA_MB=512
+```
+
+`STORAGE_USER_QUOTA_MB` は 1 人あたりの保存上限（MB）です。Cloudflare R2 を使う場合は [Cloudflare R2 設定ガイド](./help/storage-r2.md) を参照してください。
+
+## 4. 共有リンクをカード表示する
+
+共有リンク（投稿・グループ・ステージ）をカード表示するポート番号を指定します。
+
+```dotenv
+SHARE_PORT=3000
+```
+
+旧名 `POST_SHARE_PORT` も後方互換で使用できます。
+
+## 5. ログイン方法を選ぶ
+
+使う方法を `true`、使わない方法を `false` にします。
+
+```dotenv
+AUTH_METHOD_SCRATCH_ENABLED=true
+AUTH_METHOD_PASSKEY_ENABLED=true
+AUTH_METHOD_EMAIL_ENABLED=false
+AUTH_METHOD_GOOGLE_ENABLED=false
+AUTH_METHOD_MICROSOFT_ENABLED=false
+```
+
+Google / Microsoft はクライアント ID とシークレットも必要です。[認証プロバイダー設定ガイド](./help/auth-providers.md) を参照してください。
+
+## 6. アカウントを復旧する
+
+「不明な場所からのログインを拒否」でログインできなくなった場合、承認待ち画面から復旧できます。待機時間と通知の間隔を設定します。
+
+```dotenv
+AUTH_ACCOUNT_RECOVERY_ENABLED=true
+AUTH_ACCOUNT_RECOVERY_MIN_WAIT_HOURS=24
+AUTH_ACCOUNT_RECOVERY_MAX_WAIT_HOURS=168
+AUTH_ACCOUNT_RECOVERY_NOTIFICATION_INTERVAL_HOURS=24
+```
+
+## 7. AI で投稿をチェックする
+
+AI サービスを登録すると、AutoMod による投稿の自動チェックを使えます。
+
+```dotenv
+AI_PROVIDERS=[{"type":"openai","apikey":"YOUR_API_KEY"}]
+AUTOMOD_AI_PROVIDER=auto
+AUTOMOD_PROMPT=緩めに判断してください
+```
+
+[AI プロバイダー設定](./help/ai-providers.md) と [AutoMod 設定ガイド](./help/automod.md) を参照してください。
+
+## 8. ステージと通話に TURN を使う
+
+マイクとカメラを使うには HTTPS または localhost で接続してください。別のネットワーク間で通話する場合は TURN サーバーを設定します。
+
+```dotenv
+SPACES_ICE_SERVERS=[{"urls":"turn:turn.example.com:3478","username":"利用者名","credential":"パスワード"}]
+```
+
+`server/config.json` の `spaces.iceServers` にも設定できますが、環境変数がある場合はそちらが優先されます。
+
+## 9. サーバーを操作する
+
+```bash
+node server/cli.js server status
+node server/cli.js maintenance enable
+node server/cli.js maintenance disable
+```
+
+メンテナンスを解除した後は、サーバーを再起動してください。

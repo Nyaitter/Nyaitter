@@ -1,0 +1,366 @@
+diff -ruN '--exclude=.git' '--exclude=node_modules' '--exclude=dist' '--exclude=data' NyaitterIME-baseline/src/browser.js NyaitterIME-patched/src/browser.js
+--- NyaitterIME-baseline/src/browser.js	2026-11-11 22:28:11.397998076 +0000
++++ NyaitterIME-patched/src/browser.js	2026-11-11 22:28:12.205998076 +0000
+@@ -3,9 +3,15 @@
+ const core = require('./core');
+ 
+ const scriptUrl = typeof document !== 'undefined' && document.currentScript ? document.currentScript.src : null;
+-const defaultDictionaryUrl = scriptUrl
++// A host that vendors this bundle can keep the (large) generated dictionary on
++// the CDN by setting globalThis.NYAITTER_IME_DICTIONARY_URL before loading it.
++const configuredDictionaryUrl = typeof globalThis !== 'undefined' &&
++  typeof globalThis.NYAITTER_IME_DICTIONARY_URL === 'string'
++  ? globalThis.NYAITTER_IME_DICTIONARY_URL
++  : null;
++const defaultDictionaryUrl = configuredDictionaryUrl || (scriptUrl
+   ? new URL('../data/nyaitter-ime-core.bin.gz', scriptUrl).href
+-  : '../data/nyaitter-ime-core.bin.gz';
++  : '../data/nyaitter-ime-core.bin.gz');
+ 
+ let defaultDictionary = null;
+ let defaultJapanizer = null;
+diff -ruN '--exclude=.git' '--exclude=node_modules' '--exclude=dist' '--exclude=data' NyaitterIME-baseline/src/converter/viterbi.js NyaitterIME-patched/src/converter/viterbi.js
+--- NyaitterIME-baseline/src/converter/viterbi.js	2026-11-11 22:28:11.945998076 +0000
++++ NyaitterIME-patched/src/converter/viterbi.js	2026-11-11 22:28:12.225998076 +0000
+@@ -4,6 +4,108 @@
+ const OOV_LEFT_ID = 5968;
+ const OOV_RIGHT_ID = 5968;
+ const ASCII_RUN_COST = 120;
++// A literal Latin span inside Japanese text behaves grammatically like a
++// loanword noun (テスト, プッシュ are sahen nouns), and a digit span like a
++// numeral, so give their identity edges the ids those word classes have in
++// the connection matrix. The generic OOV id (5968) is outside this
++// dictionary's matrix range, which silently zeroed every connection across
++// a Latin span and left neighbouring kana fragments with no grammatical
++// context (e.g. a sentence-final した after a Latin word could not win over
++// the noun 下).
++const ASCII_LEFT_ID = 1841;
++const ASCII_RIGHT_ID = 1841;
++const NUMERIC_LEFT_ID = 2044;
++const NUMERIC_RIGHT_ID = 2044;
++const LONG_VOWEL_MARK = 'ー';
++const VOWEL_GROUPS = {
++  'あ': 'あかがさざただなはばぱまやらわゃ',
++  'い': 'いきぎしじちぢにひびぴみりゐ',
++  'う': 'うくぐすずつづぬふぶぷむゆるゔゅ',
++  'え': 'えけげせぜてでねへべぺめれゑ',
++  'お': 'おこごそぞとどのほぼぽもよろをょ',
++};
++
++function sharesVowel(previous, vowel) {
++  return (VOWEL_GROUPS[vowel] || '').includes(previous);
++}
++
++// Users sometimes spell a loanword's long vowel by repeating the vowel
++// (kiiboodo / suupaa), while Mozc stores it with ー (きーぼーど / すーぱー).
++function foldLongVowels(reading) {
++  const chars = [...reading];
++  let folded = '';
++  for (let i = 0; i < chars.length; i += 1) {
++    const char = chars[i];
++    if (i > 0 && sharesVowel(chars[i - 1], char)) folded += LONG_VOWEL_MARK;
++    else folded += char;
++  }
++  return folded;
++}
++
++const DAKUTEN_GROUPS = [
++  ['か', 'が'], ['き', 'ぎ'], ['く', 'ぐ'], ['け', 'げ'], ['こ', 'ご'],
++  ['さ', 'ざ'], ['し', 'じ'], ['す', 'ず'], ['せ', 'ぜ'], ['そ', 'ぞ'],
++  ['た', 'だ'], ['ち', 'ぢ'], ['つ', 'づ'], ['て', 'で'], ['と', 'ど'],
++  ['は', 'ば', 'ぱ'], ['ひ', 'び', 'ぴ'], ['ふ', 'ぶ', 'ぷ'], ['へ', 'べ', 'ぺ'], ['ほ', 'ぼ', 'ぽ'],
++  ['う', 'ゔ'],
++];
++const DAKUTEN_ALTERNATIVES = new Map();
++for (const group of DAKUTEN_GROUPS) {
++  for (const char of group) {
++    DAKUTEN_ALTERNATIVES.set(char, group.filter((c) => c !== char));
++  }
++}
++// Dakuten/handakuten cannot be typed at all on some input surfaces (e.g.
++// radial kana input), while Mozc readings carry them (てんぷら). Variants
++// with them toggled are tried only when the exact reading is unknown, the
++// same fallback policy as foldLongVowels, or when its cheapest entry is
++// still in the name/rare-word cost range below: あめた exists only as the
++// names 雨田/飴田, while the user means 雨だ (reading あめだ). A reading
++// that exists as an ordinary word keeps its own words (かんし stays 監視,
++// かくせい stays 覚醒). Each toggled kana costs extra so fewer toggles
++// win among the variants themselves.
++const DAKUTEN_VARIANT_COST = 1200;
++const DAKUTEN_FALLBACK_EXACT_COST = 6000;
++const MAX_DAKUTEN_VARIANTS = 32;
++
++function dakutenVariants(reading) {
++  const chars = [...reading];
++  const positions = [];
++  for (let i = 0; i < chars.length; i += 1) {
++    if (DAKUTEN_ALTERNATIVES.has(chars[i])) positions.push(i);
++  }
++  if (positions.length === 0) return [];
++  const variants = [];
++  if (positions.length > 6) {
++    // Too many combinations to enumerate; single toggles only.
++    for (const pos of positions) {
++      for (const alt of DAKUTEN_ALTERNATIVES.get(chars[pos])) {
++        const next = chars.slice();
++        next[pos] = alt;
++        variants.push({ reading: next.join(''), toggles: 1 });
++      }
++    }
++    return variants.slice(0, MAX_DAKUTEN_VARIANTS);
++  }
++  const walk = (pi, current, toggles) => {
++    if (pi === positions.length) {
++      if (toggles > 0) variants.push({ reading: current.join(''), toggles });
++      return;
++    }
++    const pos = positions[pi];
++    walk(pi + 1, current, toggles);
++    for (const alt of DAKUTEN_ALTERNATIVES.get(chars[pos])) {
++      const next = current.slice();
++      next[pos] = alt;
++      walk(pi + 1, next, toggles + 1);
++    }
++  };
++  walk(0, chars, 0);
++  // Fewer toggles are cheaper, so order by toggles before applying the cap:
++  // the cap must never drop a low-toggle variant in favour of a costly one.
++  variants.sort((a, b) => a.toggles - b.toggles);
++  return variants.slice(0, MAX_DAKUTEN_VARIANTS);
++}
+ 
+ function isAscii(char) {
+   if (!char) return false;
+@@ -17,7 +119,35 @@
+ 
+   for (let end = position + 1; end <= max; end += 1) {
+     const reading = text.slice(position, end);
+-    const candidates = dictionary.lookup(reading);
++    let candidates = dictionary.lookup(reading);
++    // Mozc stores loanword readings with ー (きーぼーど), while users often type
++    // doubled vowels (kiiboodo -> きいぼおど). Only fall back when the exact
++    // reading is unknown, so ordinary words such as おおきい are unaffected.
++    if (candidates.length === 0) {
++      const folded = foldLongVowels(reading);
++      if (folded !== reading) candidates = dictionary.lookup(folded);
++    }
++    // A reading typed without dakuten/handakuten (てんふら) should still
++    // reach the voiced dictionary word (てんぷら). Only when the exact
++    // reading is unknown, like the long-vowel fallback above, or merely
++    // name/rare-word class as described at DAKUTEN_FALLBACK_EXACT_COST.
++    const cheapestExact = candidates.reduce(
++      (min, candidate) => Math.min(min, candidate.cost ?? 1000), Infinity);
++    if (reading.length >= 2 && cheapestExact >= DAKUTEN_FALLBACK_EXACT_COST) {
++      // The same word can surface from several variants; keep the cheapest.
++      const bestByKey = new Map();
++      for (const variant of dakutenVariants(reading)) {
++        for (const candidate of dictionary.lookup(variant.reading)) {
++          const key = `${candidate.surface}|${candidate.leftId}|${candidate.rightId}`;
++          const cost = (candidate.cost ?? 1000) + DAKUTEN_VARIANT_COST * variant.toggles;
++          const existing = bestByKey.get(key);
++          if (!existing || cost < existing.cost) bestByKey.set(key, { ...candidate, cost });
++        }
++      }
++      // lookup() returns the dictionary's own (cached) array; build a new
++      // array instead of pushing into it, or later conversions would drift.
++      if (bestByKey.size > 0) candidates = [...candidates, ...bestByKey.values()];
++    }
+     for (const candidate of candidates) {
+       const wordCost = candidate.cost ?? 1000;
+       edges.push({
+@@ -40,7 +170,21 @@
+   if (isAscii(current)) {
+     let end = position + 1;
+     while (end < text.length && isAscii(text[end])) end += 1;
+-    edges.push({ start: position, end, reading: text.slice(position, end), surface: text.slice(position, end), cost: ASCII_RUN_COST, leftId: OOV_LEFT_ID, rightId: OOV_RIGHT_ID, kind: 'identity' });
++    const run = text.slice(position, end);
++    // Only word-like spans act as loanwords / numerals. A whitespace or
++    // punctuation run is a neutral break: giving it noun ids would lend
++    // the following fragment a fake noun context (e.g. the space in
++    // うえから したまで must not turn した into a verb).
++    let leftId = OOV_LEFT_ID;
++    let rightId = OOV_RIGHT_ID;
++    if (/[A-Za-z]/.test(run)) {
++      leftId = ASCII_LEFT_ID;
++      rightId = ASCII_RIGHT_ID;
++    } else if (/^[0-9][0-9.,]*$/.test(run)) {
++      leftId = NUMERIC_LEFT_ID;
++      rightId = NUMERIC_RIGHT_ID;
++    }
++    edges.push({ start: position, end, reading: run, surface: run, cost: ASCII_RUN_COST, leftId, rightId, kind: 'identity' });
+   } else {
+     edges.push({ start: position, end: position + 1, reading: current, surface: current, cost: UNKNOWN_COST, leftId: OOV_LEFT_ID, rightId: OOV_RIGHT_ID, kind: 'identity' });
+   }
+diff -ruN '--exclude=.git' '--exclude=node_modules' '--exclude=dist' '--exclude=data' NyaitterIME-baseline/src/dictionary/supplements.js NyaitterIME-patched/src/dictionary/supplements.js
+--- NyaitterIME-baseline/src/dictionary/supplements.js	1970-01-01 00:00:00.000000000 +0000
++++ NyaitterIME-patched/src/dictionary/supplements.js	2026-11-11 22:28:12.205998076 +0000
+@@ -0,0 +1,15 @@
++'use strict';
++
++// Curated entries layered over the generated Mozc OSS dictionary.
++//
++// The binary dictionary is rebuilt from Mozc, so entries that are missing or
++// whose only Mozc candidate is a rare/pejorative spelling belong here. Costs are
++// relative to the generated dictionary: a negative cost promotes the entry,
++// while a non-negative cost only adds an alternative.
++const SUPPLEMENTS = Object.freeze([
++  // Mozc only has 運痴 for うんち, which is a rare and offensive spelling.
++  { reading: 'うんち', surface: 'うんち', cost: -2000 },
++  { reading: 'うんち', surface: 'ウンチ', cost: 500 }
++]);
++
++module.exports = { SUPPLEMENTS };
+diff -ruN '--exclude=.git' '--exclude=node_modules' '--exclude=dist' '--exclude=data' NyaitterIME-baseline/src/japanizer.js NyaitterIME-patched/src/japanizer.js
+--- NyaitterIME-baseline/src/japanizer.js	2026-11-11 22:28:11.945998076 +0000
++++ NyaitterIME-patched/src/japanizer.js	2026-11-11 22:28:12.205998076 +0000
+@@ -4,6 +4,7 @@
+ const { defaultConverter } = require('./converter');
+ const englishWords = require('./romanizer/english-words');
+ const { Dictionary } = require('./dictionary');
++const { SUPPLEMENTS } = require('./dictionary/supplements');
+ 
+ function withCustomDictionary(base, entries) {
+   if (!Array.isArray(entries)) throw new TypeError('customDictionary must be an array');
+@@ -27,6 +28,10 @@
+     this.romanizer = options.romanizer ?? defaultRomanizer;
+     this.converter = options.converter ?? defaultConverter;
+     this.dictionary = options.dictionary ?? null;
++    if (this.dictionary && !this.dictionary.supplemented) {
++      this.dictionary = withCustomDictionary(this.dictionary, SUPPLEMENTS);
++      this.dictionary.supplemented = true;
++    }
+     this.ignoredTexts = options.ignoredTexts ?? [];
+     if (options.customDictionary) {
+       if (!this.dictionary) throw new Error('A base dictionary is required');
+@@ -79,9 +84,14 @@
+ }
+ 
+ function convertJapaneseSections(kana, ime, options) {
+-  // Literal English and hashtag markers must not affect Japanese connection costs.
+-  return kana.split(/([A-Za-z]+|#)/).map(part =>
+-    /^[A-Za-z]+$/.test(part) || part === '#' ? part : ime.converter.convert(part, ime.dictionary, options)
++  // Hashtag markers still delimit fragments, but literal Latin spans stay
++  // inside the conversion: the converter gives them identity edges with
++  // loanword-noun ids, so the surrounding Japanese keeps its connection
++  // context. Splitting Latin out made every neighbouring fragment look like
++  // a standalone sentence (BOS/EOS penalties, no left context), which is
++  // what let e.g. a した after a Latin word degrade to the noun 下.
++  return kana.split(/(#)/).map(part =>
++    part === '#' ? part : ime.converter.convert(part, ime.dictionary, options)
+   ).join('');
+ }
+ 
+@@ -100,10 +110,27 @@
+   return output + convert(text.slice(plainStart));
+ }
+ 
++// Treat Japanese long-vowel spellings such as ki-bo-do as one romaji run.
++// Splitting at every hyphen lets short English words (bo, do, me, ...) win over
++// the loanword reading, which made "ki-bo-do" become "キーboーど".
++const ROMAJI_RUN_PATTERN = /[A-Za-z]+(?:-[A-Za-z]+)*/g;
++
++function isEnglishHyphenatedRun(run) {
++  const parts = run.toLowerCase().split('-');
++  // Short romaji syllables collide with English words (me/ru/bo/do), so require
++  // at least one longer part before treating a hyphenated run as English.
++  return parts.length > 1 &&
++    parts.some(part => part.length >= 3) &&
++    parts.every(part => /^[a-z]$/.test(part) || englishWords.has(part));
++}
++
+ function convertMixedText(text, ime, options) {
+   if (!ime.dictionary || options.englishDetection === false) return ime.romanizer.convert(text, options);
+-  const convertPlain = value => value.replace(/[A-Za-z]+/g, (run) => {
++  const convertPlain = value => value.replace(ROMAJI_RUN_PATTERN, (run) => {
+     if (/[A-Z]/.test(run)) return ime.romanizer.convert(run, options);
++    if (run.includes('-')) {
++      return isEnglishHyphenatedRun(run) ? run : ime.romanizer.convert(run, options);
++    }
+     return chooseEnglishJapanese(run, ime, options);
+   });
+   const readings = ime.dictionary.customReadings;
+@@ -157,7 +184,16 @@
+       }
+       const { kana, japaneseCost } = analysis;
+       update(best, end, best[i].cost + japaneseCost, best[i].text + kana);
+-      if (part.length >= 2 && englishWords.has(part)) {
++      // Honour an English word at a run boundary. An internal match whose
++      // romaji reading parses cleanly (boo inside kiiboodo) is almost always
++      // part of a Japanese reading, and treating it as English prevented
++      // loanword conversion. But an internal match whose reading cannot be
++      // parsed cleanly (github, push: consonant clusters leave ASCII
++      // residue) is not Japanese at all; recognise it as English anywhere in
++      // the run and let the cost competition decide.
++      const atBoundary = i === 0 || end === run.length;
++      const unparseable = /[A-Za-z]/.test(kana);
++      if (part.length >= 2 && englishWords.has(part) && (atBoundary || unparseable)) {
+         // Prefer a dictionary-backed Japanese reading when both interpretations fit.
+         update(best, end, best[i].cost + 5900, best[i].text + run.slice(i, end));
+       }
+diff -ruN '--exclude=.git' '--exclude=node_modules' '--exclude=dist' '--exclude=data' NyaitterIME-baseline/test/integration.test.js NyaitterIME-patched/test/integration.test.js
+--- NyaitterIME-baseline/test/integration.test.js	2026-11-11 22:28:11.945998076 +0000
++++ NyaitterIME-patched/test/integration.test.js	2026-11-11 22:28:12.205998076 +0000
+@@ -27,7 +27,63 @@
+   );
+ });
+ 
++test('converts hyphenated long-vowel loanwords as one reading', () => {
++  assert.equal(convert('ki-bo-do'), 'キーボード');
++  assert.equal(convert('ki-bo-do wo tsukau'), 'キーボード を 使う');
++  assert.equal(convert('me-ru'), 'メール');
++  assert.equal(convert('ko-hi-'), 'コーヒー');
++});
++
++test('falls back to folded long vowels for doubled-vowel loanwords', () => {
++  assert.equal(convert('kiiboodo'), 'キーボード');
++  assert.equal(convert('suupaa'), 'スーパー');
++  assert.equal(convert('meeru'), 'メール');
++  // Exact Mozc readings still win over the folded fallback.
++  assert.equal(convert('ookii'), '大きい');
++  assert.equal(convert('tooi'), '遠い');
++});
++
++test('keeps hyphenated English words as English', () => {
++  assert.equal(convert('e-mail'), 'e-mail');
++  assert.equal(convert('e-mail wo okuru'), 'e-mail を 送る');
++  assert.equal(convert('keyboard-shortcut'), 'keyboard-shortcut');
++  assert.equal(convert('boo'), 'boo');
++  assert.equal(convert('book'), 'book');
++});
++
++test('supplemental dictionary promotes common spellings', () => {
++  assert.equal(convert('unchi'), 'うんち');
++  assert.equal(convert('unnti'), 'うんち');
++});
++
+ test('toHiragana converts without loading or using the dictionary', () => {
+   assert.equal(toHiragana('saikinOpenAIhaDotswokoukaisita.'), 'さいきんOpenAIはDotsをこうかいした。');
+   assert.equal(new Japanizer().toHiragana('neko,inu'), 'ねこ、いぬ');
+ });
++
++test('honours unparseable English words in the middle of a romaji run', () => {
++  // github/push cannot be parsed as romaji (their consonant clusters leave
++  // ASCII residue), so they pass through as Latin anywhere in the run, not
++  // only at the edges.
++  assert.equal(convert('kyouhagithubnipushsita'), '今日はgithubにpushした');
++  assert.equal(convert('watashihapythonwotsukau'), '私はpythonを使う');
++  assert.equal(convert('githubwomiru'), 'githubを見る');
++  // A substring that parses cleanly as romaji stays Japanese (boo in kiiboodo).
++  assert.equal(convert('kiiboodo'), 'キーボード');
++});
++
++test('keeps grammatical context across Latin spans', () => {
++  // A sentence-final した after a Latin word is the past-tense verb, not 下.
++  assert.equal(convert('kyouhaGithubdePushsita'), '今日はGithubでPushした');
++  assert.equal(convert('check sita'), 'check した');
++  // Contexts where 下 is the correct noun stay untouched.
++  assert.equal(convert('sitanioku'), '下に置く');
++  assert.equal(convert('sitanimita'), '下に見た');
++  assert.equal(convert('uekara shitamade'), '上から 下まで');
++});
++
++test('gives digit spans numeral connections', () => {
++  assert.equal(convert('100en'), '100円');
++  assert.equal(convert('5ji'), '5時');
++  assert.equal(convert('3hon'), '3本');
++});

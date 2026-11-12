@@ -1,0 +1,151 @@
+'use strict';
+
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+
+function getOrPersistHmacSecret() {
+  if (process.env.LOGIN_SECURITY_HMAC_SECRET) {
+    return process.env.LOGIN_SECURITY_HMAC_SECRET;
+  }
+  if (process.env.MULTI_ACCOUNT_COOKIE_SECRET) {
+    return process.env.MULTI_ACCOUNT_COOKIE_SECRET;
+  }
+  if (process.env.SESSION_SECRET) {
+    return process.env.SESSION_SECRET;
+  }
+
+  // 永続化ファイルから読み込み、なければ自動生成して保存
+  const dataDir = process.env.DATA_DIR || path.join(process.cwd(), 'data');
+  const secretPath = path.join(dataDir, '.auth_hmac_secret');
+
+  try {
+    if (!fs.existsSync(dataDir)) {
+      fs.mkdirSync(dataDir, { recursive: true });
+    }
+    if (fs.existsSync(secretPath)) {
+      const stored = fs.readFileSync(secretPath, 'utf8').trim();
+      if (stored && stored.length >= 16) return stored;
+    }
+    const generated = crypto.randomBytes(32).toString('base64url');
+    fs.writeFileSync(secretPath, generated, { encoding: 'utf8', mode: 0o600 });
+    return generated;
+  } catch (_) {
+    // シークレットを永続化できない場合、固定値を使うとIPハッシュを外部から計算できる。
+    // 本番では起動を止め、開発ではプロセス内だけのランダム値に留める。
+    if ((process.env.NODE_ENV || 'development') === 'production') {
+      throw new Error(
+        'LOGIN_SECURITY_HMAC_SECRET を設定するか、DATA_DIR を書き込み可能にしてください。'
+        + 'IPハッシュ用のシークレットを安全に保存できません。',
+      );
+    }
+    console.error(
+      '[login-security] シークレットを保存できないため、このプロセス内だけの一時値を使用します。'
+      + '再起動すると信頼IP・ブロックIPの照合がリセットされます。',
+    );
+    return crypto.randomBytes(32).toString('base64url');
+  }
+}
+
+const ipHashSecret = getOrPersistHmacSecret();
+
+/**
+ * IPアドレスを正規化します。
+ * IPv6の一時アドレスによる下位64ビットの頻繁なローテーションに対応するため、
+ * IPv6の場合は /64 プレフィックスに正規化します。
+ * @param {string} ip
+ * @returns {string}
+ */
+function normalizeIp(ip) {
+  let value = String(ip || '').trim();
+  if (!value) return 'unknown';
+
+  // IPv4-mapped IPv6 (e.g. ::ffff:192.168.1.1)
+  if (value.startsWith('::ffff:')) {
+    value = value.slice(7);
+  }
+
+  // IPv4 with port (e.g. 192.168.1.1:8080)
+  if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(:\d+)?$/.test(value)) {
+    return value.split(':')[0];
+  }
+
+  // IPv6
+  if (value.includes(':')) {
+    const cleanIpv6 = value.replace(/^\[|\]$/g, '').split('%')[0].toLowerCase();
+    const halves = cleanIpv6.split('::');
+    if (halves.length > 2) return cleanIpv6;
+
+    const parseSide = (side) => side
+      ? side.split(':').filter(Boolean).map((part) => part.padStart(4, '0'))
+      : [];
+    const left = parseSide(halves[0]);
+    const right = parseSide(halves[1]);
+    const missing = 8 - left.length - right.length;
+    if (missing < 0 || (halves.length === 1 && missing !== 0)) return cleanIpv6;
+
+    const expanded = halves.length === 2
+      ? [...left, ...Array(missing).fill('0000'), ...right]
+      : left;
+    if (expanded.length !== 8) return cleanIpv6;
+    return `${expanded.slice(0, 4).map((part) => part.replace(/^0+(?=[0-9a-f])/i, '') || '0').join(':')}::/64`;
+  }
+
+  return value;
+}
+
+function hashIp(ip) {
+  return crypto
+    .createHmac('sha256', ipHashSecret)
+    .update(normalizeIp(ip))
+    .digest('hex');
+}
+
+function maskIp(ip) {
+  const normalized = normalizeIp(ip);
+  if (normalized === 'unknown') return '不明なIPアドレス';
+  if (normalized.includes('.')) {
+    const parts = normalized.split('.');
+    return parts.length === 4 ? `${parts[0]}.${parts[1]}.${parts[2]}.*` : 'IPv4アドレス';
+  }
+  if (normalized.includes('::/64')) {
+    const prefix = normalized.replace('::/64', '');
+    return `${prefix}::/64`;
+  }
+  const parts = normalized.split(':').filter(Boolean);
+  return parts.length > 0 ? `${parts.slice(0, 4).join(':')}::/64` : 'IPv6アドレス';
+}
+
+function normalizeUserAgent(userAgent) {
+  return String(userAgent || '不明な端末').replace(/[\r\n\t]+/g, ' ').slice(0, 512);
+}
+
+function getRequestLoginMetadata(req) {
+  const ip = req.ip || req.socket?.remoteAddress || '';
+  return {
+    ipHash: hashIp(ip),
+    ipMasked: maskIp(ip),
+    userAgent: normalizeUserAgent(req.get?.('user-agent') || req.headers?.['user-agent']),
+  };
+}
+
+function generateApprovalPollToken() {
+  return crypto.randomBytes(32).toString('base64url');
+}
+
+function hashApprovalPollToken(token) {
+  return crypto.createHash('sha256').update(String(token || '')).digest('hex');
+}
+
+function isUnknownLoginProtectionEnabled(user) {
+  return user?.settings?.reject_unknown_login === true;
+}
+
+module.exports = {
+  getRequestLoginMetadata,
+  hashIp,
+  maskIp,
+  generateApprovalPollToken,
+  hashApprovalPollToken,
+  isUnknownLoginProtectionEnabled,
+};

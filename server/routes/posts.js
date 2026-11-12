@@ -1,0 +1,1700 @@
+const { resolvePostSearchQuery } = require('../utils/postSearchQuery');
+const express = require('express');
+const PostService = require('../services/PostService');
+const { assertAuthenticatedUserAccess } = require('../services/auth/PostAsUserService');
+const { applyUserReactionsToPayload } = require('../utils/UserReactionCache');
+const { extractPostKeywords } = require('../services/PostKeywordService');
+const { extractViewContent } = require('../utils/viewContent');
+const { requireAuth, optionalAuth } = require('../middleware/auth');
+const config = require('../config');
+const { isWithinRange, describeIntegerRange } = require('../utils/settingFormats');
+const {
+	serializePost,
+	serializeReply,
+	serializePostsBatch,
+	serializePostsByIds,
+} = require('../utils/serialize');
+const {
+	isOwnedAttachmentKey,
+	normalizeContentType,
+} = require('../adapters/storage/safeStoragePath');
+const { getPublicUrl, getFrontendUrl } = require('../utils/nyaitterAddress');
+const {
+	canViewPost,
+	createPostVisibilityContext,
+	filterViewablePosts,
+	filterDiscoverablePosts,
+	normalizeNgWords,
+} = require('../utils/postVisibility');
+const {
+	getDiscoverablePostPage,
+} = require('../services/PostDiscoveryQueryService');
+const {
+	createNotificationIfAllowed,
+} = require('../services/NotificationDeliveryService');
+const {
+	processCreatePostAction,
+	processDeletePostAction,
+	processEditPostAction,
+} = require('../services/PostActionProcessor');
+const timelineCacheManager = require('../utils/TimelineCacheManager');
+const { distributeTimeline } = require('../services/CommunityNoteService');
+const path = require('path');
+const fs = require('fs');
+const { isCrawler, generatePostOgpTags, generatePostHtml } = require('../services/OgpService');
+const { decodePostCursor } = require('../utils/postCursor');
+const RefreshAheadCache = require('../utils/RefreshAheadCache');
+
+const api = require("../utils/ApiRegistry");
+const router = api.createRouter({
+	tag: "posts",
+	basePath: "/posts",
+	description: "投稿・タイムライン・リアクション API",
+});
+const { createRateLimiter } = require('../middleware/rateLimit');
+const postWriteLimiter = createRateLimiter(config.rateLimit.postWrite);
+const searchLimiter = createRateLimiter(config.rateLimit.profileUpdate ?? config.rateLimit.postWrite);
+// トレンド系の集計も重いため、fresh 30s の間はそのまま返し、
+// fresh 超過〜stale 5min は古い値を即返して裏で1回だけ再計算する。
+// db インスタンス単位で保持し、maxEntries でメモリ増加を抑える。
+const TRENDING_FRESH_MS = 30 * 1000;
+const TRENDING_STALE_MS = 5 * 60 * 1000;
+const TRENDING_HASHTAGS_MAX_ENTRIES = 200;
+const TRENDING_POSTS_MAX_ENTRIES = 100;
+
+const trendingHashtagsCaches = new WeakMap();
+
+function getCachedTrendingHashtags(db, limit, type) {
+	let cache = trendingHashtagsCaches.get(db);
+	if (!cache) {
+		cache = new RefreshAheadCache({
+			freshMs: TRENDING_FRESH_MS,
+			staleMs: TRENDING_STALE_MS,
+			maxEntries: TRENDING_HASHTAGS_MAX_ENTRIES,
+		});
+		trendingHashtagsCaches.set(db, cache);
+	}
+	return cache.get(`trending-hashtags:${limit}:${type}`, () => db.getTrendingHashtags(limit, { type, detailed: true }));
+}
+
+const trendingPostsCaches = new WeakMap();
+
+function getCachedTrendingPosts(db, limit) {
+	let cache = trendingPostsCaches.get(db);
+	if (!cache) {
+		cache = new RefreshAheadCache({
+			freshMs: TRENDING_FRESH_MS,
+			staleMs: TRENDING_STALE_MS,
+			maxEntries: TRENDING_POSTS_MAX_ENTRIES,
+		});
+		trendingPostsCaches.set(db, cache);
+	}
+	return cache.get(`trending-posts:${limit}`, () => db.getTrendingPosts(limit));
+}
+
+function getDbAdapter(req) {
+	return req.app.locals.dbAdapter;
+}
+
+function getStorageAdapter(req) {
+	return req.app.locals.storageAdapter;
+}
+
+function enqueueGeminiModeration(req, post) {
+	const service = req.app.locals.autoModerationService;
+	if (!service?.enabled || !post) return;
+	try {
+		service.enqueue(post);
+	} catch (error) {
+		// 投稿・編集は永続化済みのため、キュー投入失敗でAPIを失敗させない。
+		console.warn('[posts] Gemini moderation enqueue failed:', error.message);
+	}
+}
+
+function contentLengthError(range) {
+	return `content must be ${describeIntegerRange(range)} characters`;
+}
+
+function safeParsePostId(idStr) {
+	const n = parseInt(idStr, 10);
+	return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+function resolvePaginationCursor(query = {}) {
+	const rawCursor = typeof query.cursor === 'string' && query.cursor.trim() ? query.cursor.trim() : null;
+	const rawBeforeId = typeof query.before_id === 'string' && query.before_id.trim() ? query.before_id.trim() : (query.before_id != null ? String(query.before_id).trim() : null);
+
+	let cursor = null;
+	let beforeId = null;
+
+	for (const candidate of [rawCursor, rawBeforeId]) {
+		if (!candidate) continue;
+		if (/^\d+$/.test(candidate) && Number.isSafeInteger(Number(candidate)) && Number(candidate) > 0) {
+			if (beforeId == null) beforeId = Number(candidate);
+		} else {
+			const decoded = decodePostCursor(candidate);
+			if (decoded) {
+				if (cursor == null) cursor = candidate;
+			} else if (Number.isSafeInteger(Number(candidate)) && Number(candidate) > 0) {
+				if (beforeId == null) beforeId = Number(candidate);
+			}
+		}
+	}
+
+	return { cursor, beforeId };
+}
+
+function getViewerNgWords(req) {
+	const ngWordsSetting = req.user?.visibilityUser?.settings?.ng_words ?? req.user?.settings?.ng_words;
+	if (!ngWordsSetting) return null;
+	const words = normalizeNgWords(ngWordsSetting);
+	return words.size > 0 ? words : null;
+}
+
+// 軽量なメトリクスAPIは投稿本体を返さないため、可視性検証だけを行う。
+async function getViewablePostIds(db, postIds, viewerId = null, knownViewer = null) {
+	const uniqueIds = [...new Set((postIds || []).map(Number).filter(Number.isInteger))];
+	if (uniqueIds.length === 0) return [];
+	const posts = await db.getPostsByIds(uniqueIds);
+	const visibilityContext = await createPostVisibilityContext(
+		db,
+		posts,
+		viewerId,
+		null,
+		knownViewer,
+	);
+	const viewable = await filterViewablePosts(db, posts, viewerId, visibilityContext);
+	const visibleIds = new Set(viewable.map((post) => Number(post.id)));
+	return uniqueIds.filter((id) => visibleIds.has(id));
+}
+
+async function getDiscoverableModePage(
+	db,
+	{
+		mode,
+		tab = 'foryou',
+		query = '',
+		viewerId = null,
+		knownViewer = null,
+		limit,
+		offset,
+		beforeId = null,
+		cursor = null,
+		ngWords = null,
+		order = 'latest',
+	},
+) {
+	const searchFilters = mode === 'search' ? await resolvePostSearchQuery(db, query) : null;
+	return getDiscoverablePostPage({
+		db,
+		viewerId,
+		knownViewer,
+		limit,
+		offset,
+		beforeId,
+		cursor,
+		ngWords,
+		includeJoinedGroups: mode === 'timeline' && tab === 'all',
+		order,
+		fetchCandidatePage: async ({ limit: candidateLimit, offset: candidateOffset, beforeId: candidateBeforeId, cursor: candidateCursor, cursorCreatedAt, cursorId }) => {
+			if (mode === 'timeline') {
+				return db.getTimelinePostIds({
+					tab,
+					order,
+					viewerId,
+					limit: candidateLimit,
+					offset: candidateOffset,
+					beforeId: candidateBeforeId,
+					cursor: candidateCursor,
+					cursorCreatedAt,
+					cursorId,
+				});
+			}
+			if (mode === 'recommended') {
+				return db.getRecommendedPostIds({
+					viewerId,
+					limit: candidateLimit,
+					offset: candidateOffset,
+					beforeId: candidateBeforeId,
+					cursor: candidateCursor,
+					cursorCreatedAt,
+					cursorId,
+				});
+			}
+			if (mode === 'search') {
+				return db.searchPostIds(query, candidateLimit, candidateOffset, candidateBeforeId, viewerId, { cursor: candidateCursor, cursorCreatedAt, cursorId, searchFilters });
+			}
+			throw new Error(`Unsupported discoverable mode: ${mode}`);
+		},
+	});
+}
+
+async function getThreadReplyPostIds(db, postId, limit, offset) {
+	if (typeof db.getThreadReplyPostIds === 'function') {
+		try {
+			return await db.getThreadReplyPostIds(postId, limit, offset);
+		} catch (error) {
+			// ネスト返信の取得に失敗したら、直下返信の取得へ後退する。
+			console.warn('[posts] nested reply query fallback:', error.message);
+		}
+	}
+	return db.getReplyPostIds(postId, limit, offset);
+}
+
+function collectPostContext(posts) {
+	const authors = new Map();
+	const mentionedIds = new Set();
+	const visited = new Set();
+	const visit = (post) => {
+		if (!post || visited.has(post.id)) return;
+		visited.add(post.id);
+		const authorObj = post.author || post.user;
+		if (authorObj?.id != null) authors.set(Number(authorObj.id), authorObj);
+		for (const match of String(post.content || '').matchAll(/@(\d+)/g)) {
+			mentionedIds.add(Number(match[1]));
+		}
+		visit(post.reply_to_post);
+		visit(post.reposted_post);
+	};
+	for (const post of posts || []) visit(post);
+	return {
+		authors,
+		mentionedIds: [...mentionedIds].filter((id) => Number.isInteger(id) && id > 0),
+	};
+}
+
+function decodeBase64File(value) {
+	if (typeof value !== 'string' || value.length === 0 || value.length % 4 !== 0) {
+		throw new Error('Invalid base64 file data');
+	}
+	if (!/^[A-Za-z0-9+/]+={0,2}$/.test(value)) {
+		throw new Error('Invalid base64 file data');
+	}
+	return Buffer.from(value, 'base64');
+}
+
+function validateAttachmentReferences(attachments, userId) {
+	if (!Array.isArray(attachments)) {
+		throw new Error('attachments must be an array');
+	}
+
+	for (const attachment of attachments) {
+		if (!attachment || typeof attachment !== 'object') {
+			throw new Error('Invalid attachment');
+		}
+		if (attachment.type === 'poll') {
+			const options = Array.isArray(attachment.options) ? attachment.options : [];
+			if (options.length < 2) {
+				throw new Error('投票には最低2つの選択肢が必要です');
+			}
+			continue;
+		}
+		if (attachment.data !== undefined) {
+			// MIMEタイプはクライアント申告値を保存するだけで、形式による拒否は行わない。
+			normalizeContentType(attachment.contentType);
+			decodeBase64File(attachment.data);
+			continue;
+		}
+		if (typeof attachment.id !== 'string' || !isOwnedAttachmentKey(attachment.id, userId)) {
+			throw new Error('Attachment does not belong to the current user');
+		}
+		if (attachment.url !== undefined && !isValidAttachmentUrl(attachment.url)) {
+			throw new Error('Invalid attachment URL');
+		}
+	}
+}
+
+// javascript: やクレデンシャル付きURL・オープンリダイレクト系の値を拒否する。
+function isValidAttachmentUrl(value) {
+	if (typeof value !== 'string' || value.length === 0) return true;
+	if (value.startsWith('/')) return true;
+	try {
+		const url = new URL(value);
+		return url.protocol === 'https:' && !url.username && !url.password;
+	} catch (_) {
+		return false;
+	}
+}
+
+function createPostActionContext(req) {
+	return {
+		db: getDbAdapter(req),
+		storage: getStorageAdapter(req),
+		realtime: req.app.locals.realtime,
+		autoModerationService: req.app.locals.autoModerationService,
+		authRequest: {
+			user: { ...req.user, visibilityUser: null },
+			headers: { cookie: req.headers.cookie || '' },
+		},
+	};
+}
+
+router.post({
+	path: '/',
+	summary: '新規投稿の作成',
+	auth: 'required',
+}, requireAuth, postWriteLimiter, (req, res) => {
+	const {
+		content,
+		attachments = [],
+		mask,
+		lock,
+		announcement,
+		group_id,
+		group_announcement,
+		scheduled_at,
+		reply_to,
+		replyTo,
+		reply_id,
+		repost_to,
+		repostTo,
+		repost_id,
+		reply_control,
+		replyControl,
+		post_as_user_id,
+	} = req.body || {};
+	const normalizedReplyTo = reply_to ?? replyTo ?? reply_id ?? null;
+	const normalizedRepostTo = repost_to ?? repostTo ?? repost_id ?? null;
+	const normalizedReplyControl = reply_control ?? replyControl ?? 'everyone';
+	const hasContent = typeof content === 'string' && content.trim().length > 0;
+	const hasAttachments = Array.isArray(attachments) && attachments.length > 0;
+	const isSimpleRepost = (content === null || content === undefined || content === '') && normalizedRepostTo;
+
+	if (!hasContent && !hasAttachments && !isSimpleRepost) {
+		return res.status(400).json({ error: 'content, attachments, or repost_to is required' });
+	}
+	if (hasContent && !isWithinRange(content.trim().length, config.limits.postContentLength)) {
+		return res.status(400).json({ error: contentLengthError(config.limits.postContentLength) });
+	}
+	if (!Array.isArray(attachments)) {
+		return res.status(400).json({ error: 'attachments must be an array' });
+	}
+
+	const queue = req.app.locals.postActionQueue;
+	if (!queue) {
+		return res.status(503).json({ error: 'Post action queue is unavailable' });
+	}
+
+	try {
+		const context = createPostActionContext(req);
+		const actionId = queue.enqueue('create', () => processCreatePostAction(context, {
+			content,
+			attachments,
+			mask,
+			lock,
+			announcement: announcement === true,
+			groupId: group_id,
+			groupAnnouncement: group_announcement === true,
+			scheduledAt: scheduled_at,
+			replyTo: normalizedReplyTo,
+			repostTo: normalizedRepostTo,
+			replyControl: normalizedReplyControl,
+			postAsUserId: post_as_user_id,
+		}), req.trustPolicy);
+		return res.status(202).json({ success: true, queued: true, action_id: actionId });
+	} catch (error) {
+		return res.status(error.statusCode || 503).json({ error: error.message });
+	}
+});
+
+router.get({
+	path: '/',
+	summary: '最新投稿一覧の取得',
+	auth: 'optional',
+}, optionalAuth, async (req, res) => {
+	const db = getDbAdapter(req);
+	const limit = Math.min(parseInt(req.query.limit, 10) || config.limits.timelinePageSize, 100);
+	const { cursor: rawCursor, beforeId } = resolvePaginationCursor(req.query);
+	const rawSinceId = safeParsePostId(req.query.since_id || req.query.sinceId || req.query.after);
+	const offset = beforeId == null && rawSinceId == null && !rawCursor ? Math.max(parseInt(req.query.offset, 10) || 0, 0) : 0;
+	const tab = req.query.tab || 'foryou';
+	const currentUserId = req.user ? req.user.id : null;
+	const knownViewer = req.user?.visibilityUser || null;
+
+	try {
+		const {
+			posts: discoveredPosts = [],
+			visibilityContext,
+			has_more,
+			next_cursor,
+		} = await getDiscoverableModePage(db, {
+			mode: tab === 'foryou' ? 'recommended' : 'timeline',
+			tab,
+			viewerId: currentUserId,
+			knownViewer,
+			limit,
+			offset,
+			beforeId,
+			cursor: rawCursor,
+			ngWords: getViewerNgWords(req),
+			order: ['latest', 'oldest', 'recommended'].includes(req.query.order) ? req.query.order : 'latest',
+		});
+
+		let enriched = await serializePostsBatch(
+			db,
+			discoveredPosts,
+			currentUserId,
+			getPublicUrl(req),
+			knownViewer,
+			visibilityContext,
+		);
+
+		if (rawSinceId != null) {
+			enriched = enriched.filter((p) => Number(p.id) > rawSinceId);
+		}
+
+		if (!req.user) {
+			res.set('Cache-Control', 'public, max-age=10, stale-while-revalidate=30');
+		}
+		await distributeTimeline(db,enriched.map(p=>Number(p.id)),currentUserId);
+		res.json({
+			posts: enriched,
+			has_more: !!has_more,
+			next_cursor: next_cursor || null,
+		});
+	} catch (err) {
+		console.error('[posts] get error:', err);
+		res.status(500).json({ error: '投稿の取得に失敗しました' });
+	}
+});
+
+router.get({
+	path: '/trending',
+	summary: 'トレンド投稿一覧の取得',
+	auth: 'optional',
+}, optionalAuth, async (req, res) => {
+	const db = getDbAdapter(req);
+	const limit = Math.min(parseInt(req.query.limit, 10) || 20, 50);
+
+		try {
+						const posts = await getCachedTrendingPosts(db, limit);
+				const currentUserId = req.user ? req.user.id : null;
+				const knownViewer = req.user?.visibilityUser || null;
+				const visibilityContext = await createPostVisibilityContext(
+					db,
+					posts,
+					currentUserId,
+					null,
+					knownViewer,
+				);
+				const viewablePosts = await filterViewablePosts(
+					db,
+					posts,
+					currentUserId,
+					visibilityContext,
+				);
+			const discoverablePosts = await filterDiscoverablePosts(
+				db,
+				viewablePosts,
+				currentUserId,
+				visibilityContext,
+				{ ngWords: getViewerNgWords(req) },
+			);
+			const hydrated = await serializePostsBatch(
+				db,
+				discoverablePosts,
+				currentUserId,
+				getPublicUrl(req),
+				knownViewer,
+				visibilityContext,
+			);
+			if (!req.user) {
+				res.set('Cache-Control', 'public, max-age=30, s-maxage=30, stale-while-revalidate=60');
+			}
+			res.json({ posts: hydrated });
+
+	} catch (err) {
+		console.error('[posts] trending error:', err);
+		res.status(500).json({ error: 'トレンド取得に失敗しました' });
+	}
+});
+
+router.get({
+	path: '/search',
+	summary: '投稿キーワード検索',
+	auth: 'optional',
+}, optionalAuth, searchLimiter, async (req, res) => {
+	const db = getDbAdapter(req);
+	const q = req.query.q || '';
+	const limit = Math.min(parseInt(req.query.limit, 10) || 30, 100);
+	const { cursor: rawCursor, beforeId } = resolvePaginationCursor(req.query);
+	const offset = beforeId == null && !rawCursor ? (parseInt(req.query.offset, 10) || 0) : 0;
+
+	if (!q.trim()) {
+		return res.json({ posts: [], has_next: false });
+	}
+
+	try {
+			const currentUserId = req.user ? req.user.id : null;
+			const knownViewer = req.user?.visibilityUser || null;
+			let queuePriority = 0;
+			const queue = req.app.locals.readOnlyRequestQueue;
+			if (queue && currentUserId != null) {
+				if (req.trustPolicy) {
+					queuePriority = req.user?.admin ? 5 : req.trustPolicy.exempt ? 0 : req.trustPolicy.queuePriority;
+				} else if (req.user?.admin) {
+					queuePriority = 5;
+				} else {
+					// Never perform a DB lookup before admission: that would let authenticated
+					// searches bypass the bounded queue while computing their priority. Without
+					// a policy, use the neutral default rather than treating every user as banned.
+					queuePriority = 0;
+				}
+			}
+			const runSearch = async () => {
+				const [page, groupPage] = await Promise.all([
+					getDiscoverableModePage(db, {
+						mode: 'search',
+						query: q,
+						viewerId: currentUserId,
+						knownViewer,
+						limit,
+						offset,
+						beforeId,
+						cursor: rawCursor,
+						ngWords: getViewerNgWords(req),
+					}),
+					currentUserId != null && typeof db.searchGroupPostIds === 'function'
+						? db.searchGroupPostIds(currentUserId, q, { limit, offset, beforeId, cursor: rawCursor, searchFilters: await resolvePostSearchQuery(db, q) })
+						: Promise.resolve({ ids: [], has_more: false, next_cursor: null }),
+				]);
+				const [posts, groupPosts] = await Promise.all([
+					serializePostsBatch(db, page.posts || [], currentUserId, getPublicUrl(req), knownViewer, page.visibilityContext),
+					serializePostsByIds(db, groupPage.ids || [], currentUserId, getPublicUrl(req), knownViewer),
+				]);
+				return { page, groupPage, posts, groupPosts };
+			};
+			let searchResult;
+			if (queue) {
+				const controller = new AbortController();
+				const onAborted = () => controller.abort();
+				const onClosed = () => { if (!res.writableEnded) controller.abort(); };
+				req.once('aborted', onAborted);
+				res.once('close', onClosed);
+				try {
+					searchResult = await queue.run(queuePriority, controller.signal, runSearch);
+				} finally {
+					req.removeListener('aborted', onAborted);
+					res.removeListener('close', onClosed);
+				}
+			} else {
+				searchResult = await runSearch();
+			}
+			const { page, groupPage, posts, groupPosts } = searchResult;
+			const { has_more, next_cursor } = page;
+				const mergedPosts = [...posts, ...groupPosts]
+					.sort((left, right) => new Date(right.created_at || 0).getTime() - new Date(left.created_at || 0).getTime())
+					.slice(0, limit);
+				res.json({ posts: mergedPosts, has_next: has_more || Boolean(groupPage.has_more), next_cursor: next_cursor || groupPage.next_cursor || null });
+		} catch (err) {
+			console.error('[posts] search error:', err);
+			if (err.statusCode === 499 || res.destroyed || res.writableEnded) return;
+			res.status([400, 503, 504].includes(err.statusCode) ? err.statusCode : 500).json({ error: err.statusCode === 400 ? err.message : err.statusCode === 504 ? '検索に時間がかかっています。しばらくしてから再試行してください' : err.statusCode === 503 ? '検索が混み合っています。しばらくしてから再試行してください' : '検索に失敗しました' });
+	}
+});
+
+router.get({
+	path: '/recommended',
+	summary: 'おすすめ投稿一覧の取得',
+	auth: 'optional',
+}, optionalAuth, async (req, res) => {
+	const db = getDbAdapter(req);
+	const limit = Math.min(parseInt(req.query.limit, 10) || 30, 100);
+	const { cursor: rawCursor, beforeId } = resolvePaginationCursor(req.query);
+	const offset = beforeId == null && !rawCursor ? (parseInt(req.query.offset, 10) || 0) : 0;
+
+		try {
+			const currentUserId = req.user ? req.user.id : null;
+			const knownViewer = req.user?.visibilityUser || null;
+			const {
+				posts: discoveredPosts = [],
+				visibilityContext,
+				has_more,
+				next_cursor,
+			} = await getDiscoverableModePage(db, {
+				mode: 'recommended',
+				viewerId: currentUserId,
+				knownViewer,
+				limit,
+				offset,
+				beforeId,
+				cursor: rawCursor,
+				ngWords: getViewerNgWords(req),
+			});
+			const posts = await serializePostsBatch(
+				db,
+				discoveredPosts,
+				currentUserId,
+				getPublicUrl(req),
+				knownViewer,
+				visibilityContext,
+			);
+			await distributeTimeline(db,posts.map(p=>Number(p.id)),currentUserId);
+			res.json({ posts, has_next: has_more, next_cursor });
+	} catch (err) {
+		console.error('[posts] recommended error:', err);
+		res.status(500).json({ error: 'おすすめ投稿の取得に失敗しました' });
+	}
+});
+
+router.get({
+	path: '/page',
+	summary: '投稿一覧のページネーション取得',
+	auth: 'optional',
+}, optionalAuth, async (req, res) => {
+	const db = getDbAdapter(req);
+	const mode = String(req.query.mode || 'timeline');
+	if (mode === 'search') {
+		let passed = false;
+		await searchLimiter(req, res, () => { passed = true; });
+		if (!passed) return;
+	}
+	const tab = String(req.query.tab || 'foryou');
+	const isDiscoverableMode = [
+		'timeline',
+		'recommended',
+		'search',
+	].includes(mode);
+	const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 30, 1), 100);
+	const { cursor: rawCursor, beforeId } = resolvePaginationCursor(req.query);
+	const rawSinceId = safeParsePostId(req.query.since_id || req.query.sinceId || req.query.after);
+	const offset = (beforeId == null && rawSinceId == null && !rawCursor) ? Math.max(parseInt(req.query.offset, 10) || 0, 0) : 0;
+	const currentUserId = req.user ? req.user.id : null;
+	const knownViewer = req.user?.visibilityUser || null;
+	const ngWords = getViewerNgWords(req);
+
+	const ngWordsKey = ngWords ? [...ngWords].sort().join(',') : '';
+	const userIdParam = req.query.user_id || req.query.userId || '';
+	const subTypeParam = req.query.sub_type || req.query.subType || '';
+	const pinIdParam = req.query.pin_id || req.query.pinId || '';
+	const idsParam = req.query.ids || '';
+	const order = ['latest', 'oldest', 'recommended'].includes(req.query.order) ? req.query.order : 'latest';
+	const cacheKey = `${mode}:${tab}:${order}:${req.query.q || ''}:${userIdParam}:${subTypeParam}:${pinIdParam}:${idsParam}:${currentUserId || 0}:${ngWordsKey}:${limit}:${offset}:${beforeId || 0}:${rawSinceId || 0}:${rawCursor || ''}`;
+	// 無効化の判定材料はキーから復元せず添えて渡す。q にコロンが含まれるとキーのフィールド境界がずれるため。
+	const cacheMeta = {
+		mode,
+		tab,
+		order,
+		query: String(req.query.q || ''),
+		profileUserId: userIdParam,
+		subType: subTypeParam,
+		viewerId: currentUserId,
+	};
+	const cachedPayload = timelineCacheManager.getPayload(cacheKey);
+	if (cachedPayload) {
+		if (['timeline','recommended'].includes(mode)) await distributeTimeline(db,cachedPayload.posts.map(p=>Number(p.id)),currentUserId);
+		return res.json(await applyUserReactionsToPayload(db,cachedPayload,currentUserId));
+	}
+	const cachedResult = timelineCacheManager.getIds(cacheKey);
+
+	try {
+		let result;
+		let fromRingBuffer = false;
+		if (cachedResult) {
+			result = cachedResult;
+		} else if (
+			mode === 'timeline' &&
+			(tab === 'all' || tab === 'foryou') &&
+			(tab !== 'all' || currentUserId == null) &&
+			!req.query.q &&
+			!ngWordsKey &&
+			offset === 0
+		) {
+			const ringResult = timelineCacheManager.getPublicRingBufferPage(limit, beforeId);
+			if (ringResult && ringResult.ids.length >= limit) {
+				result = ringResult;
+				fromRingBuffer = true;
+			}
+		}
+
+		if (!result) {
+			if (isDiscoverableMode) {
+				result = await getDiscoverableModePage(db, {
+					mode,
+					tab,
+					query: String(req.query.q || ''),
+					viewerId: currentUserId,
+					knownViewer,
+					limit,
+					offset,
+					beforeId,
+					cursor: rawCursor,
+					ngWords,
+					order,
+				});
+				if (result?.ids) {
+					timelineCacheManager.setIds(cacheKey, result, null, cacheMeta);
+				}
+			} else if (mode === 'profile') {
+				const userId = safeParsePostId(req.query.user_id);
+				if (!userId) return res.status(400).json({ error: 'user_id is required' });
+				const subType = ['all', 'posts_only', 'replies_only'].includes(req.query.sub_type)
+					? req.query.sub_type
+					: 'all';
+				if (db.getProfilePostIds) {
+					result = await db.getProfilePostIds({ userId, subType, order, limit, offset, beforeId, cursor: rawCursor });
+				} else {
+					const posts = await db.getPostsByUserId(userId, offset + limit + 1, currentUserId);
+					const filtered = posts.filter((post) => (
+						(beforeId == null || Number(post.id) < beforeId) &&
+						(subType === 'posts_only' ? post.replyTo == null
+							: subType === 'replies_only' ? post.replyTo != null : true)
+					));
+					result = {
+						ids: filtered.slice(offset, offset + limit).map((post) => post.id),
+						has_more: filtered.length > offset + limit,
+					};
+				}
+				const pinId = safeParsePostId(req.query.pin_id);
+				if (beforeId == null && offset === 0 && pinId && !result.ids.includes(pinId)) result.ids.push(pinId);
+				// 予約中ポストは通常のプロフィール一覧には出さず、専用の「予約済み」タブでのみ表示する。
+				if (Array.isArray(result.ids) && result.ids.length > 0 && typeof db.getPostsByIds === 'function') {
+					const idPosts = await db.getPostsByIds(result.ids);
+					const scheduledIds = new Set((idPosts || [])
+						.filter((post) => post && (post.scheduledAt ?? post.scheduled_at))
+						.map((post) => Number(post.id)));
+					if (scheduledIds.size > 0) {
+						result.ids = result.ids.filter((id) => !scheduledIds.has(Number(id)));
+						if (Array.isArray(result.posts)) {
+							result.posts = result.posts.filter((post) => !scheduledIds.has(Number(post.id)));
+						}
+					}
+				}
+			} else if (mode === 'ids') {
+				const ids = String(req.query.ids || '')
+					.split(',')
+					.map(safeParsePostId)
+					.filter(Boolean)
+					.slice(offset, offset + limit);
+				result = { ids, has_more: false };
+			} else {
+				return res.status(400).json({ error: 'Unsupported post page mode' });
+			}
+		}
+
+		if (rawSinceId != null) {
+			if (Array.isArray(result.posts)) {
+				result.posts = result.posts.filter((post) => Number(post.id) > rawSinceId);
+			}
+			if (Array.isArray(result.ids)) {
+				result.ids = result.ids.filter((id) => Number(id) > rawSinceId);
+			}
+		}
+
+		// リングバッファは著者情報を持たないため、検索除外（shadow）とNGワードの
+		// 発見可能性フィルタはここで明示的に適用する（通常経路は取得時に適用済み）。
+		if (fromRingBuffer && Array.isArray(result.ids) && result.ids.length > 0) {
+			const ringPosts = await db.getPostsByIds(result.ids);
+			const discoverableRingPosts = await filterDiscoverablePosts(
+				db,
+				ringPosts,
+				currentUserId,
+				null,
+				{ ngWords, includeJoinedGroups: tab === 'all' },
+			);
+			const discoverableIds = new Set(discoverableRingPosts.map((post) => Number(post.id)));
+			// 通常はリングバッファ側のカーソルを引き継ぐ。カーソルが無い経路では
+			// フィルタ前の末尾IDで補い、ページ全件が除外されても次へ進めるようにする。
+			const pageEndCursor = result.has_more && result.next_cursor == null && result.ids.length > 0
+				? result.ids[result.ids.length - 1]
+				: result.next_cursor;
+			result = {
+				...result,
+				ids: result.ids.filter((id) => discoverableIds.has(Number(id))),
+				posts: discoverableRingPosts,
+				next_cursor: pageEndCursor,
+			};
+		}
+
+			const nextCursor = result.next_cursor ?? (
+				!result.use_offset_pagination && result.has_more && result.ids?.length > 0
+					? result.ids[result.ids.length - 1]
+					: null
+			);
+			const providedPostMap = Array.isArray(result.posts)
+				? new Map(result.posts.filter(Boolean).map((post) => [Number(post.id), post]))
+				: null;
+			// アダプターが候補と同時に返した投稿本体はID順に並べ直す。
+			// pin_id等で本体が不足する場合は、ID取得へ切り替える。
+			const providedPosts = providedPostMap && Array.isArray(result.ids)
+				&& result.ids.every((id) => providedPostMap.has(Number(id)))
+				? result.ids.map((id) => providedPostMap.get(Number(id)))
+				: null;
+			const discoveredPosts = providedPosts;
+			const discoveredPostIds = discoveredPosts
+				? discoveredPosts.map((post) => Number(post.id))
+				: null;
+			// serializePostsBatch() は可視性判定まで一括で行う。
+			// ここでの事前判定を省くことで、著者・閲覧者・フォロー関係の重複取得を防ぐ。
+			const posts = discoveredPosts
+				? await serializePostsBatch(
+					db,
+					discoveredPosts,
+					currentUserId,
+					getPublicUrl(req),
+					knownViewer,
+					result.visibilityContext || null,
+				)
+				: await serializePostsByIds(
+					db,
+					result.ids || [],
+					currentUserId,
+					getPublicUrl(req),
+					knownViewer,
+				);
+			const requestedPostCount = discoveredPostIds?.length ?? posts.length;
+		const postContext = collectPostContext(posts);
+		if (['timeline','recommended'].includes(mode)) await distributeTimeline(db,posts.map(p=>Number(p.id)),currentUserId);
+		const contextUsers = Array.from(postContext.authors.values());
+		
+		const payload = {
+			posts,
+			has_more: !!result.has_more,
+			next_cursor: nextCursor,
+			context: {
+				users: (contextUsers || []).map((user) => ({
+					id: user.id,
+					name: user.name || '',
+					scid: user.scid || null,
+					icon_data: user.icon_data || null,
+					admin: !!user.admin,
+					verify: !!user.verify,
+					group_badges: user.group_badges || [],
+					display_ranks: user.display_ranks || null,
+				})),
+			},
+			meta: {
+				mode,
+				requested_count: requestedPostCount,
+				post_count: posts.length,
+				includes_metrics: true,
+			},
+		};
+
+		timelineCacheManager.setPayload(cacheKey, payload, null, cacheMeta);
+
+		const isNdjson = req.headers.accept?.includes('application/x-ndjson') || req.query.stream === '1';
+		if (isNdjson) {
+			res.writeHead(200, {
+				'Content-Type': 'application/x-ndjson; charset=utf-8',
+				'Transfer-Encoding': 'chunked',
+				'Cache-Control': 'no-cache',
+			});
+			res.write(JSON.stringify({ type: 'meta', meta: payload.meta, has_more: payload.has_more, next_cursor: payload.next_cursor, context: payload.context }) + '\n');
+			for (const post of posts) {
+				res.write(JSON.stringify({ type: 'post', post }) + '\n');
+			}
+			return res.end();
+		}
+
+		res.json(payload);
+	} catch (err) {
+		console.error('[posts] page error:', err);
+		res.status(err.statusCode === 400 ? 400 : 500).json({ error: err.statusCode === 400 ? err.message : '投稿ページの取得に失敗しました' });
+	}
+});
+
+router.get({
+	path: '/ids',
+	summary: 'タイムラインの投稿ID一覧取得',
+	auth: 'optional',
+}, optionalAuth, async (req, res) => {
+	const db = getDbAdapter(req);
+	const tab = req.query.tab || 'foryou';
+	const limit = Math.min(parseInt(req.query.limit, 10) || 30, 100);
+	const rawCursor = req.query.cursor ? String(req.query.cursor).trim() : null;
+	const offset = rawCursor ? 0 : parseInt(req.query.offset, 10) || 0;
+	const currentUserId = req.user ? req.user.id : null;
+
+		try {
+			const result = await getDiscoverableModePage(db, {
+				mode: 'timeline',
+				tab,
+				viewerId: currentUserId,
+				limit,
+				offset,
+				cursor: rawCursor,
+				ngWords: getViewerNgWords(req),
+			});
+			res.json({ ids: result.ids, has_more: result.has_more, next_cursor: result.next_cursor || null });
+
+	} catch (err) {
+		console.error('[posts] ids error:', err);
+		res.status(500).json({ error: '投稿IDの取得に失敗しました' });
+	}
+});
+
+router.get({
+	path: '/trending-hashtags',
+	summary: 'トレンドハッシュタグ・キーワード取得',
+	auth: 'optional',
+}, optionalAuth, async (req, res) => {
+	const db = getDbAdapter(req);
+	const limit = Math.min(parseInt(req.query.limit, 10) || 10, 50);
+	const type = String(req.query.type || '').trim().toLowerCase();
+
+	try {
+		const result = await getCachedTrendingHashtags(db, limit, type);
+		if (!req.user) {
+			res.set('Cache-Control', 'public, max-age=30, s-maxage=30, stale-while-revalidate=60');
+		}
+		if (Array.isArray(result)) {
+			const hashtags = result.filter((item) => String(item.tag_name || '').startsWith('#'));
+			const words = result.filter((item) => !String(item.tag_name || '').startsWith('#'));
+			res.json({ trends: result, hashtags, tags: words, words });
+		} else {
+			res.json({
+				trends: result.trends || [],
+				hashtags: result.hashtags || [],
+				tags: result.tags || result.words || [],
+				words: result.words || result.tags || [],
+			});
+		}
+	} catch (err) {
+		console.error('[posts] trending-hashtags error:', err);
+		res.status(500).json({ error: 'トレンドの取得に失敗しました' });
+	}
+});
+
+router.post({
+	path: '/hydrate',
+	summary: '投稿IDリストから投稿オブジェクトを一括生成',
+	auth: 'optional',
+}, optionalAuth, async (req, res) => {
+	const db = getDbAdapter(req);
+	const postIds = [...new Set((req.body.post_ids || [])
+		.map((id) => parseInt(id, 10))
+		.filter((id) => Number.isInteger(id) && id > 0))].slice(0, config.limits.postBatchSize);
+
+	try {
+			const currentUserId = req.user ? req.user.id : null;
+			const knownViewer = req.user?.visibilityUser || null;
+			const posts = await serializePostsByIds(
+				db,
+				postIds,
+				currentUserId,
+				getPublicUrl(req),
+				knownViewer,
+			);
+		res.json({ posts });
+	} catch (err) {
+		console.error('[posts] hydrate error:', err);
+		res.status(500).json({ error: '投稿の取得に失敗しました' });
+	}
+});
+
+router.post({
+	path: '/metrics',
+	summary: '投稿IDリストのメトリクス一括取得',
+	auth: 'optional',
+}, optionalAuth, async (req, res) => {
+	const db = getDbAdapter(req);
+	const postIds = [...new Set((req.body.post_ids || [])
+		.map((id) => parseInt(id, 10))
+		.filter((id) => Number.isInteger(id) && id > 0))].slice(0, config.limits.postBatchSize);
+
+	try {
+			const currentUserId = req.user ? req.user.id : null;
+			const knownViewer = req.user?.visibilityUser || null;
+			const viewableIds = await getViewablePostIds(
+				db,
+				postIds,
+				currentUserId,
+				knownViewer,
+			);
+		const metrics = db.getPostMetricsBatch
+			? await db.getPostMetricsBatch(viewableIds, currentUserId)
+			: await Promise.all(viewableIds.map(async (postId) => ({
+				post_id: postId,
+				like_count: db.getLikeCount ? await db.getLikeCount(postId) : 0,
+				star_count: db.getStarCount ? await db.getStarCount(postId) : 0,
+				reply_count: db.getReplyCount ? await db.getReplyCount(postId) : 0,
+				repost_count: db.getRepostCount ? await db.getRepostCount(postId) : 0,
+			})));
+		res.json({ metrics });
+	} catch (err) {
+		console.error('[posts] metrics error:', err);
+		res.status(500).json({ error: '集計の取得に失敗しました' });
+	}
+});
+
+router.get({
+	path: '/:id/thread',
+	summary: '投稿のスレッド階層取得',
+	auth: 'optional',
+}, optionalAuth, async (req, res) => {
+	const db = getDbAdapter(req);
+	const postId = safeParsePostId(req.params.id);
+	if (!postId) return res.status(400).json({ error: 'Invalid post id' });
+
+		try {
+			const currentUserId = req.user ? req.user.id : null;
+			const knownViewer = req.user?.visibilityUser || null;
+			const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 100);
+			const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+			const root = await db.getPostById(postId);
+			const replyPage = await getThreadReplyPostIds(db, postId, limit, offset);
+			const replyPostsById = new Map(
+				(await db.getPostsByIds(replyPage.ids)).filter(Boolean).map((post) => [Number(post.id), post]),
+			);
+			const orderedReplyPosts = replyPage.ids
+				.map((id) => replyPostsById.get(Number(id)))
+				.filter(Boolean);
+
+			if (!root) {
+				// 削除済みの親投稿は返信が存在する場合だけ仮想的に表示する。
+				// 参照先を完全に欠くIDや、閲覧者に見えない返信しかないIDを列挙できないようにする。
+				const replies = await serializePostsBatch(
+					db,
+					orderedReplyPosts,
+					currentUserId,
+					getPublicUrl(req),
+					knownViewer,
+				);
+				if (replies.length === 0) {
+					return res.status(404).json({ error: 'Post not found' });
+				}
+				return res.json({
+					post: {
+						id: postId,
+						unknown: true,
+						user: { id: null, name: 'UnknownPost', scid: 'unknown', nyaitter_id: '@unknown' },
+						author: { id: null, name: 'UnknownPost', scid: 'unknown', nyaitter_id: '@unknown' },
+					},
+					replies,
+					has_more: replyPage.has_more,
+					next_cursor: replyPage.next_cursor || null,
+					offset,
+					limit,
+				});
+			}
+
+		// 先祖の解決
+		const ancestorPosts = [];
+		let currentParentId = root.replyTo ?? root.reply_id ?? root.reply_to;
+		const visitedParentIds = new Set([postId]);
+		while (currentParentId != null) {
+			const numParentId = Number(currentParentId);
+			if (!Number.isInteger(numParentId) || numParentId <= 0 || visitedParentIds.has(numParentId)) {
+				break;
+			}
+			visitedParentIds.add(numParentId);
+			const parentPost = await db.getPostById(numParentId);
+			if (!parentPost) break;
+			ancestorPosts.unshift(parentPost); // ルート親から直前親への昇順
+			currentParentId = parentPost.replyTo ?? parentPost.reply_id ?? parentPost.reply_to;
+		}
+
+		const postsToSerialize = [...ancestorPosts, root, ...orderedReplyPosts];
+		const serializedPosts = await serializePostsBatch(
+			db,
+			postsToSerialize,
+			currentUserId,
+			getPublicUrl(req),
+			knownViewer,
+		);
+		const serializedAncestors = serializedPosts.slice(0, ancestorPosts.length);
+		const mainPost = serializedPosts[ancestorPosts.length] || null;
+		const serializedReplies = serializedPosts.slice(ancestorPosts.length + 1);
+
+		if (!mainPost) {
+			return res.status(404).json({ error: 'Post not found' });
+		}
+
+		res.json({
+			post: mainPost,
+			ancestors: serializedAncestors,
+			replies: serializedReplies,
+			has_more: replyPage.has_more,
+			next_cursor: replyPage.next_cursor || null,
+			offset,
+			limit,
+		});
+	} catch (err) {
+		console.error('[posts] thread error:', err);
+		res.status(500).json({ error: '投稿スレッドの取得に失敗しました' });
+	}
+});
+
+router.get({
+	path: '/:id',
+	summary: '個別投稿の取得',
+	auth: 'optional',
+}, optionalAuth, async (req, res) => {
+	const db = getDbAdapter(req);
+	const postId = safeParsePostId(req.params.id);
+	const currentUserId = req.user ? req.user.id : null;
+	const knownViewer = req.user?.visibilityUser || null;
+
+	if (!postId) {
+		return res.status(400).json({ error: 'Invalid post id' });
+	}
+
+	try {
+		const post = await db.getPostById(postId);
+		if (!post) {
+			return res.status(404).json({ error: 'Post not found' });
+		}
+		const userAgent = req.headers['user-agent'] || '';
+		const apiPrefix = config.server.apiEndpoint || '/server';
+		const isApiRequest =
+			(apiPrefix !== '/' && req.originalUrl.startsWith(apiPrefix)) ||
+			req.originalUrl.startsWith('/api/') ||
+			req.originalUrl.startsWith('/server/') ||
+			Boolean(req.headers.authorization) ||
+			Boolean(req.headers['x-api-key']) ||
+			(req.headers.accept && req.headers.accept.includes('application/json'));
+
+		if (!isApiRequest) {
+			if (isCrawler(userAgent)) {
+				// Serve OGP HTML for crawlers / embed bots
+				// クローラー向けでも公開範囲は通常表示と同じにし、見られない投稿は秘匿する。
+				if (!(await canViewPost(db, post, currentUserId, null, null, req.user?.visibilityUser || null))) {
+					return res.status(404).json({ error: 'Post not found' });
+				}
+				const author = await db.getUserById(post.userId ?? post.user_id);
+				const publicUrl = getPublicUrl(req);
+				const frontendUrl = getFrontendUrl(req);
+				const html = generatePostHtml({ post, author, publicUrl, frontendUrl });
+				res.setHeader('Content-Type', 'text/html; charset=utf-8');
+				return res.send(html);
+			} else if (req.accepts(['html', 'json']) === 'html') {
+				// Human visitor in web browser: HTTP 302 redirect directly to SPA post hash
+				return res.redirect(302, `${getFrontendUrl(req)}/#post/${post.id}`);
+			}
+		}
+
+		const serializedPost = await serializePost(
+			db,
+			post,
+			currentUserId,
+			0,
+			getPublicUrl(req),
+			knownViewer,
+		);
+		if (!serializedPost) {
+			return res.status(404).json({ error: 'Post not found' });
+		}
+		res.json({ post: serializedPost });
+
+	} catch (err) {
+		console.error('[posts] detail error:', err);
+		res.status(500).json({ error: '投稿の取得に失敗しました' });
+	}
+});
+
+router.get({
+	path: '/:id/replies',
+	summary: '個別投稿のリプライ一覧取得',
+	auth: 'optional',
+}, optionalAuth, async (req, res) => {
+	const db = getDbAdapter(req);
+	const postId = safeParsePostId(req.params.id);
+	const currentUserId = req.user ? req.user.id : null;
+	const knownViewer = req.user?.visibilityUser || null;
+
+	if (!postId) {
+		return res.status(400).json({ error: 'Invalid post id' });
+	}
+
+	try {
+		const root = await db.getPostById(postId);
+		if (!root) {
+			return res.status(404).json({ error: 'Post not found' });
+		}
+		const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 100);
+		const rawCursor = typeof req.query.cursor === 'string' ? req.query.cursor.trim() : null;
+		const offset = !rawCursor ? Math.max(parseInt(req.query.offset, 10) || 0, 0) : 0;
+		const page = await db.getReplyPostIds(postId, limit, offset, { cursor: rawCursor });
+		const replyPostsById = new Map(
+			(await db.getPostsByIds(page.ids)).filter(Boolean).map((post) => [Number(post.id), post]),
+		);
+		const orderedReplyPosts = page.ids
+			.map((id) => replyPostsById.get(Number(id)))
+			.filter(Boolean);
+		const serializedPosts = await serializePostsBatch(
+			db,
+			[root, ...orderedReplyPosts],
+			currentUserId,
+			getPublicUrl(req),
+			knownViewer,
+		);
+		if (!serializedPosts[0]) {
+			return res.status(404).json({ error: 'Post not found' });
+		}
+		res.json({
+			replies: serializedPosts.slice(1),
+			has_more: page.has_more,
+			next_cursor: page.next_cursor || null,
+			offset,
+			limit,
+		});
+	} catch (err) {
+		console.error('[posts] replies error:', err);
+		res.status(500).json({ error: 'リプライの取得に失敗しました' });
+	}
+});
+
+router.post({
+	path: '/:id/like',
+	summary: '投稿へのいいね',
+	auth: 'required',
+}, requireAuth, postWriteLimiter, async (req, res) => {
+	const db = getDbAdapter(req);
+	const storage = getStorageAdapter(req);
+	const postService = new PostService({ dbAdapter: db, storageAdapter: storage });
+
+	const postId = safeParsePostId(req.params.id);
+	const userId = req.user.id;
+
+	if (!postId) {
+		return res.status(400).json({ error: 'Invalid post id' });
+	}
+
+	try {
+		const post = await db.getPostById(postId);
+		if (!post || !(await canViewPost(db, post, userId, null, null, req.user?.visibilityUser || null))) {
+			return res.status(404).json({ error: 'Post not found' });
+		}
+		const queue = req.app.locals.postActionQueue;
+		if (queue && typeof db.hasUserLikedPost === 'function') {
+			const currentlyLiked = await db.hasUserLikedPost(userId, postId);
+			const actionId = queue.enqueue('like', async () => {
+				await assertAuthenticatedUserAccess(req, db, ['write', 'posts']);
+				const result = await postService.toggleLike(userId, postId);
+				if (result.liked && post.userId !== userId) {
+					await createNotificationIfAllowed(db, {
+						userId: post.userId,
+						type: 'like',
+						fromUserId: userId,
+						target: { kind: 'post', id: postId },
+					});
+				}
+			}, req.trustPolicy);
+			const count = typeof db.getLikeCount === 'function' ? await db.getLikeCount(postId) : 0;
+			return res.status(202).json({ success: true, queued: true, action_id: actionId, liked: !currentlyLiked, count: Math.max(0, count + (currentlyLiked ? -1 : 1)), updated_likes: null });
+		}
+		const result = await postService.toggleLike(userId, postId);
+		timelineCacheManager.updatePostMetrics(postId, {
+			like_count: result.count,
+			likeCount: result.count,
+		});
+
+		if (result.liked) {
+			if (post.userId !== userId) {
+				void (async () => {
+					try {
+						await createNotificationIfAllowed(db, {
+							userId: post.userId,
+							type: 'like',
+							fromUserId: userId,
+							target: { kind: 'post', id: postId },
+						});
+					} catch (notifErr) {
+						console.warn('[posts] like notification background error:', notifErr.message);
+					}
+				})();
+			}
+		}
+
+		res.json({
+			success: true,
+			liked: result.liked,
+			count: result.count,
+			updated_likes: null,
+		});
+	} catch (err) {
+		console.error('[posts] like error:', err);
+		res.status(500).json({ error: 'いいね処理に失敗しました' });
+	}
+});
+
+router.post({
+	path: '/:id/star',
+	summary: '投稿へのスター',
+	auth: 'required',
+}, requireAuth, postWriteLimiter, async (req, res) => {
+	const db = getDbAdapter(req);
+	const storage = getStorageAdapter(req);
+	const postService = new PostService({ dbAdapter: db, storageAdapter: storage });
+
+	const postId = safeParsePostId(req.params.id);
+	const userId = req.user.id;
+
+	if (!postId) {
+		return res.status(400).json({ error: 'Invalid post id' });
+	}
+
+	try {
+		const post = await db.getPostById(postId);
+		if (!post || !(await canViewPost(db, post, userId, null, null, req.user?.visibilityUser || null))) {
+			return res.status(404).json({ error: 'Post not found' });
+		}
+		const queue = req.app.locals.postActionQueue;
+		if (queue && typeof db.hasUserStarredPost === 'function') {
+			const currentlyStarred = await db.hasUserStarredPost(userId, postId);
+			const actionId = queue.enqueue('star', async () => {
+				await assertAuthenticatedUserAccess(req, db, ['write', 'posts']);
+				return postService.toggleStar(userId, postId);
+			}, req.trustPolicy);
+			const count = typeof db.getStarCount === 'function' ? await db.getStarCount(postId) : 0;
+			return res.status(202).json({ success: true, queued: true, action_id: actionId, starred: !currentlyStarred, count: Math.max(0, count + (currentlyStarred ? -1 : 1)), updated_stars: null });
+		}
+		const result = await postService.toggleStar(userId, postId);
+		timelineCacheManager.updatePostMetrics(postId, {
+			star_count: result.count,
+			starCount: result.count,
+		});
+
+		res.json({
+			success: true,
+			starred: result.starred,
+			count: result.count,
+			updated_stars: null,
+		});
+	} catch (err) {
+		console.error('[posts] star error:', err);
+		res.status(500).json({ error: 'スター処理に失敗しました' });
+	}
+});
+
+router.delete({
+	path: '/:id',
+	summary: '個別投稿の削除',
+	auth: 'required',
+}, requireAuth, postWriteLimiter, (req, res) => {
+	const postId = safeParsePostId(req.params.id);
+	if (!postId) {
+		return res.status(400).json({ error: 'Invalid post id' });
+	}
+
+	const queue = req.app.locals.postActionQueue;
+	if (!queue) {
+		return res.status(503).json({ error: 'Post action queue is unavailable' });
+	}
+	try {
+		const context = createPostActionContext(req);
+		const userId = Number(req.user.id);
+		const actionId = queue.enqueue('delete', () => processDeletePostAction(
+			context,
+			{ postId, userId },
+		), req.trustPolicy);
+		return res.status(202).json({ success: true, queued: true, action_id: actionId });
+	} catch (error) {
+		return res.status(error.statusCode || 503).json({ error: error.message });
+	}
+});
+
+router.delete({
+	path: '/admin/:id',
+	summary: '管理者による投稿削除',
+	auth: 'admin',
+}, requireAuth, postWriteLimiter, (req, res) => {
+	const postId = safeParsePostId(req.params.id);
+
+	if (!req.user.admin) {
+		return res.status(403).json({ error: 'Admin access required' });
+	}
+	if (!postId) {
+		return res.status(400).json({ error: 'Invalid post id' });
+	}
+
+	const queue = req.app.locals.postActionQueue;
+	if (!queue) {
+		return res.status(503).json({ error: 'Post action queue is unavailable' });
+	}
+	try {
+		const context = createPostActionContext(req);
+		const userId = Number(req.user.id);
+		const actionId = queue.enqueue('admin-delete', () => processDeletePostAction(
+			context,
+			{ postId, userId, admin: true },
+		), req.trustPolicy);
+
+		return res.status(202).json({ success: true, queued: true, action_id: actionId });
+	} catch (error) {
+		return res.status(error.statusCode || 503).json({ error: error.message });
+	}
+});
+
+router.get({
+	path: '/:id/activity',
+	summary: '投稿のアクティビティ情報取得',
+	auth: 'optional',
+}, optionalAuth, async (req, res) => {
+	const db = getDbAdapter(req);
+	const postId = safeParsePostId(req.params.id);
+
+	if (!postId) {
+		return res.status(400).json({ error: 'Invalid post id' });
+	}
+
+	try {
+		const post = await db.getPostById(postId);
+		const currentUserId = req.user ? Number(req.user.id) : null;
+		if (!post || !(await canViewPost(db, post, currentUserId, null, null, req.user?.visibilityUser || null))) {
+			return res.status(404).json({ error: 'Post not found' });
+		}
+
+		const isAuthor = Boolean(currentUserId && (Number(post.userId) === currentUserId || req.user?.admin));
+
+		// リポスト数・引用ポスト数
+		const reposts = await db.getRepostsOfPost(postId, 100);
+		const quotePosts = await db.getQuotesOfPost(postId, 100);
+
+		// いいね数
+		let likesCount = undefined;
+		if (isAuthor) {
+			const likes = await db.getLikesOfPost(postId, 100);
+			likesCount = Array.isArray(likes) ? likes.length : 0;
+		}
+
+		res.json({
+			success: true,
+			is_author: isAuthor,
+			counts: {
+				reposts: Array.isArray(reposts) ? reposts.length : 0,
+				quotes: Array.isArray(quotePosts) ? quotePosts.length : 0,
+				likes: likesCount,
+			},
+		});
+	} catch (err) {
+		console.error('[posts] activity error:', err);
+		res.status(500).json({ error: 'ポストアクティビティの取得に失敗しました' });
+	}
+});
+
+router.get({
+	path: '/:id/quotes',
+	summary: '投稿の引用ポスト一覧取得',
+	auth: 'optional',
+}, optionalAuth, async (req, res) => {
+	const db = getDbAdapter(req);
+	const postId = safeParsePostId(req.params.id);
+	const limit = Math.min(parseInt(req.query.limit, 10) || 50, 100);
+
+	if (!postId) {
+		return res.status(400).json({ error: 'Invalid post id' });
+	}
+
+	try {
+		const post = await db.getPostById(postId);
+		const currentUserId = req.user ? Number(req.user.id) : null;
+		if (!post || !(await canViewPost(db, post, currentUserId, null, null, req.user?.visibilityUser || null))) {
+			return res.status(404).json({ error: 'Post not found' });
+		}
+		const quotePosts = await db.getQuotesOfPost(postId, limit);
+		const serializedQuotes = await serializePostsBatch(db, quotePosts, currentUserId, getPublicUrl(req));
+		res.json({ quotes: serializedQuotes });
+	} catch (err) {
+		console.error('[posts] quotes list error:', err);
+		res.status(500).json({ error: '引用ポスト一覧の取得に失敗しました' });
+	}
+});
+
+router.get({
+	path: '/:id/reposts',
+	summary: '投稿のリポスト一覧取得',
+	auth: 'optional',
+}, optionalAuth, async (req, res) => {
+	const db = getDbAdapter(req);
+	const postId = safeParsePostId(req.params.id);
+	const limit = Math.min(parseInt(req.query.limit, 10) || 50, 100);
+
+	if (!postId) {
+		return res.status(400).json({ error: 'Invalid post id' });
+	}
+
+	try {
+		const post = await db.getPostById(postId);
+		const currentUserId = req.user ? Number(req.user.id) : null;
+		if (!post || !(await canViewPost(db, post, currentUserId, null, null, req.user?.visibilityUser || null))) {
+			return res.status(404).json({ error: 'Post not found' });
+		}
+		const reposts = await db.getRepostsOfPost(postId, limit);
+		res.json({ reposts });
+	} catch (err) {
+		console.error('[posts] reposts list error:', err);
+		res.status(500).json({ error: 'リポスト一覧の取得に失敗しました' });
+	}
+});
+
+router.get({
+	path: '/:id/likes',
+	summary: '投稿にいいねしたユーザー一覧取得',
+	auth: 'optional',
+}, optionalAuth, async (req, res) => {
+	const db = getDbAdapter(req);
+	const postId = safeParsePostId(req.params.id);
+	const limit = Math.min(parseInt(req.query.limit, 10) || 50, 100);
+
+	if (!postId) {
+		return res.status(400).json({ error: 'Invalid post id' });
+	}
+
+	try {
+		const post = await db.getPostById(postId);
+		const currentUserId = req.user ? Number(req.user.id) : null;
+		if (!post || !(await canViewPost(db, post, currentUserId, null, null, req.user?.visibilityUser || null))) {
+			return res.status(404).json({ error: 'Post not found' });
+		}
+		const isAuthor = Boolean(currentUserId && (Number(post.userId) === currentUserId || req.user?.admin));
+		if (!isAuthor) {
+			return res.status(403).json({ error: 'いいね一覧の閲覧権限がありません' });
+		}
+		const likes = await db.getLikesOfPost(postId, limit);
+		res.json({ likes });
+	} catch (err) {
+		console.error('[posts] likes list error:', err);
+		res.status(500).json({ error: 'いいね一覧の取得に失敗しました' });
+	}
+});
+
+router.post({
+	path: '/:id/repost',
+	summary: '投稿のリポスト実行',
+	auth: 'required',
+}, requireAuth, postWriteLimiter, async (req, res) => {
+	const db = getDbAdapter(req);
+	const postId = safeParsePostId(req.params.id);
+	const userId = req.user.id;
+
+	if (!postId) {
+		return res.status(400).json({ error: 'Invalid post id' });
+	}
+
+	try {
+		const original = await db.getPostById(postId);
+		if (!original || !(await canViewPost(db, original, userId, null, null, req.user?.visibilityUser || null))) {
+			return res.status(404).json({ error: 'Post not found' });
+		}
+		const repost = await db.repostPost(userId, postId);
+		timelineCacheManager.onPostCreated(repost);
+		const newRepostCount = (Number(original.repost_count ?? original.repostCount) || 0) + 1;
+		timelineCacheManager.updatePostMetrics(postId, {
+			repost_count: newRepostCount,
+			repostCount: newRepostCount,
+		});
+		res.status(201).json({
+			success: true,
+			post: await serializePost(db, repost, userId, 0, getPublicUrl(req)),
+		});
+	} catch (err) {
+		console.error('[posts] repost error:', err);
+		res.status(400).json({ error: err.message || 'リポストに失敗しました' });
+	}
+});
+
+router.post({
+	path: '/:id/pin',
+	summary: 'プロフィールの固定投稿ピン留め',
+	auth: 'required',
+}, requireAuth, postWriteLimiter, async (req, res) => {
+	const db = getDbAdapter(req);
+	const postId = safeParsePostId(req.params.id);
+	const userId = req.user.id;
+
+	if (!postId) {
+		return res.status(400).json({ error: 'Invalid post id' });
+	}
+
+	try {
+		const result = await db.togglePin(userId, postId);
+		const pinId = result.pinned ? postId : null;
+		res.json({ success: true, pinned: result.pinned, pin_id: pinId });
+	} catch (err) {
+		console.error('[posts] pin error:', err);
+		res.status(400).json({ error: err.message || 'ピン留め処理に失敗しました' });
+	}
+});
+
+router.post({
+	path: '/:id/dislike',
+	summary: '投稿への低評価',
+	auth: 'required',
+}, requireAuth, postWriteLimiter, async (req, res) => {
+	const db = getDbAdapter(req);
+	const postId = safeParsePostId(req.params.id);
+	const userId = req.user.id;
+
+	if (!postId) {
+		return res.status(400).json({ error: 'Invalid post id' });
+	}
+
+	try {
+		if (typeof db.dislikePost === 'function') {
+			const queue = req.app.locals.postActionQueue;
+			if (queue) {
+				const actionId = queue.enqueue('dislike', async () => {
+					await assertAuthenticatedUserAccess(req, db, ['write', 'posts']);
+					return db.dislikePost(userId, postId);
+				}, req.trustPolicy);
+				return res.status(202).json({ success: true, queued: true, action_id: actionId });
+			}
+			await db.dislikePost(userId, postId);
+		}
+		res.json({ success: true, message: '関連性が低いと評価しました' });
+	} catch (err) {
+		console.error('[posts] dislike error:', err);
+		res.status(500).json({ error: '処理に失敗しました' });
+	}
+});
+
+router.put({
+	path: '/:id',
+	summary: '個別投稿の編集・更新',
+	auth: 'required',
+}, requireAuth, postWriteLimiter, (req, res) => {
+	const postId = safeParsePostId(req.params.id);
+	const userId = req.user.id;
+
+	if (!postId) {
+		return res.status(400).json({ error: 'Invalid post id' });
+	}
+
+	const { content, attachments, mask, lock, reply_control, replyControl } = req.body || {};
+
+	if (typeof content !== 'string' || content.trim().length === 0) {
+		return res.status(400).json({ error: 'content is required' });
+	}
+	if (!isWithinRange(content.trim().length, config.limits.postContentLength)) {
+		return res.status(400).json({ error: contentLengthError(config.limits.postContentLength) });
+	}
+	if (attachments !== undefined) {
+		try {
+			validateAttachmentReferences(attachments, userId);
+		} catch (error) {
+			return res.status(400).json({ error: error.message || 'Invalid attachments' });
+		}
+	}
+
+	const rawReplyControl = reply_control ?? replyControl;
+	const normalizedReplyControl = rawReplyControl !== undefined
+		? (['everyone', 'following', 'mentioned', 'following_or_mentioned', 'mentioned_only'].includes(rawReplyControl)
+			? (rawReplyControl === 'following_or_mentioned' ? 'following' : (rawReplyControl === 'mentioned_only' ? 'mentioned' : rawReplyControl))
+			: 'everyone')
+		: undefined;
+
+	const queue = req.app.locals.postActionQueue;
+	if (!queue) {
+		return res.status(503).json({ error: 'Post action queue is unavailable' });
+	}
+
+	try {
+		const context = createPostActionContext(req);
+		const actionId = queue.enqueue('edit', () => processEditPostAction(context, {
+			postId,
+			userId,
+			content,
+			attachments,
+			mask,
+			lock,
+			replyControl: normalizedReplyControl,
+		}), req.trustPolicy);
+		return res.status(202).json({ success: true, queued: true, action_id: actionId });
+	} catch (error) {
+		return res.status(error.statusCode || 503).json({ error: error.message });
+	}
+});
+
+module.exports = router;
