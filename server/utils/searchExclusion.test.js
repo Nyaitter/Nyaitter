@@ -120,3 +120,39 @@ test('PG の setUserStatus は shadow 未指定で既存の除外を上書きし
   assert.deepEqual(updated, { shadow: false });
   assert.equal(calls.filter((c) => /UPDATE/.test(c.sql)).length, 1, '明示指定では UPDATE される');
 });
+
+test('PG の JOIN 取得ポストでも埋め込み著者に shadow が伝わり、除外が効く', async () => {
+  const joinedRow = {
+    id: 42,
+    user_id: 7,
+    content: 'joined post',
+    created_at: new Date(),
+    author_id: 7,
+    author_name: 'pguser',
+    author_scid: null,
+    author_handle: null,
+    author_icon_data: null,
+    author_bio: '',
+    author_header_image: null,
+    author_verify: false,
+    author_admin: false,
+    author_settings: {},
+    author_block: [],
+    author_shadow: true,
+    author_created_at: new Date(),
+  };
+  const pg = new PostgresAdapter({});
+  pg.pool = {
+    query: async (sql) => {
+      assert.ok(/author_shadow/.test(sql), 'ポスト取得の SELECT に author_shadow が含まれる');
+      return { rows: [joinedRow] };
+    },
+  };
+  const post = await pg.getPostById(42);
+  assert.equal(post.author.shadow, true, '埋め込み著者に shadow が伝わる');
+
+  const db = new InMemoryAdapter();
+  const stranger = await db.createUser({ name: 'joinstranger' });
+  const visible = await filterDiscoverablePosts(db, [post], stranger.id);
+  assert.deepEqual(visible, [], '埋め込み著者を優先する経路でも除外される');
+});

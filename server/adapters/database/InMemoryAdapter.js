@@ -4838,33 +4838,23 @@ class InMemoryAdapter extends DatabaseAdapter {
 			}
 		}
 
-		const calculateTagSimilarity = (str1, str2) => {
+		// 判定は「類似度が閾値を超えるか」だけを使う。各成分の上限が閾値以下の
+		// ときは厳密な計算を省いても判定は変わらない。
+		const isTagSimilarityAboveThreshold = (str1, str2, threshold) => {
 			const s1 = String(str1 || '').trim().toLowerCase().replace(/^[#＃]/, '');
 			const s2 = String(str2 || '').trim().toLowerCase().replace(/^[#＃]/, '');
-			if (s1 === s2) return 1.0;
-			if (!s1 || !s2) return 0.0;
+			if (s1 === s2) return 1.0 > threshold;
+			if (!s1 || !s2) return false;
 
 			const len1 = s1.length;
 			const len2 = s2.length;
 			const maxLen = Math.max(len1, len2);
 			const minLen = Math.min(len1, len2);
 
-			const isSubstring = s1.includes(s2) || s2.includes(s1);
-			const substringSim = isSubstring ? minLen / maxLen : 0;
+			if ((s1.includes(s2) || s2.includes(s1)) && minLen / maxLen > threshold) return true;
 
-			const d = Array.from({ length: len1 + 1 }, () => new Array(len2 + 1).fill(0));
-			for (let i = 0; i <= len1; i++) d[i][0] = i;
-			for (let j = 0; j <= len2; j++) d[0][j] = j;
-			for (let i = 1; i <= len1; i++) {
-				for (let j = 1; j <= len2; j++) {
-					const cost = s1[i - 1] === s2[j - 1] ? 0 : 1;
-					d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + cost);
-				}
-			}
-			const levSim = 1 - d[len1][len2] / maxLen;
-
-			let diceSim = 0;
-			if (len1 >= 2 && len2 >= 2) {
+			if (len1 >= 2 && len2 >= 2
+				&& (2 * (minLen - 1)) / ((len1 - 1) + (len2 - 1)) > threshold) {
 				const bg1 = new Map();
 				for (let i = 0; i < len1 - 1; i++) {
 					const bg = s1.slice(i, i + 2);
@@ -4879,10 +4869,23 @@ class InMemoryAdapter extends DatabaseAdapter {
 				for (const [bg, count1] of bg1.entries()) {
 					if (bg2.has(bg)) intersection += Math.min(count1, bg2.get(bg));
 				}
-				diceSim = (2 * intersection) / ((len1 - 1) + (len2 - 1));
+				if ((2 * intersection) / ((len1 - 1) + (len2 - 1)) > threshold) return true;
 			}
 
-			return Math.max(substringSim, levSim, diceSim);
+			if (1 - Math.abs(len1 - len2) / maxLen > threshold) {
+				const d = Array.from({ length: len1 + 1 }, () => new Array(len2 + 1).fill(0));
+				for (let i = 0; i <= len1; i++) d[i][0] = i;
+				for (let j = 0; j <= len2; j++) d[0][j] = j;
+				for (let i = 1; i <= len1; i++) {
+					for (let j = 1; j <= len2; j++) {
+						const cost = s1[i - 1] === s2[j - 1] ? 0 : 1;
+						d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + cost);
+					}
+				}
+				if (1 - d[len1][len2] / maxLen > threshold) return true;
+			}
+
+			return false;
 		};
 
 		const mapToMergedSortedList = (userMap, threshold = 0.75) => {
@@ -4896,8 +4899,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 					const isBothHashtags = cluster.representative.startsWith('#') && tag.startsWith('#');
 					const isBothNonHashtags = !cluster.representative.startsWith('#') && !tag.startsWith('#');
 					if (isBothHashtags || isBothNonHashtags) {
-						const sim = calculateTagSimilarity(cluster.representative, tag);
-						if (sim > threshold) {
+						if (isTagSimilarityAboveThreshold(cluster.representative, tag, threshold)) {
 							for (const u of users) cluster.users.add(u);
 							merged = true;
 							break;

@@ -671,7 +671,7 @@ router.get({
     } else {
       await requireGroupPermission(getDb(req), group, req.user.id, 'ban');
     }
-    const memberships = await getDb(req).getGroupMemberships(group.id, { status: requestedStatus, limit: 200, offset: normalizeOffset(req.query.offset) });
+    const memberships = await getDb(req).getGroupMemberships(group.id, { status: requestedStatus, limit: normalizeLimit(req.query.limit, 200, 200), offset: normalizeOffset(req.query.offset) });
     const users = await getDb(req).getUsersByIds(memberships.map((membership) => membership.userId ?? membership.user_id));
     await attachDisplayRanks(getDb(req), users);
     const usersById = new Map(users.map((user) => [Number(user.id), serializeUserBrief(user, getPublicUrl(req))]));

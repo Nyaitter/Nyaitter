@@ -10,8 +10,10 @@ const MAX_OEMBED_BYTES = 64 * 1024;
 const MAX_REDIRECTS = 5;
 const REQUEST_TIMEOUT_MS = 8000;
 const CACHE_TTL_MS = 60 * 60 * 1000;
+const NEGATIVE_CACHE_TTL_MS = 5 * 60 * 1000;
 const MAX_CACHE_ENTRIES = 1000;
 const cardCache = new Map();
+const pendingCardFetches = new Map();
 
 const urlCardAgent = new https.Agent({
   keepAlive: true,
@@ -562,31 +564,44 @@ async function getUrlCard(value, context = {}) {
   const cached = cardCache.get(cacheKey);
   if (cached && cached.expiresAt > now) return cached.card;
 
-  // 2. Standard remote URL resolution (oEmbed / Open Graph)
-  let card = await getOEmbedCard(buildKnownOEmbedEndpoint(targetUrl), targetUrl);
-  if (!card) {
-    try {
-      const { body, headers, targetUrl: finalUrl } = await fetchResource(targetUrl, {
-        type: 'html',
-        maxBytes: MAX_HTML_BYTES,
-      });
-      card = parseCardMetadata(body, finalUrl);
-      const discoveredEndpoint =
-        findOEmbedEndpointInLinkHeader(headers.link, finalUrl) ||
-        findOEmbedEndpointInHtml(body, finalUrl);
-      card = mergeCards(card, await getOEmbedCard(discoveredEndpoint, finalUrl));
-    } catch (_) {
-      return null;
+  // 同一URLへの同時リクエストは1回の取得に集約し、失敗は短時間だけ再試行を止める。
+  const pending = pendingCardFetches.get(cacheKey);
+  if (pending) return pending;
+
+  const task = (async () => {
+    // 2. Standard remote URL resolution (oEmbed / Open Graph)
+    let card = await getOEmbedCard(buildKnownOEmbedEndpoint(targetUrl), targetUrl);
+    if (!card) {
+      try {
+        const { body, headers, targetUrl: finalUrl } = await fetchResource(targetUrl, {
+          type: 'html',
+          maxBytes: MAX_HTML_BYTES,
+        });
+        card = parseCardMetadata(body, finalUrl);
+        const discoveredEndpoint =
+          findOEmbedEndpointInLinkHeader(headers.link, finalUrl) ||
+          findOEmbedEndpointInHtml(body, finalUrl);
+        card = mergeCards(card, await getOEmbedCard(discoveredEndpoint, finalUrl));
+      } catch (_) {
+        cardCache.set(cacheKey, { card: null, expiresAt: Date.now() + NEGATIVE_CACHE_TTL_MS });
+        return null;
+      }
     }
-  }
 
-  if (card && !card.type) {
-    card.type = 'link';
-  }
+    if (card && !card.type) {
+      card.type = 'link';
+    }
 
-  cardCache.set(cacheKey, { card, expiresAt: now + CACHE_TTL_MS });
-  pruneCardCache(now);
-  return card;
+    cardCache.set(cacheKey, { card, expiresAt: Date.now() + CACHE_TTL_MS });
+    pruneCardCache(Date.now());
+    return card;
+  })();
+  pendingCardFetches.set(cacheKey, task);
+  try {
+    return await task;
+  } finally {
+    pendingCardFetches.delete(cacheKey);
+  }
 }
 
 module.exports = {
