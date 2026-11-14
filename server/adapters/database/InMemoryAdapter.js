@@ -2078,7 +2078,6 @@ class InMemoryAdapter extends DatabaseAdapter {
 				}))
 				.filter(({ group, membership }) => group && !group.deletedAt && !group.deleted_at && membership?.status === 'active' && Boolean(group.iconData || group.icon_data) && (group.visibility === 'open' || group.visibility === 'open_invite'))
 				.sort((a, b) => String(b.membership.joinedAt || '').localeCompare(String(a.membership.joinedAt || '')))
-				.slice(0, 5)
 				.map(({ group }) => ({
 					id: String(group.id),
 					name: String(group.name || ''),

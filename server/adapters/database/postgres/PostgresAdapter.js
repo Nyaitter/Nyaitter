@@ -2473,7 +2473,6 @@ class PostgresAdapter extends DatabaseAdapter {
 			)
 			SELECT user_id, group_id, name, icon_data
 			FROM ranked_badges
-			WHERE rn <= 5
 			ORDER BY user_id, rn ASC`,
 			[missingIds],
 		);
@@ -6038,7 +6037,6 @@ class PostgresAdapter extends DatabaseAdapter {
 						  AND g.deleted_at IS NULL AND g.icon_data IS NOT NULL AND g.icon_data <> ''
 						  AND g.visibility IN ('open', 'open_invite')
 						ORDER BY gm.joined_at DESC NULLS LAST, g.created_at DESC
-						LIMIT 5
 					) g
 				), '[]'::jsonb) AS group_badges`,
 			[targetUserId],
@@ -6777,7 +6775,6 @@ class PostgresAdapter extends DatabaseAdapter {
 						  AND g.deleted_at IS NULL AND g.icon_data IS NOT NULL AND g.icon_data <> ''
 						  AND g.visibility IN ('open', 'open_invite')
 						ORDER BY gm.joined_at DESC NULLS LAST, g.created_at DESC
-						LIMIT 5
 					) g
 				), '[]'::jsonb) AS group_badges,
 				COALESCE((SELECT jsonb_agg(to_jsonb(n) ORDER BY n.created_at DESC, n.id DESC) FROM notification_rows n), '[]'::jsonb)

@@ -91,8 +91,8 @@ function serializeUserBrief(user, publicUrl = null, { includeSearchExclusion = f
 	if (!user) return null;
 	const id = Number(user.id);
 	const userBadges = Array.isArray(user.group_badges) && user.group_badges.length > 0
-		? user.group_badges.slice(0, 5)
-		: (Array.isArray(user.groupBadges) && user.groupBadges.length > 0 ? user.groupBadges.slice(0, 5) : null);
+		? user.group_badges
+		: (Array.isArray(user.groupBadges) && user.groupBadges.length > 0 ? user.groupBadges : null);
 
 	const cacheKey = `${id}:${includeSearchExclusion ? 'admin' : 'public'}`;
 	const cached = Number.isSafeInteger(id) && id > 0 ? userBriefCache.get(cacheKey) : null;
@@ -103,7 +103,7 @@ function serializeUserBrief(user, publicUrl = null, { includeSearchExclusion = f
 	if (userBadges !== null && userBadges.length > 0) {
 		effectiveBadges = userBadges;
 	} else if (Array.isArray(groupCacheBadges) && groupCacheBadges.length > 0) {
-		effectiveBadges = groupCacheBadges.slice(0, 5);
+		effectiveBadges = groupCacheBadges;
 	} else if (Array.isArray(cached?.group_badges) && cached.group_badges.length > 0) {
 		effectiveBadges = cached.group_badges;
 	} else if (userBadges !== null) {
@@ -256,18 +256,18 @@ async function serializeUser(db, user, viewerId = null, publicUrl = null) {
 		: [];
 
 	let groupBadges = Array.isArray(user.group_badges)
-		? user.group_badges.slice(0, 5)
-		: (Array.isArray(accountState?.group_badges) ? accountState.group_badges.slice(0, 5) : null);
+		? user.group_badges
+		: (Array.isArray(accountState?.group_badges) ? accountState.group_badges : null);
 	if (groupBadges === null) {
 		const cached = userGroupBadgesCache.get(Number(id));
 		if (cached && cached.expiresAt > Date.now()) {
-			groupBadges = cached.badges.slice(0, 5);
+			groupBadges = cached.badges;
 		}
 	}
 	if (groupBadges === null && typeof db.getUsersGroupBadgesBatch === 'function') {
 		try {
 			const badgeMap = await db.getUsersGroupBadgesBatch([id]);
-			const fetched = (badgeMap.get(Number(id)) || []).slice(0, 5);
+			const fetched = (badgeMap.get(Number(id)) || []);
 			if (fetched.length > 0) groupBadges = fetched;
 		} catch (_) {
 			// バッジの一括取得に失敗したら、未取得のまま次段の取得へ進む。
@@ -275,10 +275,9 @@ async function serializeUser(db, user, viewerId = null, publicUrl = null) {
 	}
 	if (groupBadges === null && typeof db.getUserGroups === 'function') {
 		try {
-			const groups = await db.getUserGroups(id, { status: 'active', limit: 20 });
+			const groups = await db.getUserGroups(id, { status: 'active', limit: 100 });
 			groupBadges = (groups || [])
 				.filter((g) => Boolean(g.icon_data || g.iconData) && (g.visibility === 'open' || g.visibility === 'open_invite'))
-				.slice(0, 5)
 				.map((g) => ({
 					id: String(g.id),
 					name: String(g.name || ''),
@@ -502,10 +501,9 @@ async function attachGroupBadgesToUsers(db, users) {
 		} else if (typeof db.getUserGroups === 'function') {
 			await Promise.all(missingIds.map(async (uid) => {
 				try {
-					const groups = await db.getUserGroups(uid, { status: 'active', limit: 20 });
+					const groups = await db.getUserGroups(uid, { status: 'active', limit: 100 });
 					const badges = (groups || [])
 						.filter((g) => Boolean(g.icon_data || g.iconData) && (g.visibility === 'open' || g.visibility === 'open_invite'))
-						.slice(0, 5)
 						.map((g) => ({
 							id: String(g.id),
 							name: String(g.name || ''),
@@ -531,8 +529,8 @@ async function attachGroupBadgesToUsers(db, users) {
 		const uid = Number(user.id);
 		const badges = badgesMap.get(uid);
 		user.group_badges = Array.isArray(badges)
-			? badges.slice(0, 5)
-			: (Array.isArray(user.group_badges) ? user.group_badges.slice(0, 5) : []);
+			? badges
+			: (Array.isArray(user.group_badges) ? user.group_badges : []);
 	}
 	return users;
 }

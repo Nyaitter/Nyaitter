@@ -11,6 +11,7 @@ function postGroupBadges(user) {
 }
 
 function validateDisplayGroupBadges(value) {
+	if (value === null) return null;
 	if (!Array.isArray(value)) return '表示するバッジの指定が正しくありません';
 	if (value.length > 20) return '表示するバッジの指定が正しくありません';
 	const valid = value.every(

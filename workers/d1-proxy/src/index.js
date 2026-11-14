@@ -2570,7 +2570,7 @@ export default {
 				for (const row of results || []) {
 					const uid = Number(row.user_id);
 					if (!badges[uid]) badges[uid] = [];
-					if (badges[uid].length < 5) {
+					{
 						badges[uid].push({
 							id: String(row.group_id),
 							name: row.name || '',
@@ -2968,7 +2968,7 @@ export default {
 						  AND g.deleted_at IS NULL AND g.icon_data IS NOT NULL AND g.icon_data <> ''
 						  AND g.visibility IN ('open', 'open_invite')
 						ORDER BY gm.joined_at DESC, g.created_at DESC
-						LIMIT 5`).bind(userId),
+					`).bind(userId),
 				]);
 
 				const notifications = (notifsRes?.results || []).map((r) => ({

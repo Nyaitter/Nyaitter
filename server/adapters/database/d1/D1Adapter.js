@@ -1391,7 +1391,7 @@ class D1Adapter extends DatabaseAdapter {
 			const res = await this._read('/groups/user-badges-batch', { body: { user_ids: ids }, cacheSeconds: 0 });
 			if (res && res.badges) {
 				for (const [uid, badges] of Object.entries(res.badges)) {
-					result.set(Number(uid), Array.isArray(badges) ? badges.slice(0, 5) : []);
+					result.set(Number(uid), Array.isArray(badges) ? badges : []);
 				}
 				return result;
 			}
@@ -1401,10 +1401,9 @@ class D1Adapter extends DatabaseAdapter {
 
 		await Promise.all(ids.map(async (userId) => {
 			try {
-				const groups = await this.getUserGroups(userId, { status: 'active', limit: 20 });
+				const groups = await this.getUserGroups(userId, { status: 'active', limit: 100 });
 				const badges = (groups || [])
 					.filter((g) => Boolean(g.icon_data || g.iconData) && (g.visibility === 'open' || g.visibility === 'open_invite'))
-					.slice(0, 5)
 					.map((g) => ({
 						id: String(g.id),
 						name: String(g.name || ''),
