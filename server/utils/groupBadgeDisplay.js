@@ -3,7 +3,7 @@
 function postGroupBadges(user) {
 	const badges = Array.isArray(user?.group_badges) ? user.group_badges : [];
 	const saved = user?.settings?.display_group_badges;
-	if (!Array.isArray(saved)) return badges;
+	if (!Array.isArray(saved)) return badges.slice(0, 5);
 	const byId = new Map(
 		badges.filter((b) => b && b.id != null).map((b) => [String(b.id), b]),
 	);

@@ -218,7 +218,7 @@
     "server/utils/blockRelationship.js": "c269e28c2e427e38e0a04f5deb682d3c38bdb96a66daa596fb0f7a7a58d2b2b2",
     "server/utils/featureAccess.js": "fd71a61a5a081436b413010eda959dc16a5dd962b667c4b769bcb2f1e2c318b4",
     "server/utils/fuzzySearch.js": "a6d79d1398fc441fcbaf10f9cf9577a2f7f7b304bf180def20e6fe53e61e0562",
-    "server/utils/groupBadgeDisplay.js": "1b25715e7e176f7258804bc36e4a002e8b5057794b31fcbee771d006d2c62077",
+    "server/utils/groupBadgeDisplay.js": "750bd062b8ccb6463e0bdabc35c7ce093da82f0858a6db9e11921fa69d3506d7",
     "server/utils/listenAddress.js": "c2954c52b5dd10b727a09914fbcaf647621f2bdd7e022286076655c57f2eb89e",
     "server/utils/mentionText.js": "a310ee4adba550ce79eff9a63671cc9b7df7ff6c01bc114830dcb353afe08139",
     "server/utils/noteEvaluation.js": "b6340e9ecde1141dc03c17baf5271703c2d9a8bc2bc0707ab3691254b19962da",
