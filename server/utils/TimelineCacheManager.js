@@ -426,8 +426,12 @@ class TimelineCacheManager {
 
 				// Public post
 				if (tab === 'all' || tab === 'foryou') {
-					if (entry.payload) this.cache.delete(key);
-					else this._appendPost(entry, postId, post);
+					// Discoverable timelines are filtered per viewer (search
+					// exclusion, NG words) when they are computed. A newly
+					// appended post has not passed that filter, so drop the
+					// entry and let the next read recompute it, as with
+					// recommended timelines.
+					this.cache.delete(key);
 				} else if (tab === 'following') {
 					// If author matches viewer
 					if (viewerId === postAuthorId) {

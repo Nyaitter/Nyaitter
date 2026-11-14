@@ -1,4 +1,5 @@
 const { resolvePostSearchQuery } = require('../utils/postSearchQuery');
+const { postGroupBadges } = require('../utils/groupBadgeDisplay');
 const express = require('express');
 const PostService = require('../services/PostService');
 const { assertAuthenticatedUserAccess } = require('../services/auth/PostAsUserService');
@@ -860,6 +861,7 @@ router.get({
 					admin: !!user.admin,
 					verify: !!user.verify,
 					group_badges: user.group_badges || [],
+					post_group_badges: user.post_group_badges || postGroupBadges(user),
 					display_ranks: user.display_ranks || null,
 				})),
 			},

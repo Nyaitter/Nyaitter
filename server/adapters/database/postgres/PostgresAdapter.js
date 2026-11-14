@@ -131,6 +131,7 @@ function normalizePostRow(row) {
 			block: row.author_block,
 			verify: row.author_verify,
 			admin: row.author_admin,
+			shadow: row.author_shadow,
 			created_at: row.author_created_at,
 		});
 	} else if (row.author && typeof row.author === 'object') {
@@ -3296,7 +3297,7 @@ class PostgresAdapter extends DatabaseAdapter {
 		if (cached) return cached;
 
 		const { rows } = await this.pool.query(
-			`SELECT p.*, u.id AS author_id, u.name AS author_name, u.scid AS author_scid, u.handle AS author_handle, u.icon_data AS author_icon_data, u.bio AS author_bio, u.header_image AS author_header_image, u.verify AS author_verify, u.admin AS author_admin, u.settings AS author_settings, u.block AS author_block, u.created_at AS author_created_at
+			`SELECT p.*, u.id AS author_id, u.name AS author_name, u.scid AS author_scid, u.handle AS author_handle, u.icon_data AS author_icon_data, u.bio AS author_bio, u.header_image AS author_header_image, u.verify AS author_verify, u.admin AS author_admin, u.settings AS author_settings, u.block AS author_block, u.created_at AS author_created_at, u.shadow AS author_shadow
 			 FROM posts p
 			 LEFT JOIN users u ON u.id = p.user_id
 			 WHERE p.id = $1`,
@@ -3329,7 +3330,7 @@ class PostgresAdapter extends DatabaseAdapter {
 
 		if (missingIds.length > 0) {
 			const { rows } = await this.pool.query(
-				`SELECT p.*, u.id AS author_id, u.name AS author_name, u.scid AS author_scid, u.handle AS author_handle, u.icon_data AS author_icon_data, u.bio AS author_bio, u.header_image AS author_header_image, u.verify AS author_verify, u.admin AS author_admin, u.settings AS author_settings, u.block AS author_block, u.created_at AS author_created_at
+				`SELECT p.*, u.id AS author_id, u.name AS author_name, u.scid AS author_scid, u.handle AS author_handle, u.icon_data AS author_icon_data, u.bio AS author_bio, u.header_image AS author_header_image, u.verify AS author_verify, u.admin AS author_admin, u.settings AS author_settings, u.block AS author_block, u.created_at AS author_created_at, u.shadow AS author_shadow
 				 FROM posts p
 				 LEFT JOIN users u ON u.id = p.user_id
 				 WHERE p.id = ANY($1::int[])`,
@@ -3372,7 +3373,7 @@ class PostgresAdapter extends DatabaseAdapter {
 			   JOIN ancestors a ON p.id = a.post_id
 			   WHERE p.reply_to IS NOT NULL AND a.anc_depth < $2
 			 )
-			 SELECT p.*, u.id AS author_id, u.name AS author_name, u.scid AS author_scid, u.handle AS author_handle, u.icon_data AS author_icon_data, u.bio AS author_bio, u.header_image AS author_header_image, u.verify AS author_verify, u.admin AS author_admin, u.settings AS author_settings, u.block AS author_block, u.created_at AS author_created_at
+			 SELECT p.*, u.id AS author_id, u.name AS author_name, u.scid AS author_scid, u.handle AS author_handle, u.icon_data AS author_icon_data, u.bio AS author_bio, u.header_image AS author_header_image, u.verify AS author_verify, u.admin AS author_admin, u.settings AS author_settings, u.block AS author_block, u.created_at AS author_created_at, u.shadow AS author_shadow
 			 FROM posts p
 			 JOIN ancestors a ON p.id = a.post_id
 			 LEFT JOIN users u ON u.id = p.user_id
@@ -3421,7 +3422,7 @@ class PostgresAdapter extends DatabaseAdapter {
 
 			if (uncachedIds.length > 0) {
 				const { rows } = await this.pool.query(
-					`SELECT p.*, u.id AS author_id, u.name AS author_name, u.scid AS author_scid, u.handle AS author_handle, u.icon_data AS author_icon_data, u.bio AS author_bio, u.header_image AS author_header_image, u.verify AS author_verify, u.admin AS author_admin, u.settings AS author_settings, u.block AS author_block, u.created_at AS author_created_at
+					`SELECT p.*, u.id AS author_id, u.name AS author_name, u.scid AS author_scid, u.handle AS author_handle, u.icon_data AS author_icon_data, u.bio AS author_bio, u.header_image AS author_header_image, u.verify AS author_verify, u.admin AS author_admin, u.settings AS author_settings, u.block AS author_block, u.created_at AS author_created_at, u.shadow AS author_shadow
 					 FROM posts p
 					 LEFT JOIN users u ON u.id = p.user_id
 					 WHERE p.id = ANY($1::int[])`,
@@ -3858,7 +3859,7 @@ class PostgresAdapter extends DatabaseAdapter {
 			: null;
 		const parsedViewerId = Number(viewerId);
 		const validViewerId = Number.isSafeInteger(parsedViewerId) && parsedViewerId > 0 ? parsedViewerId : null;
-		const authorSelect = `u.id AS author_id, u.name AS author_name, u.scid AS author_scid, u.handle AS author_handle, u.icon_data AS author_icon_data, u.bio AS author_bio, u.header_image AS author_header_image, u.verify AS author_verify, u.admin AS author_admin, u.settings AS author_settings, u.block AS author_block, u.created_at AS author_created_at`;
+		const authorSelect = `u.id AS author_id, u.name AS author_name, u.scid AS author_scid, u.handle AS author_handle, u.icon_data AS author_icon_data, u.bio AS author_bio, u.header_image AS author_header_image, u.verify AS author_verify, u.admin AS author_admin, u.settings AS author_settings, u.block AS author_block, u.created_at AS author_created_at, u.shadow AS author_shadow`;
 		const outerSelect = validViewerId == null
 			? `p.*, ${authorSelect}`
 			: `p.*, ${authorSelect},
@@ -4567,7 +4568,7 @@ class PostgresAdapter extends DatabaseAdapter {
 				author.admin AS author_admin,
 				author.settings AS author_settings,
 				author.block AS author_block,
-				author.created_at AS author_created_at,
+				author.created_at AS author_created_at, author.shadow AS author_shadow,
 				parent.id AS parent_id,
 				parent.content AS parent_content,
 				parent_author.id AS parent_author_id,

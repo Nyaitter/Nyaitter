@@ -43,6 +43,7 @@ const accountDeletionConfirmations = new Map();
 const reputation = require('../services/ReputationService');
 const { containsProtectedStatus } = require('../utils/protectedStatus');
 const { actualRanks, displayRanks, displayOptions, validateDisplaySettings, ownDisplaySettings } = require('../utils/rankDisplay');
+const { validateDisplayGroupBadges } = require('../utils/groupBadgeDisplay');
 
 router.get({path:'/me/status',summary:'自分の利用状態',auth:'required'},requireAuthAllowFrozen,async(req,res)=>{
 	try {
@@ -1246,6 +1247,10 @@ router.put({
 			const [current, profile] = await Promise.all([db.getUserById(userId), db.getReputationProfile(userId)]);
 			const displayError = validateDisplaySettings(settings, actualRanks(profile));
 			if (displayError) return res.status(400).json({ error: displayError });
+			if (settings.display_group_badges !== undefined) {
+				const badgeError = validateDisplayGroupBadges(settings.display_group_badges);
+				if (badgeError) return res.status(400).json({ error: badgeError });
+			}
 			nextSettings = { ...current?.settings, ...settings };
 			if (settings.display_ranks !== undefined) nextSettings.display_ranks = { ...current?.settings?.display_ranks, ...settings.display_ranks };
 		}

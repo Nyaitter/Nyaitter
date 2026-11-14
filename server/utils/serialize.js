@@ -14,6 +14,7 @@ const { getUserReactions, invalidateUserReactions } = require('./UserReactionCac
 const { getVisibleDmUnreadCount } = require('../services/DmVisibilityService');
 const { publicSettings } = require('./protectedStatus');
 const { attachDisplayRanks, publicDisplayRanks, ownDisplaySettingsForUser } = require('./rankDisplay');
+const { postGroupBadges } = require('./groupBadgeDisplay');
 const { computeAgePenalty, isAgeFeaturesActive } = require('../services/AgeEstimateService');
 
 function getAgeDisplayConfig() {
@@ -120,6 +121,7 @@ function serializeUserBrief(user, publicUrl = null, { includeSearchExclusion = f
 		verify: Boolean(user.verify),
 		is_imposter: Boolean(user.settings?.imposter?.parent_id),
 		group_badges: effectiveBadges,
+		post_group_badges: postGroupBadges({ group_badges: effectiveBadges, settings: user.settings }),
 		display_ranks: publicDisplayRanks(user),
 		...(includeSearchExclusion ? { shadow: !!user.shadow } : {}),
 	};
@@ -319,6 +321,7 @@ async function serializeUser(db, user, viewerId = null, publicUrl = null) {
 		star,
 		pin,
 		group_badges: groupBadges || [],
+		post_group_badges: postGroupBadges({ group_badges: groupBadges || [], settings: user.settings }),
 		created_at: user.created_at || user.createdAt || null,
 	};
 }
