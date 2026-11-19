@@ -1,6 +1,7 @@
 'use strict';
 
 const PostService = require('./PostService');
+const { normalizeMaskReason } = require('../utils/maskReason');
 const { extractPostKeywords } = require('./PostKeywordService');
 const { extractViewContent } = require('../utils/viewContent');
 const {
@@ -436,6 +437,7 @@ async function processCreatePostAction(context, payload) {
         buffer: decodeBase64File(attachment.data),
         fileName: attachment.fileName || 'file',
         contentType: normalizeContentType(attachment.contentType),
+        ...(attachment.mask ? { mask: true } : {}),
       };
     }
     return attachment;
@@ -456,6 +458,7 @@ async function processCreatePostAction(context, payload) {
     tagsGeneratedAt: new Date().toISOString(),
     attachments: processedAttachments,
     mask: Boolean(payload.mask),
+    maskReason: Boolean(payload.mask) ? normalizeMaskReason(payload.mask_reason ?? payload.maskReason) : null,
     lock: Boolean(payload.lock),
     announcement: isAnnouncement,
     groupId,
@@ -658,7 +661,7 @@ async function runDeletePostAction(context, { postId, userId, admin = false }) {
   );
 }
 
-async function runEditPostAction(context, { postId, userId, content, attachments, mask, lock, replyControl }) {
+async function runEditPostAction(context, { postId, userId, content, attachments, mask, mask_reason, maskReason, lock, replyControl }) {
   const post = await context.db.getPostById(postId);
   if (!post) throw new Error('Post not found');
   if (post.userId !== userId) throw new Error('You can only edit your own posts');
@@ -675,6 +678,7 @@ async function runEditPostAction(context, { postId, userId, content, attachments
     tagsGeneratedAt: new Date().toISOString(),
     attachments: Array.isArray(attachments) && attachments.length > 0 ? attachments : null,
     mask: !!mask,
+    mask_reason: mask ? normalizeMaskReason(mask_reason ?? maskReason) : null,
     lock: !!lock,
   };
 
@@ -746,7 +750,7 @@ async function runEditPostAction(context, { postId, userId, content, attachments
  * 添付を含む編集はキーが本文だけでは一意にならないため対象外とする。
  * 先の実行が完了すれば即座にキーは解放され、通常の連続編集には影響しない。
  */
-function buildEditDedupeKey({ postId, userId, content, mask, lock, replyControl }) {
+function buildEditDedupeKey({ postId, userId, content, mask, mask_reason, maskReason, lock, replyControl }) {
   if (postId == null || userId == null || typeof content !== 'string') return null;
   return [
     Number(postId),
@@ -754,6 +758,7 @@ function buildEditDedupeKey({ postId, userId, content, mask, lock, replyControl 
     replyControl === undefined ? 'u' : String(replyControl),
     mask ? 1 : 0,
     lock ? 1 : 0,
+    mask ? (normalizeMaskReason(mask_reason ?? maskReason) || '') : '',
     content,
   ].join('\u0000');
 }

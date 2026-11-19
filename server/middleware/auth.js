@@ -15,7 +15,7 @@ function buildContentSecurityPolicy(advertisingOrigins = config.security?.advert
     "frame-ancestors 'self'",
     "form-action 'self'",
     `script-src 'self' https://cdn.jsdelivr.net https://challenges.cloudflare.com${clientSources}${sourceList('script') ? ` ${sourceList('script')}` : ''}`,
-    `frame-src 'self' https://challenges.cloudflare.com${sourceList('frame') ? ` ${sourceList('frame')}` : ''}`,
+    `frame-src 'self' https://challenges.cloudflare.com https://www.youtube-nocookie.com https://embed.nicovideo.jp https://w.soundcloud.com${sourceList('frame') ? ` ${sourceList('frame')}` : ''}`,
     `style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com${clientSources}`,
     `img-src 'self' data: https:${sourceList('img') ? ` ${sourceList('img')}` : ''}`,
     "media-src 'self' data: blob: https:",
