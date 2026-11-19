@@ -79,35 +79,29 @@ function readSetting(envNames, configPaths, fallback) {
 
 function aiProviderSettings() {
   const providers = [];
-  const legacyKey = readSetting(['AUTOMOD_API_KEY'], ['autoMod.apiKey', 'automod.apiKey', 'geminiModeration.apiKey'], '');
-  const legacyEndpoint = readSetting(['AUTOMOD_ENDPOINT', 'AUTOMOD_BASE_URL', 'OPENAI_BASE_URL'], ['autoMod.endpoint', 'autoMod.baseUrl', 'automod.endpoint'], '');
-  const inferredType = legacyEndpoint || process.env.OPENAI_API_KEY ? 'openai' : 'gemini';
-  const legacySelection = String(readSetting(['AUTOMOD_PROVIDER'], ['autoMod.provider', 'automod.provider'], inferredType)).trim().toLowerCase();
-  const legacyType = legacySelection === 'auto' ? inferredType : legacySelection;
-  if (legacyKey) providers.push({ type: legacyType, apikey: legacyKey, url: legacyEndpoint,
-    defmodel: readSetting(['AUTOMOD_MODEL', 'GEMINI_MODEL', 'OPENAI_MODEL'], ['autoMod.model', 'automod.model', 'geminiModeration.model'], '') });
-  for (const type of ['openai', 'gemini']) {
-    const apikey = process.env[`${type.toUpperCase()}_API_KEY`];
-    if (apikey && !providers.some(provider => provider.type === type && provider.apikey === apikey)) {
-      providers.push({ type, apikey, defmodel: process.env[`${type.toUpperCase()}_MODEL`] || '', url: type === 'openai' ? process.env.OPENAI_BASE_URL || '' : '' });
-    }
-  }
-  // 設定側のプロバイダは、環境変数側の従来プロバイダを置き換えず後ろへ足す。
   const configured = readSetting(['AI_PROVIDERS', 'MODEL_PROVIDERS'], ['ai.providers', 'modelProviders', 'AI_PROVIDERS'], undefined);
   if (configured !== undefined) {
     let extra = configured;
     if (typeof extra === 'string') {
       try { extra = JSON.parse(extra); } catch { return normalizeProviders(configured); }
     }
-    if (Array.isArray(extra)) {
-      const seen = new Set(providers.map((provider) => `${provider.type}|${provider.apikey || ''}|${provider.url || ''}`));
-      for (const entry of extra) {
-        const key = `${String(entry?.type || '').trim().toLowerCase()}|${entry?.apikey || ''}|${entry?.url || ''}`;
-        if (!seen.has(key)) {
-          seen.add(key);
-          providers.push(entry);
-        }
-      }
+    if (Array.isArray(extra)) providers.push(...extra);
+    else return normalizeProviders(configured);
+  }
+  // 環境変数側の従来プロバイダは、設定側より後ろへ足す。
+  const legacyKey = readSetting(['AUTOMOD_API_KEY'], ['autoMod.apiKey', 'automod.apiKey', 'geminiModeration.apiKey'], '');
+  const legacyEndpoint = readSetting(['AUTOMOD_ENDPOINT', 'AUTOMOD_BASE_URL', 'OPENAI_BASE_URL'], ['autoMod.endpoint', 'autoMod.baseUrl', 'automod.endpoint'], '');
+  const inferredType = legacyEndpoint || process.env.OPENAI_API_KEY ? 'openai' : 'gemini';
+  const legacySelection = String(readSetting(['AUTOMOD_PROVIDER'], ['autoMod.provider', 'automod.provider'], inferredType)).trim().toLowerCase();
+  const legacyType = legacySelection === 'auto' ? inferredType : legacySelection;
+  if (legacyKey && !providers.some(provider => provider.type === legacyType && provider.apikey === legacyKey)) {
+    providers.push({ type: legacyType, apikey: legacyKey, url: legacyEndpoint,
+      defmodel: readSetting(['AUTOMOD_MODEL', 'GEMINI_MODEL', 'OPENAI_MODEL'], ['autoMod.model', 'automod.model', 'geminiModeration.model'], '') });
+  }
+  for (const type of ['openai', 'gemini']) {
+    const apikey = process.env[`${type.toUpperCase()}_API_KEY`];
+    if (apikey && !providers.some(provider => provider.type === type && provider.apikey === apikey)) {
+      providers.push({ type, apikey, defmodel: process.env[`${type.toUpperCase()}_MODEL`] || '', url: type === 'openai' ? process.env.OPENAI_BASE_URL || '' : '' });
     }
   }
   return normalizeProviders(providers);
