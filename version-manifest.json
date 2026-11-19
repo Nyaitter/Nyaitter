@@ -36,7 +36,7 @@
     "server/adapters/storage/safeStoragePath.js": "89d1d03f384863370ca1fbac89afbb0f26bd945a3a3ace6ba714f6b565e40f55",
     "server/check-config.js": "758ad1e0c7c4822084060a6044a4d83cdfa1a20e1ddc7fc9f93b08835b668cb7",
     "server/cli.js": "df56ec1358f0144d39c59e6363a5c14c17086fd738e44212bda72d803d7ea47d",
-    "server/config.js": "ee3c99a5ed6883ce68cbff4c494c869f8f0b6ec5ba5c828409363f81c7965072",
+    "server/config.js": "7de8720a141ca7bd13b0ad8f48b80cfa0ee715bc97b3c190122c2065fbe0bbc3",
     "server/config.json": "0f30b9ab7a2f92eed8b8d7980e70ec999f723fe45e733cf49ac84b62920a07d7",
     "server/dev.js": "69b4eaccf25b2354477f5f0d5d4e8f3d57b37b61f636a96416352b09d1542292",
     "server/help/README.md": "cddf7a85bf891f00718403e1b412488d2d361542ec97f6622786b5cf5196c552",
