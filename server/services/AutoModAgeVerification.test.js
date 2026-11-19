@@ -11,7 +11,7 @@ const { AutoModerationService, parseClassification } = require('./AutoModeration
 const { aggregateAuthorAge, nextAgeEstimate } = require('./AgeEstimateService');
 const { serializePostsBatch, serializePost, serializeReply } = require('../utils/serialize');
 
-function makeService(db, { mode = 'v2', respond = '<safe>', authorAge = true } = {}) {
+function makeService(db, { mode = 'v2', respond = '<safe>', authorAge = true, toolCall = false } = {}) {
   const calls = { count: 0 };
   const aiService = {
     generate: async () => {
@@ -22,7 +22,7 @@ function makeService(db, { mode = 'v2', respond = '<safe>', authorAge = true } =
   const service = new AutoModerationService({
     dbAdapter: db,
     storageAdapter: undefined,
-    moderationConfig: { enabled: true, prompt: '基準', provider: 'mock', model: 'mock', mode, authorAge },
+    moderationConfig: { enabled: true, prompt: '基準', provider: 'mock', model: 'mock', mode, authorAge, toolCall },
     ageVerifyConfig: { margin: 5, unknown: 'warn', postMinSamples: 5 },
     aiService,
   });
@@ -251,6 +251,210 @@ test('(h) 理由が無いペナルティは適用されない', async () => {
   const post2 = await db.createPost({ userId: author.id, content: 'post 2' });
   await moderate(noReasonAge.service, db, post2.id);
   assert.equal((await db.getPostById(post2.id)).age_rating, 0, '理由が無い対象年齢の引き上げは適用されない');
+});
+
+test('(i) 処理に失敗した投稿はキューの最後へ移り、他の投稿を先に処理し、落とされない', async () => {
+  const { db, author } = await setup();
+  const order = [];
+  const aiService = {
+    generate: async ({ text }) => {
+      if (text.includes('FAILME')) {
+        order.push('A');
+        throw new Error('mock failure');
+      }
+      const marker = /POST_B\d/.exec(text)?.[0];
+      if (marker) order.push(marker);
+      return '<safe>';
+    },
+  };
+  const service = new AutoModerationService({
+    dbAdapter: db,
+    storageAdapter: undefined,
+    moderationConfig: { enabled: true, prompt: '基準', provider: 'mock', model: 'mock', mode: 'v2', authorAge: true, toolCall: false },
+    ageVerifyConfig: { margin: 5, unknown: 'warn', postMinSamples: 5 },
+    aiService,
+  });
+  const failPost = await db.createPost({ userId: author.id, content: 'FAILME' });
+  try {
+    service.enqueue(failPost);
+    for (const label of ['POST_B1', 'POST_B2', 'POST_B3', 'POST_B4']) {
+      const post = await db.createPost({ userId: author.id, content: label });
+      service.enqueue(post);
+    }
+    const start = Date.now();
+    while (Date.now() - start < 30000) {
+      if (order.filter((entry) => entry === 'A').length >= 4) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.deepEqual(
+      order.filter((entry) => entry !== 'A'),
+      ['POST_B1', 'POST_B2', 'POST_B3', 'POST_B4'],
+      '失敗した投稿の後ろに並んだ投稿が先に処理される',
+    );
+    const aAttempts = order.filter((entry) => entry === 'A').length;
+    assert.ok(aAttempts >= 4, `失敗した投稿が繰り返し処理される (実際: ${aAttempts} 回)`);
+    assert.ok(
+      order.indexOf('POST_B4') < order.lastIndexOf('A'),
+      '失敗した投稿は先頭ではなく最後へ移る',
+    );
+    assert.ok(
+      service.pendingJobsByPostId.has(Number(failPost.id)),
+      '失敗した投稿はキューに残り、検査から落ちない',
+    );
+  } finally {
+    service.stop();
+  }
+});
+
+function toolResponse(calls) {
+  return {
+    choices: [{
+      message: {
+        tool_calls: calls.map(([name, args], index) => ({
+          id: `call_${index}`,
+          type: 'function',
+          function: { name, arguments: JSON.stringify(args || {}) },
+        })),
+      },
+    }],
+  };
+}
+
+function makeToolService(db, generate, { storageAdapter, maxImages, toolMaxTurns } = {}) {
+  return new AutoModerationService({
+    dbAdapter: db,
+    storageAdapter,
+    moderationConfig: {
+      enabled: true, prompt: '基準', provider: 'mock', model: 'mock', mode: 'v2',
+      authorAge: true, toolCall: true, ...(maxImages ? { maxImages } : {}),
+      ...(toolMaxTurns ? { toolMaxTurns } : {}),
+    },
+    ageVerifyConfig: { margin: 5, unknown: 'warn', postMinSamples: 5 },
+    aiService: { generate },
+  });
+}
+
+test('(n) ツールのターン上限は設定でき、既定は無制限', async () => {
+  const { db, author } = await setup();
+  const post = await db.createPost({ userId: author.id, content: '本文' });
+  let calls = 0;
+  const never = async () => {
+    calls += 1;
+    return toolResponse([]);
+  };
+  const unlimited = makeToolService(db, never);
+  assert.equal(unlimited.toolMaxTurns, 0, '既定は無制限');
+  const limited = makeToolService(db, never, { toolMaxTurns: 2 });
+  assert.equal(limited.toolMaxTurns, 2);
+  await assert.rejects(limited._classifyWithTools(post, ''), /必須のツールが呼び出されませんでした/);
+  assert.equal(calls, 2, '上限のターン数で打ち切られる');
+});
+
+test('(j) ツールモードではツール呼び出しでモデレーションが適用され、状態がプロンプトに渡る', async () => {
+  const { db, author } = await setup();
+  const post = await db.createPost({ userId: author.id, content: '判定対象の本文' });
+  await db.updatePost(post.id, { attachments: [{ id: 'att1', type: 'image/png', name: 'photo.png' }] });
+  const requests = [];
+  let turn = 0;
+  const service = makeToolService(db, async (request) => {
+    requests.push({ ...request, turns: request.turns.map((entry) => ({ ...entry })) });
+    turn += 1;
+    if (turn === 1) {
+      return toolResponse([
+        ['apply_cushion', {}],
+        ['set_moderation_reason', { reason: 'graphic content' }],
+        ['set_age_rating', { rating: 15 }],
+        ['set_author_age', { band: '18-24' }],
+      ]);
+    }
+    return toolResponse([]);
+  });
+  await moderate(service, db, post.id);
+  const updated = await db.getPostById(post.id);
+  assert.equal(updated.mask, true);
+  assert.equal(updated.mask_reason, 'graphic content');
+  assert.equal(updated.age_rating, 15);
+  assert.ok(requests[0].tools.some((tool) => tool.name === 'get_attachments'), 'ツール定義が渡される');
+  assert.equal(requests[0].turns[0].images, undefined, 'アタッチメントは最初からは付与されない');
+  const instruction = requests[0].turns[0].text;
+  assert.ok(instruction.includes(`投稿者ID: ${author.id}`), '投稿者IDが渡る');
+  assert.ok(instruction.includes('ワンクッション: なし'), 'ワンクッションの有無が渡る');
+  assert.ok(instruction.includes('photo.png'), 'アタッチメントのリストが渡る');
+});
+
+test('(k) 必須ツールが呼ばれないと、その旨が返されて追加のターンが発生する', async () => {
+  const { db, author } = await setup();
+  const post = await db.createPost({ userId: author.id, content: '問題のない本文' });
+  const requests = [];
+  let turn = 0;
+  const service = makeToolService(db, async (request) => {
+    requests.push({ ...request, turns: request.turns.map((entry) => ({ ...entry })) });
+    turn += 1;
+    if (turn === 1) return toolResponse([]);
+    if (turn === 2) return toolResponse([['set_author_age', { band: '25-34' }]]);
+    return toolResponse([]);
+  });
+  await moderate(service, db, post.id);
+  assert.ok(requests.length >= 2, '追加のターンが発生する');
+  const feedback = requests[1].turns.at(-1);
+  assert.equal(feedback.role, 'user');
+  assert.ok(feedback.text.includes('必須のツールが呼び出されていません'), '未呼び出しが返される');
+  assert.ok(feedback.text.includes('set_author_age'));
+  const updated = await db.getPostById(post.id);
+  assert.equal(updated.mask, false);
+});
+
+test('(l) 既存のワンクッション理由はモデレーションの理由で上書きされる', async () => {
+  const { db, author } = await setup();
+  const post = await db.createPost({ userId: author.id, content: '流血のある本文' });
+  await db.updatePost(post.id, { mask: true, mask_reason: '変な理由' });
+  let turn = 0;
+  const service = makeToolService(db, async () => {
+    turn += 1;
+    if (turn === 1) {
+      return toolResponse([
+        ['apply_cushion', {}],
+        ['set_moderation_reason', { reason: 'explicit gore' }],
+        ['set_author_age', { band: '18-24' }],
+      ]);
+    }
+    return toolResponse([]);
+  });
+  await moderate(service, db, post.id);
+  const updated = await db.getPostById(post.id);
+  assert.equal(updated.mask, true);
+  assert.equal(updated.mask_reason, 'explicit gore');
+});
+
+test('(m) get_attachments は指定したIDのアタッチメントだけを次のターンに提示する', async () => {
+  const { db, author } = await setup();
+  const post = await db.createPost({ userId: author.id, content: '画像つきの本文' });
+  await db.updatePost(post.id, {
+    attachments: [
+      { id: 'file1', type: 'image/png', name: 'a.png' },
+      { id: 'file2', type: 'image/png', name: 'b.png' },
+    ],
+  });
+  const storageAdapter = {
+    read: async () => ({ contentType: 'image/png', buffer: Buffer.from('png-bytes') }),
+  };
+  const requests = [];
+  let turn = 0;
+  const service = makeToolService(db, async (request) => {
+    requests.push({ ...request, turns: request.turns.map((entry) => ({ ...entry })) });
+    turn += 1;
+    if (turn === 1) return toolResponse([['get_attachments', { attachment_ids: ['file2', 'missing-id'] }]]);
+    if (turn === 2) return toolResponse([['set_author_age', { band: 'unknown' }]]);
+    return toolResponse([]);
+  }, { storageAdapter, maxImages: 4 });
+  await moderate(service, db, post.id);
+  assert.equal(requests[0].turns[0].images, undefined, '最初は画像が付かない');
+  const toolTurn = requests[1].turns.find((entry) => entry.role === 'tool');
+  assert.ok(toolTurn, 'ツール結果のターンがある');
+  assert.equal(toolTurn.images.length, 1, '指定した画像だけが提示される');
+  assert.equal(toolTurn.results[0].result.images_presented, 1);
+  assert.deepEqual(toolTurn.results[0].result.attachments.map((entry) => entry.id), ['file2']);
+  assert.deepEqual(toolTurn.results[0].result.not_found, ['missing-id']);
 });
 
 test('nextAgeEstimate: 高い方向も差が小さければ最低1は進む（デッドゾーンなし）', () => {
