@@ -827,6 +827,8 @@ function normalizePostRow(row) {
 		tags_generated_at: row.tags_generated_at || null,
 		attachments: parseJsonSafe(row.attachments, []),
 		mask: Boolean(row.mask),
+		maskReason: row.mask_reason ?? row.maskReason ?? null,
+		mask_reason: row.mask_reason ?? row.maskReason ?? null,
 		lock: Boolean(row.lock),
 		ageRating: Number(row.age_rating ?? row.ageRating ?? 0) || 0,
 		age_rating: Number(row.age_rating ?? row.ageRating ?? 0) || 0,
@@ -3145,6 +3147,7 @@ export default {
 				const content = postData.content || '';
 				const attachments = postData.attachments ? JSON.stringify(postData.attachments) : null;
 				const mask = postData.mask ? 1 : 0;
+				const maskReason = (postData.maskReason ?? postData.mask_reason) ? String(postData.maskReason ?? postData.mask_reason) : null;
 				const lock = postData.lock ? 1 : 0;
 				const announcement = postData.announcement ? 1 : 0;
 				const replyTo = (postData.replyTo ?? postData.reply_to ?? postData.reply_id) ? Number(postData.replyTo ?? postData.reply_to ?? postData.reply_id) : null;
@@ -3162,14 +3165,14 @@ export default {
 				if (hasExplicitId) {
 					createdId = Number(postData.id);
 					await db.prepare(
-						`INSERT INTO posts (id, user_id, content, attachments, mask, lock, announcement, reply_to, repost_to, tags, tags_generated_at, group_id, group_announcement, created_at, scheduled_at)
-						 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-					).bind(createdId, userId, content, attachments, mask, lock, announcement, replyTo, repostTo, tags, tagsGeneratedAt, groupId, groupAnnouncement, now, scheduledAt).run();
+						`INSERT INTO posts (id, user_id, content, attachments, mask, mask_reason, lock, announcement, reply_to, repost_to, tags, tags_generated_at, group_id, group_announcement, created_at, scheduled_at)
+						 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+					).bind(createdId, userId, content, attachments, mask, maskReason, lock, announcement, replyTo, repostTo, tags, tagsGeneratedAt, groupId, groupAnnouncement, now, scheduledAt).run();
 				} else {
 					const res = await db.prepare(
-						`INSERT INTO posts (user_id, content, attachments, mask, lock, announcement, reply_to, repost_to, tags, tags_generated_at, group_id, group_announcement, created_at, scheduled_at)
-						 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-					).bind(userId, content, attachments, mask, lock, announcement, replyTo, repostTo, tags, tagsGeneratedAt, groupId, groupAnnouncement, now, scheduledAt).run();
+						`INSERT INTO posts (user_id, content, attachments, mask, mask_reason, lock, announcement, reply_to, repost_to, tags, tags_generated_at, group_id, group_announcement, created_at, scheduled_at)
+						 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+					).bind(userId, content, attachments, mask, maskReason, lock, announcement, replyTo, repostTo, tags, tagsGeneratedAt, groupId, groupAnnouncement, now, scheduledAt).run();
 					createdId = res.meta.last_row_id;
 				}
 
@@ -3361,6 +3364,7 @@ export default {
 				if (fields.tagsGeneratedAt !== undefined) { sets.push('tags_generated_at = ?'); values.push(fields.tagsGeneratedAt || null); }
 				if (fields.attachments !== undefined) { sets.push('attachments = ?'); values.push(fields.attachments ? JSON.stringify(fields.attachments) : null); }
 				if (fields.mask !== undefined) { sets.push('mask = ?'); values.push(fields.mask ? 1 : 0); }
+				if (fields.mask_reason !== undefined || fields.maskReason !== undefined) { const reason = fields.maskReason ?? fields.mask_reason; sets.push('mask_reason = ?'); values.push(reason ? String(reason) : null); }
 				if (fields.lock !== undefined) { sets.push('lock = ?'); values.push(fields.lock ? 1 : 0); }
 				if (fields.age_rating !== undefined || fields.ageRating !== undefined) { sets.push('age_rating = ?'); values.push(Number(fields.ageRating ?? fields.age_rating ?? 0) || 0); }
 
@@ -4414,9 +4418,9 @@ export default {
 				// 純粋なリポスト行は content を空文字・attachments を NULL のまま保つ。
 				// 元投稿の本文/添付を複製するとクライアントに引用ポストとして扱われるため。
 				const res = await db.prepare(
-					`INSERT INTO posts (user_id, content, attachments, mask, lock, repost_to, created_at)
-					 VALUES (?, ?, ?, ?, ?, ?, ?)`
-				).bind(userId, '', null, original.mask, original.lock, postId, now).run();
+					`INSERT INTO posts (user_id, content, attachments, mask, mask_reason, lock, repost_to, created_at)
+					 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+				).bind(userId, '', null, original.mask, original.mask_reason ?? null, original.lock, postId, now).run();
 
 				const created = await db.prepare('SELECT * FROM posts WHERE id = ?').bind(res.meta.last_row_id).first();
 				return json(normalizePostRow(created));

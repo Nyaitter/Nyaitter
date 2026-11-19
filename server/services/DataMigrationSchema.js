@@ -116,7 +116,7 @@ const TABLE_SPECS = Object.freeze([
   },
   {
     table: 'posts',
-    columns: ['id', 'user_id', 'content', 'attachments', 'mask', 'lock', 'age_rating', 'announcement', 'reply_to', 'repost_to',
+    columns: ['id', 'user_id', 'content', 'attachments', 'mask', 'mask_reason', 'lock', 'age_rating', 'announcement', 'reply_to', 'repost_to',
       'tags', 'tags_generated_at', 'group_id', 'group_announcement', 'view_content', 'reply_control', 'scheduled_at',
       'recommendation_penalty', 'created_at',
       // 派生カウンタ。投入後に移行先で再計算する。
@@ -128,7 +128,7 @@ const TABLE_SPECS = Object.freeze([
     dates: ['tags_generated_at', 'scheduled_at', 'created_at'],
     // コピーせず移行先で再計算する列。
     derived: ['like_count', 'star_count', 'repost_count', 'reply_count'],
-    optionalColumns: ['view_content', 'reply_control', 'scheduled_at', 'recommendation_penalty'],
+    optionalColumns: ['view_content', 'reply_control', 'scheduled_at', 'recommendation_penalty', 'mask_reason'],
     // D1 にはまだ列が無い。あるDBではコピーし、無いDBでは読み飛ばして報告する。
     postgresOnlyColumns: ['view_content', 'reply_control'],
     selfReference: { column: 'reply_to', target: 'posts' },

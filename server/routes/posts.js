@@ -339,6 +339,7 @@ router.post({
 		content,
 		attachments = [],
 		mask,
+		mask_reason,
 		lock,
 		announcement,
 		group_id,
@@ -382,6 +383,7 @@ router.post({
 			content,
 			attachments,
 			mask,
+			mask_reason,
 			lock,
 			announcement: announcement === true,
 			groupId: group_id,
@@ -1654,7 +1656,7 @@ router.put({
 		return res.status(400).json({ error: 'Invalid post id' });
 	}
 
-	const { content, attachments, mask, lock, reply_control, replyControl } = req.body || {};
+	const { content, attachments, mask, mask_reason, lock, reply_control, replyControl } = req.body || {};
 
 	if (typeof content !== 'string' || content.trim().length === 0) {
 		return res.status(400).json({ error: 'content is required' });
@@ -1690,6 +1692,7 @@ router.put({
 			content,
 			attachments,
 			mask,
+			mask_reason,
 			lock,
 			replyControl: normalizedReplyControl,
 		}), req.trustPolicy);

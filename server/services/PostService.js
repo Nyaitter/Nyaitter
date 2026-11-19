@@ -12,7 +12,7 @@ class PostService {
    * - raw files: { buffer, fileName, contentType }
    * - アップロード済み: { id, url, type, name }
    */
-  async createPost({ userId, content, viewContent = null, tags = [], tagsGeneratedAt = null, attachments = [], mask = false, lock = false, announcement = false, groupId = null, groupAnnouncement = false, replyControl = 'everyone', reply_control = 'everyone', replyTo = null, repostTo = null, scheduledAt = null }) {
+  async createPost({ userId, content, viewContent = null, tags = [], tagsGeneratedAt = null, attachments = [], mask = false, maskReason = null, mask_reason = null, lock = false, announcement = false, groupId = null, groupAnnouncement = false, replyControl = 'everyone', reply_control = 'everyone', replyTo = null, repostTo = null, scheduledAt = null }) {
     const attachmentData = [];
     const uploadedKeys = [];
     const normalizedViewContent = viewContent != null ? String(viewContent) : extractViewContent(content);
@@ -28,6 +28,7 @@ class PostService {
             ...(att.url ? { url: att.url } : {}),
             type: att.type || (att.contentType?.startsWith('image/') ? 'image' : (att.contentType?.startsWith('video/') ? 'video' : 'file')),
             name: att.name || att.fileName || '添付ファイル',
+            ...(att.mask ? { mask: true } : {}),
           });
           continue;
         }
@@ -48,6 +49,7 @@ class PostService {
           url: uploaded.url,
           type: att.contentType?.startsWith('image/') ? 'image' : (att.contentType?.startsWith('video/') ? 'video' : 'file'),
           name: att.fileName,
+          ...(att.mask ? { mask: true } : {}),
         });
       }
 
@@ -60,6 +62,8 @@ class PostService {
         tagsGeneratedAt,
         attachments: attachmentData.length > 0 ? attachmentData : null,
         mask,
+        maskReason: maskReason ?? mask_reason ?? null,
+        mask_reason: maskReason ?? mask_reason ?? null,
         lock,
         announcement,
         groupId,

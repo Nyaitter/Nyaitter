@@ -421,7 +421,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 				id: Number(row.id), userId: Number(row.user_id), content: row.content,
 				tags: Array.isArray(row.tags) ? row.tags : [],
 				tagsGeneratedAt: row.tags_generated_at ?? row.tagsGeneratedAt ?? null, attachments: row.attachments,
-				mask: Boolean(row.mask), lock: Boolean(row.lock), announcement: Boolean(row.announcement),
+				mask: Boolean(row.mask), maskReason: row.mask_reason ?? row.maskReason ?? null, mask_reason: row.mask_reason ?? row.maskReason ?? null, lock: Boolean(row.lock), announcement: Boolean(row.announcement),
 				ageRating: Number(row.age_rating ?? row.ageRating ?? 0) || 0,
 				age_rating: Number(row.age_rating ?? row.ageRating ?? 0) || 0,
 				groupId: row.group_id ?? row.groupId ?? null,
@@ -2602,6 +2602,8 @@ class InMemoryAdapter extends DatabaseAdapter {
 				tagsGeneratedAt: postData.tagsGeneratedAt || null,
 				attachments: postData.attachments || null,
 			mask: !!postData.mask,
+			maskReason: (postData.maskReason ?? postData.mask_reason) ? String(postData.maskReason ?? postData.mask_reason) : null,
+			mask_reason: (postData.maskReason ?? postData.mask_reason) ? String(postData.maskReason ?? postData.mask_reason) : null,
 			lock: !!postData.lock,
 			ageRating: Number(postData.ageRating ?? postData.age_rating ?? 0) || 0,
 			age_rating: Number(postData.ageRating ?? postData.age_rating ?? 0) || 0,
@@ -2839,6 +2841,11 @@ class InMemoryAdapter extends DatabaseAdapter {
 			if (fields.tagsGeneratedAt !== undefined) post.tagsGeneratedAt = fields.tagsGeneratedAt || null;
 			if (fields.attachments !== undefined) post.attachments = fields.attachments;
 					if (fields.mask !== undefined) post.mask = !!fields.mask;
+					if (fields.mask_reason !== undefined || fields.maskReason !== undefined) {
+						const reason = fields.maskReason ?? fields.mask_reason;
+						post.maskReason = reason ? String(reason) : null;
+						post.mask_reason = post.maskReason;
+					}
 			if (fields.lock !== undefined) post.lock = !!fields.lock;
 			if (fields.age_rating !== undefined || fields.ageRating !== undefined) {
 				post.ageRating = Number(fields.ageRating ?? fields.age_rating ?? 0) || 0;
@@ -3726,6 +3733,8 @@ class InMemoryAdapter extends DatabaseAdapter {
 			content: null,
 			attachments: null,
 			mask: originalPost.mask,
+			maskReason: originalPost.maskReason ?? originalPost.mask_reason ?? null,
+			mask_reason: originalPost.maskReason ?? originalPost.mask_reason ?? null,
 			lock: !!originalPost.lock,
 			repostTo: postId,
 			createdAt: new Date(),

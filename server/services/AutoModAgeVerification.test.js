@@ -47,11 +47,12 @@ async function setup() {
 }
 
 test('(c) parseClassification は3出力を取り、欠落ラベルは null', () => {
-  assert.deepEqual(parseClassification('<safe> <age:18> <author:13-15>'), { level: 1, ageRating: 18, authorAgeBand: '13-15' });
-  assert.deepEqual(parseClassification('<low>'), { level: 2, ageRating: null, authorAgeBand: null });
-  assert.deepEqual(parseClassification('<middle> <age:all> <author:unknown>'), { level: 3, ageRating: 0, authorAgeBand: null });
+  assert.deepEqual(parseClassification('<safe> <age:18> <author:13-15>'), { level: 1, ageRating: 18, authorAgeBand: '13-15', reason: null });
+  assert.deepEqual(parseClassification('<low>'), { level: 2, ageRating: null, authorAgeBand: null, reason: null });
+  assert.deepEqual(parseClassification('<middle> <age:all> <author:unknown>'), { level: 3, ageRating: 0, authorAgeBand: null, reason: null });
   // 違反ラベル欠落時は従来どおり safe 扱い。年齢系だけが null（＝変更なし）になる。
-  assert.deepEqual(parseClassification('ラベルなし'), { level: 1, ageRating: null, authorAgeBand: null });
+  assert.deepEqual(parseClassification('ラベルなし'), { level: 1, ageRating: null, authorAgeBand: null, reason: null });
+  assert.deepEqual(parseClassification('<low> <reason>Graphic violence</reason>'), { level: 2, ageRating: null, authorAgeBand: null, reason: 'Graphic violence' });
 });
 
 test('(a) off では評価が一切走らず投稿も変わらない', async () => {
@@ -70,12 +71,13 @@ test('(a) off では評価が一切走らず投稿も変わらない', async () 
 
 test('(b) legacy では違反側だけが動き、年齢系の列は変わらない', async () => {
   const { db, author } = await setup();
-  const { service, calls } = makeService(db, { mode: 'legacy', respond: '<low> <age:18> <author:13-15>' });
+  const { service, calls } = makeService(db, { mode: 'legacy', respond: '<low> <age:18> <author:13-15> <reason>Graphic violence</reason>' });
   for (let i = 0; i < 3; i += 1) {
     const post = await db.createPost({ userId: author.id, content: `post ${i}` });
     await moderate(service, db, post.id);
     const after = await db.getPostById(post.id);
     assert.equal(after.mask, true, 'V1 の mask は従来どおり付く');
+    assert.equal(after.mask_reason, 'Graphic violence', 'ペナルティの理由が保存される');
     assert.equal(after.age_rating, 0, 'legacy では age_rating は変わらない');
   }
   assert.equal(calls.count, 3);
@@ -88,7 +90,7 @@ test('(c) v2 は対象年齢を保存し、欠落時は不変、再評価で下�
   const { db, author } = await setup();
   const post = await db.createPost({ userId: author.id, content: 'post' });
 
-  const first = makeService(db, { respond: '<safe> <age:18>' });
+  const first = makeService(db, { respond: '<safe> <age:18> <reason>Graphic violence</reason>' });
   await moderate(first.service, db, post.id);
   assert.equal((await db.getPostById(post.id)).age_rating, 18);
 
@@ -202,7 +204,7 @@ test('(f) lock+mask 投稿も v2 では年齢分類の対象になり、mask/loc
   const { db, author } = await setup();
   const post = await db.createPost({ userId: author.id, content: 'private post', mask: true, lock: true });
 
-  const v2 = makeService(db, { respond: '<safe> <age:18> <author:25-34>' });
+  const v2 = makeService(db, { respond: '<safe> <age:18> <author:25-34> <reason>Graphic violence</reason>' });
   await moderate(v2.service, db, post.id);
   const afterV2 = await db.getPostById(post.id);
   assert.equal(afterV2.age_rating, 18, 'v2 では lock+mask でも対象年齢が付く');
@@ -233,6 +235,22 @@ test('(g) serializeReply も mask を畳み、hide を返さない', async () =>
   assert.ok(!('age_penalty' in masked));
 
   assert.equal(await serializeReply(db, await db.getPostById(post.id), young.id), null, 'hide は返信でも返さない');
+});
+
+test('(h) 理由が無いペナルティは適用されない', async () => {
+  const { db, author } = await setup();
+
+  const noReason = makeService(db, { mode: 'legacy', respond: '<low>' });
+  const post = await db.createPost({ userId: author.id, content: 'post' });
+  await moderate(noReason.service, db, post.id);
+  const after = await db.getPostById(post.id);
+  assert.equal(after.mask, false, '理由が無い mask は付かない');
+  assert.equal(after.mask_reason, null);
+
+  const noReasonAge = makeService(db, { respond: '<safe> <age:18>' });
+  const post2 = await db.createPost({ userId: author.id, content: 'post 2' });
+  await moderate(noReasonAge.service, db, post2.id);
+  assert.equal((await db.getPostById(post2.id)).age_rating, 0, '理由が無い対象年齢の引き上げは適用されない');
 });
 
 test('nextAgeEstimate: 高い方向も差が小さければ最低1は進む（デッドゾーンなし）', () => {

@@ -150,6 +150,8 @@ function normalizePostRow(row) {
 		tags_generated_at: tagsGeneratedAt,
 		attachments,
 		mask: Boolean(row.mask),
+		maskReason: row.mask_reason ?? row.maskReason ?? null,
+		mask_reason: row.mask_reason ?? row.maskReason ?? null,
 		lock: Boolean(row.lock),
 		ageRating: Number(row.age_rating ?? row.ageRating ?? 0) || 0,
 		age_rating: Number(row.age_rating ?? row.ageRating ?? 0) || 0,
@@ -3091,14 +3093,15 @@ class PostgresAdapter extends DatabaseAdapter {
 			replyControl,
 			now,
 			postData.scheduledAt ?? null,
+			(postData.maskReason ?? postData.mask_reason) ? String(postData.maskReason ?? postData.mask_reason) : null,
 		];
 
 		const insertQuery = hasExplicitId
-			? `INSERT INTO posts (id, user_id, content, view_content, attachments, mask, lock, announcement, reply_to, repost_to, tags, tags_generated_at, group_id, group_announcement, reply_control, created_at, scheduled_at)
-			   VALUES ($17, $1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10::jsonb, $11, $12, $13, $14, $15, $16)
+			? `INSERT INTO posts (id, user_id, content, view_content, attachments, mask, lock, announcement, reply_to, repost_to, tags, tags_generated_at, group_id, group_announcement, reply_control, created_at, scheduled_at, mask_reason)
+			   VALUES ($18, $1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10::jsonb, $11, $12, $13, $14, $15, $16, $17)
 			   RETURNING *`
-			: `INSERT INTO posts (user_id, content, view_content, attachments, mask, lock, announcement, reply_to, repost_to, tags, tags_generated_at, group_id, group_announcement, reply_control, created_at, scheduled_at)
-			   VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10::jsonb, $11, $12, $13, $14, $15, $16)
+			: `INSERT INTO posts (user_id, content, view_content, attachments, mask, lock, announcement, reply_to, repost_to, tags, tags_generated_at, group_id, group_announcement, reply_control, created_at, scheduled_at, mask_reason)
+			   VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10::jsonb, $11, $12, $13, $14, $15, $16, $17)
 			   RETURNING *`;
 
 		if (hasExplicitId) {
@@ -3659,6 +3662,11 @@ class PostgresAdapter extends DatabaseAdapter {
 		if (fields.mask !== undefined) {
 			values.push(Boolean(fields.mask));
 			sets.push(`mask = $${values.length}`);
+		}
+		if (fields.mask_reason !== undefined || fields.maskReason !== undefined) {
+			const reason = fields.maskReason ?? fields.mask_reason;
+			values.push(reason ? String(reason) : null);
+			sets.push(`mask_reason = $${values.length}`);
 		}
 		if (fields.lock !== undefined) {
 			values.push(Boolean(fields.lock));
@@ -4607,7 +4615,7 @@ class PostgresAdapter extends DatabaseAdapter {
 		const safeLimit = Math.min(Math.max(Number(limit) || 20, 1), 100);
 		const { rows } = await this.pool.query(
 			`WITH recent_posts AS (
-				SELECT id, user_id, content, attachments, mask, lock, announcement, group_id, group_announcement, reply_to, repost_to, tags, tags_generated_at, created_at
+				SELECT id, user_id, content, attachments, mask, mask_reason, lock, announcement, group_id, group_announcement, reply_to, repost_to, tags, tags_generated_at, created_at
 				FROM posts
 				WHERE group_id IS NULL
 				  AND reply_to IS NULL
@@ -5268,8 +5276,8 @@ class PostgresAdapter extends DatabaseAdapter {
 			// 元投稿の本文/添付をコピーすると、クライアントが content の有無で
 			// リポストを引用ポストと誤判定してしまうため。
 			const { rows: created } = await client.query(
-				`INSERT INTO posts (user_id, content, attachments, mask, lock, repost_to, created_at)
-				 VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7)
+				`INSERT INTO posts (user_id, content, attachments, mask, lock, repost_to, created_at, mask_reason)
+				 VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7, $8)
 				 RETURNING *`,
 				[
 					Number(userId),
@@ -5279,6 +5287,7 @@ class PostgresAdapter extends DatabaseAdapter {
 					origRow.lock,
 					Number(postId),
 					now,
+					origRow.mask_reason ?? null,
 				],
 			);
 			const post = normalizePostRow(created[0]);

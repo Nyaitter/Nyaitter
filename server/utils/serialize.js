@@ -1045,6 +1045,7 @@ async function serializePostsBatch(
 				view_content: post.view_content ?? post.viewContent ?? extractViewContent(post.content || ''),
 				tags: Array.isArray(post.tags) ? post.tags : [],
 				mask: !!post.mask,
+				mask_reason: post.mask_reason ?? post.maskReason ?? null,
 				lock: !!post.lock,
 				announcement: !!post.announcement,
 				attachments: post.attachments || [],
@@ -1100,6 +1101,7 @@ async function serializePostsBatch(
 			...base,
 			// 年齢による mask は通常のクッションと区別がつかないよう mask へ畳む。
 			mask: !!base.mask || ageFields.age_penalty === 'mask',
+			mask_reason: (!!base.mask || ageFields.age_penalty === 'mask') ? (base.mask_reason || null) : null,
 			group_id: post.groupId ?? post.group_id ?? null,
 			scheduled_at: post.scheduledAt ?? post.scheduled_at ?? null,
 			group_announcement: Boolean(post.groupAnnouncement ?? post.group_announcement),
@@ -1173,6 +1175,7 @@ async function serializeReply(db, post, currentUserId = null, publicUrl = null) 
 				content: post.content,
 				tags: Array.isArray(post.tags) ? post.tags : [],
 				mask: !!post.mask || ageFields.age_penalty === 'mask',
+				mask_reason: (!!post.mask || ageFields.age_penalty === 'mask') ? (post.mask_reason ?? post.maskReason ?? null) : null,
 			lock: !!post.lock,
 			announcement: !!post.announcement,
 			age_rating: ageFields.age_rating,

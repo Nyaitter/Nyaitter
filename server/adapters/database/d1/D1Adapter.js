@@ -99,6 +99,8 @@ function normalizePost(post) {
 	post.tagsGeneratedAt = post.tagsGeneratedAt ?? post.tags_generated_at ?? null;
 	post.tags_generated_at = post.tagsGeneratedAt;
 	post.mask = !!post.mask;
+	post.maskReason = post.maskReason ?? post.mask_reason ?? null;
+	post.mask_reason = post.maskReason;
 	post.lock = !!post.lock;
 	post.ageRating = Number(post.ageRating ?? post.age_rating ?? 0) || 0;
 	post.age_rating = post.ageRating;
