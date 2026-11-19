@@ -457,6 +457,26 @@ test('(m) get_attachments は指定したIDのアタッチメントだけを次�
   assert.deepEqual(toolTurn.results[0].result.not_found, ['missing-id']);
 });
 
+test('(o) プロンプトが無くてもAutoModは有効になり判定が動く', async () => {
+  const { db, author } = await setup();
+  const post = await db.createPost({ userId: author.id, content: 'post' });
+  const service = new AutoModerationService({
+    dbAdapter: db,
+    storageAdapter: undefined,
+    moderationConfig: {
+      enabled: true, prompt: '', provider: 'mock', model: 'mock', mode: 'legacy',
+      authorAge: true, toolCall: false,
+    },
+    ageVerifyConfig: { margin: 5, unknown: 'warn', postMinSamples: 5 },
+    aiService: { generate: async () => '<low> <reason>Graphic violence</reason>' },
+  });
+  assert.equal(service.enabled, true);
+  await moderate(service, db, post.id);
+  const after = await db.getPostById(post.id);
+  assert.equal(after.mask, true);
+  assert.equal(after.mask_reason, 'Graphic violence');
+});
+
 test('nextAgeEstimate: 高い方向も差が小さければ最低1は進む（デッドゾーンなし）', () => {
   assert.equal(nextAgeEstimate(14, 16), 15, '差2でも1進む');
   assert.equal(nextAgeEstimate(21, 29), 22, '差8は2割で1進む');

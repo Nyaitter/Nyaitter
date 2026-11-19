@@ -148,10 +148,7 @@ class AutoModerationService {
   }
 
   get enabled() {
-    return Boolean(
-      this.config?.enabled
-      && this.config?.prompt,
-    ) && this.mode !== 'off';
+    return Boolean(this.config?.enabled) && this.mode !== 'off';
   }
 
   enqueue(post) {
