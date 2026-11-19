@@ -12,7 +12,7 @@
 			"maxNotesPerPost": 20, "penalty": 0.1
 		},
 		"dailyCaps":{"trust":null,"ban":1},
-		"positivePost":{"minUsers":5,"minAgeDays":30,"minTrust":0,"award":2},
+		"positivePost":{"award":2,"halfSaturation":2,"minAgeDays":30,"minTrust":0},
 		"penalties":{"publicNote":-3,"rejectedNote":-2,"approvedReport":-5,"falseReports":-3,"falseReportRepeat":3},
 		"trust": {
 			"Trusted":{"minScore":900,"rateMultiplier":1.5,"queuePriority":3,"disabledFeatures":[],"rateLimits":{},"publicRatioReduction":0.05,"dailyNotes":null,"ratingWeight":1.3,"publicBonus":1,"noteVisibility":1},

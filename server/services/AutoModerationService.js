@@ -5,6 +5,7 @@ const { createNotificationIfAllowed } = require('./NotificationDeliveryService')
 const { parseAgeRating, parseAuthorAgeBand, aggregateAuthorAge, resolveAutoModMode } = require('./AgeEstimateService');
 const modLog = require('./ModLogService');
 const { normalizeMaskReason } = require('../utils/maskReason');
+const { detectTextLanguage } = require('../utils/textLanguage');
 
 const MODERATION_LEVELS = Object.freeze({
   safe: 1,
@@ -118,10 +119,11 @@ function getImageMimeType(attachment, sourceContentType) {
 }
 
 class AutoModerationService {
-  constructor({ dbAdapter, storageAdapter, moderationConfig = {}, ageVerifyConfig = {}, aiService }) {
+  constructor({ dbAdapter, storageAdapter, moderationConfig = {}, ageVerifyConfig = {}, translationConfig = {}, aiService }) {
     this.db = dbAdapter;
     this.storage = storageAdapter;
     this.config = moderationConfig;
+    this.translationConfig = translationConfig || {};
     this.ageVerify = ageVerifyConfig || {};
     this.ai = aiService || getAiService();
     this.maxPendingJobs = Math.max(1, Number(moderationConfig.maxPendingJobs) || 500);
@@ -269,6 +271,8 @@ class AutoModerationService {
     }
 
     const context = await this._buildPostContext(post);
+    // 言語の推定は判定と並行して行い、ポストの言語として登録する。
+    const languagePromise = this._registerPostLanguage(post);
     let classification;
     try {
       classification = this.toolCallEnabled
@@ -288,6 +292,7 @@ class AutoModerationService {
         throw error;
       }
     }
+    await languagePromise;
     const level = classification.level;
 
     let acted = false;
@@ -376,6 +381,17 @@ class AutoModerationService {
       });
     } catch (error) {
       console.warn(`[automod] author age aggregation failed for post=${post.id}:`, error.message);
+    }
+  }
+
+  async _registerPostLanguage(post) {
+    if (this.translationConfig.languageDetection === false) return;
+    if (!post || post.language || !String(post.content || '').trim()) return;
+    try {
+      const language = await detectTextLanguage(this.ai, this.config, post.content);
+      if (language) await this.db.updatePost(post.id, { language });
+    } catch (error) {
+      console.warn('[automod] language detection failed:', error.message);
     }
   }
 

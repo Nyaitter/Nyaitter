@@ -33,6 +33,52 @@ class InMemoryAdapter extends DatabaseAdapter {
 			.slice(0, f.limit + 1).map(row => ({ ...row }));
 		return m.page(rows, f.limit);
 	}
+	async findTranslationByHash(sourceHash, targetLanguage) {
+		const row = (this.translations || new Map()).get(`${sourceHash}|${targetLanguage}`);
+		return row ? { ...row } : null;
+	}
+	async findTranslationCandidates({ targetLanguage, sourceLanguage = null, terms = [], termCount = 0, minLength = 0, maxLength = Number.MAX_SAFE_INTEGER } = {}) {
+		if (!terms.length) return [];
+		const sharedByKey = new Map();
+		for (const term of terms) {
+			for (const key of (this.translationTerms || new Map()).get(term) || []) {
+				sharedByKey.set(key, (sharedByKey.get(key) || 0) + 1);
+			}
+		}
+		const min = Number(minLength) || 0;
+		const max = Number(maxLength) || Number.MAX_SAFE_INTEGER;
+		return [...sharedByKey.entries()]
+			.map(([key, shared]) => ({ row: (this.translations || new Map()).get(key), shared }))
+			.filter(({ row, shared }) => row
+				&& row.targetLanguage === String(targetLanguage)
+				&& (!sourceLanguage || row.sourceLanguage === String(sourceLanguage))
+				&& row.sourceNormalized.length >= min
+				&& row.sourceNormalized.length <= max
+				&& shared * 10 >= 3 * ((Number(termCount) || 0) + row.bigramCount))
+			.sort((a, b) => b.shared - a.shared)
+			.slice(0, 50)
+			.map(({ row }) => ({ ...row }));
+	}
+	async saveTranslation(record) {
+		const row = {
+			sourceText: String(record.sourceText),
+			sourceNormalized: String(record.sourceNormalized || ''),
+			bigramCount: Number(record.bigramCount) || 0,
+			sourceLanguage: String(record.sourceLanguage),
+			targetLanguage: String(record.targetLanguage),
+			translatedText: String(record.translatedText),
+		};
+		const key = `${record.sourceHash}|${row.targetLanguage}`;
+		if (!(this.translations || new Map()).has(key)) {
+			(this.translations ||= new Map()).set(key, row);
+			(this.translationTerms ||= new Map());
+			for (const term of Array.isArray(record.terms) ? record.terms : []) {
+				if (!this.translationTerms.has(term)) this.translationTerms.set(term, new Set());
+				this.translationTerms.get(term).add(key);
+			}
+		}
+		return { ...row };
+	}
 	constructor() {
 		super();
 		this.users = new Map(); // id -> user
@@ -46,6 +92,8 @@ class InMemoryAdapter extends DatabaseAdapter {
 			this.blockedLoginIps = new Map(); // `${userId}:${ipHash}` -> permanent IP block
 			this.botTokens = new Map(); // tokenId -> { userId, tokenHash, name, ... }
 		this.posts = new Map();
+		this.translations = new Map(); // `${sourceHash}|${targetLanguage}` -> translation record
+		this.translationTerms = new Map(); // bigram -> Set of translation keys
 		this.postEvents = new Map();
 		this.nextPostEventId = 1;
 		this.groups = new Map(); // groupId -> group
@@ -421,7 +469,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 				id: Number(row.id), userId: Number(row.user_id), content: row.content,
 				tags: Array.isArray(row.tags) ? row.tags : [],
 				tagsGeneratedAt: row.tags_generated_at ?? row.tagsGeneratedAt ?? null, attachments: row.attachments,
-				mask: Boolean(row.mask), maskReason: row.mask_reason ?? row.maskReason ?? null, mask_reason: row.mask_reason ?? row.maskReason ?? null, lock: Boolean(row.lock), announcement: Boolean(row.announcement),
+				mask: Boolean(row.mask), maskReason: row.mask_reason ?? row.maskReason ?? null, mask_reason: row.mask_reason ?? row.maskReason ?? null, language: row.language ?? null, lock: Boolean(row.lock), announcement: Boolean(row.announcement),
 				ageRating: Number(row.age_rating ?? row.ageRating ?? 0) || 0,
 				age_rating: Number(row.age_rating ?? row.ageRating ?? 0) || 0,
 				groupId: row.group_id ?? row.groupId ?? null,
@@ -2604,6 +2652,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 			mask: !!postData.mask,
 			maskReason: (postData.maskReason ?? postData.mask_reason) ? String(postData.maskReason ?? postData.mask_reason) : null,
 			mask_reason: (postData.maskReason ?? postData.mask_reason) ? String(postData.maskReason ?? postData.mask_reason) : null,
+			language: postData.language ? String(postData.language) : null,
 			lock: !!postData.lock,
 			ageRating: Number(postData.ageRating ?? postData.age_rating ?? 0) || 0,
 			age_rating: Number(postData.ageRating ?? postData.age_rating ?? 0) || 0,
@@ -2846,6 +2895,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 						post.maskReason = reason ? String(reason) : null;
 						post.mask_reason = post.maskReason;
 					}
+					if (fields.language !== undefined) post.language = fields.language ? String(fields.language) : null;
 			if (fields.lock !== undefined) post.lock = !!fields.lock;
 			if (fields.age_rating !== undefined || fields.ageRating !== undefined) {
 				post.ageRating = Number(fields.ageRating ?? fields.age_rating ?? 0) || 0;

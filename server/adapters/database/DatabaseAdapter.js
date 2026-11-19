@@ -302,6 +302,18 @@ class DatabaseAdapter {
 		throw new Error('createPost() must be implemented');
 	}
 
+	async findTranslationByHash(sourceHash, targetLanguage) {
+		throw new Error('findTranslationByHash() must be implemented');
+	}
+
+	async findTranslationCandidates(filters = {}) {
+		throw new Error('findTranslationCandidates() must be implemented');
+	}
+
+	async saveTranslation(record) {
+		throw new Error('saveTranslation() must be implemented');
+	}
+
 	async enqueuePostEvent(eventType, payload, options = {}) {
 		throw new Error('enqueuePostEvent() must be implemented');
 	}

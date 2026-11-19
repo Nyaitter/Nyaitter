@@ -57,6 +57,7 @@ const { ModerationReportService } = require('./services/ModerationReportService'
 const { configureNotificationDelivery } = require('./services/NotificationDeliveryService');
 const { startModerationAssignmentScheduler } = require('./services/ModerationAssignmentScheduler');
 const { AutoModerationService } = require('./services/AutoModerationService');
+const { TranslationService } = require('./services/TranslationService');
 const { startPollExpirationScheduler } = require('./services/PollExpirationScheduler');
 const { startScheduledPostPublisher } = require('./services/ScheduledPostPublisher');
 const { AccountRecoveryService } = require('./services/auth/AccountRecoveryService');
@@ -534,6 +535,7 @@ const restRoutes = [
     ['', require('./routes/notes')],
     ['uploads', require('./routes/uploads')],
     ['url-cards', require('./routes/urlCards')],
+    ['translate', require('./routes/translate')],
     ['ranking', require('./routes/ranking')],
     ['ui', require('./routes/ui')],
     ['dm', require('./routes/dm')],
@@ -931,6 +933,11 @@ const autoModerationService = new AutoModerationService({
     storageAdapter,
     moderationConfig: config.autoMod,
     ageVerifyConfig: config.ageVerify,
+    translationConfig: config.translation,
+});
+const translationService = new TranslationService({
+    dbAdapter,
+    translationConfig: config.translation,
 });
 const postActionQueue = new PostActionQueue();
 const postKeywordBackfillQueue = new PostActionQueue({ maxPendingJobs: 2000 });
@@ -947,6 +954,7 @@ postEventOutbox = new PostEventOutbox({
 app.locals.pushNotificationService = pushNotificationService;
 app.locals.moderationReportService = moderationReportService;
 app.locals.autoModerationService = autoModerationService;
+app.locals.translationService = translationService;
 app.locals.postActionQueue = postActionQueue;
 app.locals.readOnlyRequestQueue = readOnlyRequestQueue;
 app.locals.postKeywordBackfillQueue = postKeywordBackfillQueue;

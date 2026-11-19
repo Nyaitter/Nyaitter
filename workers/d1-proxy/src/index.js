@@ -829,6 +829,7 @@ function normalizePostRow(row) {
 		mask: Boolean(row.mask),
 		maskReason: row.mask_reason ?? row.maskReason ?? null,
 		mask_reason: row.mask_reason ?? row.maskReason ?? null,
+		language: row.language ?? null,
 		lock: Boolean(row.lock),
 		ageRating: Number(row.age_rating ?? row.ageRating ?? 0) || 0,
 		age_rating: Number(row.age_rating ?? row.ageRating ?? 0) || 0,
@@ -1007,6 +1008,69 @@ export default {
 					let q; try { q = modLogs.query(await request.json(), 'sqlite'); } catch (_) { return badRequest('Invalid filters'); }
 					const rows = await db.prepare(q.sql).bind(...q.args).all();
 					return json(modLogs.page(rows.results.map(modLogs.mapRow), q.limit));
+				}
+				if (method === 'POST' && pathname === '/translations') {
+					let body; try { body = await request.json(); } catch (_) { return badRequest('Invalid translation'); }
+					const row = {
+						sourceText: String(body.sourceText || ''),
+						sourceNormalized: String(body.sourceNormalized || ''),
+						sourceLanguage: String(body.sourceLanguage || ''),
+						targetLanguage: String(body.targetLanguage || ''),
+						translatedText: String(body.translatedText || ''),
+					};
+					const id = String(body.id || crypto.randomUUID());
+					const terms = Array.isArray(body.terms) ? body.terms.map((term) => String(term)) : [];
+					const statements = [
+						db.prepare('INSERT INTO translations (id, source_hash, source_text, source_normalized, norm_length, bigram_count, source_language, target_language, translated_text, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING')
+							.bind(id, String(body.sourceHash || ''), row.sourceText, row.sourceNormalized, row.sourceNormalized.length, Number(body.bigramCount) || 0, row.sourceLanguage, row.targetLanguage, row.translatedText, Number(body.createdAt) || Date.now()),
+						...terms.map((term) => db.prepare('INSERT INTO translation_terms (translation_id, term) VALUES (?, ?) ON CONFLICT DO NOTHING').bind(id, term)),
+					];
+					await db.batch(statements);
+					return json(row);
+				}
+				if (method === 'POST' && pathname === '/translations/exact') {
+					let body; try { body = await request.json(); } catch (_) { return badRequest('Invalid query'); }
+					const found = await db.prepare('SELECT source_text AS sourceText, source_normalized AS sourceNormalized, source_language AS sourceLanguage, target_language AS targetLanguage, translated_text AS translatedText FROM translations WHERE source_hash = ? AND target_language = ? LIMIT 1')
+						.bind(String(body.sourceHash || ''), String(body.targetLanguage || '')).first();
+					return json(found || null);
+				}
+				if (method === 'POST' && pathname === '/translations/candidates') {
+					let body; try { body = await request.json(); } catch (_) { return badRequest('Invalid query'); }
+					const terms = Array.isArray(body.terms) ? body.terms.map((term) => String(term)) : [];
+					if (!terms.length) return json([]);
+					const targetLanguage = String(body.targetLanguage || '');
+					const sourceLanguage = body.sourceLanguage ? String(body.sourceLanguage) : null;
+					const minLength = Number(body.minLength) || 0;
+					const maxLength = Number(body.maxLength) || 9007199254740991;
+					const termCount = Number(body.termCount) || terms.length;
+					const sharedById = new Map();
+					for (let i = 0; i < terms.length; i += 90) {
+						const chunk = terms.slice(i, i + 90);
+						const placeholders = chunk.map(() => '?').join(', ');
+						let sql = `SELECT tt.translation_id AS translationId, COUNT(*) AS shared FROM translation_terms tt JOIN translations t ON t.id = tt.translation_id WHERE tt.term IN (${placeholders}) AND t.target_language = ? AND t.norm_length BETWEEN ? AND ?`;
+						const binds = [...chunk, targetLanguage, minLength, maxLength];
+						if (sourceLanguage) { sql += ' AND t.source_language = ?'; binds.push(sourceLanguage); }
+						sql += ' GROUP BY tt.translation_id';
+						const rows = await db.prepare(sql).bind(...binds).all();
+						for (const counted of rows.results || []) {
+							sharedById.set(counted.translationId, (sharedById.get(counted.translationId) || 0) + counted.shared);
+						}
+					}
+					const ids = [...sharedById.keys()];
+					if (!ids.length) return json([]);
+					const found = [];
+					for (let i = 0; i < ids.length; i += 90) {
+						const chunk = ids.slice(i, i + 90);
+						const placeholders = chunk.map(() => '?').join(', ');
+						const rows = await db.prepare(`SELECT id, source_text AS sourceText, source_normalized AS sourceNormalized, source_language AS sourceLanguage, target_language AS targetLanguage, translated_text AS translatedText, bigram_count AS bigramCount FROM translations WHERE id IN (${placeholders})`).bind(...chunk).all();
+						found.push(...(rows.results || []));
+					}
+					return json(found
+						.map((row) => ({ row, shared: sharedById.get(row.id) || 0 }))
+						.filter(({ row, shared }) => shared * 10 >= 3 * (termCount + (Number(row.bigramCount) || 0)))
+						.sort((a, b) => b.shared - a.shared)
+						.slice(0, 50)
+						.map(({ row }) => row));
 				}
 				if (method === 'GET' && pathname === '/migration/snapshot') {
 					return json(await exportMigrationSnapshot(db));
@@ -3148,6 +3212,7 @@ export default {
 				const attachments = postData.attachments ? JSON.stringify(postData.attachments) : null;
 				const mask = postData.mask ? 1 : 0;
 				const maskReason = (postData.maskReason ?? postData.mask_reason) ? String(postData.maskReason ?? postData.mask_reason) : null;
+				const language = postData.language ? String(postData.language) : null;
 				const lock = postData.lock ? 1 : 0;
 				const announcement = postData.announcement ? 1 : 0;
 				const replyTo = (postData.replyTo ?? postData.reply_to ?? postData.reply_id) ? Number(postData.replyTo ?? postData.reply_to ?? postData.reply_id) : null;
@@ -3165,14 +3230,14 @@ export default {
 				if (hasExplicitId) {
 					createdId = Number(postData.id);
 					await db.prepare(
-						`INSERT INTO posts (id, user_id, content, attachments, mask, mask_reason, lock, announcement, reply_to, repost_to, tags, tags_generated_at, group_id, group_announcement, created_at, scheduled_at)
-						 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-					).bind(createdId, userId, content, attachments, mask, maskReason, lock, announcement, replyTo, repostTo, tags, tagsGeneratedAt, groupId, groupAnnouncement, now, scheduledAt).run();
+						`INSERT INTO posts (id, user_id, content, attachments, mask, mask_reason, lock, announcement, reply_to, repost_to, tags, tags_generated_at, group_id, group_announcement, created_at, scheduled_at, language)
+						 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+					).bind(createdId, userId, content, attachments, mask, maskReason, lock, announcement, replyTo, repostTo, tags, tagsGeneratedAt, groupId, groupAnnouncement, now, scheduledAt, language).run();
 				} else {
 					const res = await db.prepare(
-						`INSERT INTO posts (user_id, content, attachments, mask, mask_reason, lock, announcement, reply_to, repost_to, tags, tags_generated_at, group_id, group_announcement, created_at, scheduled_at)
-						 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-					).bind(userId, content, attachments, mask, maskReason, lock, announcement, replyTo, repostTo, tags, tagsGeneratedAt, groupId, groupAnnouncement, now, scheduledAt).run();
+						`INSERT INTO posts (user_id, content, attachments, mask, mask_reason, lock, announcement, reply_to, repost_to, tags, tags_generated_at, group_id, group_announcement, created_at, scheduled_at, language)
+						 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+					).bind(userId, content, attachments, mask, maskReason, lock, announcement, replyTo, repostTo, tags, tagsGeneratedAt, groupId, groupAnnouncement, now, scheduledAt, language).run();
 					createdId = res.meta.last_row_id;
 				}
 
@@ -3365,6 +3430,7 @@ export default {
 				if (fields.attachments !== undefined) { sets.push('attachments = ?'); values.push(fields.attachments ? JSON.stringify(fields.attachments) : null); }
 				if (fields.mask !== undefined) { sets.push('mask = ?'); values.push(fields.mask ? 1 : 0); }
 				if (fields.mask_reason !== undefined || fields.maskReason !== undefined) { const reason = fields.maskReason ?? fields.mask_reason; sets.push('mask_reason = ?'); values.push(reason ? String(reason) : null); }
+				if (fields.language !== undefined) { sets.push('language = ?'); values.push(fields.language ? String(fields.language) : null); }
 				if (fields.lock !== undefined) { sets.push('lock = ?'); values.push(fields.lock ? 1 : 0); }
 				if (fields.age_rating !== undefined || fields.ageRating !== undefined) { sets.push('age_rating = ?'); values.push(Number(fields.ageRating ?? fields.age_rating ?? 0) || 0); }
 

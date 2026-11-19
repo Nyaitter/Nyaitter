@@ -920,6 +920,24 @@ const config = {
     };
   })(),
 
+  translation: (() => {
+    const provider = String(readSetting(['TRANSLATION_AI_PROVIDER', 'TRANSLATION_PROVIDER'], ['translation.aiProvider', 'translation.provider'], 'auto')).trim().toLowerCase();
+    const model = readSetting(['TRANSLATION_AI_MODEL', 'TRANSLATION_MODEL'], ['translation.aiModel', 'translation.model'], '');
+    const similarityRaw = Number(readSetting(['TRANSLATION_SIMILARITY_THRESHOLD'], ['translation.similarityThreshold'], 0.9));
+    return {
+      provider, model,
+      maxConcurrent: exactIntegerSetting(
+        'Translation max concurrent',
+        ['TRANSLATION_MAX_CONCURRENT'],
+        ['translation.maxConcurrent'],
+        5,
+        1,
+      ),
+      similarityThreshold: Number.isFinite(similarityRaw) && similarityRaw >= 0 && similarityRaw <= 1 ? similarityRaw : 0.9,
+      languageDetection: String(readSetting(['TRANSLATION_LANGUAGE_DETECTION'], ['translation.languageDetection'], 'on')).trim().toLowerCase() !== 'off',
+    };
+  })(),
+
   ageVerify: (() => {
     const unknownRaw = String(readSetting(['AGE_VERIFY_UNKNOWN'], ['ageVerify.unknown'], 'mask')).trim().toLowerCase();
     if (!['mask', 'none', 'warn'].includes(unknownRaw)) console.warn(`[config] AGE_VERIFY_UNKNOWN must be mask or none; using mask.`);

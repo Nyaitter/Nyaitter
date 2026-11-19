@@ -679,6 +679,7 @@ async function runEditPostAction(context, { postId, userId, content, attachments
     attachments: Array.isArray(attachments) && attachments.length > 0 ? attachments : null,
     mask: !!mask,
     mask_reason: mask ? normalizeMaskReason(mask_reason ?? maskReason) : null,
+    language: null,
     lock: !!lock,
   };
 
