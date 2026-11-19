@@ -18,6 +18,7 @@ const InMemoryAdapter = require('./InMemoryAdapter');
 const PostgresAdapter = require('./postgres/PostgresAdapter');
 const D1Adapter = require('./d1/D1Adapter');
 const notesService = require('../../services/CommunityNoteService');
+const reputation = require('../../services/ReputationService');
 
 function seedNegativeReasons(adapter) {
   // 独立票 11,12,13 と、独立集合に入らない関係者 98,99 の否定票。
@@ -255,4 +256,130 @@ test('統合: basis は独立ゲートを満たさない note 由来の正の額
   assert.equal(basis.trust.successes, 1);
   const basisExcluded = await adapter.getTrustBasisProfile(11, { excludeScope: 'note:8' });
   assert.equal(basisExcluded.trust.score, 0);
+});
+
+// 投稿への反応による TrustScore の上下。反応が少ない環境でも証拠を捨てず、
+// 重み付けした証拠量に対して飽和する形で加点することの回帰テスト。
+async function trustUser(adapter, { ageDays = 60, trust = 0 } = {}) {
+  const user = await adapter.createUser({ name: 'user' });
+  adapter.users.get(user.id).created_at = new Date(Date.now() - ageDays * 86400000);
+  if (trust) await adapter.replaceReputationEvents(`seed:${user.id}`, [reputation.event('seed', user.id, 'trust', trust)]);
+  return user;
+}
+
+async function authorTrust(adapter, authorId) {
+  const profile = await adapter.getReputationProfile(authorId);
+  return Number(profile.trust?.score || 0);
+}
+
+test('TrustScore: 反応が1〜2件でも信頼できる反応でスコアが動く', async () => {
+  const adapter = new InMemoryAdapter();
+  const author = await trustUser(adapter);
+  const post = await adapter.createPost({ userId: author.id, content: 'hello' });
+
+  await reputation.syncPostTrust(adapter, post.id);
+  assert.equal(await authorTrust(adapter, author.id), 0, '反応ゼロでは変化しない');
+
+  const fan1 = await trustUser(adapter);
+  await adapter.toggleLike(fan1.id, post.id);
+  await reputation.syncPostTrust(adapter, post.id);
+  const one = await authorTrust(adapter, author.id);
+  assert.ok(Math.abs(one - 2 / 3) < 1e-9, `証拠量1で award の 1/3（${one}）`);
+
+  const fan2 = await trustUser(adapter);
+  await adapter.toggleLike(fan2.id, post.id);
+  await reputation.syncPostTrust(adapter, post.id);
+  const two = await authorTrust(adapter, author.id);
+  assert.ok(Math.abs(two - 1) < 1e-9, `証拠量2で award の半分（${two}）`);
+  assert.ok(two > one);
+});
+
+test('TrustScore: 若いアカウントの反応は部分的に数える', async () => {
+  const adapter = new InMemoryAdapter();
+  const author = await trustUser(adapter);
+  const post = await adapter.createPost({ userId: author.id, content: 'hello' });
+  const young = await trustUser(adapter, { ageDays: 15 });
+  await adapter.toggleLike(young.id, post.id);
+  await reputation.syncPostTrust(adapter, post.id);
+  const score = await authorTrust(adapter, author.id);
+  assert.ok(Math.abs(score - 0.4) < 1e-9, `15日目の反応は重み 0.5、証拠量 0.5 で 0.4 点（${score}）`);
+});
+
+test('TrustScore: 低信頼の多数より高信頼の少数が重い', async () => {
+  const adapterLow = new InMemoryAdapter();
+  const authorLow = await trustUser(adapterLow);
+  const postLow = await adapterLow.createPost({ userId: authorLow.id, content: 'a' });
+  for (let i = 0; i < 10; i++) {
+    const fan = await trustUser(adapterLow, { trust: -90 });
+    await adapterLow.toggleLike(fan.id, postLow.id);
+  }
+  await reputation.syncPostTrust(adapterLow, postLow.id);
+  const low = await authorTrust(adapterLow, authorLow.id);
+  assert.ok(Math.abs(low - 2 / 3) < 1e-9, `重み 0.1 の10件は証拠量1と等しい（${low}）`);
+
+  const adapterHigh = new InMemoryAdapter();
+  const authorHigh = await trustUser(adapterHigh);
+  const postHigh = await adapterHigh.createPost({ userId: authorHigh.id, content: 'b' });
+  for (let i = 0; i < 2; i++) {
+    const fan = await trustUser(adapterHigh);
+    await adapterHigh.toggleLike(fan.id, postHigh.id);
+  }
+  await reputation.syncPostTrust(adapterHigh, postHigh.id);
+  const high = await authorTrust(adapterHigh, authorHigh.id);
+  assert.ok(Math.abs(high - 1) < 1e-9, `重み 1 の2件は証拠量2（${high}）`);
+  assert.ok(high > low, '高信頼の少数が低信頼の多数を上回る');
+});
+
+test('TrustScore: 関係のある反応者はまとめて逓減する', async () => {
+  const adapter = new InMemoryAdapter();
+  const author = await trustUser(adapter);
+  const post = await adapter.createPost({ userId: author.id, content: 'hello' });
+  const a = await trustUser(adapter);
+  const b = await trustUser(adapter);
+  await adapter.toggleFollow(a.id, b.id);
+  await adapter.toggleLike(a.id, post.id);
+  await adapter.toggleLike(b.id, post.id);
+  await reputation.syncPostTrust(adapter, post.id);
+  const score = await authorTrust(adapter, author.id);
+  assert.ok(Math.abs(score - 6 / 7) < 1e-9, `同じかたまりの2件は証拠量 1+1/2（${score}）`);
+});
+
+test('TrustScore: 公開ノートは減点し、モデレーション済みの投稿は加点しない', async () => {
+  const adapter = new InMemoryAdapter();
+  const author = await trustUser(adapter);
+  const noteAuthor = await trustUser(adapter);
+  const post = await adapter.createPost({ userId: author.id, content: 'hello' });
+  const fan = await trustUser(adapter);
+  await adapter.toggleLike(fan.id, post.id);
+  await adapter.createNote({ postId: post.id, userId: noteAuthor.id, content: 'note', status: 'public' });
+  await reputation.syncPostTrust(adapter, post.id);
+  assert.equal(await authorTrust(adapter, author.id), -3, '公開ノートがある投稿は反応があっても -3');
+
+  const adapter2 = new InMemoryAdapter();
+  const author2 = await trustUser(adapter2);
+  const post2 = await adapter2.createPost({ userId: author2.id, content: 'hello' });
+  const fan2 = await trustUser(adapter2);
+  await adapter2.toggleLike(fan2.id, post2.id);
+  await adapter2.replaceReputationEvents(`moderation-post:${post2.id}:seed`, [reputation.event('moderation', author2.id, 'trust', -1, 0, '2026-01-01')]);
+  await reputation.syncPostTrust(adapter2, post2.id);
+  assert.equal(await authorTrust(adapter2, author2.id), -1, 'モデレーションの記録だけが残り、投稿の加点は付かない');
+});
+
+test('TrustScore: 反応が成立しない場合はゼロのまま壊れない', async () => {
+  const adapter = new InMemoryAdapter();
+  const author = await trustUser(adapter);
+  const post = await adapter.createPost({ userId: author.id, content: 'hello' });
+
+  await adapter.toggleLike(author.id, post.id);
+  await reputation.syncPostTrust(adapter, post.id);
+  assert.equal(await authorTrust(adapter, author.id), 0, '自分の反応は数えない');
+
+  const fresh = await adapter.createUser({ name: 'fresh' });
+  await adapter.toggleLike(fresh.id, post.id);
+  await reputation.syncPostTrust(adapter, post.id);
+  const score = await authorTrust(adapter, author.id);
+  assert.ok(Number.isFinite(score) && score >= 0 && score < 0.01, `作りたてのアカウントの反応はほぼゼロ（${score}）`);
+
+  await reputation.syncPostTrust(adapter, 999999);
+  assert.ok(Number.isFinite(await authorTrust(adapter, author.id)), '存在しない投稿でも壊れない');
 });

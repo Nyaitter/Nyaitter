@@ -101,6 +101,7 @@ function normalizePost(post) {
 	post.mask = !!post.mask;
 	post.maskReason = post.maskReason ?? post.mask_reason ?? null;
 	post.mask_reason = post.maskReason;
+	post.language = post.language ?? null;
 	post.lock = !!post.lock;
 	post.ageRating = Number(post.ageRating ?? post.age_rating ?? 0) || 0;
 	post.age_rating = post.ageRating;
@@ -304,6 +305,20 @@ class D1Adapter extends DatabaseAdapter {
 	async searchModLogs(input = {}) {
 		const filters = require('../modLogs').normalizeFilters(input);
 		return this._request('/mod-logs/search', { method: 'POST', body: filters, retry: true });
+	}
+	async findTranslationByHash(sourceHash, targetLanguage) {
+		return this._request('/translations/exact', { method: 'POST', body: { sourceHash: String(sourceHash), targetLanguage: String(targetLanguage) }, retry: true });
+	}
+	async findTranslationCandidates(filters = {}) {
+		return this._request('/translations/candidates', { method: 'POST', body: filters, retry: true });
+	}
+	async saveTranslation(record) {
+		const row = {
+			...record,
+			id: require('crypto').randomUUID(),
+			createdAt: Date.now(),
+		};
+		return this._request('/translations', { method: 'POST', body: row, retry: true });
 	}
 	constructor(options = {}) {
 		super();

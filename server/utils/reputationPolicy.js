@@ -21,7 +21,7 @@ const defaults = {
     Suspicious: { minScore: -1000000, rateMultiplier: 0.5, queuePriority: -2, disabledFeatures: ['notes', 'uploads'], publicRatioReduction: 0, dailyNotes: null, ratingWeight: 1, publicBonus: 0, noteVisibility: 0 },
     Banned: { minScore: -1000001, rateMultiplier: 0.25, queuePriority: -3, disabledFeatures: ['write', 'notes', 'uploads'], publicRatioReduction: 0, dailyNotes: null, ratingWeight: 1, publicBonus: 0, noteVisibility: 0 },
   },
-  positivePost: { minUsers: 5, minAgeDays: 30, minTrust: 0, award: 2 },
+  positivePost: { award: 2, halfSaturation: 2, minAgeDays: 30, minTrust: 0 },
   penalties: { publicNote: -3, rejectedNote: -2, approvedReport: -5, falseReports: -3, falseReportRepeat: 3 },
 };
 
@@ -82,7 +82,10 @@ function buildPolicy(input = {}) {
   const ordered=['Trusted','Reliable','Credible','Neutral','Questionable'];
   if (policy.trust.Neutral.minScore!==0 || ordered.some((rank,i)=>i && policy.trust[ordered[i-1]].minScore<=policy.trust[rank].minScore)) throw new Error('Trust thresholds must decrease through Neutral=0');
   if (policy.trust.Suspicious.minScore>=policy.trust.Questionable.minScore || policy.trust.Banned.minScore>policy.trust.Suspicious.minScore) throw new Error('Trust thresholds must decrease through Neutral=0');
-  if (!Number.isInteger(policy.positivePost.minUsers) || policy.positivePost.minUsers<3 || !Number.isFinite(policy.positivePost.minAgeDays) || policy.positivePost.minAgeDays<0 || !Number.isFinite(policy.positivePost.minTrust) || !Number.isFinite(policy.positivePost.award) || policy.positivePost.award<0 || policy.positivePost.award>10) throw new Error('Invalid positive post evidence');
+  if (!Number.isFinite(policy.positivePost.award) || policy.positivePost.award<0 || policy.positivePost.award>10
+    || !Number.isFinite(policy.positivePost.halfSaturation) || policy.positivePost.halfSaturation<=0 || policy.positivePost.halfSaturation>1000
+    || !Number.isFinite(policy.positivePost.minAgeDays) || policy.positivePost.minAgeDays<0
+    || !Number.isFinite(policy.positivePost.minTrust)) throw new Error('Invalid positive post evidence');
   for (const [dimension, cap] of Object.entries(policy.dailyCaps)) if (!(dimension !== 'ban' && cap === null) && (!Number.isFinite(cap) || cap < 0 || cap > 100)) throw new Error('Invalid reputation daily cap');
   for (const [key, value] of Object.entries(policy.penalties)) if (!Number.isFinite(value) || (key === 'falseReportRepeat' ? !Number.isInteger(value) || value < 2 : value > 0 || value < -100)) throw new Error('Invalid reputation penalty');
   return policy;

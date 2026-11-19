@@ -152,6 +152,7 @@ function normalizePostRow(row) {
 		mask: Boolean(row.mask),
 		maskReason: row.mask_reason ?? row.maskReason ?? null,
 		mask_reason: row.mask_reason ?? row.maskReason ?? null,
+		language: row.language ?? null,
 		lock: Boolean(row.lock),
 		ageRating: Number(row.age_rating ?? row.ageRating ?? 0) || 0,
 		age_rating: Number(row.age_rating ?? row.ageRating ?? 0) || 0,
@@ -515,6 +516,57 @@ class PostgresAdapter extends DatabaseAdapter {
 		const m = require('../modLogs'); const q = m.query(input, 'postgres');
 		const { rows } = await this.pool.query(q.sql, q.args);
 		return m.page(rows.map(m.mapRow), q.limit);
+	}
+	async findTranslationByHash(sourceHash, targetLanguage) {
+		const { rows } = await this.pool.query(
+			'SELECT source_text AS "sourceText", source_normalized AS "sourceNormalized", source_language AS "sourceLanguage", target_language AS "targetLanguage", translated_text AS "translatedText" FROM translations WHERE source_hash = $1 AND target_language = $2 LIMIT 1',
+			[String(sourceHash), String(targetLanguage)],
+		);
+		return rows[0] || null;
+	}
+	async findTranslationCandidates({ targetLanguage, sourceLanguage = null, terms = [], termCount = 0, minLength = 0, maxLength = Number.MAX_SAFE_INTEGER } = {}) {
+		if (!terms.length) return [];
+		const { rows } = await this.pool.query(
+			`SELECT t.source_text AS "sourceText", t.source_normalized AS "sourceNormalized", t.source_language AS "sourceLanguage", t.target_language AS "targetLanguage", t.translated_text AS "translatedText", COUNT(*)::int AS shared
+			 FROM translation_terms tt
+			 JOIN translations t ON t.id = tt.translation_id
+			 WHERE tt.term = ANY($1::text[])
+			   AND t.target_language = $2
+			   AND ($3::text IS NULL OR t.source_language = $3)
+			   AND t.norm_length BETWEEN $4 AND $5
+			 GROUP BY t.id
+			 HAVING COUNT(*) * 10 >= 3 * ($6 + t.bigram_count)
+			 ORDER BY shared DESC
+			 LIMIT 50`,
+			[terms, String(targetLanguage), sourceLanguage ? String(sourceLanguage) : null, Number(minLength) || 0, Number(maxLength) || Number.MAX_SAFE_INTEGER, Number(termCount) || 0],
+		);
+		return rows;
+	}
+	async saveTranslation(record) {
+		const row = {
+			id: crypto.randomUUID(),
+			sourceHash: String(record.sourceHash),
+			sourceText: String(record.sourceText),
+			sourceNormalized: String(record.sourceNormalized || ''),
+			normLength: String(record.sourceNormalized || '').length,
+			bigramCount: Number(record.bigramCount) || 0,
+			sourceLanguage: String(record.sourceLanguage),
+			targetLanguage: String(record.targetLanguage),
+			translatedText: String(record.translatedText),
+			createdAt: Date.now(),
+		};
+		const inserted = await this.pool.query(
+			'INSERT INTO translations (id, source_hash, source_text, source_normalized, norm_length, bigram_count, source_language, target_language, translated_text, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT DO NOTHING RETURNING id',
+			[row.id, row.sourceHash, row.sourceText, row.sourceNormalized, row.normLength, row.bigramCount, row.sourceLanguage, row.targetLanguage, row.translatedText, row.createdAt],
+		);
+		const terms = Array.isArray(record.terms) ? record.terms : [];
+		if (inserted.rowCount && terms.length) {
+			await this.pool.query(
+				'INSERT INTO translation_terms (translation_id, term) SELECT $1, unnest($2::text[]) ON CONFLICT DO NOTHING',
+				[row.id, terms],
+			);
+		}
+		return row;
 	}
 	constructor(options = {}) {
 		super();
@@ -3094,14 +3146,15 @@ class PostgresAdapter extends DatabaseAdapter {
 			now,
 			postData.scheduledAt ?? null,
 			(postData.maskReason ?? postData.mask_reason) ? String(postData.maskReason ?? postData.mask_reason) : null,
+			postData.language ? String(postData.language) : null,
 		];
 
 		const insertQuery = hasExplicitId
-			? `INSERT INTO posts (id, user_id, content, view_content, attachments, mask, lock, announcement, reply_to, repost_to, tags, tags_generated_at, group_id, group_announcement, reply_control, created_at, scheduled_at, mask_reason)
-			   VALUES ($18, $1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10::jsonb, $11, $12, $13, $14, $15, $16, $17)
+			? `INSERT INTO posts (id, user_id, content, view_content, attachments, mask, lock, announcement, reply_to, repost_to, tags, tags_generated_at, group_id, group_announcement, reply_control, created_at, scheduled_at, mask_reason, language)
+			   VALUES ($19, $1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10::jsonb, $11, $12, $13, $14, $15, $16, $17, $18)
 			   RETURNING *`
-			: `INSERT INTO posts (user_id, content, view_content, attachments, mask, lock, announcement, reply_to, repost_to, tags, tags_generated_at, group_id, group_announcement, reply_control, created_at, scheduled_at, mask_reason)
-			   VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10::jsonb, $11, $12, $13, $14, $15, $16, $17)
+			: `INSERT INTO posts (user_id, content, view_content, attachments, mask, lock, announcement, reply_to, repost_to, tags, tags_generated_at, group_id, group_announcement, reply_control, created_at, scheduled_at, mask_reason, language)
+			   VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10::jsonb, $11, $12, $13, $14, $15, $16, $17, $18)
 			   RETURNING *`;
 
 		if (hasExplicitId) {
@@ -3667,6 +3720,10 @@ class PostgresAdapter extends DatabaseAdapter {
 			const reason = fields.maskReason ?? fields.mask_reason;
 			values.push(reason ? String(reason) : null);
 			sets.push(`mask_reason = $${values.length}`);
+		}
+		if (fields.language !== undefined) {
+			values.push(fields.language ? String(fields.language) : null);
+			sets.push(`language = $${values.length}`);
 		}
 		if (fields.lock !== undefined) {
 			values.push(Boolean(fields.lock));

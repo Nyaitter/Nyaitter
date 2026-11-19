@@ -92,25 +92,52 @@ async function independenceContext(db,ids) {
   return {byId:new Map(snapshot.users.filter(Boolean).map(u=>[Number(u.id),u])),profiles:snapshot.profiles,edges};
 }
 
-async function independentUsers(db,ids,excluded,{minAgeDays=policy.notes.minIndependentAgeDays,minTrust=0,context=null}={}) {
-  if (!ids.length) return [];
-  context ||= await independenceContext(db,[...ids,...excluded]);
-  const selected=[]; const {byId,profiles,edges}=context;
+// 反応者の信頼スコアが minTrust からこの幅だけ下がるまで、重みを直線的に割り引く。
+const REACTOR_TRUST_SPAN=100;
+
+function reactorWeight(user,profile,rules) {
+  const ageDays=(Date.now()-new Date(user.created_at || user.createdAt).getTime())/86400000;
+  if (!Number.isFinite(ageDays)) return 0;
+  const ageFactor=rules.minAgeDays>0?Math.min(1,Math.max(0,ageDays)/rules.minAgeDays):1;
+  const score=Number(profile?.trust?.score || 0);
+  const trustFactor=Math.min(1,Math.max(0,1+(score-rules.minTrust)/REACTOR_TRUST_SPAN));
+  return ageFactor*trustFactor;
+}
+
+// 反応の証拠量。関係のある反応者はひとかたまりとして数え、人数に対する増分を逓減させる。
+async function positivePostEvidence(db,authorId,ids) {
+  const {byId,profiles,edges}=await independenceContext(db,[...ids,authorId]);
+  const author=byId.get(authorId);
+  const weights=new Map();
   for (const uid of ids.map(Number)) {
     const user=byId.get(uid);
-    if (!user || excluded.includes(uid) || user.freeze || isImposter(user)) continue;
-    const age=(Date.now()-new Date(user.created_at || user.createdAt).getTime())/86400000;
-    if (!Number.isFinite(age) || age<minAgeDays) continue;
-    const profile=profiles[uid] || {};
-    if (Number(profile.trust?.score || 0)<minTrust || trustRank(profile,policy)==='Banned') continue;
-    let related=false;
-    for (const other of [...excluded,...selected]) {
-      const otherUser=byId.get(other);
-      if (edges.has(`${uid}:${other}`) || (user.block || []).map(Number).includes(other) || (otherUser?.block || []).map(Number).includes(uid)) {related=true;break;}
-    }
-    if (!related) selected.push(uid);
+    if (!user || user.freeze || isImposter(user)) continue;
+    if (trustRank(profiles[uid] || {},policy)==='Banned') continue;
+    if ((user.block || []).map(Number).includes(authorId) || (author?.block || []).map(Number).includes(uid)) continue;
+    const weight=reactorWeight(user,profiles[uid] || {},policy.positivePost);
+    if (weight>0) weights.set(uid,weight);
   }
-  return selected;
+  const parent=new Map([...weights.keys()].map(uid=>[uid,uid]));
+  const find=(x)=>{while (parent.get(x)!==x) {parent.set(x,parent.get(parent.get(x)));x=parent.get(x);} return x;};
+  const link=(a,b)=>{if (weights.has(a) && weights.has(b)) parent.set(find(a),find(b));};
+  for (const pair of edges) {const [a,b]=pair.split(':').map(Number); link(a,b);}
+  const blockSets=new Map([...weights.keys()].map(uid=>[uid,new Set((byId.get(uid)?.block || []).map(Number))]));
+  const weightedIds=[...weights.keys()];
+  for (let i=0;i<weightedIds.length;i++) for (let j=i+1;j<weightedIds.length;j++) {
+    if (blockSets.get(weightedIds[i]).has(weightedIds[j]) || blockSets.get(weightedIds[j]).has(weightedIds[i])) link(weightedIds[i],weightedIds[j]);
+  }
+  const clusters=new Map();
+  for (const [uid,weight] of weights) {
+    const root=find(uid);
+    if (!clusters.has(root)) clusters.set(root,[]);
+    clusters.get(root).push(weight);
+  }
+  let evidence=0;
+  for (const members of clusters.values()) {
+    members.sort((a,b)=>b-a);
+    members.forEach((weight,index)=>{evidence+=weight/(index+1);});
+  }
+  return evidence;
 }
 
 async function syncPostTrust(db,postId) {
@@ -127,10 +154,11 @@ async function syncPostTrust(db,postId) {
       const ids=await db.listPositivePostUsers(postId,policy.notes.maxRatings);
       const visible=[];
       for (const uid of ids) if (uid!==authorId && await canViewPost(db,post,uid)) visible.push(uid);
-      const independent=visible.length>=policy.positivePost.minUsers
-        ? await independentUsers(db,visible,[authorId],{minAgeDays:policy.positivePost.minAgeDays,minTrust:policy.positivePost.minTrust})
-        : [];
-      if (independent.length>=policy.positivePost.minUsers) amount=policy.positivePost.award;
+      if (visible.length) {
+        const evidence=await positivePostEvidence(db,authorId,visible);
+        const {award,halfSaturation}=policy.positivePost;
+        if (evidence>0) amount=award*evidence/(evidence+halfSaturation);
+      }
     }
     await db.replaceReputationEvents(`post-trust:${postId}`,amount?[event('post',authorId,'trust',amount,0,day)]:[]);
   });
@@ -155,4 +183,4 @@ async function retractReportTrust(db,{reportId,userId,targetKind,targetId,report
   if (result.postId) await syncPostTrust(db,result.postId);
 }
 
-module.exports={policy,event,serialized,effectivePolicy,enforceAccess,getStatus,independenceContext,independentUsers,syncPostTrust,syncReport,cancelPostEvents,retractReportTrust};
+module.exports={policy,event,serialized,effectivePolicy,enforceAccess,getStatus,independenceContext,positivePostEvidence,syncPostTrust,syncReport,cancelPostEvents,retractReportTrust};
