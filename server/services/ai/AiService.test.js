@@ -12,6 +12,7 @@ const {
   isValidReasoningEffort,
   modelOmitsReasoningEffort,
   isReasoningEffortError,
+  parseToolCalls,
 } = require('./AiService');
 
 test('resolveReasoningEffort accepts only exact API values', () => {
@@ -139,6 +140,50 @@ test('generate retries once without reasoning_effort when the API rejects the va
     assert.equal(chats[0].body.reasoning_effort, 'none');
     assert.ok(!('reasoning_effort' in chats[1].body));
   }, (body) => ('reasoning_effort' in body ? effortError : null));
+});
+
+test('parseToolCalls reads OpenAI and Gemini tool calls', () => {
+  assert.deepEqual(parseToolCalls({
+    choices: [{ message: { tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'get_post', arguments: '{"post_id": 42}' } }] } }],
+  }), [{ id: 'call_1', name: 'get_post', args: { post_id: 42 } }]);
+  assert.deepEqual(parseToolCalls({
+    candidates: [{ content: { parts: [{ functionCall: { name: 'apply_cushion', args: {} } }, { text: 'ok' }] } }],
+  }), [{ id: null, name: 'apply_cushion', args: {} }]);
+  assert.deepEqual(parseToolCalls({ choices: [{ message: { content: '<safe>' } }] }), []);
+  assert.deepEqual(parseToolCalls(null), []);
+});
+
+test('generate sends tools and tool turns for OpenAI chat completions', async () => {
+  const toolReply = {
+    status: 200,
+    payload: {
+      choices: [{ message: { tool_calls: [{ id: 'call_9', type: 'function', function: { name: 'set_author_age', arguments: '{"band":"18-24"}' } }] } }],
+    },
+  };
+  await withFakeOpenAi(async (service, requests) => {
+    const response = await service.generate({
+      provider: 'fake',
+      model: 'gpt-5',
+      system: 'sys',
+      tools: [{ name: 'set_author_age', description: '年齢帯', parameters: { type: 'object', properties: { band: { type: 'string' } } } }],
+      turns: [
+        { role: 'user', text: '判定してください' },
+        { role: 'assistant', toolCalls: [{ id: 'call_1', name: 'get_post', args: { post_id: 7 } }] },
+        { role: 'tool', results: [{ id: 'call_1', name: 'get_post', result: { post: { id: 7 } } }] },
+      ],
+    });
+    assert.deepEqual(parseToolCalls(response), [{ id: 'call_9', name: 'set_author_age', args: { band: '18-24' } }]);
+    const chat = requests.find((r) => r.url.endsWith('/chat/completions'));
+    assert.ok(chat, 'chat completion request captured');
+    assert.equal(chat.body.tools[0].type, 'function');
+    assert.equal(chat.body.tools[0].function.name, 'set_author_age');
+    const assistant = chat.body.messages.find((message) => message.role === 'assistant');
+    assert.equal(assistant.tool_calls[0].function.name, 'get_post');
+    assert.equal(assistant.tool_calls[0].function.arguments, '{"post_id":7}');
+    const toolMessage = chat.body.messages.find((message) => message.role === 'tool');
+    assert.equal(toolMessage.tool_call_id, 'call_1');
+    assert.deepEqual(JSON.parse(toolMessage.content), { post: { id: 7 } });
+  }, () => toolReply);
 });
 
 test('generate does not retry unrelated API errors', async () => {

@@ -49,6 +49,137 @@ function headers(provider) {
   return value;
 }
 
+// ツール呼び出し用の共通形式。
+// turns: { role: 'user', text?, images? }
+//      | { role: 'assistant', text?, toolCalls?: [{ id?, name, args }] }
+//      | { role: 'tool', results: [{ id?, name, result }], text?, images? }
+// tools: [{ name, description, parameters }]（parameters は JSON Schema）
+function parseToolCalls(response) {
+  const calls = [];
+  const message = response?.choices?.[0]?.message;
+  if (Array.isArray(message?.tool_calls)) {
+    for (const call of message.tool_calls) {
+      const name = call?.function?.name;
+      if (typeof name !== 'string' || !name) continue;
+      let args = call.function.arguments;
+      if (typeof args === 'string') {
+        try { args = JSON.parse(args); } catch { args = {}; }
+      }
+      calls.push({
+        id: typeof call.id === 'string' ? call.id : null,
+        name,
+        args: args && typeof args === 'object' ? args : {},
+      });
+    }
+    return calls;
+  }
+  const parts = response?.candidates?.[0]?.content?.parts;
+  if (Array.isArray(parts)) {
+    for (const part of parts) {
+      const functionCall = part?.functionCall;
+      if (functionCall && typeof functionCall.name === 'string' && functionCall.name) {
+        calls.push({
+          id: null,
+          name: functionCall.name,
+          args: functionCall.args && typeof functionCall.args === 'object' ? functionCall.args : {},
+        });
+      }
+    }
+  }
+  return calls;
+}
+
+function geminiTurns(turns) {
+  const contents = [];
+  for (const turn of turns || []) {
+    if (!turn || typeof turn !== 'object') continue;
+    if (turn.role === 'assistant') {
+      const parts = [];
+      if (turn.text) parts.push({ text: String(turn.text) });
+      for (const call of turn.toolCalls || []) {
+        parts.push({ functionCall: { name: call.name, args: call.args || {} } });
+      }
+      if (parts.length) contents.push({ role: 'model', parts });
+      continue;
+    }
+    if (turn.role === 'tool') {
+      const parts = [];
+      for (const entry of turn.results || []) {
+        const result = entry.result && typeof entry.result === 'object' ? entry.result : { value: entry.result ?? null };
+        parts.push({ functionResponse: { name: entry.name, response: { result } } });
+      }
+      if (turn.text) parts.push({ text: String(turn.text) });
+      for (const image of turn.images || []) parts.push({ inlineData: image });
+      if (parts.length) contents.push({ role: 'user', parts });
+      continue;
+    }
+    const parts = [];
+    if (turn.text) parts.push({ text: String(turn.text) });
+    for (const image of turn.images || []) parts.push({ inlineData: image });
+    if (parts.length) contents.push({ role: 'user', parts });
+  }
+  return contents;
+}
+
+function openAiTurns(turns) {
+  const messages = [];
+  let pendingCallIds = [];
+  let sequence = 0;
+  for (const turn of turns || []) {
+    if (!turn || typeof turn !== 'object') continue;
+    if (turn.role === 'assistant') {
+      const message = { role: 'assistant', content: turn.text ? String(turn.text) : null };
+      pendingCallIds = [];
+      if (Array.isArray(turn.toolCalls) && turn.toolCalls.length) {
+        message.tool_calls = turn.toolCalls.map((call) => {
+          const id = typeof call.id === 'string' && call.id ? call.id : `call_${++sequence}`;
+          pendingCallIds.push({ id, name: call.name });
+          return { id, type: 'function', function: { name: call.name, arguments: JSON.stringify(call.args || {}) } };
+        });
+      }
+      messages.push(message);
+      continue;
+    }
+    if (turn.role === 'tool') {
+      for (const entry of turn.results || []) {
+        let toolCallId = typeof entry.id === 'string' && entry.id ? entry.id : null;
+        if (!toolCallId) {
+          const index = pendingCallIds.findIndex((pending) => pending.name === entry.name);
+          toolCallId = (index >= 0 ? pendingCallIds.splice(index, 1)[0] : pendingCallIds.shift())?.id || `call_${++sequence}`;
+        } else {
+          const index = pendingCallIds.findIndex((pending) => pending.id === toolCallId);
+          if (index >= 0) pendingCallIds.splice(index, 1);
+        }
+        messages.push({
+          role: 'tool',
+          tool_call_id: toolCallId,
+          content: JSON.stringify(entry.result ?? null),
+        });
+      }
+      if (turn.text || (Array.isArray(turn.images) && turn.images.length)) {
+        const content = [];
+        if (turn.text) content.push({ type: 'text', text: String(turn.text) });
+        for (const image of turn.images || []) {
+          content.push({ type: 'image_url', image_url: { url: `data:${image.mimeType};base64,${image.data}` } });
+        }
+        messages.push({ role: 'user', content });
+      }
+      continue;
+    }
+    if (turn.text && !(Array.isArray(turn.images) && turn.images.length)) {
+      messages.push({ role: 'user', content: String(turn.text) });
+      continue;
+    }
+    const content = [];
+    if (turn.text) content.push({ type: 'text', text: String(turn.text) });
+    for (const image of turn.images || []) {
+      content.push({ type: 'image_url', image_url: { url: `data:${image.mimeType};base64,${image.data}` } });
+    }
+    if (content.length) messages.push({ role: 'user', content });
+  }
+  return messages;
+}
+
 function modelSupportsGeneration(model, type) {
   if (type === 'gemini') return model.supportedGenerationMethods?.includes('generateContent');
   return !/(?:embedding|whisper|tts|dall-e|moderation|image|realtime|transcribe|audio|sora)/i.test(model.id || '');
@@ -201,6 +332,9 @@ class AiService {
         if (remaining <= 0) throw lastError || Object.assign(new Error('AI routing timed out'), { code: 'AI_TIMEOUT' });
         const attempt = { ...request, workDir: this.workDir, timeoutMs: Math.min(request.timeoutMs || 45000, remaining) };
         try {
+          if (request.tools && !['openai', 'gemini'].includes(provider.type)) {
+            throw Object.assign(new Error('Tool calls are not supported by this AI provider'), { code: 'AI_CAPABILITY' });
+          }
           if (!['openai', 'gemini'].includes(provider.type)) return await cliGenerate(provider, model, attempt);
           return await this._generateApi(provider, model, attempt);
         } catch (error) {
@@ -220,23 +354,48 @@ class AiService {
 
   async _generateApi(provider, model, request) {
     if (provider.type === 'gemini') {
-      const parts = [{ text: request.text || '' }, ...(request.images || []).map(image => ({ inlineData: image }))];
+      const contents = Array.isArray(request.turns) && request.turns.length
+        ? geminiTurns(request.turns)
+        : [{ role: 'user', parts: [{ text: request.text || '' }, ...(request.images || []).map(image => ({ inlineData: image }))] }];
+      const payload = {
+        systemInstruction: { parts: [{ text: request.system || '' }] },
+        contents,
+        generationConfig: { candidateCount: 1, maxOutputTokens: request.maxOutputTokens || 256 },
+      };
+      if (Array.isArray(request.tools) && request.tools.length) {
+        payload.tools = [{
+          functionDeclarations: request.tools.map(tool => ({
+            name: tool.name,
+            description: tool.description || '',
+            parameters: tool.parameters || { type: 'object', properties: {} },
+          })),
+        }];
+      }
       return requestJson(`${baseUrl(provider)}/models/${encodeURIComponent(String(model).replace(/^models\//, ''))}:generateContent`, {
         method: 'POST', headers: headers(provider),
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: request.system || '' }] },
-          contents: [{ role: 'user', parts }],
-          generationConfig: { candidateCount: 1, maxOutputTokens: request.maxOutputTokens || 256 },
-        }),
+        body: JSON.stringify(payload),
       }, request.timeoutMs || 45000);
     }
     const content = [{ type: 'text', text: request.text || '' }, ...(request.images || []).map(image => ({
       type: 'image_url', image_url: { url: `data:${image.mimeType};base64,${image.data}` },
     }))];
+    const messages = Array.isArray(request.turns) && request.turns.length
+      ? [{ role: 'system', content: request.system || '' }, ...openAiTurns(request.turns)]
+      : [{ role: 'system', content: request.system || '' }, { role: 'user', content }];
     const body = {
-      model, messages: [{ role: 'system', content: request.system || '' }, { role: 'user', content }],
+      model, messages,
       [provider.url ? 'max_tokens' : 'max_completion_tokens']: request.maxOutputTokens || 256,
     };
+    if (Array.isArray(request.tools) && request.tools.length) {
+      body.tools = request.tools.map(tool => ({
+        type: 'function',
+        function: {
+          name: tool.name,
+          description: tool.description || '',
+          parameters: tool.parameters || { type: 'object', properties: {} },
+        },
+      }));
+    }
     const reasoningEffort = modelOmitsReasoningEffort(model) ? null : resolveReasoningEffort(request.reasoningEffort);
     if (reasoningEffort) body.reasoning_effort = reasoningEffort;
     const send = (payload) => requestJson(`${baseUrl(provider)}/chat/completions`, {
@@ -261,4 +420,4 @@ function getAiService() {
   return sharedService;
 }
 
-module.exports = { AiService, getAiService, REASONING_EFFORT_VALUES, resolveReasoningEffort, isValidReasoningEffort, modelOmitsReasoningEffort, isReasoningEffortError };
+module.exports = { AiService, getAiService, parseToolCalls, REASONING_EFFORT_VALUES, resolveReasoningEffort, isValidReasoningEffort, modelOmitsReasoningEffort, isReasoningEffortError };

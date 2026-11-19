@@ -878,10 +878,20 @@ const config = {
     if (mode !== modeRaw) console.warn(`[config] AUTOMOD_MODE must be off, legacy, or v2; using off.`);
     const authorAgeRaw = String(readSetting(['AUTOMOD_AUTHOR_AGE'], ['autoMod.authorAge', 'automod.authorAge'], 'on')).trim().toLowerCase();
     if (!['on', 'off'].includes(authorAgeRaw)) console.warn(`[config] AUTOMOD_AUTHOR_AGE must be on or off; using on.`);
+    const toolCallRaw = String(readSetting(['AUTOMOD_TOOL_CALL'], ['autoMod.toolCall', 'automod.toolCall'], 'on')).trim().toLowerCase();
+    if (!['on', 'off'].includes(toolCallRaw)) console.warn(`[config] AUTOMOD_TOOL_CALL must be on or off; using on.`);
     const providers = aiProviderSettings();
     return {
       provider, model, prompt, reasoningEffort, mode,
       authorAge: authorAgeRaw !== 'off',
+      toolCall: toolCallRaw !== 'off',
+      toolMaxTurns: exactIntegerSetting(
+        'AutoMod tool max turns',
+        ['AUTOMOD_TOOL_MAX_TURNS'],
+        ['autoMod.toolMaxTurns', 'automod.toolMaxTurns'],
+        0,
+        0,
+      ),
 		      maxImages: exactIntegerSetting(
 		        'AutoMod max images',
 		        ['AUTOMOD_MAX_IMAGES', 'AUTOMOD_MOD_MAX_IMAGES', 'GEMINI_MOD_MAX_IMAGES'],
