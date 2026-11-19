@@ -78,8 +78,6 @@ function readSetting(envNames, configPaths, fallback) {
 }
 
 function aiProviderSettings() {
-  const configured = readSetting(['AI_PROVIDERS', 'MODEL_PROVIDERS'], ['ai.providers', 'modelProviders', 'AI_PROVIDERS'], undefined);
-  if (configured !== undefined) return normalizeProviders(configured);
   const providers = [];
   const legacyKey = readSetting(['AUTOMOD_API_KEY'], ['autoMod.apiKey', 'automod.apiKey', 'geminiModeration.apiKey'], '');
   const legacyEndpoint = readSetting(['AUTOMOD_ENDPOINT', 'AUTOMOD_BASE_URL', 'OPENAI_BASE_URL'], ['autoMod.endpoint', 'autoMod.baseUrl', 'automod.endpoint'], '');
@@ -92,6 +90,24 @@ function aiProviderSettings() {
     const apikey = process.env[`${type.toUpperCase()}_API_KEY`];
     if (apikey && !providers.some(provider => provider.type === type && provider.apikey === apikey)) {
       providers.push({ type, apikey, defmodel: process.env[`${type.toUpperCase()}_MODEL`] || '', url: type === 'openai' ? process.env.OPENAI_BASE_URL || '' : '' });
+    }
+  }
+  // 設定側のプロバイダは、環境変数側の従来プロバイダを置き換えず後ろへ足す。
+  const configured = readSetting(['AI_PROVIDERS', 'MODEL_PROVIDERS'], ['ai.providers', 'modelProviders', 'AI_PROVIDERS'], undefined);
+  if (configured !== undefined) {
+    let extra = configured;
+    if (typeof extra === 'string') {
+      try { extra = JSON.parse(extra); } catch { return normalizeProviders(configured); }
+    }
+    if (Array.isArray(extra)) {
+      const seen = new Set(providers.map((provider) => `${provider.type}|${provider.apikey || ''}|${provider.url || ''}`));
+      for (const entry of extra) {
+        const key = `${String(entry?.type || '').trim().toLowerCase()}|${entry?.apikey || ''}|${entry?.url || ''}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          providers.push(entry);
+        }
+      }
     }
   }
   return normalizeProviders(providers);
@@ -906,7 +922,7 @@ const config = {
 		        500,
 		        1,
 		      ),
-      enabled: Boolean(prompt && providers.some(item => provider === 'auto' || item.type === provider || item.id.toLowerCase() === provider)),
+      enabled: providers.some(item => provider === 'auto' || item.type === provider || item.id.toLowerCase() === provider),
     };
   })(),
 
