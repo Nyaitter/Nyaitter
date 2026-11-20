@@ -186,6 +186,55 @@ test('訳し直しても切れる場合は保存せずに失敗する', async ()
   assert.equal(saved, null);
 });
 
+test('ツール呼び出しで返された翻訳結果を使う', async () => {
+  const ai = {
+    generate: async (request) => {
+      assert.ok(Array.isArray(request.tools));
+      return {
+        choices: [{
+          message: {
+            tool_calls: [{
+              id: 'call-1',
+              function: {
+                name: 'submit_translation',
+                arguments: JSON.stringify({ source_language: 'en', translated_text: '«ツール経由の翻訳。»' }),
+              },
+            }],
+          },
+          finish_reason: 'tool_calls',
+        }],
+      };
+    },
+  };
+  const { service } = makeService(ai);
+  const result = await service.translate({ text: 'A tool call sentence.', targetLanguage: 'ja' });
+  assert.equal(result.sourceLanguage, 'en');
+  assert.equal(result.translatedText, '«ツール経由の翻訳。»');
+});
+
+test('ツール呼び出しが使えないプロバイダではテキスト形式に切り替える', async () => {
+  let calls = 0;
+  const ai = {
+    generate: async (request) => {
+      calls += 1;
+      if (request.tools) throw Object.assign(new Error('Tool calls are not supported'), { code: 'AI_CAPABILITY' });
+      return 'en\n«テキスト経由の翻訳。»';
+    },
+  };
+  const { service } = makeService(ai);
+  const result = await service.translate({ text: 'A fallback sentence.', targetLanguage: 'ja' });
+  assert.equal(calls, 2);
+  assert.equal(result.translatedText, '«テキスト経由の翻訳。»');
+});
+
+test('ツール呼び出しが返らなかった場合は応答テキストから読み取る', async () => {
+  const { ai } = makeAi();
+  const { service } = makeService(ai);
+  const result = await service.translate({ text: 'Plain text reply', targetLanguage: 'ja' });
+  assert.equal(result.translatedText, '«Plain text reply»');
+  assert.equal(result.sourceLanguage, 'en');
+});
+
 test('翻訳リクエストには日本語と中国語の見分け方と出力言語の確認が含まれる', async () => {
   const { ai, state } = makeAi();
   const { service } = makeService(ai);
