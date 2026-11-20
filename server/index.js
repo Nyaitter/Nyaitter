@@ -933,7 +933,6 @@ const autoModerationService = new AutoModerationService({
     storageAdapter,
     moderationConfig: config.autoMod,
     ageVerifyConfig: config.ageVerify,
-    translationConfig: config.translation,
 });
 const translationService = new TranslationService({
     dbAdapter,

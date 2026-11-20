@@ -6,20 +6,19 @@ const InMemoryAdapter = require('../adapters/database/InMemoryAdapter');
 const { TranslationService } = require('./TranslationService');
 const { textHash } = require('../utils/textLanguage');
 
-// 検出リクエストには言語コードを返し、翻訳リクエストには «» で囲んで返すモック。
+// 翻訳リクエストには、1行目に言語コード、2行目以降に «» で囲んだ翻訳を返すモック。
 function makeAi({ delayMs = 0 } = {}) {
   const state = { calls: 0, translateCalls: 0, active: 0, maxActive: 0 };
   const ai = {
     generate: async (request) => {
       state.calls += 1;
+      state.translateCalls += 1;
       state.active += 1;
       state.maxActive = Math.max(state.maxActive, state.active);
       try {
         if (delayMs) await new Promise((resolve) => setTimeout(resolve, delayMs));
-        const system = String(request.system || '');
-        if (system.includes('ISO 639-1')) return request.text.includes('こんにちは') ? 'ja' : 'en';
-        state.translateCalls += 1;
-        return `«${request.text}»`;
+        const code = request.text.includes('こんにちは') ? 'ja' : 'en';
+        return `${code}\n«${request.text}»`;
       } finally {
         state.active -= 1;
       }
@@ -38,6 +37,7 @@ test('翻訳してDBへ保存し、次回の同一テキストはキャッシュ
   const { ai, state } = makeAi();
   const { db, service } = makeService(ai);
   const first = await service.translate({ text: 'Hello world', targetLanguage: 'ja' });
+  assert.equal(state.calls, 1);
   assert.equal(first.translatedText, '«Hello world»');
   assert.equal(first.sourceLanguage, 'en');
   assert.equal(first.cached, false);
@@ -63,13 +63,18 @@ test('一致度が閾値以上のテキストは保存済みの翻訳で応答�
   assert.equal(state.translateCalls, translateCallsBefore);
 });
 
-test('対象言語と原文の言語が同じ場合は原文をそのまま返し、保存しない', async () => {
-  const { ai } = makeAi();
+test('対象言語と原文の言語が同じ場合は原文をそのまま返し、判定結果を保存する', async () => {
+  const { ai, state } = makeAi();
   const { db, service } = makeService(ai);
   const result = await service.translate({ text: 'こんにちは、世界', targetLanguage: 'ja' });
   assert.equal(result.translatedText, 'こんにちは、世界');
   assert.equal(result.sourceLanguage, 'ja');
-  assert.equal(await db.findTranslationByHash(textHash('こんにちは、世界'), 'ja'), null);
+  const saved = await db.findTranslationByHash(textHash('こんにちは、世界'), 'ja');
+  assert.equal(saved.translatedText, 'こんにちは、世界');
+  const callsBefore = state.calls;
+  const again = await service.translate({ text: 'こんにちは、世界', targetLanguage: 'ja' });
+  assert.equal(again.cached, true);
+  assert.equal(state.calls, callsBefore);
 });
 
 test('並行作業数は設定値までに制限される', async () => {

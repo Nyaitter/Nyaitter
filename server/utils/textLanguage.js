@@ -78,17 +78,6 @@ function sameLanguage(a, b) {
   return left.split('-')[0] === right.split('-')[0];
 }
 
-async function detectTextLanguage(aiService, { provider, model } = {}, text) {
-  const response = await aiService.generate({
-    provider: provider || 'auto',
-    model: model || undefined,
-    system: 'You identify the language of a text. Reply with only the ISO 639-1 language code, such as ja, en, ko, or zh. If the language cannot be determined, reply with und.',
-    text: String(text || '').slice(0, 1000),
-    maxOutputTokens: 16,
-  });
-  return parseLanguageCode(extractAiText(response));
-}
-
 module.exports = {
   normalizeText,
   textHash,
@@ -97,5 +86,4 @@ module.exports = {
   normalizeLanguageCode,
   parseLanguageCode,
   sameLanguage,
-  detectTextLanguage,
 };

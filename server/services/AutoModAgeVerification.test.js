@@ -24,7 +24,6 @@ function makeService(db, { mode = 'v2', respond = '<safe>', authorAge = true, to
     storageAdapter: undefined,
     moderationConfig: { enabled: true, prompt: '基準', provider: 'mock', model: 'mock', mode, authorAge, toolCall },
     ageVerifyConfig: { margin: 5, unknown: 'warn', postMinSamples: 5 },
-    translationConfig: { languageDetection: false },
     aiService,
   });
   return { service, calls };
@@ -273,7 +272,6 @@ test('(i) 処理に失敗した投稿はキューの最後へ移り、他の投�
     storageAdapter: undefined,
     moderationConfig: { enabled: true, prompt: '基準', provider: 'mock', model: 'mock', mode: 'v2', authorAge: true, toolCall: false },
     ageVerifyConfig: { margin: 5, unknown: 'warn', postMinSamples: 5 },
-    translationConfig: { languageDetection: false },
     aiService,
   });
   const failPost = await db.createPost({ userId: author.id, content: 'FAILME' });
@@ -332,7 +330,6 @@ function makeToolService(db, generate, { storageAdapter, maxImages, toolMaxTurns
       ...(toolMaxTurns ? { toolMaxTurns } : {}),
     },
     ageVerifyConfig: { margin: 5, unknown: 'warn', postMinSamples: 5 },
-    translationConfig: { languageDetection: false },
     aiService: { generate },
   });
 }
@@ -471,7 +468,6 @@ test('(o) プロンプトが無くてもAutoModは有効になり判定が動く
       authorAge: true, toolCall: false,
     },
     ageVerifyConfig: { margin: 5, unknown: 'warn', postMinSamples: 5 },
-    translationConfig: { languageDetection: false },
     aiService: { generate: async () => '<low> <reason>Graphic violence</reason>' },
   });
   assert.equal(service.enabled, true);
@@ -479,27 +475,6 @@ test('(o) プロンプトが無くてもAutoModは有効になり判定が動く
   const after = await db.getPostById(post.id);
   assert.equal(after.mask, true);
   assert.equal(after.mask_reason, 'Graphic violence');
-});
-
-test('(p) 判定と並行して言語が推定され、ポストの言語として登録される', async () => {
-  const { db, author } = await setup();
-  const post = await db.createPost({ userId: author.id, content: 'Hello, this is an English post.' });
-  const service = new AutoModerationService({
-    dbAdapter: db,
-    storageAdapter: undefined,
-    moderationConfig: {
-      enabled: true, prompt: '基準', provider: 'mock', model: 'mock', mode: 'legacy',
-      authorAge: true, toolCall: false,
-    },
-    ageVerifyConfig: { margin: 5, unknown: 'warn', postMinSamples: 5 },
-    translationConfig: { languageDetection: true },
-    aiService: {
-      generate: async (request) => (String(request.system || '').includes('ISO 639-1') ? 'en' : '<safe>'),
-    },
-  });
-  await moderate(service, db, post.id);
-  const after = await db.getPostById(post.id);
-  assert.equal(after.language, 'en');
 });
 
 test('nextAgeEstimate: 高い方向も差が小さければ最低1は進む（デッドゾーンなし）', () => {
