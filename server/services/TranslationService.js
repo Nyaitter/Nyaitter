@@ -149,7 +149,11 @@ class TranslationService {
         system: [
           `Translate the user's text into ${job.targetLanguage}.`,
           'First, identify the language of the text. The first line of your reply must contain only the ISO 639-1 language code of the original text, such as ja, en, ko, or zh.',
-          'From the second line on, write the translation. Preserve the original tone, nuance, and feel as much as possible.',
+          'From the second line on, write the translation.',
+          'Before translating, grasp the tone and feel of the whole text, and keep that same tone and feel in the translation.',
+          'Preserving the meaning and nuance matters more than translating word for word. If a literal translation would lose the nuance, rephrase it in another natural way, or leave that part in the original language instead of forcing a translation.',
+          'Do not force translations of slang; leave slang as it is.',
+          'Keep proper nouns as they are, or write them as they are read in the target language.',
           'Keep placeholders such as {name}, mentions, hashtags, URLs, and line breaks unchanged.',
           'If the text is already in the target language, write the original text unchanged from the second line on.',
         ].join(' '),
