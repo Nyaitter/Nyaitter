@@ -9,7 +9,6 @@ const {
   extractAiText,
   normalizeLanguageCode,
   parseLanguageCode,
-  scriptLanguage,
   sameLanguage,
 } = require('../utils/textLanguage');
 
@@ -176,6 +175,7 @@ class TranslationService {
       system: [
         `Translate the user's text into ${job.targetLanguage}.`,
         'First, identify the language of the text. The first line of your reply must contain only the ISO 639-1 language code of the original text, such as ja, en, ko, or zh.',
+        'Japanese and Chinese share many characters, so judge the language from the whole sentence, not from individual characters. Text that contains hiragana or katakana is Japanese, never Chinese; text that contains hangul is Korean.',
         'From the second line on, write the translation.',
         'Translate the whole text; do not leave out or summarize any part of it, and finish the last sentence completely, never stopping in the middle of a word or sentence.',
         'Before translating, grasp the tone and feel of the whole text, and keep that same tone and feel in the translation.',
@@ -187,6 +187,7 @@ class TranslationService {
         'Keep proper nouns as they are, or write them as they are read in the target language.',
         'Keep placeholders such as {name}, mentions, hashtags, URLs, and line breaks unchanged.',
         'If the text is already in the target language, write the original text unchanged from the second line on.',
+        `Write the translation in ${job.targetLanguage} only. Before finishing, check that the translation is not written in the language you identified or in any other language.`,
       ].join(' '),
       text: job.text,
       maxOutputTokens: 2048,
@@ -196,7 +197,7 @@ class TranslationService {
     const raw = extractAiText(response);
     const newlineIndex = raw.indexOf('\n');
     const detected = newlineIndex >= 0 ? parseLanguageCode(raw.slice(0, newlineIndex)) : null;
-    const sourceLanguage = scriptLanguage(job.text) || hinted || detected;
+    const sourceLanguage = hinted || detected;
     if (!sourceLanguage) throw new Error('言語を判定できませんでした');
     let translatedText = (detected ? raw.slice(newlineIndex + 1) : raw).trim();
     if (sameLanguage(sourceLanguage, job.targetLanguage)) translatedText = job.text;
@@ -206,13 +207,9 @@ class TranslationService {
 
   async _runJob(job) {
     const hinted = job.sourceLanguage ? normalizeLanguageCode(job.sourceLanguage) : null;
-    const fromScript = scriptLanguage(job.text);
     let sourceLanguage = hinted;
     let translatedText = null;
-    if (fromScript && sameLanguage(fromScript, job.targetLanguage)) {
-      sourceLanguage = fromScript;
-      translatedText = job.text;
-    } else if (hinted && sameLanguage(hinted, job.targetLanguage)) {
+    if (hinted && sameLanguage(hinted, job.targetLanguage)) {
       translatedText = job.text;
     } else {
       // 途中で切れた翻訳は保存せず、1回だけ訳し直す。
