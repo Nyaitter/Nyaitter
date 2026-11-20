@@ -144,6 +144,7 @@ class TranslationService {
       const response = await this.ai.generate({
         provider: this.config.provider || 'auto',
         model: this.config.model || undefined,
+        reasoningEffort: this.config.reasoningEffort || undefined,
         system: [
           `Translate the user's text into ${job.targetLanguage}.`,
           'First, identify the language of the text. The first line of your reply must contain only the ISO 639-1 language code of the original text, such as ja, en, ko, or zh.',
