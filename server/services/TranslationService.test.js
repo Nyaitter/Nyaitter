@@ -186,6 +186,46 @@ test('訳し直しても切れる場合は保存せずに失敗する', async ()
   assert.equal(saved, null);
 });
 
+test('かなを含む日本語は中国語と誤判定されず、対象言語が日本語なら翻訳しない', async () => {
+  let calls = 0;
+  const ai = {
+    generate: async () => {
+      calls += 1;
+      return 'zh\n去pixiv看一眼吧';
+    },
+  };
+  const { service } = makeService(ai);
+  const result = await service.translate({ text: '一回pixiv見てこいよ', targetLanguage: 'ja' });
+  assert.equal(result.sourceLanguage, 'ja');
+  assert.equal(result.translatedText, '一回pixiv見てこいよ');
+  assert.equal(calls, 0);
+});
+
+test('かなを含む日本語の元言語は、AIの判定より文字種を優先して日本語にする', async () => {
+  const ai = {
+    generate: async () => 'zh\n«Go check pixiv once»',
+  };
+  const { service } = makeService(ai);
+  const result = await service.translate({ text: '一回pixiv見てこいよ', targetLanguage: 'en' });
+  assert.equal(result.sourceLanguage, 'ja');
+  assert.equal(result.translatedText, '«Go check pixiv once»');
+});
+
+test('ハングルを含む韓国語は対象言語が韓国語なら翻訳しない', async () => {
+  let calls = 0;
+  const ai = {
+    generate: async () => {
+      calls += 1;
+      return 'en\n«translation»';
+    },
+  };
+  const { service } = makeService(ai);
+  const result = await service.translate({ text: '오늘은 좋은 날씨네요', targetLanguage: 'ko' });
+  assert.equal(result.sourceLanguage, 'ko');
+  assert.equal(result.translatedText, '오늘은 좋은 날씨네요');
+  assert.equal(calls, 0);
+});
+
 test('設定した reasoning effort が翻訳リクエストに渡り、未設定では渡らない', async () => {
   const configured = makeAi();
   const { service } = makeService(configured.ai, { reasoningEffort: 'none' });

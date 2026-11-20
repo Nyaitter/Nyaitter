@@ -69,6 +69,14 @@ function parseLanguageCode(text) {
   return normalizeLanguageCode(token);
 }
 
+// かなは日本語にしか、ハングルは韓国語にしか現れないため、文字種だけで言語が確定する。
+function scriptLanguage(text) {
+  const value = String(text || '');
+  if (/[ぁ-ゟァ-ヿㇰ-ㇿｦ-ﾝ]/.test(value)) return 'ja';
+  if (/[가-힣ᄀ-ᇿ㄰-㆏]/.test(value)) return 'ko';
+  return null;
+}
+
 function sameLanguage(a, b) {
   const left = normalizeLanguageCode(a);
   const right = normalizeLanguageCode(b);
@@ -85,5 +93,6 @@ module.exports = {
   extractAiText,
   normalizeLanguageCode,
   parseLanguageCode,
+  scriptLanguage,
   sameLanguage,
 };
