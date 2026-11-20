@@ -12,7 +12,8 @@ const {
   sameLanguage,
 } = require('../utils/textLanguage');
 
-const REQUEST_TIMEOUT_MS = 60_000;
+const REQUEST_TIMEOUT_MS = 20_000;
+const ROUTING_TIMEOUT_MS = 50_000;
 const MAX_TEXT_LENGTH = 5000;
 const FUZZY_MAX_LENGTH = 3000;
 const RESULT_CACHE_LIMIT = 1000;
@@ -155,6 +156,7 @@ class TranslationService {
         text: job.text,
         maxOutputTokens: 2048,
         timeoutMs: REQUEST_TIMEOUT_MS,
+        routingTimeoutMs: ROUTING_TIMEOUT_MS,
       });
       const raw = extractAiText(response);
       const newlineIndex = raw.indexOf('\n');
