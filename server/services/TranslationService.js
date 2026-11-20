@@ -14,6 +14,27 @@ const {
 
 const REQUEST_TIMEOUT_MS = 20_000;
 const ROUTING_TIMEOUT_MS = 50_000;
+const SENTENCE_END_CHARS = '.!?。！？…';
+const CLOSING_CHARS = ')]}\u300d\u300f\u201d\u2019"\u0027\u00bb>';
+
+function stripClosingChars(text) {
+  let result = String(text || '').trimEnd();
+  while (result && CLOSING_CHARS.includes(result[result.length - 1])) result = result.slice(0, -1).trimEnd();
+  return result;
+}
+
+// 応答が長さ制限で切れたかどうか。プロバイダが理由を返さない場合は、文末の形から推定する。
+function looksTruncated(response, sourceText, translatedText) {
+  if (response && typeof response === 'object') {
+    if (response.choices?.[0]?.finish_reason === 'length') return true;
+    if (response.candidates?.[0]?.finishReason === 'MAX_TOKENS') return true;
+  }
+  const source = stripClosingChars(sourceText);
+  if (!source || !SENTENCE_END_CHARS.includes(source[source.length - 1])) return false;
+  const translated = stripClosingChars(translatedText);
+  if (!translated) return true;
+  return !SENTENCE_END_CHARS.includes(translated[translated.length - 1]);
+}
 const MAX_TEXT_LENGTH = 5000;
 const FUZZY_MAX_LENGTH = 3000;
 const RESULT_CACHE_LIMIT = 1000;
@@ -134,6 +155,43 @@ class TranslationService {
     }
   }
 
+  // 元の言語の推定と翻訳を1回の呼び出しで行う。1行目が言語コード、2行目以降が翻訳。
+  async _generateTranslation(job, hinted) {
+    const response = await this.ai.generate({
+      provider: this.config.provider || 'auto',
+      model: this.config.model || undefined,
+      reasoningEffort: this.config.reasoningEffort || undefined,
+      system: [
+        `Translate the user's text into ${job.targetLanguage}.`,
+        'First, identify the language of the text. The first line of your reply must contain only the ISO 639-1 language code of the original text, such as ja, en, ko, or zh.',
+        'From the second line on, write the translation.',
+        'Translate the whole text; do not leave out or summarize any part of it, and finish the last sentence completely, never stopping in the middle of a word or sentence.',
+        'Before translating, grasp the tone and feel of the whole text, and keep that same tone and feel in the translation.',
+        'Preserving the meaning and nuance matters more than translating word for word. If a literal translation would lose the nuance, rephrase it in another natural way, or leave that part in the original language instead of forcing a translation.',
+        'Render idioms and set phrases by what they mean and how they land, not word for word. Never carry a metaphor over literally when it would sound unnatural in the target language; drop the metaphor and say what it means, in the same tone. If a phrase describes what someone or something is, keep it as a description of what they are; do not turn it into an action they perform.',
+        'Do not force translations of slang; leave slang as it is.',
+        'If you keep a slang expression in the original language, keep the whole expression; do not translate half of it.',
+        'When you keep slang in the original language, word the rest of the sentence so its meaning stays clear from the context. If a slang term is not widely known, add a brief, natural hint at what it means within the same sentence.',
+        'Keep proper nouns as they are, or write them as they are read in the target language.',
+        'Keep placeholders such as {name}, mentions, hashtags, URLs, and line breaks unchanged.',
+        'If the text is already in the target language, write the original text unchanged from the second line on.',
+      ].join(' '),
+      text: job.text,
+      maxOutputTokens: 2048,
+      timeoutMs: REQUEST_TIMEOUT_MS,
+      routingTimeoutMs: ROUTING_TIMEOUT_MS,
+    });
+    const raw = extractAiText(response);
+    const newlineIndex = raw.indexOf('\n');
+    const detected = newlineIndex >= 0 ? parseLanguageCode(raw.slice(0, newlineIndex)) : null;
+    const sourceLanguage = hinted || detected;
+    if (!sourceLanguage) throw new Error('言語を判定できませんでした');
+    let translatedText = (detected ? raw.slice(newlineIndex + 1) : raw).trim();
+    if (sameLanguage(sourceLanguage, job.targetLanguage)) translatedText = job.text;
+    const truncated = translatedText !== job.text && looksTruncated(response, job.text, translatedText);
+    return { sourceLanguage, translatedText, truncated };
+  }
+
   async _runJob(job) {
     const hinted = job.sourceLanguage ? normalizeLanguageCode(job.sourceLanguage) : null;
     let sourceLanguage = hinted;
@@ -141,38 +199,12 @@ class TranslationService {
     if (hinted && sameLanguage(hinted, job.targetLanguage)) {
       translatedText = job.text;
     } else {
-      // 元の言語の推定と翻訳を1回の呼び出しで行う。1行目が言語コード、2行目以降が翻訳。
-      const response = await this.ai.generate({
-        provider: this.config.provider || 'auto',
-        model: this.config.model || undefined,
-        reasoningEffort: this.config.reasoningEffort || undefined,
-        system: [
-          `Translate the user's text into ${job.targetLanguage}.`,
-          'First, identify the language of the text. The first line of your reply must contain only the ISO 639-1 language code of the original text, such as ja, en, ko, or zh.',
-          'From the second line on, write the translation.',
-          'Translate the whole text; do not leave out or summarize any part of it.',
-          'Before translating, grasp the tone and feel of the whole text, and keep that same tone and feel in the translation.',
-          'Preserving the meaning and nuance matters more than translating word for word. If a literal translation would lose the nuance, rephrase it in another natural way, or leave that part in the original language instead of forcing a translation.',
-          'Render idioms and set phrases by what they mean and how they land, not word for word. Never carry a metaphor over literally when it would sound unnatural in the target language; drop the metaphor and say what it means, in the same tone.',
-          'Do not force translations of slang; leave slang as it is.',
-          'If you keep a slang expression in the original language, keep the whole expression; do not translate half of it.',
-          'When you keep slang in the original language, word the rest of the sentence so its meaning stays clear from the context.',
-          'Keep proper nouns as they are, or write them as they are read in the target language.',
-          'Keep placeholders such as {name}, mentions, hashtags, URLs, and line breaks unchanged.',
-          'If the text is already in the target language, write the original text unchanged from the second line on.',
-        ].join(' '),
-        text: job.text,
-        maxOutputTokens: 2048,
-        timeoutMs: REQUEST_TIMEOUT_MS,
-        routingTimeoutMs: ROUTING_TIMEOUT_MS,
-      });
-      const raw = extractAiText(response);
-      const newlineIndex = raw.indexOf('\n');
-      const detected = newlineIndex >= 0 ? parseLanguageCode(raw.slice(0, newlineIndex)) : null;
-      sourceLanguage = hinted || detected;
-      if (!sourceLanguage) throw new Error('言語を判定できませんでした');
-      translatedText = (detected ? raw.slice(newlineIndex + 1) : raw).trim();
-      if (sameLanguage(sourceLanguage, job.targetLanguage)) translatedText = job.text;
+      // 途中で切れた翻訳は保存せず、1回だけ訳し直す。
+      let attempt = await this._generateTranslation(job, hinted);
+      if (attempt.truncated) attempt = await this._generateTranslation(job, hinted);
+      if (attempt.truncated) throw new Error('翻訳結果が途中で切れました');
+      sourceLanguage = attempt.sourceLanguage;
+      translatedText = attempt.translatedText;
     }
     if (!translatedText) throw new Error('翻訳結果が空でした');
     const normalized = normalizeText(job.text);
