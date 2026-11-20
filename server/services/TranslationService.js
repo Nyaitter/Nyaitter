@@ -171,7 +171,7 @@ class TranslationService {
         'Render idioms and set phrases by what they mean and how they land, not word for word. Never carry a metaphor over literally when it would sound unnatural in the target language; drop the metaphor and say what it means, in the same tone. If a phrase describes what someone or something is, keep it as a description of what they are; do not turn it into an action they perform.',
         'Do not force translations of slang; leave slang as it is.',
         'If you keep a slang expression in the original language, keep the whole expression; do not translate half of it.',
-        'When you keep slang in the original language, word the rest of the sentence so its meaning stays clear from the context. If a slang term is not widely known, add a brief, natural hint at what it means within the same sentence.',
+        'When you keep slang in the original language, word the rest of the sentence so its meaning stays clear from the context. If a slang term is not widely known, work a brief hint at its meaning into the wording of the sentence itself; do not transliterate kept slang into the target language\u2019s script, and do not attach a parenthetical gloss to it.',
         'Keep proper nouns as they are, or write them as they are read in the target language.',
         'Keep placeholders such as {name}, mentions, hashtags, URLs, and line breaks unchanged.',
         'If the text is already in the target language, write the original text unchanged from the second line on.',
