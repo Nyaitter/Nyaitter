@@ -362,6 +362,10 @@ class AiService {
         contents,
         generationConfig: { candidateCount: 1, maxOutputTokens: request.maxOutputTokens || 256 },
       };
+      // Gemini では reasoning effort の none だけを思考の停止として渡す。
+      if (resolveReasoningEffort(request.reasoningEffort) === 'none') {
+        payload.generationConfig.thinkingConfig = { thinkingBudget: 0 };
+      }
       if (Array.isArray(request.tools) && request.tools.length) {
         payload.tools = [{
           functionDeclarations: request.tools.map(tool => ({

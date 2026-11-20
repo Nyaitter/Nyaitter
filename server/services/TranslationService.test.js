@@ -8,10 +8,11 @@ const { textHash } = require('../utils/textLanguage');
 
 // 翻訳リクエストには、1行目に言語コード、2行目以降に «» で囲んだ翻訳を返すモック。
 function makeAi({ delayMs = 0 } = {}) {
-  const state = { calls: 0, translateCalls: 0, active: 0, maxActive: 0 };
+  const state = { calls: 0, translateCalls: 0, active: 0, maxActive: 0, requests: [] };
   const ai = {
     generate: async (request) => {
       state.calls += 1;
+      state.requests.push(request);
       state.translateCalls += 1;
       state.active += 1;
       state.maxActive = Math.max(state.maxActive, state.active);
@@ -132,4 +133,16 @@ test('同一テキストの同時リクエストは1回の翻訳に集約され�
   ]);
   assert.equal(a.translatedText, b.translatedText);
   assert.equal(state.translateCalls, 1);
+});
+
+test('設定した reasoning effort が翻訳リクエストに渡り、未設定では渡らない', async () => {
+  const configured = makeAi();
+  const { service } = makeService(configured.ai, { reasoningEffort: 'none' });
+  await service.translate({ text: 'Hello world', targetLanguage: 'ja' });
+  assert.equal(configured.state.requests[0].reasoningEffort, 'none');
+
+  const plain = makeAi();
+  const { service: plainService } = makeService(plain.ai);
+  await plainService.translate({ text: 'Hello world', targetLanguage: 'ja' });
+  assert.equal(plain.state.requests[0].reasoningEffort, undefined);
 });

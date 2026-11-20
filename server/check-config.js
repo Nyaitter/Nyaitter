@@ -509,6 +509,11 @@ function inspect() {
         addIssue('error', 'AUTOMOD_REASONING_EFFORT_INVALID', 'AutoModのreasoning effortの値が不正です。', 'AUTOMOD_REASONING_EFFORT / autoMod.reasoningEffort には none / minimal / low / medium / high / xhigh / max のいずれかを、大文字・小文字を含め正確に設定するか、未設定にしてください。値は変換されません。未設定の場合はパラメータ自体を送信しません。');
     }
 
+    const translationReasoningEffort = firstSetting(['TRANSLATION_REASONING_EFFORT'], config, ['translation.reasoningEffort']);
+    if (translationReasoningEffort !== undefined && translationReasoningEffort !== '' && !isValidReasoningEffort(translationReasoningEffort)) {
+        addIssue('error', 'TRANSLATION_REASONING_EFFORT_INVALID', '翻訳のreasoning effortの値が不正です。', 'TRANSLATION_REASONING_EFFORT / translation.reasoningEffort には none / minimal / low / medium / high / xhigh / max のいずれかを、大文字・小文字を含め正確に設定するか、未設定にしてください。値は変換されません。未設定の場合はパラメータ自体を送信しません。');
+    }
+
     const autoModMode = firstSetting(['AUTOMOD_MODE'], config, ['autoMod.mode', 'automod.mode']);
     if (autoModMode !== undefined && autoModMode !== '' && !['off', 'legacy', 'v2'].includes(String(autoModMode).trim().toLowerCase())) {
         addIssue('error', 'AUTOMOD_MODE_INVALID', 'AutoModのモードの値が不正です。', 'AUTOMOD_MODE / autoMod.mode には off / legacy / v2 のいずれかを設定するか、未設定にしてください（未設定時は v2）。');

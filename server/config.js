@@ -923,9 +923,10 @@ const config = {
   translation: (() => {
     const provider = String(readSetting(['TRANSLATION_AI_PROVIDER', 'TRANSLATION_PROVIDER'], ['translation.aiProvider', 'translation.provider'], 'auto')).trim().toLowerCase();
     const model = readSetting(['TRANSLATION_AI_MODEL', 'TRANSLATION_MODEL'], ['translation.aiModel', 'translation.model'], '');
+    const reasoningEffort = String(readSetting(['TRANSLATION_REASONING_EFFORT'], ['translation.reasoningEffort'], ''));
     const similarityRaw = Number(readSetting(['TRANSLATION_SIMILARITY_THRESHOLD'], ['translation.similarityThreshold'], 0.9));
     return {
-      provider, model,
+      provider, model, reasoningEffort,
       maxConcurrent: exactIntegerSetting(
         'Translation max concurrent',
         ['TRANSLATION_MAX_CONCURRENT'],
