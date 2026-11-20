@@ -1,6 +1,6 @@
 'use strict';
 
-const { getAiService } = require('./ai/AiService');
+const { getAiService, parseToolCalls } = require('./ai/AiService');
 const { calculateStringSimilarity } = require('../utils/fuzzySearch');
 const {
   normalizeText,
@@ -166,34 +166,75 @@ class TranslationService {
     }
   }
 
-  // 元の言語の推定と翻訳を1回の呼び出しで行う。1行目が言語コード、2行目以降が翻訳。
+  _translationSystem(job, toolMode) {
+    return [
+      `Translate the user's text into ${job.targetLanguage}.`,
+      'First, identify the language of the text.',
+      'Japanese and Chinese share many characters, so judge the language from the whole sentence, not from individual characters. Text that contains hiragana or katakana is Japanese, never Chinese; text that contains hangul is Korean.',
+      toolMode
+        ? 'Report the result by calling the submit_translation tool with source_language set to the ISO 639-1 language code of the original text, such as ja, en, ko, or zh, and translated_text set to the translation.'
+        : 'The first line of your reply must contain only the ISO 639-1 language code of the original text, such as ja, en, ko, or zh. From the second line on, write the translation.',
+      'Translate the whole text; do not leave out or summarize any part of it, and finish the last sentence completely, never stopping in the middle of a word or sentence.',
+      'Before translating, grasp the tone and feel of the whole text, and keep that same tone and feel in the translation.',
+      'Preserving the meaning and nuance matters more than translating word for word. If a literal translation would lose the nuance, rephrase it in another natural way, or leave that part in the original language instead of forcing a translation.',
+      'Render idioms and set phrases by what they mean and how they land, not word for word. Never carry a metaphor over literally when it would sound unnatural in the target language; drop the metaphor and say what it means, in the same tone. If a phrase describes what someone or something is, keep it as a description of what they are; do not turn it into an action they perform.',
+      'Do not force translations of slang; leave slang as it is.',
+      'If you keep a slang expression in the original language, keep the whole expression; do not translate half of it.',
+      'When you keep slang in the original language, word the rest of the sentence so its meaning stays clear from the context. If a slang term is not widely known, work a brief hint at its meaning into the wording of the sentence itself; do not transliterate kept slang into the target language\u2019s script, and do not attach a parenthetical gloss to it.',
+      'Keep proper nouns as they are, or write them as they are read in the target language.',
+      'Keep placeholders such as {name}, mentions, hashtags, URLs, and line breaks unchanged.',
+      'If the text is already in the target language, write the original text unchanged as the translation.',
+      `Write the translation in ${job.targetLanguage} only. Before finishing, check that the translation is not written in the language you identified or in any other language.`,
+    ].join(' ');
+  }
+
+  // 元の言語の推定と翻訳を1回の呼び出しで行う。結果はツール呼び出しで受け取り、使えない場合はテキスト形式で受け取る。
   async _generateTranslation(job, hinted) {
-    const response = await this.ai.generate({
+    const request = {
       provider: this.config.provider || 'auto',
       model: this.config.model || undefined,
       reasoningEffort: this.config.reasoningEffort || undefined,
-      system: [
-        `Translate the user's text into ${job.targetLanguage}.`,
-        'First, identify the language of the text. The first line of your reply must contain only the ISO 639-1 language code of the original text, such as ja, en, ko, or zh.',
-        'Japanese and Chinese share many characters, so judge the language from the whole sentence, not from individual characters. Text that contains hiragana or katakana is Japanese, never Chinese; text that contains hangul is Korean.',
-        'From the second line on, write the translation.',
-        'Translate the whole text; do not leave out or summarize any part of it, and finish the last sentence completely, never stopping in the middle of a word or sentence.',
-        'Before translating, grasp the tone and feel of the whole text, and keep that same tone and feel in the translation.',
-        'Preserving the meaning and nuance matters more than translating word for word. If a literal translation would lose the nuance, rephrase it in another natural way, or leave that part in the original language instead of forcing a translation.',
-        'Render idioms and set phrases by what they mean and how they land, not word for word. Never carry a metaphor over literally when it would sound unnatural in the target language; drop the metaphor and say what it means, in the same tone. If a phrase describes what someone or something is, keep it as a description of what they are; do not turn it into an action they perform.',
-        'Do not force translations of slang; leave slang as it is.',
-        'If you keep a slang expression in the original language, keep the whole expression; do not translate half of it.',
-        'When you keep slang in the original language, word the rest of the sentence so its meaning stays clear from the context. If a slang term is not widely known, work a brief hint at its meaning into the wording of the sentence itself; do not transliterate kept slang into the target language\u2019s script, and do not attach a parenthetical gloss to it.',
-        'Keep proper nouns as they are, or write them as they are read in the target language.',
-        'Keep placeholders such as {name}, mentions, hashtags, URLs, and line breaks unchanged.',
-        'If the text is already in the target language, write the original text unchanged from the second line on.',
-        `Write the translation in ${job.targetLanguage} only. Before finishing, check that the translation is not written in the language you identified or in any other language.`,
-      ].join(' '),
       text: job.text,
       maxOutputTokens: 2048,
       timeoutMs: REQUEST_TIMEOUT_MS,
       routingTimeoutMs: ROUTING_TIMEOUT_MS,
-    });
+    };
+    let response;
+    let toolMode = true;
+    try {
+      response = await this.ai.generate({
+        ...request,
+        system: this._translationSystem(job, true),
+        tools: [{
+          name: 'submit_translation',
+          description: 'Report the language of the original text and its translation.',
+          parameters: {
+            type: 'object',
+            properties: {
+              source_language: { type: 'string', description: 'ISO 639-1 language code of the original text' },
+              translated_text: { type: 'string', description: 'The translation' },
+            },
+            required: ['source_language', 'translated_text'],
+          },
+        }],
+      });
+    } catch (error) {
+      if (!error || error.code !== 'AI_CAPABILITY') throw error;
+      toolMode = false;
+      response = await this.ai.generate({ ...request, system: this._translationSystem(job, false) });
+    }
+    if (toolMode) {
+      const call = parseToolCalls(response).find((entry) => entry.name === 'submit_translation');
+      if (call) {
+        const detected = normalizeLanguageCode(call.args.source_language);
+        const sourceLanguage = hinted || detected;
+        if (!sourceLanguage) throw new Error('言語を判定できませんでした');
+        let translatedText = String(call.args.translated_text || '').trim();
+        if (sameLanguage(sourceLanguage, job.targetLanguage)) translatedText = job.text;
+        const truncated = translatedText !== job.text && looksTruncated(response, job.text, translatedText);
+        return { sourceLanguage, translatedText, truncated };
+      }
+    }
     const raw = extractAiText(response);
     const newlineIndex = raw.indexOf('\n');
     const detected = newlineIndex >= 0 ? parseLanguageCode(raw.slice(0, newlineIndex)) : null;
