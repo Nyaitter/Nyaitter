@@ -135,6 +135,57 @@ test('同一テキストの同時リクエストは1回の翻訳に集約され�
   assert.equal(state.translateCalls, 1);
 });
 
+test('長さ制限で切れた応答は訳し直し、完成した翻訳だけを保存する', async () => {
+  let calls = 0;
+  const ai = {
+    generate: async () => {
+      calls += 1;
+      if (calls === 1) {
+        return { choices: [{ message: { content: 'en\nCut off in the middle of a wo' }, finish_reason: 'length' }] };
+      }
+      return { choices: [{ message: { content: 'en\nComplete translation.' }, finish_reason: 'stop' }] };
+    },
+  };
+  const { db, service } = makeService(ai);
+  const result = await service.translate({ text: 'A sentence that needs a full translation.', targetLanguage: 'ja' });
+  assert.equal(calls, 2);
+  assert.equal(result.translatedText, 'Complete translation.');
+  const saved = await db.findTranslationByHash(textHash('A sentence that needs a full translation.'), 'ja');
+  assert.equal(saved.translatedText, 'Complete translation.');
+});
+
+test('文末が途中で切れた応答は訳し直す', async () => {
+  let calls = 0;
+  const ai = {
+    generate: async () => {
+      calls += 1;
+      return calls === 1 ? 'en\n最後まで行かない途中の文' : 'en\n最後まで訳した文。';
+    },
+  };
+  const { service } = makeService(ai);
+  const result = await service.translate({ text: 'A sentence that needs a full translation.', targetLanguage: 'ja' });
+  assert.equal(calls, 2);
+  assert.equal(result.translatedText, '最後まで訳した文。');
+});
+
+test('訳し直しても切れる場合は保存せずに失敗する', async () => {
+  let calls = 0;
+  const ai = {
+    generate: async () => {
+      calls += 1;
+      return 'en\nAlways cut off mid wo';
+    },
+  };
+  const { db, service } = makeService(ai);
+  await assert.rejects(
+    service.translate({ text: 'A sentence that needs a full translation.', targetLanguage: 'ja' }),
+    /途中で切れました/,
+  );
+  assert.equal(calls, 2);
+  const saved = await db.findTranslationByHash(textHash('A sentence that needs a full translation.'), 'ja');
+  assert.equal(saved, null);
+});
+
 test('設定した reasoning effort が翻訳リクエストに渡り、未設定では渡らない', async () => {
   const configured = makeAi();
   const { service } = makeService(configured.ai, { reasoningEffort: 'none' });
