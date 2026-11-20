@@ -90,29 +90,40 @@ class TranslationService {
     const remembered = this._cacheGet(key);
     if (remembered) return { ...remembered, cached: true };
 
-    const exact = await this.db.findTranslationByHash(hash, target).catch(() => null);
-    if (exact) {
-      const result = { translatedText: exact.translatedText, sourceLanguage: exact.sourceLanguage, targetLanguage: target };
-      this._cacheSet(key, result);
-      return { ...result, cached: true };
-    }
-    const fuzzy = await this._findFuzzy(source, target, sourceLanguage);
-    if (fuzzy) {
-      const result = { translatedText: fuzzy.translatedText, sourceLanguage: fuzzy.sourceLanguage, targetLanguage: target };
-      this._cacheSet(key, result);
-      return { ...result, cached: true };
-    }
-
+    // 同じ文の翻訳が処理中なら、検索やキューへの追加はせず、その完了を待つ。
     if (this.pending.has(key)) return this.pending.get(key);
-    const promise = new Promise((resolve, reject) => {
-      this.queue.push({ key, text: source, targetLanguage: target, sourceLanguage: sourceLanguage || null, resolve, reject });
-    });
+    let resolveJob;
+    let rejectJob;
+    const promise = new Promise((resolve, reject) => { resolveJob = resolve; rejectJob = reject; });
     this.pending.set(key, promise);
     promise.catch(() => {}).finally(() => {
       if (this.pending.get(key) === promise) this.pending.delete(key);
     });
-    this._pump();
+    this._prepareJob({ key, hash, text: source, targetLanguage: target, sourceLanguage: sourceLanguage || null, resolve: resolveJob, reject: rejectJob });
     return promise;
+  }
+
+  async _prepareJob(job) {
+    try {
+      const exact = await this.db.findTranslationByHash(job.hash, job.targetLanguage).catch(() => null);
+      if (exact) {
+        const result = { translatedText: exact.translatedText, sourceLanguage: exact.sourceLanguage, targetLanguage: job.targetLanguage };
+        this._cacheSet(job.key, result);
+        job.resolve({ ...result, cached: true });
+        return;
+      }
+      const fuzzy = await this._findFuzzy(job.text, job.targetLanguage, job.sourceLanguage);
+      if (fuzzy) {
+        const result = { translatedText: fuzzy.translatedText, sourceLanguage: fuzzy.sourceLanguage, targetLanguage: job.targetLanguage };
+        this._cacheSet(job.key, result);
+        job.resolve({ ...result, cached: true });
+        return;
+      }
+      this.queue.push(job);
+      this._pump();
+    } catch (error) {
+      job.reject(error);
+    }
   }
 
   async _findFuzzy(text, target, sourceLanguage) {

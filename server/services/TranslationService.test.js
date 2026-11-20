@@ -226,6 +226,39 @@ test('ハングルを含む韓国語は対象言語が韓国語なら翻訳し�
   assert.equal(calls, 0);
 });
 
+test('保存済み翻訳の検索中でも、同じ文のリクエストは合流して検索を繰り返さない', async () => {
+  const { ai, state } = makeAi();
+  const { db, service } = makeService(ai);
+  let lookups = 0;
+  const original = db.findTranslationByHash.bind(db);
+  db.findTranslationByHash = async (...args) => {
+    lookups += 1;
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    return original(...args);
+  };
+  const [a, b] = await Promise.all([
+    service.translate({ text: 'Join during lookup', targetLanguage: 'ja' }),
+    service.translate({ text: 'Join during lookup', targetLanguage: 'ja' }),
+  ]);
+  assert.equal(a.translatedText, '«Join during lookup»');
+  assert.equal(b.translatedText, a.translatedText);
+  assert.equal(state.translateCalls, 1);
+  assert.equal(lookups, 1);
+});
+
+test('キューで待機中の文へのリクエストは、新しく追加せず待機中の翻訳に合流する', async () => {
+  const { ai, state } = makeAi({ delayMs: 60 });
+  const { service } = makeService(ai, { maxConcurrent: 1 });
+  const first = service.translate({ text: 'First in line', targetLanguage: 'ja' });
+  const queued = service.translate({ text: 'Queued sentence', targetLanguage: 'ja' });
+  const duplicate = service.translate({ text: 'Queued sentence', targetLanguage: 'ja' });
+  const [firstResult, queuedResult, duplicateResult] = await Promise.all([first, queued, duplicate]);
+  assert.equal(firstResult.translatedText, '«First in line»');
+  assert.equal(queuedResult.translatedText, '«Queued sentence»');
+  assert.equal(duplicateResult.translatedText, queuedResult.translatedText);
+  assert.equal(state.translateCalls, 2);
+});
+
 test('設定した reasoning effort が翻訳リクエストに渡り、未設定では渡らない', async () => {
   const configured = makeAi();
   const { service } = makeService(configured.ai, { reasoningEffort: 'none' });
