@@ -9,6 +9,7 @@ const {
   extractAiText,
   normalizeLanguageCode,
   parseLanguageCode,
+  scriptLanguage,
   sameLanguage,
 } = require('../utils/textLanguage');
 
@@ -184,7 +185,7 @@ class TranslationService {
     const raw = extractAiText(response);
     const newlineIndex = raw.indexOf('\n');
     const detected = newlineIndex >= 0 ? parseLanguageCode(raw.slice(0, newlineIndex)) : null;
-    const sourceLanguage = hinted || detected;
+    const sourceLanguage = scriptLanguage(job.text) || hinted || detected;
     if (!sourceLanguage) throw new Error('言語を判定できませんでした');
     let translatedText = (detected ? raw.slice(newlineIndex + 1) : raw).trim();
     if (sameLanguage(sourceLanguage, job.targetLanguage)) translatedText = job.text;
@@ -194,9 +195,13 @@ class TranslationService {
 
   async _runJob(job) {
     const hinted = job.sourceLanguage ? normalizeLanguageCode(job.sourceLanguage) : null;
+    const fromScript = scriptLanguage(job.text);
     let sourceLanguage = hinted;
     let translatedText = null;
-    if (hinted && sameLanguage(hinted, job.targetLanguage)) {
+    if (fromScript && sameLanguage(fromScript, job.targetLanguage)) {
+      sourceLanguage = fromScript;
+      translatedText = job.text;
+    } else if (hinted && sameLanguage(hinted, job.targetLanguage)) {
       translatedText = job.text;
     } else {
       // 途中で切れた翻訳は保存せず、1回だけ訳し直す。
