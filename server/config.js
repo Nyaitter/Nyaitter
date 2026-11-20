@@ -916,6 +916,13 @@ const config = {
 		        500,
 		        1,
 		      ),
+		      maxConcurrent: exactIntegerSetting(
+		        'AutoMod max concurrent',
+		        ['AUTOMOD_MAX_CONCURRENT'],
+		        ['autoMod.maxConcurrent', 'automod.maxConcurrent'],
+		        1,
+		        1,
+		      ),
       enabled: providers.some(item => provider === 'auto' || item.type === provider || item.id.toLowerCase() === provider),
     };
   })(),

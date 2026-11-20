@@ -129,8 +129,17 @@ class AutoModerationService {
     this.queueHead = 0;
     // Map keeps at most one queued job per post and lets edits replace stale input.
     this.pendingJobsByPostId = new Map();
-    this.processing = false;
+    this.activeCount = 0;
     this.stopped = false;
+  }
+
+  get maxConcurrent() {
+    const value = Number(this.config.maxConcurrent);
+    return Number.isInteger(value) && value > 0 ? value : 1;
+  }
+
+  get processing() {
+    return this.activeCount > 0;
   }
 
   get mode() {
@@ -193,14 +202,15 @@ class AutoModerationService {
   }
 
   _startProcessing() {
-    if (this.processing || this.stopped) return;
-    this.processing = true;
-    void this._processQueue().catch((error) => {
-      console.error('[automod] queue stopped unexpectedly:', error.message);
-    }).finally(() => {
-      this.processing = false;
-      if (!this.stopped && this.queue.length > this.queueHead) this._startProcessing();
-    });
+    while (!this.stopped && this.activeCount < this.maxConcurrent && this.queue.length > this.queueHead) {
+      this.activeCount += 1;
+      void this._processQueue().catch((error) => {
+        console.error('[automod] queue stopped unexpectedly:', error.message);
+      }).finally(() => {
+        this.activeCount -= 1;
+        this._startProcessing();
+      });
+    }
   }
 
   async _processQueue() {
@@ -225,7 +235,7 @@ class AutoModerationService {
         );
         this.pendingJobsByPostId.set(job.postId, job);
         this.queue.push(job);
-        if (this.queue.length - this.queueHead <= 1) {
+        if (this.queue.length - this.queueHead <= 1 && this.activeCount <= 1) {
           const waitMs = Number(error?.statusCode) === 429
             ? RATE_LIMIT_BACKOFF_MS
             : ERROR_BACKOFF_MS;
