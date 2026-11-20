@@ -485,3 +485,35 @@ test('nextAgeEstimate: 高い方向も差が小さければ最低1は進む（�
   assert.equal(nextAgeEstimate(null, 16), 16);
   assert.equal(nextAgeEstimate(20, null), 20);
 });
+
+test('(q) 同時処理数は設定値まで並行して処理される', async () => {
+  const { db, author } = await setup();
+  let active = 0;
+  let maxActive = 0;
+  const aiService = {
+    generate: async () => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      active -= 1;
+      return '<safe>';
+    },
+  };
+  const service = new AutoModerationService({
+    dbAdapter: db,
+    storageAdapter: undefined,
+    moderationConfig: { enabled: true, prompt: '基準', provider: 'mock', model: 'mock', mode: 'v2', authorAge: true, toolCall: false, maxConcurrent: 3 },
+    ageVerifyConfig: { margin: 5, unknown: 'warn', postMinSamples: 5 },
+    aiService,
+  });
+  for (let i = 0; i < 6; i++) {
+    const post = await db.createPost({ userId: author.id, content: `CONCURRENT_${i}` });
+    service.enqueue(post);
+  }
+  const start = Date.now();
+  while (Date.now() - start < 10000) {
+    if (!service.processing && service.queue.length <= service.queueHead) break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.ok(maxActive > 1 && maxActive <= 3, `同時に処理されたのは ${maxActive} 件`);
+});
