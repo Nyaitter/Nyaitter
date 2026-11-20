@@ -8,8 +8,8 @@ const {
   indexTerms,
   extractAiText,
   normalizeLanguageCode,
+  parseLanguageCode,
   sameLanguage,
-  detectTextLanguage,
 } = require('../utils/textLanguage');
 
 const REQUEST_TIMEOUT_MS = 60_000;
@@ -134,27 +134,35 @@ class TranslationService {
   }
 
   async _runJob(job) {
-    const sourceLanguage = job.sourceLanguage
-      ? normalizeLanguageCode(job.sourceLanguage)
-      : await detectTextLanguage(this.ai, this.config, job.text);
-    if (!sourceLanguage) throw new Error('言語を判定できませんでした');
-    if (sameLanguage(sourceLanguage, job.targetLanguage)) {
-      return { translatedText: job.text, sourceLanguage, targetLanguage: job.targetLanguage, cached: false };
+    const hinted = job.sourceLanguage ? normalizeLanguageCode(job.sourceLanguage) : null;
+    let sourceLanguage = hinted;
+    let translatedText = null;
+    if (hinted && sameLanguage(hinted, job.targetLanguage)) {
+      translatedText = job.text;
+    } else {
+      // 元の言語の推定と翻訳を1回の呼び出しで行う。1行目が言語コード、2行目以降が翻訳。
+      const response = await this.ai.generate({
+        provider: this.config.provider || 'auto',
+        model: this.config.model || undefined,
+        system: [
+          `Translate the user's text into ${job.targetLanguage}.`,
+          'First, identify the language of the text. The first line of your reply must contain only the ISO 639-1 language code of the original text, such as ja, en, ko, or zh.',
+          'From the second line on, write the translation. Preserve the original tone, nuance, and feel as much as possible.',
+          'Keep placeholders such as {name}, mentions, hashtags, URLs, and line breaks unchanged.',
+          'If the text is already in the target language, write the original text unchanged from the second line on.',
+        ].join(' '),
+        text: job.text,
+        maxOutputTokens: 2048,
+        timeoutMs: REQUEST_TIMEOUT_MS,
+      });
+      const raw = extractAiText(response);
+      const newlineIndex = raw.indexOf('\n');
+      const detected = newlineIndex >= 0 ? parseLanguageCode(raw.slice(0, newlineIndex)) : null;
+      sourceLanguage = hinted || detected;
+      if (!sourceLanguage) throw new Error('言語を判定できませんでした');
+      translatedText = (detected ? raw.slice(newlineIndex + 1) : raw).trim();
+      if (sameLanguage(sourceLanguage, job.targetLanguage)) translatedText = job.text;
     }
-    const response = await this.ai.generate({
-      provider: this.config.provider || 'auto',
-      model: this.config.model || undefined,
-      system: [
-        `Translate the user's text into ${job.targetLanguage}.`,
-        'Preserve the original tone, nuance, and feel as much as possible.',
-        'Keep placeholders such as {name}, mentions, hashtags, URLs, and line breaks unchanged.',
-        'Output only the translated text.',
-      ].join(' '),
-      text: job.text,
-      maxOutputTokens: 2048,
-      timeoutMs: REQUEST_TIMEOUT_MS,
-    });
-    const translatedText = extractAiText(response).trim();
     if (!translatedText) throw new Error('翻訳結果が空でした');
     const normalized = normalizeText(job.text);
     const terms = normalized.length <= FUZZY_MAX_LENGTH ? indexTerms(normalized) : [];

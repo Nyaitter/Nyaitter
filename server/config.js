@@ -934,7 +934,6 @@ const config = {
         1,
       ),
       similarityThreshold: Number.isFinite(similarityRaw) && similarityRaw >= 0 && similarityRaw <= 1 ? similarityRaw : 0.9,
-      languageDetection: String(readSetting(['TRANSLATION_LANGUAGE_DETECTION'], ['translation.languageDetection'], 'on')).trim().toLowerCase() !== 'off',
     };
   })(),
 
