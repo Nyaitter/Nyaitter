@@ -153,7 +153,7 @@ class TranslationService {
           'Translate the whole text; do not leave out or summarize any part of it.',
           'Before translating, grasp the tone and feel of the whole text, and keep that same tone and feel in the translation.',
           'Preserving the meaning and nuance matters more than translating word for word. If a literal translation would lose the nuance, rephrase it in another natural way, or leave that part in the original language instead of forcing a translation.',
-          'Render idioms and set phrases by what they mean and how they land, not word for word.',
+          'Render idioms and set phrases by what they mean and how they land, not word for word. Never carry a metaphor over literally when it would sound unnatural in the target language; drop the metaphor and say what it means, in the same tone.',
           'Do not force translations of slang; leave slang as it is.',
           'If you keep a slang expression in the original language, keep the whole expression; do not translate half of it.',
           'Keep proper nouns as they are, or write them as they are read in the target language.',
