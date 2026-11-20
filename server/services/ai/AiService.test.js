@@ -47,7 +47,10 @@ test('modelOmitsReasoningEffort only skips non-reasoning families', () => {
 test('isReasoningEffortError matches only effort rejections', () => {
   assert.equal(isReasoningEffortError({ statusCode: 400, param: 'reasoning_effort', code: 'unsupported_value' }), true);
   assert.equal(isReasoningEffortError({ statusCode: 400, param: '', code: 'invalid reasoning_effort value' }), true);
+  assert.equal(isReasoningEffortError({ statusCode: 400, param: 'reasoning', code: '' }), true);
+  assert.equal(isReasoningEffortError({ statusCode: 400, param: '', code: '', detailMessage: 'reasoning is not supported for this model' }), true);
   assert.equal(isReasoningEffortError({ statusCode: 400, param: 'max_completion_tokens', code: 'unsupported_value' }), false);
+  assert.equal(isReasoningEffortError({ statusCode: 400, param: '', code: '', detailMessage: 'context length exceeded' }), false);
   assert.equal(isReasoningEffortError({ statusCode: 429, param: 'reasoning_effort', code: '' }), false);
   assert.equal(isReasoningEffortError(new Error('boom')), false);
 });
@@ -131,6 +134,21 @@ test('generate retries once without reasoning_effort when the API rejects the va
   const effortError = {
     status: 400,
     payload: { error: { code: 'unsupported_value', param: 'reasoning_effort', message: "Unsupported value: 'reasoning_effort' does not support 'none' with this model." } },
+  };
+  await withFakeOpenAi(async (service, requests) => {
+    const result = await service.generate({ provider: 'fake', model: 'o3', text: 'hi', reasoningEffort: 'none' });
+    assert.ok(result.choices);
+    const chats = requests.filter((r) => r.url.endsWith('/chat/completions'));
+    assert.equal(chats.length, 2);
+    assert.equal(chats[0].body.reasoning_effort, 'none');
+    assert.ok(!('reasoning_effort' in chats[1].body));
+  }, (body) => ('reasoning_effort' in body ? effortError : null));
+});
+
+test('generate retries without reasoning_effort when the rejection names the reasoning param', async () => {
+  const effortError = {
+    status: 400,
+    payload: { error: { code: 'invalid_request_error', param: 'reasoning', message: 'reasoning is not supported with tools' } },
   };
   await withFakeOpenAi(async (service, requests) => {
     const result = await service.generate({ provider: 'fake', model: 'o3', text: 'hi', reasoningEffort: 'none' });

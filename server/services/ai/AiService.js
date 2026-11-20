@@ -16,10 +16,12 @@ async function requestJson(url, options, timeoutMs = 15000) {
     if (!response.ok) {
       let code = '';
       let param = '';
+      let detailMessage = '';
       try {
         const detail = (await response.json())?.error;
         code = detail?.code || '';
         param = detail?.param || '';
+        detailMessage = detail?.message || '';
         if (response.status === 400 && (detail?.param === 'model' || /(?:model.*(?:not supported|not found|unavailable)|unknown model)/i.test(detail?.message || ''))) {
           code = 'AI_MODEL_UNAVAILABLE';
         }
@@ -28,6 +30,7 @@ async function requestJson(url, options, timeoutMs = 15000) {
       error.statusCode = response.status;
       error.code = String(code);
       error.param = String(param);
+      error.detailMessage = String(detailMessage);
       throw error;
     }
     return await response.json();
@@ -219,8 +222,9 @@ function modelOmitsReasoningEffort(model) {
 // True only when the API rejected the reasoning_effort value itself
 // (the error response names the parameter), never for unrelated errors.
 function isReasoningEffortError(error) {
-  return error?.statusCode === 400
-    && (error.param === 'reasoning_effort' || /reasoning_effort/.test(error.code || ''));
+  if (error?.statusCode !== 400) return false;
+  if (error.param === 'reasoning_effort' || error.param === 'reasoning') return true;
+  return /reasoning/.test(error.code || '') || /reasoning/.test(error.detailMessage || '');
 }
 
 class AiService {
