@@ -364,6 +364,28 @@ test('(o) テキスト判定でラベルの無い応答は安全とみなさず�
   assert.equal(result.reason, 'Harassment');
 });
 
+test('(q) ツール判定が失敗したらテキスト判定へ切り替える', async () => {
+  const { db, author } = await setup();
+  const post = await db.createPost({ userId: author.id, content: '判定対象の本文' });
+  const service = new AutoModerationService({
+    dbAdapter: db,
+    storageAdapter: undefined,
+    moderationConfig: { enabled: true, prompt: '基準', provider: 'mock', model: 'mock', mode: 'v2', authorAge: true, toolCall: true },
+    ageVerifyConfig: { margin: 5, unknown: 'warn', postMinSamples: 5 },
+    aiService: {
+      generate: async (request) => {
+        if (request.tools) throw Object.assign(new Error('AI API timed out'), { code: 'AI_TIMEOUT' });
+        return '<low> <age:all> <author:unknown> <reason>Harassment</reason>';
+      },
+    },
+  });
+  await moderate(service, db, post.id);
+  const updated = await db.getPostById(post.id);
+  assert.equal(updated.mask, true, 'テキスト判定の結果が適用される');
+  const failures = (db.modLogs || []).filter((entry) => entry.result === 'failure');
+  assert.equal(failures.length, 0, '失敗として記録されない');
+});
+
 test('(p) ツール判定で呼び出しの無いターンが続いたら打ち切る', async () => {
   const { db, author } = await setup();
   const post = await db.createPost({ userId: author.id, content: '本文' });
