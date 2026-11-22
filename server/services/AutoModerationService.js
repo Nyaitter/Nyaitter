@@ -285,8 +285,8 @@ class AutoModerationService {
         ? await this._classifyWithTools(post, context)
         : await this._classify(post, context);
     } catch (error) {
-      if (this.toolCallEnabled && error?.code === 'AI_CAPABILITY') {
-        console.warn('[automod] tool calls are not supported by the configured provider; using text classification');
+      if (this.toolCallEnabled) {
+        console.warn('[automod] tool classification failed; using text classification:', error?.code || error?.message);
         try {
           classification = await this._classify(post, context);
         } catch (fallbackError) {
