@@ -47,12 +47,12 @@ async function setup() {
 }
 
 test('(c) parseClassification は3出力を取り、欠落ラベルは null', () => {
-  assert.deepEqual(parseClassification('<safe> <age:18> <author:13-15>'), { level: 1, ageRating: 18, authorAgeBand: '13-15', reason: null });
-  assert.deepEqual(parseClassification('<low>'), { level: 2, ageRating: null, authorAgeBand: null, reason: null });
-  assert.deepEqual(parseClassification('<middle> <age:all> <author:unknown>'), { level: 3, ageRating: 0, authorAgeBand: null, reason: null });
+  assert.deepEqual(parseClassification('<safe> <age:18> <author:13-15>'), { level: 1, ageRating: 18, authorAgeBand: '13-15', reason: null, report: false });
+  assert.deepEqual(parseClassification('<low>'), { level: 2, ageRating: null, authorAgeBand: null, reason: null, report: false });
+  assert.deepEqual(parseClassification('<middle> <age:all> <author:unknown>'), { level: 3, ageRating: 0, authorAgeBand: null, reason: null, report: false });
   // 違反ラベル欠落時は従来どおり safe 扱い。年齢系だけが null（＝変更なし）になる。
-  assert.deepEqual(parseClassification('ラベルなし'), { level: 1, ageRating: null, authorAgeBand: null, reason: null });
-  assert.deepEqual(parseClassification('<low> <reason>Graphic violence</reason>'), { level: 2, ageRating: null, authorAgeBand: null, reason: 'Graphic violence' });
+  assert.deepEqual(parseClassification('ラベルなし'), { level: 1, ageRating: null, authorAgeBand: null, reason: null, report: false });
+  assert.deepEqual(parseClassification('<low> <reason>Graphic violence</reason>'), { level: 2, ageRating: null, authorAgeBand: null, reason: 'Graphic violence', report: false });
 });
 
 test('(a) off では評価が一切走らず投稿も変わらない', async () => {
@@ -564,4 +564,44 @@ test('(q) 同時処理数は設定値まで並行して処理される', async (
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   assert.ok(maxActive > 1 && maxActive <= 3, `同時に処理されたのは ${maxActive} 件`);
+});
+
+test('(r) parseClassification はラベル範囲内の <report> を拾う', () => {
+  assert.equal(parseClassification('<safe> <age:all> <author:25-34> <report> <reason>Needs human review</reason>').report, true);
+  assert.equal(parseClassification('<report> <safe>').report, false);
+  assert.equal(parseClassification('<safe> <age:all> <author:25-34>').report, false);
+});
+
+test('(s) 理由のないペナルティ判定は1回だけ判定し直して理由付きで適用する', async () => {
+  const { db, author } = await setup();
+  const post = await db.createPost({ userId: author.id, content: 'threat' });
+  let n = 0;
+  const { service, calls } = makeService(db, {
+    respond: () => (++n === 1 ? '<low>' : '<low> <reason>Harassment</reason>'),
+  });
+  await moderate(service, db, post.id);
+  assert.equal(calls.count, 2);
+  const after = await db.getPostById(post.id);
+  assert.equal(Boolean(after.mask), true);
+  assert.equal(after.mask_reason ?? after.maskReason, 'Harassment');
+});
+
+test('(t) <report> はAutoModからの報告を作成し、重複は作らない', async () => {
+  const { db, author } = await setup();
+  const post = await db.createPost({ userId: author.id, content: 'borderline' });
+  const { service } = makeService(db, {
+    respond: '<safe> <age:all> <author:25-34> <report> <reason>Needs human review</reason>',
+  });
+  await moderate(service, db, post.id);
+  const openReports = async () => {
+    const listed = await db.getUnassignedModerationReports(200);
+    return listed.filter((row) => Number(row.targetId) === Number(post.id));
+  };
+  const first = await openReports();
+  assert.equal(first.length, 1);
+  assert.equal(Number(first[0].reporterUserId), 0);
+  assert.equal(first[0].description, 'Needs human review');
+  assert.equal(first[0].targetSnapshot.automod, true);
+  await moderate(service, db, post.id);
+  assert.equal((await openReports()).length, 1);
 });

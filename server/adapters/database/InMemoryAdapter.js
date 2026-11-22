@@ -4095,7 +4095,8 @@ class InMemoryAdapter extends DatabaseAdapter {
 
 		async assignModerationReport(reportId, assignment = {}) {
 			const admin = this.users.get(Number(assignment.adminId));
-			if (!admin || !admin.admin || admin.freeze || admin.admin_request_excluded) return null;
+			if (!admin || admin.freeze) return null;
+			if (!assignment.groupModerator && (!admin.admin || admin.admin_request_excluded)) return null;
 			const report = this.moderationReports.get(Number(reportId));
 			if (!report || report.status === 'resolved') return null;
 			if (

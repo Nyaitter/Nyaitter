@@ -46,9 +46,38 @@ function serializeReportBrief(report) {
     reporter_id: report.reporterUserId ?? report.reporterId ?? null,
     target_kind: report.targetKind ?? null,
     target_id: report.targetId ?? null,
+    group_id: report.targetSnapshot?.post?.groupId ?? null,
     assigned_at: report.assignedAt || null,
     created_at: report.createdAt || null,
   };
+}
+
+function isSiteAdmin(user) {
+  return Boolean(user && (user.role === 'admin' || user.admin));
+}
+
+// 対応は管理者と担当者だけが扱える。担当者にはグループのモデレーターも含まれる。
+async function loadReportForHandler(req, res) {
+  const service = getModerationService(req);
+  if (!service) {
+    res.status(503).json({ error: 'Moderation service is unavailable' });
+    return null;
+  }
+  const reportId = parseInt(req.params.id, 10);
+  if (!Number.isInteger(reportId) || reportId < 1) {
+    res.status(400).json({ error: '通報IDが不正です' });
+    return null;
+  }
+  const report = await service.getReportById(reportId);
+  if (!report) {
+    res.status(404).json({ error: '通報が見つかりません' });
+    return null;
+  }
+  if (!isSiteAdmin(req.user) && Number(report.assignedAdminId) !== Number(req.user.id)) {
+    res.status(403).json({ error: 'このリクエストを対応する権限がありません' });
+    return null;
+  }
+  return { service, report };
 }
 
 function serializeReport(report) {
@@ -120,8 +149,8 @@ router.get({
 router.get({
   path: '/assigned',
   summary: '自分に割り当てられた通報一覧の取得',
-  auth: 'admin',
-}, requireAuth, requireAdmin, async (req, res) => {
+  auth: 'required',
+}, requireAuth, async (req, res) => {
   const service = getModerationService(req);
   if (!service) return res.status(503).json({ error: 'Moderation service is unavailable' });
   try {
@@ -139,17 +168,12 @@ router.get({
 router.get({
   path: '/:id',
   summary: '通報詳細の取得',
-  auth: 'admin',
-}, requireAuth, requireAdmin, async (req, res) => {
-  const service = getModerationService(req);
-  if (!service) return res.status(503).json({ error: 'Moderation service is unavailable' });
+  auth: 'required',
+}, requireAuth, async (req, res) => {
   try {
-    const reportId = parseInt(req.params.id, 10);
-    if (!Number.isInteger(reportId) || reportId < 1) {
-      return res.status(400).json({ error: '通報IDが不正です' });
-    }
-    const report = await service.getReportById(reportId);
-    if (!report) return res.status(404).json({ error: '通報が見つかりません' });
+    const loaded = await loadReportForHandler(req, res);
+    if (!loaded) return;
+    const { service, report } = loaded;
     let targetState = null;
     if (typeof service.getTargetState === 'function') {
       targetState = await service.getTargetState(report);
@@ -164,17 +188,14 @@ router.get({
 router.patch({
   path: '/:id',
   summary: '通報の審査ステータス更新・処置実行',
-  auth: 'admin',
-}, requireAuth, requireAdmin, async (req, res) => {
-  const service = getModerationService(req);
-  if (!service) return res.status(503).json({ error: 'Moderation service is unavailable' });
+  auth: 'required',
+}, requireAuth, async (req, res) => {
   try {
-    const reportId = parseInt(req.params.id, 10);
-    if (!Number.isInteger(reportId) || reportId < 1) {
-      return res.status(400).json({ error: '通報IDが不正です' });
-    }
+    const loaded = await loadReportForHandler(req, res);
+    if (!loaded) return;
+    const { service, report } = loaded;
     const { status, note, action } = req.body || {};
-    const updated = await service.updateReportStatus(reportId, { status, note, action, moderatorId: req.user.id });
+    const updated = await service.updateReportStatus(report.id, { status, note, action, moderatorId: req.user.id });
 
     res.json({ success: true, report: updated });
   } catch (error) {
@@ -186,18 +207,13 @@ router.patch({
 router.post({
   path: '/:id/resolve',
   summary: '通報・申請の対応完了',
-  auth: 'admin',
-}, requireAuth, requireAdmin, async (req, res) => {
-  const service = getModerationService(req);
-  if (!service) return res.status(503).json({ error: 'Moderation service is unavailable' });
+  auth: 'required',
+}, requireAuth, async (req, res) => {
   try {
-    const reportId = parseInt(req.params.id, 10);
-    if (!Number.isInteger(reportId) || reportId < 1) {
-      return res.status(400).json({ error: '通報IDが不正です' });
-    }
-
-    const report = await service.getReportById(reportId);
-    if (!report) return res.status(404).json({ error: '通報が見つかりません' });
+    const loaded = await loadReportForHandler(req, res);
+    if (!loaded) return;
+    const { service, report } = loaded;
+    const reportId = report.id;
 
     let resolved = null;
     if (report.assignmentType === 'freeze_appeal') {
