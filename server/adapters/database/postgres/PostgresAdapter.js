@@ -6552,8 +6552,9 @@ class PostgresAdapter extends DatabaseAdapter {
 	async assignModerationReport(reportId, assignment = {}) {
 		return this._withTransaction(async (client) => {
 			const eligible = await client.query(
-				`SELECT id FROM users WHERE id = $1 AND admin = TRUE AND admin_request_excluded = FALSE AND COALESCE("freeze", '') = '' FOR UPDATE`,
-				[Number(assignment.adminId)],
+				`SELECT id FROM users WHERE id = $1 AND COALESCE("freeze", '') = ''
+				   AND ((admin = TRUE AND admin_request_excluded = FALSE) OR $2::boolean) FOR UPDATE`,
+				[Number(assignment.adminId), Boolean(assignment.groupModerator)],
 			);
 			if (!eligible.rows.length) return null;
 			const existingRes = await client.query('SELECT * FROM moderation_reports WHERE id = $1 FOR UPDATE', [Number(reportId)]);

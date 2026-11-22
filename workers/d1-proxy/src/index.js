@@ -2339,12 +2339,12 @@ export default {
 						? null
 						: String(body.claimStaleBefore);
 					const claimClause = claimStaleBefore ? ' AND (claimed_at IS NULL OR claimed_at <= ?)' : '';
-					const bindings = [Number(body.adminId), assignedAt, JSON.stringify(excluded), reportId, Number(body.adminId)];
+					const bindings = [Number(body.adminId), assignedAt, JSON.stringify(excluded), reportId, Number(body.adminId), body.groupModerator ? 1 : 0];
 					if (claimStaleBefore) bindings.push(claimStaleBefore);
 					const result = await db.prepare(
 						`UPDATE moderation_reports
 						 SET status = 'assigned', assigned_admin_id = ?, assigned_at = ?, excluded_admin_ids = ?, claimed_at = NULL
-						 WHERE id = ? AND status <> 'resolved' AND EXISTS (SELECT 1 FROM users WHERE id = ? AND admin = 1 AND admin_request_excluded = 0 AND COALESCE(freeze, '') = '')${claimClause}`
+						 WHERE id = ? AND status <> 'resolved' AND EXISTS (SELECT 1 FROM users WHERE id = ? AND COALESCE(freeze, '') = '' AND ((admin = 1 AND admin_request_excluded = 0) OR ? = 1))${claimClause}`
 					).bind(...bindings).run();
 					// changes 0 = CAS 失敗。再SELECT して行を返すとサービス側は奪取成功と誤認する。
 					if (result.meta.changes === 0) return json(null);

@@ -2,6 +2,7 @@ const crypto = require('crypto');
 const { createNotificationIfAllowed } = require('./NotificationDeliveryService');
 const config = require('../config');
 const modLog = require('./ModLogService');
+const { normalizeMaskReason } = require('../utils/maskReason');
 
 const REPORT_TARGET_KINDS = new Set(['user', 'post', 'dm', 'dm_message']);
 const REPORT_DESCRIPTION_MAX_LENGTH = config.moderation?.descriptionMaxLength || 2000;
@@ -111,6 +112,33 @@ class ModerationReportService {
     return (await this._assignReport(report)) || report;
   }
 
+  async createAutomodReport({ postId, description = '' }) {
+    const id = toSafeInteger(postId, 'postId', { minimum: 1 });
+    const normalizedDescription = String(description || '').trim();
+    if (!normalizedDescription) throw new Error('description is required');
+    if (normalizedDescription.length > this.descriptionMaxLength) {
+      throw new Error(`description must be ${this.descriptionMaxLength} characters or less`);
+    }
+    for (const status of ['pending', 'assigned']) {
+      const open = await this.listReports({ status, limit: 200 });
+      const existing = open.find((report) => Number(report.reporterUserId) === 0
+        && report.targetKind === 'post'
+        && Number(report.targetId) === id);
+      if (existing) return existing;
+    }
+    const snapshot = await this._captureTargetSnapshot({ reporterUserId: 0, targetKind: 'post', targetId: id });
+    snapshot.automod = true;
+    const report = await this.db.createModerationReport({
+      reporterUserId: 0,
+      targetKind: 'post',
+      targetId: id,
+      description: normalizedDescription,
+      targetSnapshot: snapshot,
+      createdAt: this.now().toISOString(),
+    });
+    return (await this._assignReport(report)) || report;
+  }
+
   async createFreezeAppeal({ userId, description = '' }) {
     const appellantId = toSafeInteger(userId, 'userId');
     const normalizedDescription = String(description || '').trim();
@@ -177,11 +205,15 @@ class ModerationReportService {
     const postId = Number(report.targetSnapshot?.post?.id ?? report.targetId);
     if (!Number.isSafeInteger(postId) || postId < 1) return null;
     const post = await this.db.getPostById(postId);
-    if (!post) return { exists: false, mask: false, lock: false };
+    if (!post) return { exists: false, mask: false, lock: false, mask_reason: null, age_rating: 0 };
     return {
       exists: true,
       mask: Boolean(post.mask),
       lock: Boolean(post.lock),
+      mask_reason: typeof post.mask_reason === 'string'
+        ? post.mask_reason
+        : (typeof post.maskReason === 'string' ? post.maskReason : null),
+      age_rating: Number(post.age_rating ?? post.ageRating ?? 0) || 0,
     };
   }
 
@@ -241,6 +273,7 @@ class ModerationReportService {
           attachments: cloneJson(post.attachments, []),
           mask: Boolean(post.mask),
           lock: Boolean(post.lock),
+          groupId: post.groupId ?? post.group_id ?? null,
           createdAt: post.createdAt ?? post.created_at ?? null,
         },
       };
@@ -298,12 +331,58 @@ class ModerationReportService {
     return candidates[crypto.randomInt(candidates.length)];
   }
 
+  // グループ内のポストの報告は、そのグループのモデレーターが担当する。
+  // グループが存在しない場合は null を返し、管理者側の割り当てに委ねる。
+  async _groupModeratorIds(groupId) {
+    if (!groupId || typeof this.db.getGroupById !== 'function') return null;
+    const group = await this.db.getGroupById(groupId).catch(() => null);
+    if (!group) return null;
+    const { listActiveGroupMemberIds, resolveGroupMembership, isAdmin } = require('./GroupService');
+    const memberIds = await listActiveGroupMemberIds(this.db, group.id ?? groupId);
+    const moderators = [];
+    for (const userId of memberIds) {
+      const { membership, role } = await resolveGroupMembership(this.db, group, userId);
+      if (!isAdmin(group, membership, role)) continue;
+      const user = await this.db.getUserById(userId).catch(() => null);
+      if (!user || user.freeze) continue;
+      moderators.push(userId);
+    }
+    return moderators;
+  }
+
+  async _chooseGroupModerator(moderatorIds, excludedAdminIds = []) {
+    const candidates = (moderatorIds || []).filter((id) => !excludedAdminIds.includes(id));
+    if (candidates.length === 0) return null;
+    const counts = [];
+    for (const id of candidates) {
+      const assigned = typeof this.db.listModerationReportsForAdmin === 'function'
+        ? await this.db.listModerationReportsForAdmin(id, { status: 'assigned', limit: 100, offset: 0 })
+        : [];
+      counts.push({ adminId: id, activeCount: Array.isArray(assigned) ? assigned.length : 0 });
+    }
+    const minimum = Math.min(...counts.map((row) => row.activeCount));
+    const least = counts.filter((row) => row.activeCount === minimum);
+    return least[crypto.randomInt(least.length)];
+  }
+
   async _assignReport(report, { expectedAdminId, excludedAdminIds, claimStaleBefore } = {}) {
     if (!report || report.status === 'resolved') return null;
     const excluded = [...new Set((excludedAdminIds || report.excludedAdminIds || [])
       .map(Number)
       .filter(Number.isInteger))];
-    const selected = await this._chooseLeastLoadedAdmin(excluded);
+    const groupId = report.targetSnapshot?.post?.groupId || null;
+    let selected = null;
+    let groupModerator = false;
+    if (groupId) {
+      const moderatorIds = await this._groupModeratorIds(groupId);
+      if (moderatorIds !== null) {
+        groupModerator = true;
+        selected = await this._chooseGroupModerator(moderatorIds, excluded);
+      }
+    }
+    if (!selected && !groupModerator) {
+      selected = await this._chooseLeastLoadedAdmin(excluded);
+    }
     if (!selected) return null;
 
     const assignment = {
@@ -311,6 +390,7 @@ class ModerationReportService {
       excludedAdminIds: excluded,
       assignedAt: this.now().toISOString(),
     };
+    if (groupModerator) assignment.groupModerator = true;
     if (expectedAdminId !== undefined) assignment.expectedAdminId = expectedAdminId;
     if (claimStaleBefore) assignment.claimStaleBefore = claimStaleBefore;
     const assigned = await this.db.assignModerationReport(report.id, assignment);
@@ -405,6 +485,7 @@ class ModerationReportService {
     const normalizedActions = {
       deletePost: Boolean(actions.deletePost),
       maskPost: Boolean(actions.maskPost),
+      maskReason: normalizeMaskReason(actions.maskReason),
       makePrivate: Boolean(actions.makePrivate),
       searchExclude: Boolean(actions.searchExclude),
       freeze: Boolean(actions.freeze),
@@ -422,6 +503,13 @@ class ModerationReportService {
     }
     if (normalizedActions.falseReport && normalizedActions.evidence.length<10) throw new Error('虚偽報告の認定には具体的な根拠が必要です');
     if (normalizedActions.falseReport && ['deletePost','maskPost','makePrivate','searchExclude','freeze'].some(key=>normalizedActions[key])) throw new Error('対応する報告を虚偽報告には認定できません');
+    if (report.targetSnapshot?.post?.groupId) {
+      const resolver = await this.db.getUserById(adminId).catch(() => null);
+      const resolverIsAdmin = Boolean(resolver && (resolver.role === 'admin' || resolver.admin));
+      if (!resolverIsAdmin && (normalizedActions.makePrivate || normalizedActions.searchExclude || normalizedActions.freeze || normalizedActions.falseReport)) {
+        throw new Error('グループ内の報告では実行できない対応が含まれています');
+      }
+    }
     const touchesPost = normalizedActions.deletePost || normalizedActions.maskPost || normalizedActions.makePrivate;
     if (touchesPost && report.targetKind !== 'post') {
       throw new Error('ポスト以外はポストへの対応を実行できません');
@@ -485,7 +573,11 @@ class ModerationReportService {
         throw new Error('対象のポストが見つかりません');
       }
       const postUpdates = {};
-      if (normalizedActions.maskPost) postUpdates.mask = true;
+      if (normalizedActions.maskPost) {
+        postUpdates.mask = true;
+        postUpdates.mask_reason = normalizedActions.maskReason;
+        postUpdates.maskReason = normalizedActions.maskReason;
+      }
       if (normalizedActions.makePrivate) postUpdates.lock = true;
       let updated;
       try {
