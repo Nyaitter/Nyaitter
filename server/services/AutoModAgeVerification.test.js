@@ -350,6 +350,32 @@ test('(n) ツールのターン上限は設定でき、既定は無制限', asyn
   assert.equal(calls, 2, '上限のターン数で打ち切られる');
 });
 
+test('(o) テキスト判定でラベルの無い応答は安全とみなさずエラーにする', async () => {
+  const { db, author } = await setup();
+  const post = await db.createPost({ userId: author.id, content: '判定対象の本文' });
+  const empty = makeService(db, { respond: '' });
+  await assert.rejects(
+    empty.service._classify(post, ''),
+    (error) => error.code === 'AI_INVALID_RESPONSE',
+  );
+  const labeled = makeService(db, { respond: '<low> <reason>Harassment</reason>' });
+  const result = await labeled.service._classify(post, '');
+  assert.equal(result.level, 2);
+  assert.equal(result.reason, 'Harassment');
+});
+
+test('(p) ツール判定で呼び出しの無いターンが続いたら打ち切る', async () => {
+  const { db, author } = await setup();
+  const post = await db.createPost({ userId: author.id, content: '本文' });
+  let calls = 0;
+  const service = makeToolService(db, async () => {
+    calls += 1;
+    return toolResponse([]);
+  });
+  await assert.rejects(service._classifyWithTools(post, ''), /必須のツールが呼び出されませんでした/);
+  assert.equal(calls, 3, '呼び出しの無いターンが3回続いたら打ち切られる');
+});
+
 test('(j) ツールモードではツール呼び出しでモデレーションが適用され、状態がプロンプトに渡る', async () => {
   const { db, author } = await setup();
   const post = await db.createPost({ userId: author.id, content: '判定対象の本文' });

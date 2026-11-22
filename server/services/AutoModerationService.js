@@ -431,9 +431,14 @@ class AutoModerationService {
       model: this.config.model,
       system: this._buildSystemPrompt(),
       text: instruction,
-      images, maxOutputTokens: 256, timeoutMs: REQUEST_TIMEOUT_MS,
+      images, maxOutputTokens: 2048, timeoutMs: REQUEST_TIMEOUT_MS,
       reasoningEffort: this.config.reasoningEffort || undefined,
     });
+    if (!/<(safe|low|middle|high)>/i.test(extractResponseText(response))) {
+      const error = new Error('判定ラベルが応答に含まれていません');
+      error.code = 'AI_INVALID_RESPONSE';
+      throw error;
+    }
     return parseClassification(response);
   }
 
@@ -695,6 +700,7 @@ class AutoModerationService {
     };
     const turns = [{ role: 'user', text: instruction }];
     const maxTurns = this.toolMaxTurns;
+    let emptyTurns = 0;
     for (let turn = 0; maxTurns === 0 || turn < maxTurns; turn++) {
       const response = await this.ai.generate({
         provider: this.config.provider,
@@ -702,7 +708,7 @@ class AutoModerationService {
         system: this._buildSystemPrompt(),
         turns,
         tools,
-        maxOutputTokens: 512, timeoutMs: REQUEST_TIMEOUT_MS,
+        maxOutputTokens: 2048, timeoutMs: REQUEST_TIMEOUT_MS,
         reasoningEffort: this.config.reasoningEffort || undefined,
       });
       const calls = parseToolCalls(response);
@@ -711,12 +717,19 @@ class AutoModerationService {
       if (!calls.length) {
         const missing = this._missingRequiredTools(state, post);
         if (!missing.length) break;
+        emptyTurns += 1;
+        if (emptyTurns >= 3) {
+          const error = new Error(`必須のツールが呼び出されませんでした: ${missing.join(', ')}`);
+          error.code = 'AI_CAPABILITY';
+          throw error;
+        }
         turns.push({
           role: 'user',
           text: `必須のツールが呼び出されていません: ${missing.join(', ')}。必ず呼び出してください。`,
         });
         continue;
       }
+      emptyTurns = 0;
       const results = [];
       const pendingImages = [];
       for (const call of calls) {
@@ -730,7 +743,9 @@ class AutoModerationService {
     }
     const missing = this._missingRequiredTools(state, post);
     if (missing.length) {
-      throw new Error(`必須のツールが呼び出されませんでした: ${missing.join(', ')}`);
+      const error = new Error(`必須のツールが呼び出されませんでした: ${missing.join(', ')}`);
+      error.code = 'AI_CAPABILITY';
+      throw error;
     }
     return {
       level: state.private && state.cushion
