@@ -51,7 +51,7 @@ router.get({path:'/me/status',summary:'自分の利用状態',auth:'required'},r
 		const [status, user] = await Promise.all([reputation.getStatus(db, req.user.id), db.getUserById(req.user.id)]);
 		const actual = { trust: status.trust.rank };
 		res.set('Cache-Control','no-store');
-		return res.json({ ...status, display_ranks: displayRanks(actual, user?.settings?.display_ranks), display_rank_options: displayOptions(actual), display_settings: ownDisplaySettings(user?.settings, actual) });
+		return res.json({ ...status, estimated_age: user?.age_estimate ?? null, display_ranks: displayRanks(actual, user?.settings?.display_ranks), display_rank_options: displayOptions(actual), display_settings: ownDisplaySettings(user?.settings, actual) });
 	}
 	catch(error) { console.error('[users] status:',error.message); return res.status(503).json({error:'利用状態を取得できませんでした'}); }
 });
