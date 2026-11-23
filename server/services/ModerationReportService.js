@@ -548,6 +548,8 @@ class ModerationReportService {
       if (post && await modLog.operation(this.db, 'admin', adminId, 'delete_post', 'post', postId, () => this.db.adminDeletePost(postId))) {
         await require('./ReputationService').cancelPostEvents(this.db,postId,notesToDelete);
         await this._deletePostAttachments(post.attachments);
+        require('../utils/TimelineCacheManager').onPostDeleted(postId);
+        require('../utils/serialize').invalidateImmutablePostCache(postId);
         applied.deletePost = true;
       } else if (!post) {
         await modLog.record(this.db, 'admin', adminId, 'delete_post', 'post', postId, 'skipped');
@@ -590,6 +592,8 @@ class ModerationReportService {
       if (normalizedActions.maskPost) await modLog.record(this.db, 'admin', adminId, 'mask_post', 'post', postId, updated ? 'success' : 'failure');
       if (normalizedActions.makePrivate) await modLog.record(this.db, 'admin', adminId, 'make_private', 'post', postId, updated ? 'success' : 'failure');
       if (!updated) throw new Error('ポストの公開範囲を変更できませんでした');
+      require('../utils/TimelineCacheManager').updatePost(updated);
+      require('../utils/serialize').invalidateImmutablePostCache(postId);
       applied.maskPost = normalizedActions.maskPost;
       applied.makePrivate = normalizedActions.makePrivate;
     }

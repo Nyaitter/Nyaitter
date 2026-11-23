@@ -183,4 +183,67 @@ async function retractReportTrust(db,{reportId,userId,targetKind,targetId,report
   if (result.postId) await syncPostTrust(db,result.postId);
 }
 
-module.exports={policy,event,serialized,effectivePolicy,enforceAccess,getStatus,independenceContext,positivePostEvidence,syncPostTrust,syncReport,cancelPostEvents,retractReportTrust};
+const TRUST_RANK_ORDER=['Trusted','Reliable','Credible','Neutral','Questionable','Suspicious'];
+const OPERATOR_TRUST_RANK_SCOPE_PREFIX='operator-trust-rank:';
+
+// ランク帯はポリシーの閾値から導く。最上位は自帯の幅だけ上へ、最下位は1つ上の帯の幅だけ下へ広げる。
+function trustRankBand(rank) {
+  const index=TRUST_RANK_ORDER.indexOf(rank);
+  if (index===-1) return null;
+  const lo=policy.trust[rank].minScore;
+  if (index===0) return {lo,hi:lo+(lo-policy.trust[TRUST_RANK_ORDER[1]].minScore)};
+  const hi=policy.trust[TRUST_RANK_ORDER[index-1]].minScore;
+  if (index===TRUST_RANK_ORDER.length-1) return {lo:hi-(policy.trust[TRUST_RANK_ORDER[index-2]].minScore-hi),hi};
+  return {lo,hi};
+}
+
+function resolveTrustRankName(value) {
+  const name=String(value ?? '').trim().toLowerCase();
+  if (name==='banned') throw new Error('Banned はこのコマンドでは変更できません');
+  const rank=TRUST_RANK_ORDER.find(candidate=>candidate.toLowerCase()===name);
+  if (!rank) throw new Error(`ランクは ${TRUST_RANK_ORDER.join(' / ')} のいずれかで指定してください`);
+  return rank;
+}
+
+async function getTrustRank(db,userId) {
+  const profile=await db.getReputationProfile(Number(userId));
+  return {rank:trustRank(profile,policy),score:Number(profile?.trust?.score || 0)};
+}
+
+async function setTrustRank(db,userId,targetRank) {
+  const uid=Number(userId);
+  const target=resolveTrustRankName(targetRank);
+  return serialized(db,`trust-rank:${uid}`,async()=>{
+    const profile=await db.getReputationProfile(uid);
+    if (Number(profile?.ban?.score || 0)>0) throw new Error('Banned のユーザーにはTrustRankを変更できません');
+    const previousRank=trustRank(profile,policy);
+    const previousScore=Number(profile?.trust?.score || 0);
+    if (previousRank===target) return {rank:previousRank,score:previousScore,previousRank,previousScore,changed:false};
+    const from=trustRankBand(previousRank);
+    const to=trustRankBand(target);
+    const position=Math.min(1,Math.max(0,(previousScore-from.lo)/(from.hi-from.lo)));
+    let targetScore=Math.round((to.lo+position*(to.hi-to.lo))*100)/100;
+    if (target!==TRUST_RANK_ORDER[0] && targetScore>=to.hi) targetScore=to.hi-0.01;
+    if (targetScore<to.lo) targetScore=to.lo;
+    const scope=`${OPERATOR_TRUST_RANK_SCOPE_PREFIX}${uid}`;
+    const evidence=await db.getReputationEvidence(uid,OPERATOR_TRUST_RANK_SCOPE_PREFIX);
+    const previousAdjustment=evidence.filter(e=>e.dimension==='trust').reduce((sum,e)=>sum+Number(e.amount || 0),0);
+    const total=previousAdjustment+(targetScore-previousScore);
+    const metadata={fromRank:previousRank,toRank:target,fromScore:previousScore,toScore:targetScore};
+    const day=new Date().toISOString().slice(0,10);
+    const events=[];
+    let remaining=Math.abs(total)<1e-9?0:total;
+    let index=0;
+    while (Math.abs(remaining)>100) {
+      const amount=Math.sign(remaining)*100;
+      events.push({key:`adjust:${index++}`,userId:uid,dimension:'trust',amount,successes:0,day,cap:null,metadata});
+      remaining-=amount;
+    }
+    if (remaining!==0) events.push({key:`adjust:${index}`,userId:uid,dimension:'trust',amount:remaining,successes:0,day,cap:null,metadata});
+    await db.replaceReputationEvents(scope,events);
+    const updated=await db.getReputationProfile(uid);
+    return {rank:trustRank(updated,policy),score:Number(updated?.trust?.score || 0),previousRank,previousScore,changed:true};
+  });
+}
+
+module.exports={policy,event,serialized,effectivePolicy,enforceAccess,getStatus,independenceContext,positivePostEvidence,syncPostTrust,syncReport,cancelPostEvents,retractReportTrust,getTrustRank,setTrustRank};

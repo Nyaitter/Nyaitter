@@ -314,6 +314,8 @@ class AutoModerationService {
       fields.mask_reason = classification.reason;
       const updated = await modLog.operation(this.db, 'automod', null, action, 'post', post.id, () => this.db.updatePost(post.id, fields));
       if (updated) {
+        require('../utils/TimelineCacheManager').updatePost(updated);
+        require('../utils/serialize').invalidateImmutablePostCache(post.id);
         acted = true;
         await modLog.operation(this.db, 'automod', null, 'auto_notice', 'user', Number(post.userId), () => createNotificationIfAllowed(this.db, {
           userId: Number(post.userId),
@@ -334,7 +336,11 @@ class AutoModerationService {
         const updated = await modLog.operation(this.db, 'automod', null, action, 'post', post.id, () => this.db.updatePost(post.id, {
           mask_reason: classification.reason,
         }));
-        if (updated) acted = true;
+        if (updated) {
+          require('../utils/TimelineCacheManager').updatePost(updated);
+          require('../utils/serialize').invalidateImmutablePostCache(post.id);
+          acted = true;
+        }
       }
     }
 
@@ -387,6 +393,8 @@ class AutoModerationService {
       ...(raising ? { mask_reason: classification.reason, maskReason: classification.reason } : {}),
     }));
     if (!updated) return false;
+    require('../utils/TimelineCacheManager').updatePost(updated);
+    require('../utils/serialize').invalidateImmutablePostCache(post.id);
 
     if (classification.ageRating > current) {
       await modLog.operation(this.db, 'automod', null, 'auto_notice', 'user', Number(post.userId), () => createNotificationIfAllowed(this.db, {

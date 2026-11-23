@@ -161,6 +161,51 @@ function createCommandHandler({ dbAdapter, shutdown, getStatus, managers = {} })
       };
     }
 
+    if (command.action === 'get-trust-rank') {
+      const userId = parseUserId(command.userId);
+      if (userId == null) {
+        return { ok: false, error: 'get-trust-rank requires a valid userId' };
+      }
+      const existing = await dbAdapter.getUserById(userId);
+      if (!existing) return { ok: false, error: `User #${userId} was not found` };
+      const { getTrustRank } = require('../services/ReputationService');
+      const result = await getTrustRank(dbAdapter, userId);
+      return { ok: true, user: { id: userId, rank: result.rank, score: result.score } };
+    }
+
+    if (command.action === 'set-trust-rank') {
+      const userId = parseUserId(command.userId);
+      if (userId == null || typeof command.rank !== 'string' || !command.rank) {
+        return { ok: false, error: 'set-trust-rank requires a valid userId and rank' };
+      }
+      let existing;
+      try { existing = await dbAdapter.getUserById(userId); } catch (error) {
+        await modLog.record(dbAdapter, 'operator', null, 'set_trust_rank', 'user', userId, 'failure');
+        throw error;
+      }
+      if (!existing) {
+        await modLog.record(dbAdapter, 'operator', null, 'set_trust_rank', 'user', userId, 'failure');
+        return { ok: false, error: `User #${userId} was not found` };
+      }
+      const { setTrustRank } = require('../services/ReputationService');
+      try {
+        const result = await modLog.operation(dbAdapter, 'operator', null, 'set_trust_rank', 'user', userId, () => setTrustRank(dbAdapter, userId, command.rank), 'failure');
+        return {
+          ok: true,
+          user: {
+            id: userId,
+            rank: result.rank,
+            score: result.score,
+            previousRank: result.previousRank,
+            previousScore: result.previousScore,
+            changed: result.changed,
+          },
+        };
+      } catch (error) {
+        return { ok: false, error: error.message };
+      }
+    }
+
     // ── セキュリティ ───────────────────────────────────────────────────────
     if (command.action === 'get-security-events') {
       if (!managers.securityManager) return { ok: false, error: 'SecurityManager not available' };
