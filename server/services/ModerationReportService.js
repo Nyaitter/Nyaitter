@@ -504,9 +504,7 @@ class ModerationReportService {
     if (normalizedActions.falseReport && normalizedActions.evidence.length<10) throw new Error('虚偽報告の認定には具体的な根拠が必要です');
     if (normalizedActions.falseReport && ['deletePost','maskPost','makePrivate','searchExclude','freeze'].some(key=>normalizedActions[key])) throw new Error('対応する報告を虚偽報告には認定できません');
     if (report.targetSnapshot?.post?.groupId) {
-      const resolver = await this.db.getUserById(adminId).catch(() => null);
-      const resolverIsAdmin = Boolean(resolver && (resolver.role === 'admin' || resolver.admin));
-      if (!resolverIsAdmin && (normalizedActions.makePrivate || normalizedActions.searchExclude || normalizedActions.freeze || normalizedActions.falseReport)) {
+      if (normalizedActions.makePrivate || normalizedActions.searchExclude || normalizedActions.freeze || normalizedActions.falseReport) {
         throw new Error('グループ内の報告では実行できない対応が含まれています');
       }
     }
@@ -516,6 +514,9 @@ class ModerationReportService {
     }
 
     const candidateUserIds = this.getReviewTargetUserIds(report);
+    if (normalizedActions.notice && normalizedActions.targetUserId == null && candidateUserIds.length === 1) {
+      normalizedActions.targetUserId = candidateUserIds[0];
+    }
     const needsTargetUser = normalizedActions.searchExclude || normalizedActions.freeze || normalizedActions.notice;
     if (needsTargetUser && !candidateUserIds.includes(Number(normalizedActions.targetUserId))) {
       throw new Error('対応対象ユーザーが報告対象に含まれていません');
