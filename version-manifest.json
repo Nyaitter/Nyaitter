@@ -141,7 +141,7 @@
     "server/services/AccountRecoveryScheduler.js": "865bbe1b757edb8dce0980c02f95be336202c62e6fc530de36bd23b2fb4b013a",
     "server/services/AgeEstimateService.js": "af796a507f05d3b01229be8a6148a3c22e304652472abf90a3703e20ae8288b7",
     "server/services/AutoModAgeVerification.test.js": "2e02cd95ff6664bdacbcee990265d3a34423fa8569cf59607b25c7d9b4abe022",
-    "server/services/AutoModerationService.js": "61ce8bd90dcee35e5b1f99b65f9eb60943f301e40e50009d9779889406580377",
+    "server/services/AutoModerationService.js": "998652d41f90cc678946eee3b96209a911ff93f10fb842152395ee4c51cd8486",
     "server/services/CallService.js": "c94c88defaddda70b9a4f569a2c545a855b06c7d2204295f442e8c41e52a7021",
     "server/services/CommunityNoteService.js": "b32557fa8242533dbe9e8a739578bb744232e010324b7e18a550c56f4c56c13c",
     "server/services/CommunityNoteService.test.js": "2655bb5c6ed46db730e8748ee515bbbf975ee290888b52b8f662d584a7e77dbb",
