@@ -16,6 +16,11 @@ router.post({path:'/:id/trust-retract',summary:'報告による利用状態へ�
   const validId=id=>typeof id==='number' && Number.isSafeInteger(id) && id>0;
   if (!Number.isSafeInteger(reportId) || reportId<=0 || [userId,targetId,reporterId].some(id=>id!=null && !validId(id))
     || (targetKind!=null && !['post','user'].includes(targetKind)) || String(reason || '').trim().length<10) return res.status(400).json({error:'報告と取消理由を指定してください'});
+  const moderationService = getModerationService(req);
+  if (moderationService) {
+    const targetReport = await moderationService.getReportById(reportId).catch(() => null);
+    if (targetReport?.targetSnapshot?.post?.groupId != null) return res.status(403).json({error:'このリクエストを対応する権限がありません'});
+  }
   try {
     const db=req.app.locals.dbAdapter;
     await require('../services/ModLogService').operation(db, 'admin', req.user.id, 'report_trust_processing', 'report', reportId, async () => {
@@ -56,7 +61,7 @@ function isSiteAdmin(user) {
   return Boolean(user && (user.role === 'admin' || user.admin));
 }
 
-// 対応は管理者と担当者だけが扱える。担当者にはグループのモデレーターも含まれる。
+// グループ内の報告は担当のモデレーターだけが扱える。それ以外の報告は管理者と担当者が扱える。
 async function loadReportForHandler(req, res) {
   const service = getModerationService(req);
   if (!service) {
@@ -73,7 +78,9 @@ async function loadReportForHandler(req, res) {
     res.status(404).json({ error: '通報が見つかりません' });
     return null;
   }
-  if (!isSiteAdmin(req.user) && Number(report.assignedAdminId) !== Number(req.user.id)) {
+  const isGroupReport = report.targetSnapshot?.post?.groupId != null;
+  const isAssignee = Number(report.assignedAdminId) === Number(req.user.id);
+  if (!isAssignee && (isGroupReport || !isSiteAdmin(req.user))) {
     res.status(403).json({ error: 'このリクエストを対応する権限がありません' });
     return null;
   }
