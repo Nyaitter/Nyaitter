@@ -31,6 +31,8 @@ nscli — Nyaitter ローカル管理CLI
   nscli  verify grant <#ユーザーID>
   nscli  verify revoke <#ユーザーID>
   nscli  verify list
+  nscli  trust show <#ユーザーID>
+  nscli  trust rank <#ユーザーID> <ランク名>
   nscli  server start
   nscli  server stop
   nscli  server restart
@@ -190,6 +192,33 @@ async function setVerification(userIdArgument, verify) {
     console.log(`#${response.user.id} の認証を${response.user.verify ? '付与' : '解除'}しました。`);
 }
 
+function formatTrustScore(score) {
+    const value = Number(score) || 0;
+    return Number.isInteger(value) ? String(value) : String(Math.round(value * 100) / 100);
+}
+
+async function showTrustRank(userIdArgument) {
+    const userId = parseUserId(userIdArgument);
+    if (userId == null) throw new Error('ユーザーIDは #3480 または 3480 形式の非負整数で指定してください');
+    const response = await requestOperatorCommand({ action: 'get-trust-rank', userId });
+    if (!response?.ok) throw new Error(response?.error || 'TrustRankの取得に失敗しました');
+    console.log(`#${response.user.id} のTrustRankは ${response.user.rank} です（スコア ${formatTrustScore(response.user.score)}）`);
+}
+
+async function setTrustRank(userIdArgument, rankArgument) {
+    const userId = parseUserId(userIdArgument);
+    if (userId == null) throw new Error('ユーザーIDは #3480 または 3480 形式の非負整数で指定してください');
+    if (!rankArgument) throw new Error('ランク名を指定してください');
+    const response = await requestOperatorCommand({ action: 'set-trust-rank', userId, rank: rankArgument });
+    if (!response?.ok) throw new Error(response?.error || 'TrustRankの変更に失敗しました');
+    const user = response.user;
+    if (!user.changed) {
+        console.log(`#${user.id} のTrustRankは ${user.rank} です（スコア ${formatTrustScore(user.score)}）`);
+        return;
+    }
+    console.log(`#${user.id} のTrustRankを ${user.previousRank} から ${user.rank} に変更しました（スコア ${formatTrustScore(user.previousScore)} → ${formatTrustScore(user.score)}）`);
+}
+
 async function listOperatorUsers(field) {
     const response = await requestOperatorCommand({ action: 'list-operator-users', field });
     if (!response?.ok) throw new Error(response?.error || '一覧の取得に失敗しました');
@@ -283,6 +312,17 @@ async function main(argv) {
         }
         if (command === 'grant' || command === 'revoke') {
             await setVerification(argument, command === 'grant');
+            return;
+        }
+    }
+
+    if (group === 'trust') {
+        if (command === 'show') {
+            await showTrustRank(argument);
+            return;
+        }
+        if (command === 'rank') {
+            await setTrustRank(argument, argv[3]);
             return;
         }
     }
