@@ -4397,6 +4397,23 @@ class PostgresAdapter extends DatabaseAdapter {
 			}
 		}
 
+		// 信頼スコアが負の投稿者はおすすめで沈めるため、候補の投稿者の信頼スコアをまとめて引く。
+		// 失敗してもおすすめ自体は止めない。
+		let authorTrustScores = new Map();
+		if (candidateRows.length > 0) {
+			try {
+				const authorIds = [...new Set(candidateRows.map((row) => Number(row.user_id)).filter((id) => Number.isSafeInteger(id) && id > 0))];
+				const { rows: trustRows } = await this.pool.query(
+					'SELECT user_id, score FROM reputation_profiles WHERE dimension = $1 AND user_id = ANY($2::int[])',
+					['trust', authorIds],
+				);
+				authorTrustScores = new Map((trustRows || []).filter((row) => Number(row.score) < 0).map((row) => [Number(row.user_id), Math.max(-50, Number(row.score))]));
+			} catch (err) {
+				console.warn('[recommendations] Postgres trust lookup failed:', err?.message || err);
+				authorTrustScores = new Map();
+			}
+		}
+
 		// 共通の採点ユーティリティで Node.js サーバー上で高速にスコアリングする。
 		const scored = scoreRecommendedPosts(candidateRows, {
 			viewerId: validViewerId,
@@ -4410,6 +4427,7 @@ class PostgresAdapter extends DatabaseAdapter {
 			blockedAuthors,
 			viewerAgeEstimate,
 			authorAgeEstimates,
+			authorTrustScores,
 			now,
 			limit: normalizedLimit,
 		});

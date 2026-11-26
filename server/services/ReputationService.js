@@ -46,7 +46,6 @@ async function enforceAccess(req,res,principal) {
 const trustDescriptions = {
   Trusted:'継続して信頼できる活動が確認されています。',Reliable:'安定した良い活動が確認されています。',
   Credible:'信頼できる活動が増えています。',Neutral:'標準の状態です。新しい利用者もここから始まります。',
-  Questionable:'確認された問題により一部の利用を制限しています。',Suspicious:'確認された問題の繰り返しにより利用を制限しています。',
   Banned:'閲覧のみ利用できます。',
 };
 const featureLabels={write:'投稿・反応',posts:'投稿',polls:'アンケート',notes:'ノート作成・評価',uploads:'アップロード',dm:'メッセージ送信',call:'通話',spaces:'スペース',groups:'グループ'};
@@ -56,14 +55,14 @@ const noteBenefits=rules=>rules.disabledFeatures.includes('notes')?[]:[
   rules.dailyNotes===null?'ノートは1日に何件でも作成できます':`ノートは1日${rules.dailyNotes}件まで作成できます`,
   `ノートの評価が${rules.ratingWeight}倍の重みで反映されます`,
   rules.noteVisibility===1?'閲覧できる投稿の公開前のノートをすべて確認できます':rules.noteVisibility>0?'公開前に見られるノートの範囲が広がります':'公開前のノートは一部が表示されます',
-  ...(rules.publicBonus>0?[`作成したノートが公開されると、信頼スコアに${rules.publicBonus}点が追加されます`]:[]),
+  ...(rules.publicBonus>0?['作成したノートが公開されると、信頼スコアが上がります']:[]),
 ];
 const noteRestrictions=['自分のノートは評価できません','同じ投稿にノートを作成できるのは一度だけです',`1つの投稿に作成できるノートは全員で${policy.notes.maxNotesPerPost}件までです`,'公開前のノートの閲覧範囲は、見る人の信頼ランクで広がります','公開後も、投稿の公開範囲やブロックによる閲覧制限は変わりません','反応していない投稿の公開前のノートは通知されません'];
 const rateLimitLabels={general:'全体の操作',auth:'ログイン・認証',postWrite:'投稿',profileUpdate:'プロフィールの変更',dmSend:'メッセージ送信',upload:'アップロード',notification:'通知の確認',reportCreate:'通報',reportAction:'通報への対応',verificationApplication:'認証の申請'};
 
 async function getStatus(db,userId) {
   const profile=await db.getReputationProfile(userId);
-  const trustRanks=['Trusted','Reliable','Credible','Neutral','Questionable','Suspicious','Banned'].map(rank=>{
+  const trustRanks=['Trusted','Reliable','Credible','Neutral','Banned'].map(rank=>{
     const rules=policy.trust[rank];
     const { hasFeatureAccess } = require('../utils/featureAccess');
     const features=Object.entries(featureLabels).map(([feature,label])=>({label,allowed:hasFeatureAccess(policy,rank,feature==='write'?['write']:['write',feature])}));
@@ -74,7 +73,7 @@ async function getStatus(db,userId) {
       return `${label}: ${seconds%60===0?`${seconds/60}分`:`${seconds}秒`}あたり${max}回まで`;
     }):[];
     const queue=features.find(f=>f.label===featureLabels.write).allowed?[rules.queuePriority>0?'混雑時も投稿が優先して送信されます':rules.queuePriority<0?'混雑時は投稿の送信をお待ちいただくことがあります':'投稿は通常の順番で送信されます']:[];
-    return {rank,label:`${rank} User`,description:trustDescriptions[rank],requirements:rules.minScore>0?[`信頼スコア${rules.minScore}点以上`]:[],benefits:[...features.filter(f=>f.allowed).map(f=>`${f.label}を利用できます`),...queue, ...limits, ...noteBenefits(rules)],restrictions:[...features.filter(f=>!f.allowed).map(f=>`${f.label}は利用できません`),...noteRestrictions,'短時間に操作が集中すると、一時的に利用が制限されることがあります']};
+    return {rank,label:`${rank} User`,description:trustDescriptions[rank],benefits:[...features.filter(f=>f.allowed).map(f=>`${f.label}を利用できます`),...queue, ...limits, ...noteBenefits(rules)],restrictions:[...features.filter(f=>!f.allowed).map(f=>`${f.label}は利用できません`),...noteRestrictions,'短時間に操作が集中すると、一時的に利用が制限されることがあります']};
   });
   const category=(ranks,rank)=>({...ranks.find(r=>r.rank===rank),ranks});
   return {trust:category(trustRanks,trustRank(profile,policy))};
@@ -93,7 +92,8 @@ async function independenceContext(db,ids) {
 }
 
 // 反応者の信頼スコアが minTrust からこの幅だけ下がるまで、重みを直線的に割り引く。
-const REACTOR_TRUST_SPAN=100;
+// 幅はスコアの下限までの距離で、下限に達した反応者は証拠に数えない。
+const REACTOR_TRUST_SPAN=50;
 
 function reactorWeight(user,profile,rules) {
   const ageDays=(Date.now()-new Date(user.created_at || user.createdAt).getTime())/86400000;
@@ -183,17 +183,16 @@ async function retractReportTrust(db,{reportId,userId,targetKind,targetId,report
   if (result.postId) await syncPostTrust(db,result.postId);
 }
 
-const TRUST_RANK_ORDER=['Trusted','Reliable','Credible','Neutral','Questionable','Suspicious'];
+const TRUST_RANK_ORDER=['Trusted','Reliable','Credible','Neutral'];
 const OPERATOR_TRUST_RANK_SCOPE_PREFIX='operator-trust-rank:';
 
-// ランク帯はポリシーの閾値から導く。最上位は自帯の幅だけ上へ、最下位は1つ上の帯の幅だけ下へ広げる。
+// ランク帯はポリシーの閾値から導く。最上位は自帯の幅だけ上へ広げる。最下位の下限はスコアの下限と一致する。
 function trustRankBand(rank) {
   const index=TRUST_RANK_ORDER.indexOf(rank);
   if (index===-1) return null;
   const lo=policy.trust[rank].minScore;
   if (index===0) return {lo,hi:lo+(lo-policy.trust[TRUST_RANK_ORDER[1]].minScore)};
   const hi=policy.trust[TRUST_RANK_ORDER[index-1]].minScore;
-  if (index===TRUST_RANK_ORDER.length-1) return {lo:hi-(policy.trust[TRUST_RANK_ORDER[index-2]].minScore-hi),hi};
   return {lo,hi};
 }
 
@@ -226,22 +225,30 @@ async function setTrustRank(db,userId,targetRank) {
     if (target!==TRUST_RANK_ORDER[0] && targetScore>=to.hi) targetScore=to.hi-0.01;
     if (targetScore<to.lo) targetScore=to.lo;
     const scope=`${OPERATOR_TRUST_RANK_SCOPE_PREFIX}${uid}`;
-    const evidence=await db.getReputationEvidence(uid,OPERATOR_TRUST_RANK_SCOPE_PREFIX);
-    const previousAdjustment=evidence.filter(e=>e.dimension==='trust').reduce((sum,e)=>sum+Number(e.amount || 0),0);
-    const total=previousAdjustment+(targetScore-previousScore);
     const metadata={fromRank:previousRank,toRank:target,fromScore:previousScore,toScore:targetScore};
     const day=new Date().toISOString().slice(0,10);
-    const events=[];
-    let remaining=Math.abs(total)<1e-9?0:total;
-    let index=0;
-    while (Math.abs(remaining)>100) {
-      const amount=Math.sign(remaining)*100;
-      events.push({key:`adjust:${index++}`,userId:uid,dimension:'trust',amount,successes:0,day,cap:null,metadata});
-      remaining-=amount;
+    // スコアの下限で見えている値と保存上の合計がずれることがあるため、目標のランクに到達するまで差分を足し直す。
+    let updated=profile;
+    for (let attempt=0; attempt<3; attempt++) {
+      const currentScore=Number(updated?.trust?.score || 0);
+      const shortfall=Math.round((targetScore-currentScore)*100)/100;
+      if (attempt>0 && Math.abs(shortfall)<0.005) break;
+      const evidence=await db.getReputationEvidence(uid,OPERATOR_TRUST_RANK_SCOPE_PREFIX);
+      const previousAdjustment=evidence.filter(e=>e.dimension==='trust').reduce((sum,e)=>sum+Number(e.amount || 0),0);
+      const total=previousAdjustment+shortfall;
+      const events=[];
+      let remaining=Math.abs(total)<1e-9?0:total;
+      let index=0;
+      while (Math.abs(remaining)>100) {
+        const amount=Math.sign(remaining)*100;
+        events.push({key:`adjust:${index++}`,userId:uid,dimension:'trust',amount,successes:0,day,cap:null,metadata});
+        remaining-=amount;
+      }
+      if (remaining!==0) events.push({key:`adjust:${index}`,userId:uid,dimension:'trust',amount:remaining,successes:0,day,cap:null,metadata});
+      await db.replaceReputationEvents(scope,events);
+      updated=await db.getReputationProfile(uid);
+      if (trustRank(updated,policy)===target) break;
     }
-    if (remaining!==0) events.push({key:`adjust:${index}`,userId:uid,dimension:'trust',amount:remaining,successes:0,day,cap:null,metadata});
-    await db.replaceReputationEvents(scope,events);
-    const updated=await db.getReputationProfile(uid);
     return {rank:trustRank(updated,policy),score:Number(updated?.trust?.score || 0),previousRank,previousScore,changed:true};
   });
 }

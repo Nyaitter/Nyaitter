@@ -1898,6 +1898,21 @@ class D1Adapter extends DatabaseAdapter {
 			}
 		}
 
+		let authorTrustScores = new Map();
+		if (candidates.length > 0) {
+			try {
+				const authorIds = [...new Set(candidates.map((post) => Number(post.user_id ?? post.userId)).filter((id) => Number.isSafeInteger(id) && id > 0))];
+				const { profiles } = await this.getReputationDisplayContext(authorIds);
+				for (const [id, profile] of Object.entries(profiles || {})) {
+					const score = Number(profile?.trust?.score);
+					if (Number.isFinite(score) && score < 0) authorTrustScores.set(Number(id), Math.max(-50, score));
+				}
+			} catch (err) {
+				console.warn('[recommendations] D1 trust lookup failed:', err?.message || err);
+				authorTrustScores = new Map();
+			}
+		}
+
 		const scored = scoreRecommendedPosts(candidates, {
 			viewerId: viewerId == null ? null : Number(viewerId),
 			keywordProfile,
@@ -1910,6 +1925,7 @@ class D1Adapter extends DatabaseAdapter {
 			blockedAuthors,
 			viewerAgeEstimate,
 			authorAgeEstimates,
+			authorTrustScores,
 			limit: normalizedLimit,
 		});
 

@@ -284,13 +284,13 @@ test('TrustScore: 反応が1〜2件でも信頼できる反応でスコアが動
   await adapter.toggleLike(fan1.id, post.id);
   await reputation.syncPostTrust(adapter, post.id);
   const one = await authorTrust(adapter, author.id);
-  assert.ok(Math.abs(one - 2 / 3) < 1e-9, `証拠量1で award の 1/3（${one}）`);
+  assert.ok(Math.abs(one - 2.5) < 1e-9, `証拠量1で 2.5 点（${one}）`);
 
   const fan2 = await trustUser(adapter);
   await adapter.toggleLike(fan2.id, post.id);
   await reputation.syncPostTrust(adapter, post.id);
   const two = await authorTrust(adapter, author.id);
-  assert.ok(Math.abs(two - 1) < 1e-9, `証拠量2で award の半分（${two}）`);
+  assert.ok(Math.abs(two - 4) < 1e-9, `証拠量2で 4 点（${two}）`);
   assert.ok(two > one);
 });
 
@@ -302,20 +302,20 @@ test('TrustScore: 若いアカウントの反応は部分的に数える', async
   await adapter.toggleLike(young.id, post.id);
   await reputation.syncPostTrust(adapter, post.id);
   const score = await authorTrust(adapter, author.id);
-  assert.ok(Math.abs(score - 0.4) < 1e-9, `15日目の反応は重み 0.5、証拠量 0.5 で 0.4 点（${score}）`);
+  assert.ok(Math.abs(score - 10 / 7) < 1e-9, `15日目の反応は重み 0.5、証拠量 0.5 で 10/7 点（${score}）`);
 });
 
-test('TrustScore: 低信頼の多数より高信頼の少数が重い', async () => {
+test('TrustScore: 軽い反応の多数より重い反応の少数が重い', async () => {
   const adapterLow = new InMemoryAdapter();
   const authorLow = await trustUser(adapterLow);
   const postLow = await adapterLow.createPost({ userId: authorLow.id, content: 'a' });
-  for (let i = 0; i < 10; i++) {
-    const fan = await trustUser(adapterLow, { trust: -90 });
+  for (let i = 0; i < 6; i++) {
+    const fan = await trustUser(adapterLow, { ageDays: 7.5 });
     await adapterLow.toggleLike(fan.id, postLow.id);
   }
   await reputation.syncPostTrust(adapterLow, postLow.id);
   const low = await authorTrust(adapterLow, authorLow.id);
-  assert.ok(Math.abs(low - 2 / 3) < 1e-9, `重み 0.1 の10件は証拠量1と等しい（${low}）`);
+  assert.ok(Math.abs(low - 10 / 3) < 1e-6, `重み 0.25 の6件は証拠量 1.5（${low}）`);
 
   const adapterHigh = new InMemoryAdapter();
   const authorHigh = await trustUser(adapterHigh);
@@ -326,8 +326,8 @@ test('TrustScore: 低信頼の多数より高信頼の少数が重い', async ()
   }
   await reputation.syncPostTrust(adapterHigh, postHigh.id);
   const high = await authorTrust(adapterHigh, authorHigh.id);
-  assert.ok(Math.abs(high - 1) < 1e-9, `重み 1 の2件は証拠量2（${high}）`);
-  assert.ok(high > low, '高信頼の少数が低信頼の多数を上回る');
+  assert.ok(Math.abs(high - 4) < 1e-9, `重み 1 の2件は証拠量2（${high}）`);
+  assert.ok(high > low, '重い反応の少数が軽い反応の多数を上回る');
 });
 
 test('TrustScore: 関係のある反応者はまとめて逓減する', async () => {
@@ -341,7 +341,7 @@ test('TrustScore: 関係のある反応者はまとめて逓減する', async ()
   await adapter.toggleLike(b.id, post.id);
   await reputation.syncPostTrust(adapter, post.id);
   const score = await authorTrust(adapter, author.id);
-  assert.ok(Math.abs(score - 6 / 7) < 1e-9, `同じかたまりの2件は証拠量 1+1/2（${score}）`);
+  assert.ok(Math.abs(score - 10 / 3) < 1e-9, `同じかたまりの2件は証拠量 1+1/2（${score}）`);
 });
 
 test('TrustScore: 公開ノートは減点し、モデレーション済みの投稿は加点しない', async () => {
@@ -363,6 +363,23 @@ test('TrustScore: 公開ノートは減点し、モデレーション済みの�
   await adapter2.replaceReputationEvents(`moderation-post:${post2.id}:seed`, [reputation.event('moderation', author2.id, 'trust', -1, 0, '2026-01-01')]);
   await reputation.syncPostTrust(adapter2, post2.id);
   assert.equal(await authorTrust(adapter2, author2.id), -1, 'モデレーションの記録だけが残り、投稿の加点は付かない');
+});
+
+test('TrustScore: スコアの下限は-50で、下限の反応者は証拠に数えない', async () => {
+  const adapter = new InMemoryAdapter();
+  const author = await trustUser(adapter);
+  const post = await adapter.createPost({ userId: author.id, content: 'hello' });
+  const floored = await trustUser(adapter, { trust: -80 });
+  assert.equal(await authorTrust(adapter, floored.id), -50, 'スコアは-50で止まる');
+  await adapter.toggleLike(floored.id, post.id);
+  await reputation.syncPostTrust(adapter, post.id);
+  assert.equal(await authorTrust(adapter, author.id), 0, '下限の反応者の反応は証拠に数えない');
+
+  const half = await trustUser(adapter, { trust: -25 });
+  await adapter.toggleLike(half.id, post.id);
+  await reputation.syncPostTrust(adapter, post.id);
+  const score = await authorTrust(adapter, author.id);
+  assert.ok(Math.abs(score - 10 / 7) < 1e-9, `-25 の反応者は重み 0.5 で証拠量 0.5（${score}）`);
 });
 
 test('TrustScore: 反応が成立しない場合はゼロのまま壊れない', async () => {
