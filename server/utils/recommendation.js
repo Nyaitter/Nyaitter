@@ -50,6 +50,9 @@ const DISLIKED_AUTHOR_HARD_COUNT = 2;
 const NEGATIVE_TAG_MAX_PENALTY = 14;
 // 反応済みの投稿は加算ペナルティではなく乗算で強く沈める（高い素点でも再浮上しにくくする）。
 const REACTED_SCORE_FACTOR = 0.3;
+// 信頼スコアが負の投稿者は、スコアの下限までの割合に応じて最大でこの割合まで沈める。
+const LOW_TRUST_DEMOTION_MAX = 0.5;
+const LOW_TRUST_RANGE = 50;
 
 // Diversity caps for a single page.
 const AUTHOR_CAP = 2;
@@ -168,6 +171,7 @@ function scoreRecommendedPosts(candidatePosts, {
 	blockedAuthors = new Set(),
 	viewerAgeEstimate = null,
 	authorAgeEstimates = null,
+	authorTrustScores = null,
 	now = Date.now(),
 	limit = 30,
 } = {}) {
@@ -178,6 +182,7 @@ function scoreRecommendedPosts(candidatePosts, {
 	const authorAgeById = Number.isFinite(Number(viewerAgeEstimate)) && viewerAgeEstimate != null
 		? toCountMap(authorAgeEstimates, { numericKeys: true })
 		: new Map();
+	const authorTrustById = toCountMap(authorTrustScores, { numericKeys: true });
 	const dislikedCounts = toCountMap(dislikedAuthorCounts, { numericKeys: true });
 	const negativeTags = new Map();
 	for (const [tag, count] of toCountMap(negativeTagCounts).entries()) {
@@ -289,7 +294,11 @@ function scoreRecommendedPosts(candidatePosts, {
 		let totalScoreRaw = Math.max(0, recencyScore + engagementScore + followScore + affinityScore + ageProximity - penalty);
 		if (validViewerId != null && reactedPostIds?.has(postId)) totalScoreRaw *= REACTED_SCORE_FACTOR;
 		const recommendationPenalty = Math.max(0, Math.min(1, Number(post?.recommendation_penalty ?? post?.recommendationPenalty) || 0));
-		const totalScore = totalScoreRaw * (1 - recommendationPenalty);
+		const authorTrust = authorTrustById.get(authorId);
+		const trustDemotion = authorTrust != null && authorTrust < 0
+			? LOW_TRUST_DEMOTION_MAX * Math.min(1, -authorTrust / LOW_TRUST_RANGE)
+			: 0;
+		const totalScore = totalScoreRaw * (1 - recommendationPenalty) * (1 - trustDemotion);
 		scored.push({
 			id: Number.isSafeInteger(postId) ? postId : null,
 			authorId: Number.isSafeInteger(authorId) ? authorId : null,

@@ -78,6 +78,22 @@ test('reactedPostIds: 一律減点ではなく乗算で強く沈む', () => {
   assert.ok(Math.abs(ratio - 0.3) < 1e-9, `ratio=${ratio}`);
 });
 
+test('authorTrustScores: 信頼スコアが負の投稿者は割合に応じて沈む', () => {
+  const now = new Date('2026-01-01T01:00:00Z').getTime();
+  const posts = [post(1, 2), post(2, 3), post(3, 4)];
+  const scored = scoreRecommendedPosts(posts, {
+    viewerId: 1,
+    now,
+    limit: 10,
+    authorTrustScores: new Map([[2, -50], [3, 0], [4, -25]]),
+  });
+  const byAuthor = new Map(scored.map((s) => [s.authorId, s.score]));
+  const base = byAuthor.get(3);
+  assert.ok(Math.abs(byAuthor.get(2) / base - 0.5) < 1e-9, `下限では半分（${byAuthor.get(2) / base}）`);
+  assert.ok(Math.abs(byAuthor.get(4) / base - 0.75) < 1e-9, `-25 では 0.75 倍（${byAuthor.get(4) / base}）`);
+  assert.deepEqual(scored.map((s) => s.authorId), [3, 4, 2]);
+});
+
 test('affinity: 複数タグ一致が単一一致より明確に高い（飽和緩和）', () => {
   const now = new Date('2026-01-01T01:00:00Z').getTime();
   const profile = new Map([['猫', 12], ['写真', 12]]);

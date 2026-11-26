@@ -2,7 +2,7 @@
 
 const { parseIntegerRange, isWithinRange, describeIntegerRange } = require('./settingFormats');
 
-const trustNumbers = Object.freeze({ Trusted: 3, Reliable: 2, Credible: 1, Neutral: 0, Questionable: -1, Suspicious: -2, Banned: -3 });
+const trustNumbers = Object.freeze({ Trusted: 3, Reliable: 2, Credible: 1, Neutral: 0, Banned: -3 });
 const featureNames = Object.freeze(['write', 'posts', 'polls', 'notes', 'uploads', 'dm', 'call', 'spaces', 'groups']);
 
 function parseFeatureAccess(value = {}) {

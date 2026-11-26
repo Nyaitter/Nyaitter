@@ -161,7 +161,7 @@ test('D-Low: reputationPolicy の安全域検証', () => {
   assert.throws(() => buildPolicy({ notes: { penalty: 100 } }));
   assert.throws(() => buildPolicy({ notes: { minPublicSample: 500 } }));
   assert.throws(() => buildPolicy({
-    trust: { Suspicious: { minScore: 500, rateMultiplier: 0.5, queuePriority: -2, disabledFeatures: ['notes', 'uploads'] } },
+    trust: { Credible: { minScore: 1000 } },
   }));
 });
 

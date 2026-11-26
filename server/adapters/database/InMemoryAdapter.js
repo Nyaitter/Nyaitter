@@ -4767,6 +4767,14 @@ class InMemoryAdapter extends DatabaseAdapter {
 				if (authorAge != null) authorAgeEstimates.set(authorId, Number(authorAge));
 			}
 
+			const authorTrustScores = new Map();
+			for (const post of candidates) {
+				const authorId = Number(post.userId ?? post.user_id);
+				if (!Number.isSafeInteger(authorId) || authorTrustScores.has(authorId)) continue;
+				const score = Number(this.reputationProfiles?.get(authorId)?.trust?.score);
+				if (Number.isFinite(score) && score < 0) authorTrustScores.set(authorId, Math.max(-50, score));
+			}
+
 			const scored = scoreRecommendedPosts(candidates, {
 				viewerId: normalizedViewerId,
 				keywordProfile: keywordAffinities,
@@ -4779,6 +4787,7 @@ class InMemoryAdapter extends DatabaseAdapter {
 				blockedAuthors,
 				viewerAgeEstimate,
 				authorAgeEstimates,
+				authorTrustScores,
 				limit: normalizedLimit,
 			});
 

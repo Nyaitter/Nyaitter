@@ -21,6 +21,8 @@ function sortOrdered(events) {
 function profileFromRows(rows) {
   const result = {};
   for (const r of rows || []) result[r.dimension] = { score: Number(r.score), successes: Number(r.successes), positiveDays: Number(r.positive_days || 0) };
+  // 信頼スコアの下限は-50。保存上の合計がそれ未満でも、扱う値は-50で止める。
+  if (result.trust) result.trust.score = Math.max(-50, result.trust.score);
   return result;
 }
 
@@ -108,9 +110,10 @@ function installMemory(Adapter) {
     return [{...winner,key:'outcome',metadata:JSON.parse(winner.metadata)}];
   };
   require('./reportReputation').installMemory(Adapter);
+  const floorTrustScore = profile => { if (profile?.trust) profile.trust.score = Math.max(-50, profile.trust.score); return profile; };
   Adapter.prototype.getReputationDisplayContext = async function(ids) {
     const profiles = {};
-    for (const id of ids) profiles[id] = structuredClone(this.reputationProfiles?.get(Number(id)) || {});
+    for (const id of ids) profiles[id] = floorTrustScore(structuredClone(this.reputationProfiles?.get(Number(id)) || {}));
     return { users: await this.getUsersByIds(ids), profiles };
   };
   const limited=(value,cap)=>cap===-1?value:Math.min(value,cap);
@@ -218,7 +221,7 @@ function installMemory(Adapter) {
         total.score+=score;total.successes+=successesOf(daily);
         if (daily.positive>0 && score>0) total.positiveDays++;
       }
-      return profile;
+      return floorTrustScore(profile);
     }
     const profile=structuredClone(this.reputationProfiles?.get(uid) || {});
     for (const total of Object.values(profile)) total.positiveDays=0;
@@ -227,7 +230,7 @@ function installMemory(Adapter) {
       const dimension=key.split(':')[1];
       if (profile[dimension]) profile[dimension].positiveDays++;
     }
-    return profile;
+    return floorTrustScore(profile);
   };
   Adapter.prototype.getTrustBasisProfile = async function(userId,{excludeScope=null}={}) {
     const days=new Map();
@@ -244,6 +247,7 @@ function installMemory(Adapter) {
     }
     const trust={score:0,successes:0,positiveDays:0};
     for (const row of days.values()) {const score=scoreOf(row);trust.score+=score;trust.successes+=successesOf(row);if (score>0) trust.positiveDays++;}
+    trust.score=Math.max(-50,trust.score);
     return {trust};
   };
   Adapter.prototype.replaceReputationEvents = async function(scope, input, evaluation = null) {

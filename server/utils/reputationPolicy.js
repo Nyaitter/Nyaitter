@@ -13,15 +13,13 @@ const defaults = {
   },
   dailyCaps: { trust: null, ban: 1 },
   trust: {
-    Trusted: { minScore: 900, rateMultiplier: 1.5, queuePriority: 3, disabledFeatures: [], publicRatioReduction: 0.05, dailyNotes: null, ratingWeight: 1.3, publicBonus: 1, noteVisibility: 1 },
-    Reliable: { minScore: 600, rateMultiplier: 1.3, queuePriority: 2, disabledFeatures: [], publicRatioReduction: 0.04, dailyNotes: null, ratingWeight: 1.2, publicBonus: 0.5, noteVisibility: 0.5 },
-    Credible: { minScore: 300, rateMultiplier: 1.1, queuePriority: 1, disabledFeatures: [], publicRatioReduction: 0.02, dailyNotes: null, ratingWeight: 1.1, publicBonus: 0.25, noteVisibility: 0.25 },
+    Trusted: { minScore: 500, rateMultiplier: 1.5, queuePriority: 3, disabledFeatures: [], publicRatioReduction: 0.05, dailyNotes: null, ratingWeight: 1.3, publicBonus: 1, noteVisibility: 1 },
+    Reliable: { minScore: 250, rateMultiplier: 1.3, queuePriority: 2, disabledFeatures: [], publicRatioReduction: 0.04, dailyNotes: null, ratingWeight: 1.2, publicBonus: 0.5, noteVisibility: 0.5 },
+    Credible: { minScore: 100, rateMultiplier: 1.1, queuePriority: 1, disabledFeatures: [], publicRatioReduction: 0.02, dailyNotes: null, ratingWeight: 1.1, publicBonus: 0.25, noteVisibility: 0.25 },
     Neutral: { minScore: 0, rateMultiplier: 1, queuePriority: 0, disabledFeatures: [], publicRatioReduction: 0, dailyNotes: null, ratingWeight: 1, publicBonus: 0, noteVisibility: 0 },
-    Questionable: { minScore: -10, rateMultiplier: 0.75, queuePriority: -1, disabledFeatures: ['notes'], publicRatioReduction: 0, dailyNotes: null, ratingWeight: 1, publicBonus: 0, noteVisibility: 0 },
-    Suspicious: { minScore: -1000000, rateMultiplier: 0.5, queuePriority: -2, disabledFeatures: ['notes', 'uploads'], publicRatioReduction: 0, dailyNotes: null, ratingWeight: 1, publicBonus: 0, noteVisibility: 0 },
     Banned: { minScore: -1000001, rateMultiplier: 0.25, queuePriority: -3, disabledFeatures: ['write', 'notes', 'uploads'], publicRatioReduction: 0, dailyNotes: null, ratingWeight: 1, publicBonus: 0, noteVisibility: 0 },
   },
-  positivePost: { award: 2, halfSaturation: 2, minAgeDays: 30, minTrust: 0 },
+  positivePost: { award: 10, halfSaturation: 3, minAgeDays: 30, minTrust: 0 },
   penalties: { publicNote: -3, rejectedNote: -2, approvedReport: -5, falseReports: -3, falseReportRepeat: 3 },
 };
 
@@ -79,9 +77,8 @@ function buildPolicy(input = {}) {
       || rank.disabledFeatures.some(f => !['write', 'notes', 'uploads', 'dm'].includes(f))) throw new Error('Invalid trust policy');
     if (rank.rateLimits && Object.values(rank.rateLimits).some(v => !Number.isInteger(v) || v < 1)) throw new Error('Invalid trust rate limits');
   }
-  const ordered=['Trusted','Reliable','Credible','Neutral','Questionable'];
+  const ordered=['Trusted','Reliable','Credible','Neutral'];
   if (policy.trust.Neutral.minScore!==0 || ordered.some((rank,i)=>i && policy.trust[ordered[i-1]].minScore<=policy.trust[rank].minScore)) throw new Error('Trust thresholds must decrease through Neutral=0');
-  if (policy.trust.Suspicious.minScore>=policy.trust.Questionable.minScore || policy.trust.Banned.minScore>policy.trust.Suspicious.minScore) throw new Error('Trust thresholds must decrease through Neutral=0');
   if (!Number.isFinite(policy.positivePost.award) || policy.positivePost.award<0 || policy.positivePost.award>10
     || !Number.isFinite(policy.positivePost.halfSaturation) || policy.positivePost.halfSaturation<=0 || policy.positivePost.halfSaturation>1000
     || !Number.isFinite(policy.positivePost.minAgeDays) || policy.positivePost.minAgeDays<0
@@ -93,7 +90,7 @@ function buildPolicy(input = {}) {
 
 function trustRank(profile, policy) {
   if (Number(profile?.ban?.score || 0) > 0) return 'Banned';
-  return ['Trusted', 'Reliable', 'Credible', 'Neutral', 'Questionable'].find(rank => Number(profile?.trust?.score || 0) >= policy.trust[rank].minScore) || 'Suspicious';
+  return ['Trusted', 'Reliable', 'Credible', 'Neutral'].find(rank => Number(profile?.trust?.score || 0) >= policy.trust[rank].minScore) || 'Neutral';
 }
 
 module.exports = { buildPolicy, trustRank };
