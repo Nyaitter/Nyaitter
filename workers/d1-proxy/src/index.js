@@ -2235,6 +2235,29 @@ export default {
 					return json(normalizeModerationReportRow(row), 201);
 				}
 
+				if (method === 'POST' && pathname === '/moderation-reports/open-by-target') {
+					const body = await request.json();
+					const targetKind = String(body.targetKind || '');
+					const targetId = ['dm', 'dm_message'].includes(targetKind)
+						? String(body.targetId || '').trim()
+						: Number(body.targetId);
+					const row = await db.prepare(
+						`SELECT * FROM moderation_reports
+						 WHERE target_kind = ? AND target_id = ? AND assignment_type = 'report' AND status IN ('pending', 'assigned')
+						 ORDER BY created_at ASC, id ASC LIMIT 1`
+					).bind(targetKind, targetId).first();
+					return json(normalizeModerationReportRow(row));
+				}
+
+				if (method === 'POST' && pathname.match(/^\/moderation-reports\/(\d+)\/snapshot$/)) {
+					const reportId = Number(pathname.split('/')[2]);
+					const body = await request.json();
+					await db.prepare('UPDATE moderation_reports SET target_snapshot = ? WHERE id = ?')
+						.bind(JSON.stringify(body.targetSnapshot || {}), reportId).run();
+					const row = await db.prepare('SELECT * FROM moderation_reports WHERE id = ?').bind(reportId).first();
+					return json(normalizeModerationReportRow(row));
+				}
+
 				if (method === 'GET' && pathname.match(/^\/users\/(\d+)\/moderation-appeal\/open$/)) {
 					const userId = Number(pathname.split('/')[2]);
 					const row = await db.prepare(
@@ -2382,12 +2405,6 @@ export default {
 					if (result.meta.changes === 0) return json(null);
 					const row = await db.prepare('SELECT * FROM moderation_reports WHERE id = ?').bind(reportId).first();
 					return json(normalizeModerationReportRow(row));
-				}
-
-				if (method === 'POST' && pathname.match(/^\/moderation-reports\/(\d+)\/delete$/)) {
-					const reportId = Number(pathname.split('/')[2]);
-					const result = await db.prepare('DELETE FROM moderation_reports WHERE id = ?').bind(reportId).run();
-					return json({ success: result.meta.changes > 0 });
 				}
 
 				if (method === 'POST' && pathname.match(/^\/users\/(\d+)\/follow$/)) {

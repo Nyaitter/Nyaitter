@@ -102,6 +102,12 @@ router.post({
 
   const subscription = normalizeSubscription(req.body?.subscription);
   if (!subscription) {
+    let endpointHost = null;
+    try {
+      const rawEndpoint = req.body?.subscription?.endpoint;
+      if (typeof rawEndpoint === 'string') endpointHost = new URL(rawEndpoint).hostname || null;
+    } catch (_) {}
+    console.warn('[push] Rejected subscription:', endpointHost ? `endpoint host ${endpointHost}` : 'malformed subscription');
     return res.status(400).json({ error: 'Invalid PushSubscription' });
   }
 
