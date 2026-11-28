@@ -60,6 +60,27 @@ function contentModerationNotificationMessage(applied) {
   return '';
 }
 
+// 1件のリクエストに集まった報告の一覧。統合前に作られたリクエストは
+// 行の報告者と理由から先頭の1件を組み立てる。
+function reportEntriesOf(report) {
+  const fromSnapshot = report?.targetSnapshot?.reports;
+  if (Array.isArray(fromSnapshot) && fromSnapshot.length > 0) {
+    return fromSnapshot
+      .filter((entry) => entry && typeof entry === 'object')
+      .map((entry) => ({
+        reporter_id: Number(entry.reporter_id) || 0,
+        description: typeof entry.description === 'string' ? entry.description : '',
+        created_at: entry.created_at || null,
+      }));
+  }
+  if (!report) return [];
+  return [{
+    reporter_id: Number(report.reporterUserId ?? report.reporterId ?? report.reporter_user_id) || 0,
+    description: typeof report.description === 'string' ? report.description : '',
+    created_at: report.createdAt || report.created_at || null,
+  }];
+}
+
 function attachmentKeys(attachments) {
   const parsed = typeof attachments === 'string'
     ? (() => { try { return JSON.parse(attachments); } catch (_) { return []; } })()
@@ -96,18 +117,49 @@ class ModerationReportService {
       throw new Error(`description must be ${this.descriptionMaxLength} characters or less`);
     }
 
+    if (kind === 'user' && reporterId === id) throw new Error('自分自身は報告できません');
+
+    // 同じ対象への対応中の報告があれば新しいリクエストを作らず、
+    // 理由を追加して1件にまとめる。
+    const existing = typeof this.db.getOpenModerationReportByTarget === 'function'
+      ? await this.db.getOpenModerationReportByTarget(kind, id)
+      : null;
+    if (existing) {
+      const entries = reportEntriesOf(existing);
+      if (entries.some((entry) => entry.reporter_id === reporterId)) return existing;
+      entries.push({
+        reporter_id: reporterId,
+        description: normalizedDescription,
+        created_at: this.now().toISOString(),
+      });
+      if (typeof this.db.updateModerationReportSnapshot === 'function') {
+        const updated = await this.db.updateModerationReportSnapshot(existing.id, {
+          ...(existing.targetSnapshot || {}),
+          reports: entries,
+        });
+        if (updated) return updated;
+      }
+      return existing;
+    }
+
+    const createdAt = this.now().toISOString();
     const snapshot = await this._captureTargetSnapshot({
       reporterUserId: reporterId,
       targetKind: kind,
       targetId: id,
     });
+    snapshot.reports = [{
+      reporter_id: reporterId,
+      description: normalizedDescription,
+      created_at: createdAt,
+    }];
     const report = await this.db.createModerationReport({
       reporterUserId: reporterId,
       targetKind: kind,
       targetId: id,
       description: normalizedDescription,
       targetSnapshot: snapshot,
-      createdAt: this.now().toISOString(),
+      createdAt,
     });
     return (await this._assignReport(report)) || report;
   }
@@ -197,7 +249,9 @@ class ModerationReportService {
 
   async getReportById(reportId) {
     const id = toSafeInteger(reportId, 'reportId', { minimum: 1 });
-    return this.db.getModerationReportById(id);
+    const report = await this.db.getModerationReportById(id);
+    if (report) report.reports = reportEntriesOf(report);
+    return report;
   }
 
   async getTargetState(report) {
@@ -218,17 +272,19 @@ class ModerationReportService {
   }
 
   async listReports({ status = 'assigned', limit = 50, offset = 0, adminId = null } = {}) {
+    let reports;
     if (adminId != null && typeof this.db.listModerationReportsForAdmin === 'function') {
-      return this.db.listModerationReportsForAdmin(adminId, { status, limit, offset });
+      reports = await this.db.listModerationReportsForAdmin(adminId, { status, limit, offset });
+    } else if (typeof this.db.listModerationReports === 'function') {
+      reports = await this.db.listModerationReports({ status, limit, offset });
+    } else if (typeof this.db.getUnassignedModerationReports === 'function') {
+      const unassigned = await this.db.getUnassignedModerationReports(limit + offset);
+      reports = unassigned.slice(offset, offset + limit);
+    } else {
+      reports = [];
     }
-    if (typeof this.db.listModerationReports === 'function') {
-      return this.db.listModerationReports({ status, limit, offset });
-    }
-    if (typeof this.db.getUnassignedModerationReports === 'function') {
-      const reports = await this.db.getUnassignedModerationReports(limit + offset);
-      return reports.slice(offset, offset + limit);
-    }
-    return [];
+    for (const report of reports) report.reports = reportEntriesOf(report);
+    return reports;
   }
 
   async updateReportStatus(reportId, { status, note, action, moderatorId } = {}) {
@@ -407,15 +463,6 @@ class ModerationReportService {
     }));
   }
 
-  async _deleteCompletedRequest(report) {
-    try {
-      const deleted = await this.db.deleteModerationReport(report.id);
-      if (!deleted) console.warn(`[moderation] completed request ${report.id} was not deleted`);
-    } catch (error) {
-      console.warn(`[moderation] completed request ${report.id} cleanup failed:`, error.message);
-    }
-  }
-
   async _notifyReporter(report, actionTaken) {
     await modLog.operation(this.db, 'system', null, 'reporter_notice', 'user', report.reporterUserId, () => createNotificationIfAllowed(this.db, {
       userId: report.reporterUserId,
@@ -469,7 +516,6 @@ class ModerationReportService {
     }
     if (report?.status==='resolved' && Number(report.assignedAdminId)===Number(adminId) && Number(report.resolution?.moderatorId)===Number(adminId)) {
       await require('./ReputationService').syncReport(this.db,report);
-      await this._deleteCompletedRequest(report);
       return report;
     }
     if (!report || report.status !== 'assigned' || Number(report.assignedAdminId) !== Number(adminId)) {
@@ -672,7 +718,6 @@ class ModerationReportService {
     }
 
     await this._notifyReporter(resolved, actionTaken);
-    await this._deleteCompletedRequest(resolved);
     return resolved;
   }
 
@@ -716,7 +761,6 @@ class ModerationReportService {
       type: decision === 'approved' ? 'appeal_approved' : 'appeal_rejected',
       target: { kind: 'route', value: '#notifications' },
     }));
-    await this._deleteCompletedRequest(resolved);
     return resolved;
   }
 
@@ -760,7 +804,6 @@ class ModerationReportService {
       type: decision === 'approved' ? 'verification_approved' : 'verification_rejected',
       target: { kind: 'route', value: '#notifications' },
     }));
-    await this._deleteCompletedRequest(resolved);
     return resolved;
   }
 

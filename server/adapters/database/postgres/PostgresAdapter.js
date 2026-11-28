@@ -6524,6 +6524,24 @@ class PostgresAdapter extends DatabaseAdapter {
 		return normalizeModerationReportRow(rows[0]);
 	}
 
+	async getOpenModerationReportByTarget(targetKind, targetId) {
+		const { rows } = await this.pool.query(
+			`SELECT * FROM moderation_reports
+			 WHERE target_kind = $1 AND target_id = $2 AND assignment_type = 'report' AND status IN ('pending', 'assigned')
+			 ORDER BY created_at ASC, id ASC LIMIT 1`,
+			[String(targetKind), String(targetId)],
+		);
+		return rows[0] ? normalizeModerationReportRow(rows[0]) : null;
+	}
+
+	async updateModerationReportSnapshot(reportId, targetSnapshot) {
+		const { rows } = await this.pool.query(
+			'UPDATE moderation_reports SET target_snapshot = $2::jsonb WHERE id = $1 RETURNING *',
+			[Number(reportId), JSON.stringify(targetSnapshot || {})],
+		);
+		return rows[0] ? normalizeModerationReportRow(rows[0]) : null;
+	}
+
 	async listModerationReportsForAdmin(adminId, options = {}) {
 		const status = options.status || 'assigned';
 		const limit = Math.max(1, Math.min(Number(options.limit) || 50, 100));
@@ -6669,14 +6687,6 @@ class PostgresAdapter extends DatabaseAdapter {
 			[Number(reportId), Number(adminId), JSON.stringify(resolution || {}), now],
 		);
 		return normalizeModerationReportRow(rows[0]);
-	}
-
-	async deleteModerationReport(reportId) {
-		const result = await this.pool.query(
-			'DELETE FROM moderation_reports WHERE id = $1',
-			[Number(reportId)],
-		);
-		return result.rowCount > 0;
 	}
 
 	// ==================== Push Subscriptions ====================

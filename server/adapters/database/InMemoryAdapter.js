@@ -4062,6 +4062,21 @@ class InMemoryAdapter extends DatabaseAdapter {
 			return this._copyModerationReport(this.moderationReports.get(Number(reportId)));
 		}
 
+		async getOpenModerationReportByTarget(targetKind, targetId) {
+			const report = [...this.moderationReports.values()]
+				.filter((entry) => entry.assignmentType === 'report' && entry.status !== 'resolved')
+				.filter((entry) => entry.targetKind === String(targetKind) && String(entry.targetId) === String(targetId))
+				.sort((left, right) => new Date(left.createdAt) - new Date(right.createdAt))[0];
+			return this._copyModerationReport(report);
+		}
+
+		async updateModerationReportSnapshot(reportId, targetSnapshot) {
+			const report = this.moderationReports.get(Number(reportId));
+			if (!report) return null;
+			report.targetSnapshot = JSON.parse(JSON.stringify(targetSnapshot || {}));
+			return this._copyModerationReport(report);
+		}
+
 		async listModerationReportsForAdmin(adminId, options = {}) {
 			const status = options.status || 'assigned';
 			const limit = Math.max(1, Math.min(Number(options.limit) || 50, 100));
@@ -4162,10 +4177,6 @@ class InMemoryAdapter extends DatabaseAdapter {
 			report.resolvedAt = new Date();
 			report.claimedAt = null;
 			return this._copyModerationReport(report);
-		}
-
-		async deleteModerationReport(reportId) {
-			return this.moderationReports.delete(Number(reportId));
 		}
 
 		async upsertPushSubscription(userId, subscription) {

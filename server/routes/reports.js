@@ -93,6 +93,11 @@ function serializeReport(report) {
     ...serializeReportBrief(report),
     reporter_id: report.reporterUserId ?? report.reporter_id ?? null,
     description: report.description || '',
+    reports: Array.isArray(report.reports) ? report.reports : [{
+      reporter_id: report.reporterUserId ?? report.reporter_id ?? null,
+      description: report.description || '',
+      created_at: report.createdAt || report.created_at || null,
+    }],
     target_snapshot: report.targetSnapshot || report.target_snapshot || {},
     assigned_admin_id: report.assignedAdminId ?? report.assigned_admin_id ?? null,
     excluded_admin_ids: report.excludedAdminIds || report.excluded_admin_ids || [],

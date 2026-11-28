@@ -2387,6 +2387,17 @@ class D1Adapter extends DatabaseAdapter {
 		));
 	}
 
+	async getOpenModerationReportByTarget(targetKind, targetId) {
+		return mapModerationReport(await this._write('/moderation-reports/open-by-target', { targetKind, targetId }));
+	}
+
+	async updateModerationReportSnapshot(reportId, targetSnapshot) {
+		return mapModerationReport(await this._write(
+			`/moderation-reports/${requireId(reportId, 'reportId', 1)}/snapshot`,
+			{ targetSnapshot },
+		));
+	}
+
 	async listModerationReportsForAdmin(adminId, options = {}) {
 		const reports = await this._read(this._query(
 			`/moderation-reports/admin/${requireId(adminId, 'adminId')}`,
@@ -2451,13 +2462,6 @@ class D1Adapter extends DatabaseAdapter {
 			`/moderation-reports/${requireId(reportId, 'reportId', 1)}/resolve`,
 			{ adminId: requireId(adminId, 'adminId'), resolution },
 		));
-	}
-
-	async deleteModerationReport(reportId) {
-		const result = await this._write(
-			`/moderation-reports/${requireId(reportId, 'reportId', 1)}/delete`,
-		);
-		return typeof result === 'boolean' ? result : Boolean(result?.success);
 	}
 
 	async upsertPushSubscription(userId, subscription) {

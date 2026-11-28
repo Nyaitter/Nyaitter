@@ -684,6 +684,8 @@ class DatabaseAdapter {
 	async getOpenModerationAppealByUserId(userId) { throw new Error('getOpenModerationAppealByUserId() must be implemented'); }
 	async getOpenModerationVerificationByUserId(userId) { throw new Error('getOpenModerationVerificationByUserId() must be implemented'); }
 	async getModerationReportById(reportId) { throw new Error('getModerationReportById() must be implemented'); }
+	async getOpenModerationReportByTarget(targetKind, targetId) { throw new Error('getOpenModerationReportByTarget() must be implemented'); }
+	async updateModerationReportSnapshot(reportId, targetSnapshot) { throw new Error('updateModerationReportSnapshot() must be implemented'); }
 	async listModerationReportsForAdmin(adminId, options = {}) { throw new Error('listModerationReportsForAdmin() must be implemented'); }
 	async getModerationAdminWorkloads(excludedAdminIds = []) { throw new Error('getModerationAdminWorkloads() must be implemented'); }
 	async setAdminRequestExcluded(userId, excluded) { throw new Error('setAdminRequestExcluded() must be implemented'); }
@@ -692,7 +694,6 @@ class DatabaseAdapter {
 	async getUnassignedModerationReports(limit = 100) { throw new Error('getUnassignedModerationReports() must be implemented'); }
 	async claimModerationReport(reportId, adminId, claimedAtIso) { throw new Error('claimModerationReport() must be implemented'); }
 	async resolveModerationReport(reportId, adminId, resolution) { throw new Error('resolveModerationReport() must be implemented'); }
-	async deleteModerationReport(reportId) { throw new Error('deleteModerationReport() must be implemented'); }
 
 	
 	async upsertPushSubscription(userId, subscription) {
